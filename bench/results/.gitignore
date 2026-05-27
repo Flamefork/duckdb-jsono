@@ -1,0 +1,5 @@
+*.json
+!baseline.json
+*.parquet
+profiles/
+samply/

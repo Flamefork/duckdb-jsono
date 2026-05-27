@@ -1,0 +1,213 @@
+# name: test/sql/jsono_numbers.test
+# description: JSONO number encoding — VAL_INT60 / VAL_DEC60 / VAL_EXT INT64 / UINT64 / NUMBER
+# group: [sql]
+
+require jsono
+
+# Small non-negative integer stays in VAL_INT60
+query I
+SELECT to_json(jsono('0'));
+----
+0
+
+# Plain positive integer
+query I
+SELECT to_json(jsono('42'));
+----
+42
+
+# Largest VAL_INT60 magnitude (2^59 - 1) round-trips inline
+query I
+SELECT to_json(jsono('576460752303423487'));
+----
+576460752303423487
+
+# Signed value just past VAL_INT60 → VAL_EXT/INT64
+query I
+SELECT to_json(jsono('1000000000000000000'));
+----
+1000000000000000000
+
+# INT64 maximum round-trips through VAL_EXT/INT64
+query I
+SELECT to_json(jsono('9223372036854775807'));
+----
+9223372036854775807
+
+# Negative INT64 boundary round-trips
+query I
+SELECT to_json(jsono('-9223372036854775808'));
+----
+-9223372036854775808
+
+# Unsigned value above INT64 range → VAL_EXT/UINT64
+query I
+SELECT to_json(jsono('9223372036854775808'));
+----
+9223372036854775808
+
+# UINT64 maximum (2^64 - 1) round-trips
+query I
+SELECT to_json(jsono('18446744073709551615'));
+----
+18446744073709551615
+
+# Bignum just past UINT64 (2^64) → VAL_EXT/NUMBER, byte-exact (was an error before Phase 3)
+query I
+SELECT to_json(jsono('18446744073709551616'));
+----
+18446744073709551616
+
+# Very large bignum → VAL_EXT/NUMBER, byte-exact
+query I
+SELECT to_json(jsono('99999999999999999999999999999999999999'));
+----
+99999999999999999999999999999999999999
+
+# Large negative bignum below INT64 min → VAL_EXT/NUMBER
+query I
+SELECT to_json(jsono('-99999999999999999999'));
+----
+-99999999999999999999
+
+# jsono_type reports BIGINT for signed extension, UBIGINT for unsigned, DOUBLE for NUMBER bignum
+query IIII
+SELECT
+  jsono_type(try_jsono('42')),
+  jsono_type(try_jsono('9223372036854775807')),
+  jsono_type(try_jsono('18446744073709551615')),
+  jsono_type(try_jsono('18446744073709551616'));
+----
+BIGINT	BIGINT	UBIGINT	DOUBLE
+
+# NUMBER-encoded numbers (exponent/fractional bignum) are numeric -> DOUBLE, matching
+# json_type; a JSON string keeps VARCHAR even when it looks like a number.
+query IIIII
+SELECT
+  jsono_type(try_jsono('1.5e-3')),
+  jsono_type(try_jsono('1e3')),
+  jsono_type(try_jsono('1.23456789012345678901')),
+  jsono_type(try_jsono('-99999999999999999999')),
+  jsono_type(try_jsono('"1e3"'));
+----
+DOUBLE	DOUBLE	DOUBLE	DOUBLE	VARCHAR
+
+#===--------------------------------------------------------------------===#
+# Fractional numbers — VAL_DEC60 byte-exact from mantissa/scale text form
+#===--------------------------------------------------------------------===#
+
+# Trailing-zero form preserved byte-exact (mantissa=3140, scale=3)
+query I
+SELECT to_json(jsono('3.140'));
+----
+3.140
+
+# Same value without trailing zero is a distinct text, also byte-exact
+query I
+SELECT to_json(jsono('3.14'));
+----
+3.14
+
+# Classic non-binary-representable fraction round-trips byte-exact
+query I
+SELECT to_json(jsono('0.1'));
+----
+0.1
+
+# Leading-zero integer part
+query I
+SELECT to_json(jsono('0.5'));
+----
+0.5
+
+# Negative fraction
+query I
+SELECT to_json(jsono('-0.25'));
+----
+-0.25
+
+# Negative zero integer (no fraction) stays an integer literal
+query I
+SELECT to_json(jsono('-0'));
+----
+0
+
+# Scale boundary: scale = 22 (last exactly representable power of ten)
+query I
+SELECT to_json(jsono('0.0000000000000000000001'));
+----
+0.0000000000000000000001
+
+# Mantissa boundary: 2^53 - 1 digits with a decimal point, fits DEC60
+query I
+SELECT to_json(jsono('9007199254740991.0'));
+----
+9007199254740991.0
+
+#===--------------------------------------------------------------------===#
+# Fractional / numeric forms NOT reconstructible from mantissa/scale → NUMBER raw text
+#===--------------------------------------------------------------------===#
+
+# Exponent form is preserved byte-exact via NUMBER (not normalized away)
+query I
+SELECT to_json(jsono('1E2'));
+----
+1E2
+
+# Lowercase exponent preserved
+query I
+SELECT to_json(jsono('1e2'));
+----
+1e2
+
+# Signed-exponent fraction preserved
+query I
+SELECT to_json(jsono('1.5e-3'));
+----
+1.5e-3
+
+# Mantissa beyond 2^53 → high-precision NUMBER, byte-exact
+query I
+SELECT to_json(jsono('74622141568500868.257030035227776'));
+----
+74622141568500868.257030035227776
+
+# Scale beyond 22 → NUMBER, byte-exact
+query I
+SELECT to_json(jsono('0.00000000000000000000001'));
+----
+0.00000000000000000000001
+
+# Mantissa exactly 2^53 (16 digits) is out of the |mantissa|<2^53 bound → NUMBER
+query I
+SELECT to_json(jsono('9007199254740992.0'));
+----
+9007199254740992.0
+
+#===--------------------------------------------------------------------===#
+# Mixed / nested
+#===--------------------------------------------------------------------===#
+
+# Mixed object exercising int60, int64, uint64, dec60, number together
+query I
+SELECT to_json(jsono('{"big":9223372036854775000,"dec":3.140,"num":1E2,"small":7,"u":18446744073709551615}'));
+----
+{"big":9223372036854775000,"dec":3.140,"num":1E2,"small":7,"u":18446744073709551615}
+
+# Numbers nested in arrays
+query I
+SELECT to_json(jsono('[1,2.5,3.140,1e2,18446744073709551616]'));
+----
+[1,2.5,3.140,1e2,18446744073709551616]
+
+# NULL handling alongside numbers
+query I
+SELECT to_json(jsono('{"d":2.50,"n":null,"u":18446744073709551615}'));
+----
+{"d":2.50,"n":null,"u":18446744073709551615}
+
+# String values that look like numbers stay strings
+query I
+SELECT to_json(jsono('{"s":"3.140","d":3.140}'));
+----
+{"d":3.140,"s":"3.140"}

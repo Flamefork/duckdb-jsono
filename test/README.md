@@ -1,11 +1,20 @@
-# Testing this extension
-This directory contains all the tests for this extension. The `sql` directory holds tests that are written as [SQLLogicTests](https://duckdb.org/dev/sqllogictest/intro.html). DuckDB aims to have most its tests in this format as SQL statements, so for the quack extension, this should probably be the goal too.
+# Tests
 
-The root makefile contains targets to build and run all of these tests. To run the SQLLogicTests:
+`test/sql/` holds [SQLLogicTests](https://duckdb.org/dev/sqllogictest/intro.html) —
+the primary test format for this extension. One `.test` file per feature or
+related cluster of behavior.
+
+Run them from the repo root:
+
 ```bash
-make test
+uv run make test          # release build
+uv run make test_debug    # debug build
 ```
-or 
-```bash
-make test_debug
-```
+
+Each SQLLogic file must start with `# group: [sql]` and `require jsono`
+(add `require parquet` only for Parquet-specific cases). Keep output
+deterministic — sort results or use fixed inputs.
+
+When changing `JSONO` storage or casts, cover bind-time errors, runtime
+invalid-input behavior, NULL behavior, and Parquet round-trips. For bug fixes,
+add or update a focused SQLLogic case before changing the implementation.

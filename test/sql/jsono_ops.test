@@ -1,0 +1,166 @@
+# name: test/sql/jsono_ops.test
+# description: JSONO construction, introspection, and merge primitives
+# group: [sql]
+
+require jsono
+
+# Tolerant constructor: invalid/empty text maps to SQL NULL, valid JSON round-trips through JSONO.
+query III
+SELECT
+  to_json(try_jsono('{"b":2,"a":1}')),
+  try_jsono('{not json') IS NULL,
+  try_jsono('') IS NULL;
+----
+{"a":1,"b":2}	true	true
+
+# jsono_type reports the JSON type of the value; NULL input stays NULL.
+query IIIIIIII
+SELECT
+  jsono_type(try_jsono('{"a":1}')),
+  jsono_type(try_jsono('[1,2]')),
+  jsono_type(try_jsono('"s"')),
+  jsono_type(try_jsono('42')),
+  jsono_type(try_jsono('3.5')),
+  jsono_type(try_jsono('true')),
+  jsono_type(try_jsono('null')),
+  jsono_type(NULL::JSONO) IS NULL;
+----
+OBJECT	ARRAY	VARCHAR	BIGINT	DOUBLE	BOOLEAN	NULL	true
+
+# jsono_keys lists object keys in stored (sorted) order; NULL input stays NULL.
+query II
+SELECT
+  jsono_keys(try_jsono('{"b":2,"a":1,"c":3}')),
+  jsono_keys(NULL::JSONO) IS NULL;
+----
+[a, b, c]	true
+
+# jsono_validate fully checks the current VERSION=1 storage contract; SQL NULL stays NULL.
+query IIII
+SELECT
+  jsono_validate(jsono('{"a":"x","b":[1,true,null]}')),
+  jsono_validate(NULL::JSONO) IS NULL,
+  jsono_validate({'jsono_slots': 'not jsono'::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}::JSONO),
+  jsono_validate({
+    'jsono_slots': unhex('4A534E4F010100000000000000000000'),
+    'jsono_key_heap': ''::BLOB,
+    'jsono_string_heap': ''::BLOB,
+    'jsono_skips': ''::BLOB
+  }::JSONO);
+----
+true	true	false	false
+
+# Nested arrays must have distinct closing slots. This blob is a valid `[["x"]]`
+# value with the outer ARR_END slot removed and the outer span shortened so the
+# inner ARR_END would be reused by both arrays.
+query I
+SELECT jsono_validate({
+  'jsono_slots': unhex('4A534E4F010100000000000000000020000000010000002001000000000000800000000000000030'),
+  'jsono_key_heap': ''::BLOB,
+  'jsono_string_heap': unhex('78'),
+  'jsono_skips': unhex('02000000000000000000000004000000010000000300000001000000')
+}::JSONO);
+----
+false
+
+# High-bit keys still take the full UTF-8 validator; invalid key bytes are rejected.
+query II
+WITH base AS (
+  SELECT jsono('{"a":1}')::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS raw
+)
+SELECT
+  jsono_validate(jsono('{"\u00e9":1}')),
+  jsono_validate({
+    'jsono_slots': raw.jsono_slots,
+    'jsono_key_heap': unhex('FF'),
+    'jsono_string_heap': raw.jsono_string_heap,
+    'jsono_skips': raw.jsono_skips
+  }::JSONO)
+FROM base;
+----
+true	false
+
+# jsono_storage_size reports the physical four-BLOB footprint without validating the value.
+query IIIIII
+SELECT
+  s.jsono_slots,
+  s.jsono_key_heap,
+  s.jsono_string_heap,
+  s.jsono_skips,
+  s.total,
+  jsono_storage_size(NULL::JSONO) IS NULL
+FROM (SELECT jsono_storage_size(jsono('{"a":"x"}')) AS s);
+----
+40	1	1	20	62	true
+
+# A constant JSONPath argument inspects a nested position; mirrors json_type(j, path) / json_keys(j, path).
+query IIIII
+SELECT
+  jsono_type(try_jsono('{"p":{"items":[{"k":1},{"k":2}]}}'), '$.p.items[1].k'),
+  jsono_keys(try_jsono('{"a":{"c":1,"b":2},"z":9}'), '$.a'),
+  jsono_keys(try_jsono('{"p":{"items":[{"x":1},{"y":2,"z":3}]}}'), '$.p.items[1]'),
+  jsono_type(try_jsono('{"a.b":42}'), '$."a.b"'),
+  jsono_type(try_jsono('{"a":[1,2]}'), '$.a');
+----
+BIGINT	[b, c]	[y, z]	BIGINT	ARRAY
+
+# A missing path yields NULL; a non-object target yields NULL keys.
+query III
+SELECT
+  jsono_type(try_jsono('{"a":1}'), '$.missing') IS NULL,
+  jsono_keys(try_jsono('{"a":1}'), '$.missing') IS NULL,
+  jsono_keys(try_jsono('{"a":5}'), '$.a') IS NULL;
+----
+true	true	true
+
+# Path argument must be a constant.
+statement ok
+CREATE TABLE jsono_path_specs AS SELECT '$.a' AS s;
+
+statement error
+SELECT jsono_type(try_jsono('{"a":1}'), s) FROM jsono_path_specs;
+----
+constant
+
+# Wildcard paths are not addressable to a single position.
+statement error
+SELECT jsono_keys(try_jsono('{"a":[]}'), '$.a[*]');
+----
+wildcard
+
+# Merge patch composes existing JSONO objects without text intermediates.
+query I
+SELECT to_json(jsono_merge_patch(
+  try_jsono('{"a":1,"b":{"x":1,"y":2},"c":3}'),
+  try_jsono('{"b":{"y":20,"z":30},"c":null,"d":4}')
+));
+----
+{"a":1,"b":{"x":1,"y":20,"z":30},"d":4}
+
+# Variadic merge patch applies patches left-to-right.
+query I
+SELECT to_json(jsono_merge_patch(
+  try_jsono('{"a":1}'),
+  try_jsono('{"b":2}'),
+  try_jsono('{"a":3}')
+));
+----
+{"a":3,"b":2}
+
+# Ordered group merge keeps the latest non-null values under IGNORE NULLS.
+query I
+SELECT to_json(jsono_group_merge(patch, 'IGNORE NULLS' ORDER BY ts))
+FROM (VALUES
+  (try_jsono('{"a":1,"b":{"x":1,"y":2}}'), 1),
+  (try_jsono('{"a":null,"b":{"x":null,"z":3}}'), 2),
+  (try_jsono('{"c":4}'), 3)
+) AS t(patch, ts);
+----
+{"a":1,"b":{"x":1,"y":2,"z":3},"c":4}
+
+# Empty/all-NULL group merge returns an empty object, matching json_group_merge.
+query I
+SELECT to_json(jsono_group_merge(patch, 'IGNORE NULLS'))
+FROM (VALUES (NULL::JSONO)) AS t(patch);
+----
+{}

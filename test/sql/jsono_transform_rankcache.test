@@ -1,0 +1,31 @@
+# name: test/sql/jsono_transform_rankcache.test
+# description: jsono_transform survives rank-cache slot collisions during recursion
+# group: [sql]
+
+require jsono
+
+# Regression for a use-after-free in the transform rank cache: a parent object on
+# the checkpoint path holds a reference into a cache slot while recursing into a
+# nested object that hashes to the same slot and resizes it. The document below is
+# engineered to collide (top object of 17 keys vs. its 3076-key child both map to
+# the same slot), so pre-fix this crashed with an out-of-bounds vector access.
+# The collision depends on internal cache sizing; if those change the doc still
+# exercises a large nested object, just without the specific collision.
+query I
+WITH nested AS (
+	SELECT '{' || string_agg(format('"c{:04d}":{}', i, i), ',' ORDER BY i) || '}' AS obj
+	FROM range(3076) t(i)
+),
+top AS (
+	SELECT '{' || string_agg(
+		CASE WHEN i = 8 THEN format('"k{:02d}":', i) || (SELECT obj FROM nested)
+		     ELSE format('"k{:02d}":{}', i, i * 100) END,
+		',' ORDER BY i) || '}' AS doc
+	FROM range(17) t(i)
+)
+SELECT jsono_transform(
+	doc::JSONO,
+	'{"a":{"path":"$.k08.c0500","type":"BIGINT"},"b":{"path":"$.k09","type":"BIGINT"}}')
+FROM top;
+----
+{'a': 500, 'b': 900}

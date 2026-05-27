@@ -1,0 +1,144 @@
+# name: test/sql/jsono_entries.test
+# description: jsono_entries flattens a JSONO document into leaf (key, value) structs
+# group: [sql]
+
+require jsono
+
+# Return type is LIST(STRUCT(key VARCHAR, value VARCHAR)).
+query I
+SELECT typeof(jsono_entries(jsono('{"a":1}')));
+----
+STRUCT("key" VARCHAR, "value" VARCHAR)[]
+
+# --- default key_style is 'jsonpath' ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"},"d":true}'))) u)
+ORDER BY u.key;
+----
+$.a	1
+$.b.c	x
+$.d	true
+
+# Same document, dotted keys.
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"},"d":true}'), 'dotted')) u)
+ORDER BY u.key;
+----
+a	1
+b.c	x
+d	true
+
+# --- arrays: index segments ([i] for jsonpath, .i for dotted) ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"arr":[10,20]}'))) u)
+ORDER BY u.key;
+----
+$.arr[0]	10
+$.arr[1]	20
+
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"arr":[10,20]}'), 'dotted')) u)
+ORDER BY u.key;
+----
+arr.0	10
+arr.1	20
+
+# --- root array ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('[1,2]'))) u)
+ORDER BY u.key;
+----
+$[0]	1
+$[1]	2
+
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('[1,2]'), 'dotted')) u)
+ORDER BY u.key;
+----
+0	1
+1	2
+
+# --- nested arrays of objects ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":[1,{"b":2},[3,4]]}'), 'dotted')) u)
+ORDER BY u.key;
+----
+a.0	1
+a.1.b	2
+a.2.0	3
+a.2.1	4
+
+# --- key containing a dot: jsonpath quotes it, dotted collides (like json_flatten) ---
+query I
+SELECT u.key FROM (SELECT unnest(jsono_entries(jsono('{"a.b":1}'))) u);
+----
+$."a.b"
+
+query I
+SELECT u.key FROM (SELECT unnest(jsono_entries(jsono('{"a.b":1}'), 'dotted')) u);
+----
+a.b
+
+# A literal dotted key and a nested path collapse to the same dotted key (duplicate preserved).
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":1},"a.b":2}'), 'dotted')) u)
+ORDER BY u.value;
+----
+a.b	1
+a.b	2
+
+# --- empty containers contribute no leaves ---
+query I
+SELECT count(*) FROM (SELECT unnest(jsono_entries(jsono('{"a":{},"b":[],"c":1}'))) u);
+----
+1
+
+# --- null leaf: key is kept, value is SQL NULL ---
+query IT
+SELECT u.key, coalesce(u.value, '<NULL>')
+FROM (SELECT unnest(jsono_entries(jsono('{"keep":1,"n":null}'), 'dotted')) u)
+ORDER BY u.key;
+----
+keep	1
+n	<NULL>
+
+# --- value stringification: ints, big ints, decimals, bool, string ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"i":42,"big":9223372036854775807,"f":3.14,"b":false,"s":"hi"}'), 'dotted')) u)
+ORDER BY u.key;
+----
+b	false
+big	9223372036854775807
+f	3.14
+i	42
+s	hi
+
+# --- NULL input yields NULL ---
+query I
+SELECT jsono_entries(NULL::jsono) IS NULL;
+----
+true
+
+# --- empty object yields an empty list (not NULL) ---
+query I
+SELECT len(jsono_entries(jsono('{}')));
+----
+0
+
+# --- bind errors ---
+statement error
+SELECT jsono_entries(jsono('{}'), 'invalid');
+----
+
+statement error
+SELECT jsono_entries(jsono('{"a":1}'), key_style) FROM (VALUES ('dotted')) t(key_style);
+----

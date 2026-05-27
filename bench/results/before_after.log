@@ -1,0 +1,218 @@
+############ BATCH 1: SYNTHETIC (all SCENARIOS) ############
+Running 58 benchmark case(s) across 2 target(s)
+Running current/parse/1k/flat... 2.6ms, 395,257 rows/s
+Running current/parse/10k/flat... 23.3ms, 433,651 rows/s
+Running current/parse/100k/flat... 228.9ms, 438,020 rows/s
+Running current/parse/1k/nested... 2.5ms, 401,606 rows/s
+Running current/parse/10k/nested... 23.2ms, 435,161 rows/s
+Running current/parse/100k/nested... 228.7ms, 442,478 rows/s
+Running current/parse_struct/100k/nested_typed... 34.1ms, 2,977,077 rows/s
+Running current/parse_struct_roundtrip/100k/nested_typed... 82.0ms, 1,249,844 rows/s
+Running current/parse_struct_json_roundtrip/100k/nested_typed... 82.0ms, 1,253,290 rows/s
+Running current/transform/1k/nested_core... 0.9ms, 1,136,364 rows/s
+Running current/transform/10k/nested_core... 7.3ms, 1,400,560 rows/s
+Running current/transform/100k/nested_core... 75.3ms, 1,357,589 rows/s
+Running current/transform/1k/ecommerce_join... 0.4ms, 2,941,176 rows/s
+Running current/transform/10k/ecommerce_join... 2.7ms, 4,065,041 rows/s
+Running current/transform/100k/ecommerce_join... 36.9ms, 2,741,228 rows/s
+Running current/transform/1k/flat_core... 1.2ms, 884,956 rows/s
+Running current/transform/10k/flat_core... 10.3ms, 988,142 rows/s
+Running current/transform/100k/flat_core... 101.9ms, 988,631 rows/s
+Running current/group_merge/1k/few_groups_ignore_nulls... 5.0ms, 202,429 rows/s
+Running current/group_merge/10k/few_groups_ignore_nulls... 40.8ms, 245,942 rows/s
+Running current/group_merge/100k/few_groups_ignore_nulls... 392.4ms, 257,427 rows/s
+Running current/group_merge_jsono/1k/few_groups_ignore_nulls... 4.8ms, 210,084 rows/s
+Running current/group_merge_jsono/10k/few_groups_ignore_nulls... 40.6ms, 250,125 rows/s
+Running current/group_merge_jsono/100k/few_groups_ignore_nulls... 392.5ms, 257,546 rows/s
+Running current/group_merge/1k/many_groups_ignore_nulls... 7.0ms, 148,588 rows/s
+Running current/group_merge/10k/many_groups_ignore_nulls... 63.9ms, 168,209 rows/s
+Running current/group_merge/100k/many_groups_ignore_nulls... 439.7ms, 229,516 rows/s
+Running current/group_merge_jsono/1k/many_groups_ignore_nulls... 6.1ms, 164,745 rows/s
+Running current/group_merge_jsono/10k/many_groups_ignore_nulls... 53.9ms, 188,076 rows/s
+Running current/group_merge_jsono/100k/many_groups_ignore_nulls... 437.5ms, 229,785 rows/s
+Running current/parse/100k/number_heavy... 85.5ms, 1,199,760 rows/s
+Running current/parse_copy/100k/number_heavy... 129.4ms, 785,299 rows/s, 4.61MB out
+Running baseline/parse/1k/flat... 3.0ms, 353,357 rows/s
+Running baseline/parse/10k/flat... 24.6ms, 412,371 rows/s
+Running baseline/parse/100k/flat... 240.4ms, 427,661 rows/s
+Running baseline/parse/1k/nested... 2.8ms, 358,423 rows/s
+Running baseline/parse/10k/nested... 24.8ms, 418,760 rows/s
+Running baseline/parse/100k/nested... 238.6ms, 422,797 rows/s
+Running baseline/parse_struct/100k/nested_typed... 34.1ms, 2,944,641 rows/s
+Running baseline/parse_struct_roundtrip/100k/nested_typed... 77.1ms, 1,306,848 rows/s
+Running baseline/parse_struct_json_roundtrip/100k/nested_typed... 77.6ms, 1,309,758 rows/s
+Running baseline/transform/1k/flat_core... 1.3ms, 826,446 rows/s
+Running baseline/transform/10k/flat_core... 10.2ms, 986,193 rows/s
+Running baseline/transform/100k/flat_core... 102.9ms, 999,900 rows/s
+Running baseline/group_merge/1k/few_groups_ignore_nulls... 4.9ms, 211,416 rows/s
+Running baseline/group_merge/10k/few_groups_ignore_nulls... 40.0ms, 250,689 rows/s
+Running baseline/group_merge/100k/few_groups_ignore_nulls... 400.7ms, 254,123 rows/s
+Running baseline/group_merge_jsono/1k/few_groups_ignore_nulls... 5.2ms, 205,339 rows/s
+Running baseline/group_merge_jsono/10k/few_groups_ignore_nulls... 39.5ms, 259,875 rows/s
+Running baseline/group_merge_jsono/100k/few_groups_ignore_nulls... 383.7ms, 265,294 rows/s
+Running baseline/group_merge/1k/many_groups_ignore_nulls... 6.4ms, 160,000 rows/s
+Running baseline/group_merge/10k/many_groups_ignore_nulls... 75.1ms, 153,799 rows/s
+Running baseline/group_merge/100k/many_groups_ignore_nulls... 460.0ms, 221,710 rows/s
+Running baseline/group_merge_jsono/1k/many_groups_ignore_nulls... 6.6ms, 158,479 rows/s
+Running baseline/group_merge_jsono/10k/many_groups_ignore_nulls... 53.7ms, 191,205 rows/s
+Running baseline/group_merge_jsono/100k/many_groups_ignore_nulls... 440.9ms, 227,273 rows/s
+Running baseline/parse/100k/number_heavy... 97.7ms, 1,028,172 rows/s
+Running baseline/parse_copy/100k/number_heavy... 132.9ms, 760,398 rows/s, 4.12MB out
+
+Results saved to /Users/flamefork/Development/ff/duckdb-jsono/bench/results/latest.json
+
+┌──────────┬─────────────┬──────────────────────────┬─────────┬────────┬───────────┬────────┬─────────────────┐
+│  target  │  operation  │         scenario         │  size   │ min_ms │ median_ms │ max_ms │ rows_per_second │
+│ varchar  │   varchar   │         varchar          │ varchar │ double │  double   │ double │      int64      │
+├──────────┼─────────────┼──────────────────────────┼─────────┼────────┼───────────┼────────┼─────────────────┤
+│ baseline │ group_merge │ few_groups_ignore_nulls  │ 100k    │  393.5 │     400.7 │  411.7 │          254123 │
+│ current  │ group_merge │ few_groups_ignore_nulls  │ 100k    │  388.5 │     392.5 │  402.1 │          257427 │
+│ baseline │ group_merge │ few_groups_ignore_nulls  │ 10k     │   39.9 │      40.0 │   41.1 │          250689 │
+│ current  │ group_merge │ few_groups_ignore_nulls  │ 10k     │   40.7 │      40.8 │   41.1 │          245942 │
+│ baseline │ group_merge │ few_groups_ignore_nulls  │ 1k      │    4.7 │       4.9 │    5.4 │          211416 │
+│ current  │ group_merge │ few_groups_ignore_nulls  │ 1k      │    4.9 │       5.0 │    5.2 │          202429 │
+│ baseline │ group_merge │ many_groups_ignore_nulls │ 100k    │  451.0 │     460.0 │  519.5 │          221710 │
+│ current  │ group_merge │ many_groups_ignore_nulls │ 100k    │  435.7 │     439.7 │  456.1 │          229516 │
+│ baseline │ group_merge │ many_groups_ignore_nulls │ 10k     │   65.0 │      75.1 │   93.1 │          153799 │
+│ current  │ group_merge │ many_groups_ignore_nulls │ 10k     │   59.5 │      63.9 │   71.6 │          168209 │
+│    ·     │     ·       │       ·                  │ ·       │     ·  │        ·  │     ·  │             ·   │
+│    ·     │     ·       │       ·                  │ ·       │     ·  │        ·  │     ·  │             ·   │
+│    ·     │     ·       │       ·                  │ ·       │     ·  │        ·  │     ·  │             ·   │
+│ current  │ transform   │ ecommerce_join           │ 1k      │    0.3 │       0.4 │    0.4 │         2941176 │
+│ baseline │ transform   │ flat_core                │ 100k    │  100.0 │     102.9 │  106.0 │          999900 │
+│ current  │ transform   │ flat_core                │ 100k    │  101.2 │     101.9 │  104.0 │          988631 │
+│ baseline │ transform   │ flat_core                │ 10k     │   10.1 │      10.2 │   10.6 │          986193 │
+│ current  │ transform   │ flat_core                │ 10k     │   10.1 │      10.3 │   10.4 │          988142 │
+│ baseline │ transform   │ flat_core                │ 1k      │    1.2 │       1.3 │    1.3 │          826446 │
+│ current  │ transform   │ flat_core                │ 1k      │    1.1 │       1.2 │    1.3 │          884956 │
+│ current  │ transform   │ nested_core              │ 100k    │   73.7 │      75.3 │   75.8 │         1357589 │
+│ current  │ transform   │ nested_core              │ 10k     │    7.1 │       7.3 │    7.4 │         1400560 │
+│ current  │ transform   │ nested_core              │ 1k      │    0.9 │       0.9 │    1.0 │         1136364 │
+└──────────┴─────────────┴──────────────────────────┴─────────┴────────┴───────────┴────────┴─────────────────┘
+  58 rows (20 shown)                                                                                8 columns
+
+
+############ BATCH 2: NUMBER_HEAVY ############
+Running 4 benchmark case(s) across 2 target(s)
+Running current/parse/100k/number_heavy... 85.4ms, 1,180,080 rows/s
+Running current/parse_copy/100k/number_heavy... 133.6ms, 770,713 rows/s, 4.61MB out
+Running baseline/parse/100k/number_heavy... 98.4ms, 1,018,537 rows/s
+Running baseline/parse_copy/100k/number_heavy... 136.8ms, 760,861 rows/s, 4.12MB out
+
+Results saved to /Users/flamefork/Development/ff/duckdb-jsono/bench/results/latest.json
+
+┌──────────┬────────────┬──────────────┬─────────┬────────┬───────────┬────────┬─────────────────┐
+│  target  │ operation  │   scenario   │  size   │ min_ms │ median_ms │ max_ms │ rows_per_second │
+│ varchar  │  varchar   │   varchar    │ varchar │ double │  double   │ double │      int64      │
+├──────────┼────────────┼──────────────┼─────────┼────────┼───────────┼────────┼─────────────────┤
+│ baseline │ parse      │ number_heavy │ 100k    │   98.2 │      98.4 │   99.6 │         1018537 │
+│ current  │ parse      │ number_heavy │ 100k    │   84.7 │      85.4 │   86.3 │         1180080 │
+│ baseline │ parse_copy │ number_heavy │ 100k    │  131.4 │     136.8 │  141.6 │          760861 │
+│ current  │ parse_copy │ number_heavy │ 100k    │  129.8 │     133.6 │  136.0 │          770713 │
+└──────────┴────────────┴──────────────┴─────────┴────────┴───────────┴────────┴─────────────────┘
+
+
+############ BATCH 3: FIELD_SAMPLE nested (scan_text / parse / parse_copy) ############
+Running 5 benchmark case(s) across 2 target(s)
+Running current/scan_text/245760/field_sample_nested... 802.2ms, 341,898 rows/s
+Running current/parse/245760/field_sample_nested... 1972.2ms, 126,333 rows/s
+Running current/parse_copy/245760/field_sample_nested... 4311.4ms, 65,761 rows/s, 42.25MB out
+Running baseline/parse/245760/field_sample_nested... 2200.2ms, 117,998 rows/s
+Running baseline/parse_copy/245760/field_sample_nested... 4172.9ms, 63,066 rows/s, 42.25MB out
+
+Results saved to /Users/flamefork/Development/ff/duckdb-jsono/bench/results/latest.json
+
+┌──────────┬────────────┬──────────────────┬─────────┬────────┬───────────┬────────┬─────────────────┐
+│  target  │ operation  │     scenario     │  size   │ min_ms │ median_ms │ max_ms │ rows_per_second │
+│ varchar  │  varchar   │     varchar      │ varchar │ double │  double   │ double │      int64      │
+├──────────┼────────────┼──────────────────┼─────────┼────────┼───────────┼────────┼─────────────────┤
+│ baseline │ parse      │ field_sample_nested │ 245760  │ 2082.8 │    2200.2 │ 2324.1 │          117998 │
+│ current  │ parse      │ field_sample_nested │ 245760  │ 1945.3 │    1972.2 │ 2004.8 │          126333 │
+│ baseline │ parse_copy │ field_sample_nested │ 245760  │ 3896.9 │    4172.9 │ 4962.3 │           63066 │
+│ current  │ parse_copy │ field_sample_nested │ 245760  │ 3737.2 │    4311.4 │ 5188.4 │           65761 │
+│ current  │ scan_text  │ field_sample_nested │ 245760  │  718.8 │     802.2 │  911.2 │          341898 │
+└──────────┴────────────┴──────────────────┴─────────┴────────┴───────────┴────────┴─────────────────┘
+
+
+############ BATCH 4: FIELD_SAMPLE typed_core ############
+Running 10 benchmark case(s) across 2 target(s)
+Running current/parse_struct/245760/field_sample_typed_core... 77.6ms, 3,387,457 rows/s
+Running current/parse_struct_roundtrip/245760/field_sample_typed_core... 332.6ms, 751,031 rows/s
+Running current/parse_struct_json_roundtrip/245760/field_sample_typed_core... 340.8ms, 725,105 rows/s
+Running current/object_jsono/245760/field_sample_typed_core... 68.3ms, 3,631,742 rows/s
+Running current/object_json/245760/field_sample_typed_core... 191.7ms, 1,387,456 rows/s
+Running baseline/parse_struct/245760/field_sample_typed_core... 77.4ms, 3,552,472 rows/s
+Running baseline/parse_struct_roundtrip/245760/field_sample_typed_core... 373.2ms, 661,250 rows/s
+Running baseline/parse_struct_json_roundtrip/245760/field_sample_typed_core... 365.8ms, 679,252 rows/s
+Running baseline/object_jsono/245760/field_sample_typed_core... 68.1ms, 3,644,669 rows/s
+Running baseline/object_json/245760/field_sample_typed_core... 173.9ms, 1,435,430 rows/s
+
+Results saved to /Users/flamefork/Development/ff/duckdb-jsono/bench/results/latest.json
+
+┌──────────┬─────────────────────────────┬──────────────────────┬─────────┬────────┬───────────┬────────┬─────────────────┐
+│  target  │          operation          │       scenario       │  size   │ min_ms │ median_ms │ max_ms │ rows_per_second │
+│ varchar  │           varchar           │       varchar        │ varchar │ double │  double   │ double │      int64      │
+├──────────┼─────────────────────────────┼──────────────────────┼─────────┼────────┼───────────┼────────┼─────────────────┤
+│ baseline │ object_json                 │ field_sample_typed_core │ 245760  │  171.2 │     173.9 │  177.9 │         1435430 │
+│ current  │ object_json                 │ field_sample_typed_core │ 245760  │  177.1 │     191.7 │  217.4 │         1387456 │
+│ baseline │ object_jsono                │ field_sample_typed_core │ 245760  │   67.4 │      68.1 │   70.7 │         3644669 │
+│ current  │ object_jsono                │ field_sample_typed_core │ 245760  │   67.7 │      68.3 │   69.3 │         3631742 │
+│ baseline │ parse_struct                │ field_sample_typed_core │ 245760  │   69.2 │      77.4 │   98.1 │         3552472 │
+│ current  │ parse_struct                │ field_sample_typed_core │ 245760  │   72.6 │      77.6 │   81.0 │         3387457 │
+│ baseline │ parse_struct_json_roundtrip │ field_sample_typed_core │ 245760  │  361.8 │     365.8 │  371.7 │          679252 │
+│ current  │ parse_struct_json_roundtrip │ field_sample_typed_core │ 245760  │  338.9 │     340.8 │  365.6 │          725105 │
+│ baseline │ parse_struct_roundtrip      │ field_sample_typed_core │ 245760  │  371.7 │     373.2 │  383.3 │          661250 │
+│ current  │ parse_struct_roundtrip      │ field_sample_typed_core │ 245760  │  327.2 │     332.6 │  336.4 │          751031 │
+└──────────┴─────────────────────────────┴──────────────────────┴─────────┴────────┴───────────┴────────┴─────────────────┘
+  10 rows                                                                                                       8 columns
+
+
+############ BATCH 5: FIELD_SAMPLE typed_products ############
+Running 10 benchmark case(s) across 2 target(s)
+Running current/parse_struct/245760/field_sample_typed_products... 262.9ms, 952,152 rows/s
+Running current/parse_struct_roundtrip/245760/field_sample_typed_products... 1059.6ms, 236,126 rows/s
+Running current/parse_struct_json_roundtrip/245760/field_sample_typed_products... 1053.2ms, 235,773 rows/s
+Running current/object_jsono/245760/field_sample_typed_products... 241.7ms, 1,031,868 rows/s
+Running current/object_json/245760/field_sample_typed_products... 406.2ms, 608,196 rows/s
+Running baseline/parse_struct/245760/field_sample_typed_products... 246.6ms, 1,003,225 rows/s
+Running baseline/parse_struct_roundtrip/245760/field_sample_typed_products... 917.6ms, 269,781 rows/s
+Running baseline/parse_struct_json_roundtrip/245760/field_sample_typed_products... 941.1ms, 264,879 rows/s
+Running baseline/object_jsono/245760/field_sample_typed_products... 243.5ms, 1,027,640 rows/s
+Running baseline/object_json/245760/field_sample_typed_products... 399.6ms, 616,604 rows/s
+
+Results saved to /Users/flamefork/Development/ff/duckdb-jsono/bench/results/latest.json
+
+┌──────────┬─────────────────────────────┬──────────────────────────┬─────────┬────────┬───────────┬────────┬─────────────────┐
+│  target  │          operation          │         scenario         │  size   │ min_ms │ median_ms │ max_ms │ rows_per_second │
+│ varchar  │           varchar           │         varchar          │ varchar │ double │  double   │ double │      int64      │
+├──────────┼─────────────────────────────┼──────────────────────────┼─────────┼────────┼───────────┼────────┼─────────────────┤
+│ baseline │ object_json                 │ field_sample_typed_products │ 245760  │  398.6 │     399.6 │  402.2 │          616604 │
+│ current  │ object_json                 │ field_sample_typed_products │ 245760  │  404.1 │     406.3 │  408.5 │          608196 │
+│ baseline │ object_jsono                │ field_sample_typed_products │ 245760  │  239.2 │     243.5 │  254.4 │         1027640 │
+│ current  │ object_jsono                │ field_sample_typed_products │ 245760  │  238.2 │     241.7 │  252.4 │         1031868 │
+│ baseline │ parse_struct                │ field_sample_typed_products │ 245760  │  245.0 │     246.6 │  265.3 │         1003225 │
+│ current  │ parse_struct                │ field_sample_typed_products │ 245760  │  258.1 │     262.9 │  273.7 │          952152 │
+│ baseline │ parse_struct_json_roundtrip │ field_sample_typed_products │ 245760  │  927.8 │     941.1 │  978.4 │          264879 │
+│ current  │ parse_struct_json_roundtrip │ field_sample_typed_products │ 245760  │ 1042.4 │    1053.2 │ 1074.4 │          235773 │
+│ baseline │ parse_struct_roundtrip      │ field_sample_typed_products │ 245760  │  911.0 │     917.6 │  933.4 │          269781 │
+│ current  │ parse_struct_roundtrip      │ field_sample_typed_products │ 245760  │ 1040.8 │    1059.6 │ 1065.4 │          236126 │
+└──────────┴─────────────────────────────┴──────────────────────────┴─────────┴────────┴───────────┴────────┴─────────────────┘
+  10 rows                                                                                                           8 columns
+
+
+############ BATCH 6: FIELD_SAMPLE rules (current-only; baseline cannot read new layout) ############
+Generating field_sample JSONO data: /Users/flamefork/Development/ff/duckdb-jsono/bench/data/field_sample/events_nested_jsono.parquet (zstd level 8, row group 32768)
+Running 1 benchmark case(s) across 1 target(s)
+Running current/transform/245760/field_sample_rules... 129.4ms, 1,998,699 rows/s
+
+Results saved to /Users/flamefork/Development/ff/duckdb-jsono/bench/results/latest.json
+
+┌─────────┬───────────┬─────────────────┬─────────┬────────┬───────────┬────────┬─────────────────┐
+│ target  │ operation │    scenario     │  size   │ min_ms │ median_ms │ max_ms │ rows_per_second │
+│ varchar │  varchar  │     varchar     │ varchar │ double │  double   │ double │      int64      │
+├─────────┼───────────┼─────────────────┼─────────┼────────┼───────────┼────────┼─────────────────┤
+│ current │ transform │ field_sample_rules │ 245760  │  123.0 │     129.4 │  152.0 │         1998699 │
+└─────────┴───────────┴─────────────────┴─────────┴────────┴───────────┴────────┴─────────────────┘
+
+
+############ ALL BATCHES DONE ############

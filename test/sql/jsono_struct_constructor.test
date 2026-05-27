@@ -1,0 +1,150 @@
+# name: test/sql/jsono_struct_constructor.test
+# description: Native JSONO construction from STRUCT inputs
+# group: [sql]
+
+require jsono
+
+require json
+
+# STRUCT fields become a JSON object with sorted keys. VARCHAR stays a JSON string.
+query I
+SELECT to_json(jsono({'b': 2, 'a': 'x', 'n': NULL, 'arr': ['c', NULL, 'd']}));
+----
+{"a":"x","arr":["c",null,"d"],"b":2,"n":null}
+
+# JSON children are parsed as subtrees; VARCHAR children with JSON-looking text stay strings.
+query I
+SELECT to_json(jsono({'s': '{"x":1}', 'j': '{"b":2,"a":1}'::JSON}));
+----
+{"j":{"a":1,"b":2},"s":"{\"x\":1}"}
+
+# JSONO children compose without a text round-trip.
+query I
+SELECT to_json(jsono({'z': 1, 'nested': jsono('{"b":2,"a":1}')}));
+----
+{"nested":{"a":1,"b":2},"z":1}
+
+# Nested STRUCT and LIST values follow JSON object/array semantics.
+query I
+SELECT to_json(jsono({'outer': {'b': 2, 'a': [1, NULL, 3]}, 'z': true}));
+----
+{"outer":{"a":[1,null,3],"b":2},"z":true}
+
+# Options are available through the second argument. nulls=omit removes SQL NULL object fields.
+query I
+SELECT to_json(jsono({'b': NULL, 'a': 1, 'nested': {'x': NULL, 'y': 2}}, {'nulls': 'omit'}));
+----
+{"a":1,"nested":{"y":2}}
+
+# The same internal option is exposed as omit_nulls for future named-argument parity.
+query I
+SELECT to_json(jsono({'b': NULL, 'a': 1}, {'omit_nulls': true}));
+----
+{"a":1}
+
+# STRUCT -> JSONO cast uses the same default constructor semantics.
+query II
+SELECT typeof({'a': 1}::JSONO), to_json({'b': 2, 'a': 'x'}::JSONO);
+----
+JSONO	{"a":"x","b":2}
+
+# Top-level NULL STRUCT becomes SQL NULL, matching jsono(NULL).
+query I
+SELECT jsono(NULL::STRUCT(a INTEGER)) IS NULL;
+----
+true
+
+# DOUBLE struct fields have no source text, so they materialize through the
+# shortest-round-trip double formatter (VAL_EXT/DOUBLE).
+query I
+SELECT to_json(jsono({'a': 3.5::DOUBLE, 'b': 2.0::DOUBLE, 'c': 0.1::DOUBLE}));
+----
+{"a":3.5,"b":2.0,"c":0.1}
+
+query I
+SELECT to_json(jsono({'big': 1e20::DOUBLE, 'small': 1e-7::DOUBLE, 'neg': -0.0::DOUBLE}));
+----
+{"big":100000000000000000000.0,"neg":-0.0,"small":1e-7}
+
+# Top-level JSON input remains accepted.
+query I
+SELECT to_json(jsono('{"b":2,"a":1}'::JSON));
+----
+{"a":1,"b":2}
+
+statement error
+SELECT jsono({'a': 1}, {'nulls': 'bad'});
+----
+jsono() option 'nulls' must be 'include' or 'omit'
+
+statement error
+SELECT jsono({'a': 1}, {'unknown': 'x'});
+----
+jsono() unknown option 'unknown'
+
+# Non-finite doubles have no JSON representation and are rejected at construction.
+statement error
+SELECT jsono({'d': 'inf'::DOUBLE});
+----
+non-finite
+
+statement error
+SELECT jsono({'d': 'nan'::DOUBLE});
+----
+non-finite
+
+# Exact integer and decimal STRUCT fields preserve their value instead of being
+# coerced through BIGINT/DOUBLE: UBIGINT past INT64_MAX used to hard-fail and
+# DECIMAL used to lose its exact digits. Construction now matches the parse path.
+query I
+SELECT to_json(jsono({'u': 18446744073709551615::UBIGINT}));
+----
+{"u":18446744073709551615}
+
+query I
+SELECT to_json(jsono({'u': 42::UBIGINT}));
+----
+{"u":42}
+
+query I
+SELECT to_json(jsono({'d': 123456789012345678901234567890123456.12::DECIMAL(38,2)}));
+----
+{"d":123456789012345678901234567890123456.12}
+
+query I
+SELECT to_json(jsono({'d': 12345.12::DECIMAL(10,2)}));
+----
+{"d":12345.12}
+
+# Construction matches the text parse path byte-for-byte for the same exact value.
+query I
+SELECT to_json(jsono({'u': 18446744073709551615::UBIGINT})) = to_json(jsono('{"u":18446744073709551615}'));
+----
+true
+
+query I
+SELECT to_json(jsono({'d': 123456789012345678901234567890123456.12::DECIMAL(38,2)})) = to_json(jsono('{"d":123456789012345678901234567890123456.12}'));
+----
+true
+
+# Exact types survive inside lists too.
+query I
+SELECT to_json(jsono({'ids': [1::UBIGINT, 18446744073709551615::UBIGINT]}));
+----
+{"ids":[1,18446744073709551615]}
+
+# 128-bit integers take the same text classifier path instead of being rejected.
+query I
+SELECT to_json(jsono({'h': 123::HUGEINT}));
+----
+{"h":123}
+
+query I
+SELECT to_json(jsono({'h': 170141183460469231731687303715884105727::HUGEINT}));
+----
+{"h":170141183460469231731687303715884105727}
+
+query I
+SELECT to_json(jsono({'h': 340282366920938463463374607431768211455::UHUGEINT}));
+----
+{"h":340282366920938463463374607431768211455}

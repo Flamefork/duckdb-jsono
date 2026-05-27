@@ -1,0 +1,75 @@
+# name: test/sql/jsono_parquet.test
+# description: JSONO round-trips through Parquet via STRUCT<jsono_key_heap, jsono_string_heap, jsono_slots, jsono_skips>
+# group: [sql]
+
+require jsono
+
+require parquet
+
+statement ok
+CREATE TABLE events AS
+  SELECT i AS rid,
+         jsono('{"id":' || i || ',"name":"row_' || i || '","score":' || (i * 0.5) || '}') AS j
+  FROM range(100) t(i);
+
+# Native column carries the JSONO alias
+query I
+SELECT typeof(j) FROM events LIMIT 1;
+----
+JSONO
+
+statement ok
+COPY events TO '__TEST_DIR__/events_jsono.parquet';
+
+# After Parquet round-trip the alias is dropped — the column comes back as the
+# structural shape STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB).
+query I
+SELECT typeof(j) FROM '__TEST_DIR__/events_jsono.parquet' LIMIT 1;
+----
+STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
+
+# Implicit cast lets to_json work on the bare-STRUCT shape directly,
+# so the user doesn't have to remember to ::JSONO-cast after read.
+query II
+SELECT rid, to_json(j)
+FROM '__TEST_DIR__/events_jsono.parquet'
+ORDER BY rid LIMIT 3;
+----
+0	{"id":0,"name":"row_0","score":0.0}
+1	{"id":1,"name":"row_1","score":0.5}
+2	{"id":2,"name":"row_2","score":1.0}
+
+# Row count survives
+query I
+SELECT count(*) FROM '__TEST_DIR__/events_jsono.parquet';
+----
+100
+
+# Native table value byte-identical to the value read back from Parquet. Both
+# sides cast through the bare STRUCT to make field access dispatch cleanly
+# (struct_extract doesn't follow extension-type aliases yet).
+query I
+WITH src AS (SELECT j::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS native
+             FROM events WHERE rid = 42),
+     pq  AS (SELECT j AS roundtripped
+             FROM '__TEST_DIR__/events_jsono.parquet' WHERE rid = 42)
+SELECT
+  src.native.jsono_key_heap = pq.roundtripped.jsono_key_heap
+  AND src.native.jsono_string_heap = pq.roundtripped.jsono_string_heap
+  AND src.native.jsono_slots = pq.roundtripped.jsono_slots
+  AND src.native.jsono_skips = pq.roundtripped.jsono_skips
+FROM src, pq;
+----
+true
+
+# NULL row round-trips as NULL
+statement ok
+INSERT INTO events VALUES (999, NULL);
+
+statement ok
+COPY events TO '__TEST_DIR__/events_jsono2.parquet';
+
+query I
+SELECT j IS NULL FROM '__TEST_DIR__/events_jsono2.parquet' WHERE rid = 999;
+----
+true

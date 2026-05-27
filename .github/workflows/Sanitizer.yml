@@ -1,0 +1,72 @@
+#
+# Builds the extension with AddressSanitizer + UndefinedBehaviorSanitizer (both
+# default-on for a clang Debug build of DuckDB) and runs the SQLLogic suite plus
+# the hypothesis property/fuzz harness against that instrumented build. This is
+# the binary-format safety net: the JSONO reader walks raw BLOB offsets, so an
+# off-by-one there is invisible in a release build but trapped here.
+#
+name: Sanitizer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanitizer:
+    name: ASan + UBSan (linux_amd64)
+    runs-on: ubuntu-latest
+    env:
+      # Standalone clang build: no vcpkg, no Docker, no external libraries
+      # (jsono vendors yyjson + string-view-lite; parquet uses bundled mbedtls).
+      GEN: ninja
+      CC: clang
+      CXX: clang++
+      # Leak detection is noisy against the DuckDB runtime; this job targets
+      # memory-safety and UB, not leaks.
+      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build clang
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      # Cache compiled objects across runs. DuckDB core is the bulk of the
+      # ~15-minute debug build and rarely changes between pushes; only the
+      # jsono sources recompile, so warm-cache rebuilds are dominated by the
+      # link step. The sanitizer compile flags are part of the ccache hash, so
+      # this cache never collides with the release pipeline's ccache.
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: sanitizer-asan-ubsan
+          max-size: 1G
+
+      - name: Build (Debug = ASan + UBSan)
+        env:
+          EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        run: make debug
+
+      - name: SQLLogic tests under sanitizers
+        run: make test_debug
+
+      - name: Property + fuzz harness under sanitizers
+        env:
+          JSONO_DUCKDB_BIN: build/debug/duckdb
+          JSONO_EXTENSION: build/debug/extension/jsono/jsono.duckdb_extension
+          JSONO_PROPERTY_MAX_EXAMPLES: "1000"
+        run: uv run --no-project test/property/jsono_property.py
