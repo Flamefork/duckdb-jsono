@@ -6,47 +6,16 @@ each jsono operation produces output semantically equal to its core DuckDB json
 baseline before any timing happens. The gate compares normalized output over the
 full dataset and fails loudly with a sample diff on any mismatch.
 """
-import json
 import sys
 from pathlib import Path
 
 import duckdb
 
 from config import DATA_DIR, JSONO_EXTENSION_PATH, SCENARIOS, SIZES, URL_SIZES
+from sql_literals import sql_json, sql_string, sql_typed_literal
 
 REQUIRED_EVENT_COLUMNS = ["json_nested", "json_flat", "g1e1", "g1e3", "g1e4"]
 REQUIRED_URL_COLUMNS = ["url_short", "url_marketing", "url_wide_query", "url_mixed"]
-
-
-def sql_string(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
-def sql_json(value: object) -> str:
-    return sql_string(json.dumps(value, separators=(",", ":")))
-
-
-def sql_typed_literal(value: object) -> str:
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str):
-        return sql_string(value)
-    if isinstance(value, int | float):
-        return str(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(sql_typed_literal(item) for item in value) + "]"
-    if isinstance(value, dict):
-        fields = []
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError(
-                    f"typed struct literal key must be a string, got: {key!r}"
-                )
-            fields.append(f"{sql_string(key)}: {sql_typed_literal(item)}")
-        return "{" + ", ".join(fields) + "}"
-    raise ValueError(f"unsupported typed literal value: {value!r}")
 
 
 def extract_path_sql(path: object) -> str:

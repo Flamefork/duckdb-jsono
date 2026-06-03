@@ -1,5 +1,8 @@
 *.json
 !baseline.json
+*.html
+*.png
+*.svg
 *.parquet
 profiles/
 samply/

@@ -413,6 +413,20 @@
       "runs": 5,
       "rows_per_second": 2192719,
       "output_bytes": null
+    },
+    {
+      "id": "current/optimizer_project/100k/repeated_filter_project",
+      "target": "current",
+      "target_kind": "jsono",
+      "operation": "optimizer_project",
+      "scenario": "repeated_filter_project",
+      "size": "100k",
+      "min_ms": 22.11,
+      "median_ms": 23.19,
+      "max_ms": 25.35,
+      "runs": 7,
+      "rows_per_second": 4522840,
+      "output_bytes": null
     }
   ]
 }

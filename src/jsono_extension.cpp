@@ -4,6 +4,7 @@
 #include "jsono_extract.hpp"
 #include "jsono.hpp"
 #include "jsono_ops.hpp"
+#include "jsono_optimizer.hpp"
 #include "jsono_transform.hpp"
 
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -15,6 +16,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterJsonoOps(loader);
 	RegisterJsonoTransform(loader);
 	RegisterJsonoExtract(loader);
+	RegisterJsonoOptimizer(loader);
 }
 
 void JsonoExtension::Load(ExtensionLoader &loader) {

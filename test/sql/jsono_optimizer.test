@@ -1,0 +1,312 @@
+# name: test/sql/jsono_optimizer.test
+# description: JSONO optimizer rewrite for repeated extract-string filters
+# group: [sql]
+
+require jsono
+
+statement ok
+CREATE TABLE jsono_optimizer_probe AS
+SELECT jsono(payload) AS j
+FROM (
+  VALUES
+    ('{"kind":"commit","commit":{"operation":"create","collection":"app.bsky.feed.post"},"did":"u1","time_us":1000,"o":{"a":1}}'),
+    ('{"kind":"commit","commit":{"operation":"create","collection":"app.bsky.feed.like"},"did":"u2","time_us":2000,"o":{"a":1}}'),
+    ('{"kind":"commit","commit":{"operation":"delete","collection":"app.bsky.feed.post"},"did":"u3","time_us":3000,"o":{"a":1}}'),
+    ('{"kind":"identity","commit":{"operation":"create","collection":"app.bsky.feed.post"},"did":"u4","time_us":4000,"o":{"a":1}}'),
+    ('{"kind":"commit","commit":{"operation":"create"},"did":"u5","time_us":5000,"o":{"a":2}}'),
+    ('{"kind":null,"commit":{"operation":"create","collection":"app.bsky.feed.post"},"did":"u6","time_us":null,"o":{"a":1}}'),
+    ('{"kind":"commit","commit":{"operation":"create","collection":"app.bsky.feed.post"},"did":"u1","time_us":7000,"o":{"a":2}}')
+) AS rows(payload);
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE jsono_optimizer_expected AS
+SELECT j->>'$.did' AS did
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create')
+  AND (j->>'$.commit.collection' IN ['app.bsky.feed.post', 'app.bsky.feed.like'])
+ORDER BY did;
+
+statement ok
+RESET disabled_optimizers;
+
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_optimizer_expected EXCEPT
+   SELECT j->>'$.did' AS did
+   FROM jsono_optimizer_probe
+   WHERE (j->>'$.kind' = 'commit')
+     AND (j->>'$.commit.operation' = 'create')
+     AND (j->>'$.commit.collection' IN ['app.bsky.feed.post', 'app.bsky.feed.like']))
+  UNION ALL
+  (SELECT j->>'$.did' AS did
+   FROM jsono_optimizer_probe
+   WHERE (j->>'$.kind' = 'commit')
+     AND (j->>'$.commit.operation' = 'create')
+     AND (j->>'$.commit.collection' IN ['app.bsky.feed.post', 'app.bsky.feed.like'])
+   EXCEPT SELECT * FROM jsono_optimizer_expected)
+);
+----
+0
+
+query I
+SELECT count(*)
+FROM jsono_optimizer_probe
+WHERE ('commit' = (j->>'$.kind'))
+  AND (j->>'$.o' = '{"a":1}');
+----
+3
+
+query I
+SELECT count(*)
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.missing' = 'x');
+----
+0
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE jsono_optimizer_project_expected AS
+SELECT j->>'$.did' AS user_id,
+       MIN(CAST(j->>'$.time_us' AS BIGINT)) AS first_time,
+       MAX(CAST(j->>'$.time_us' AS BIGINT)) AS last_time,
+       MIN(j->>'$.o') AS first_object
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create')
+  AND (j->>'$.commit.collection' = 'app.bsky.feed.post')
+GROUP BY user_id
+ORDER BY user_id;
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT j->>'$.did' AS user_id,
+               MIN(CAST(j->>'$.time_us' AS BIGINT)) AS first_time,
+               MAX(CAST(j->>'$.time_us' AS BIGINT)) AS last_time,
+               MIN(j->>'$.o') AS first_object
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create')
+  AND (j->>'$.commit.collection' = 'app.bsky.feed.post')
+GROUP BY user_id;
+----
+physical_plan	<REGEX>:.*__jsono_internal_project.*
+
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_optimizer_project_expected EXCEPT
+   SELECT j->>'$.did' AS user_id,
+          MIN(CAST(j->>'$.time_us' AS BIGINT)) AS first_time,
+          MAX(CAST(j->>'$.time_us' AS BIGINT)) AS last_time,
+          MIN(j->>'$.o') AS first_object
+   FROM jsono_optimizer_probe
+   WHERE (j->>'$.kind' = 'commit')
+     AND (j->>'$.commit.operation' = 'create')
+     AND (j->>'$.commit.collection' = 'app.bsky.feed.post')
+   GROUP BY user_id)
+  UNION ALL
+  (SELECT j->>'$.did' AS user_id,
+          MIN(CAST(j->>'$.time_us' AS BIGINT)) AS first_time,
+          MAX(CAST(j->>'$.time_us' AS BIGINT)) AS last_time,
+          MIN(j->>'$.o') AS first_object
+   FROM jsono_optimizer_probe
+   WHERE (j->>'$.kind' = 'commit')
+     AND (j->>'$.commit.operation' = 'create')
+     AND (j->>'$.commit.collection' = 'app.bsky.feed.post')
+   GROUP BY user_id
+   EXCEPT SELECT * FROM jsono_optimizer_project_expected)
+);
+----
+0
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE jsono_optimizer_project_in_expected AS
+SELECT j->>'$.commit.collection' AS event,
+       CAST(j->>'$.time_us' AS BIGINT) / 1000 AS time_bucket,
+       count() AS count
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create')
+  AND (j->>'$.commit.collection' IN ['app.bsky.feed.post', 'app.bsky.feed.like'])
+GROUP BY event, time_bucket
+ORDER BY event, time_bucket;
+
+statement ok
+RESET disabled_optimizers;
+
+query II
+EXPLAIN SELECT j->>'$.commit.collection' AS event,
+               CAST(j->>'$.time_us' AS BIGINT) / 1000 AS time_bucket,
+               count() AS count
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create')
+  AND (j->>'$.commit.collection' IN ['app.bsky.feed.post', 'app.bsky.feed.like'])
+GROUP BY event, time_bucket;
+----
+physical_plan	<REGEX>:.*__jsono_internal_project.*
+
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_optimizer_project_in_expected EXCEPT
+   SELECT j->>'$.commit.collection' AS event,
+          CAST(j->>'$.time_us' AS BIGINT) / 1000 AS time_bucket,
+          count() AS count
+   FROM jsono_optimizer_probe
+   WHERE (j->>'$.kind' = 'commit')
+     AND (j->>'$.commit.operation' = 'create')
+     AND (j->>'$.commit.collection' IN ['app.bsky.feed.post', 'app.bsky.feed.like'])
+   GROUP BY event, time_bucket)
+  UNION ALL
+  (SELECT j->>'$.commit.collection' AS event,
+          CAST(j->>'$.time_us' AS BIGINT) / 1000 AS time_bucket,
+          count() AS count
+   FROM jsono_optimizer_probe
+   WHERE (j->>'$.kind' = 'commit')
+     AND (j->>'$.commit.operation' = 'create')
+     AND (j->>'$.commit.collection' IN ['app.bsky.feed.post', 'app.bsky.feed.like'])
+   GROUP BY event, time_bucket
+   EXCEPT SELECT * FROM jsono_optimizer_project_in_expected)
+);
+----
+0
+
+statement ok
+CREATE TEMP TABLE jsono_optimizer_extrema_probe AS
+SELECT group_id, jsono(payload) AS j
+FROM (
+  VALUES
+    ('same_width', '{"x":100}'),
+    ('same_width', '{"x":200}'),
+    ('different_width', '{"x":10}'),
+    ('different_width', '{"x":9}'),
+    ('leading_zero_strings', '{"x":"001"}'),
+    ('leading_zero_strings', '{"x":"010"}'),
+    ('negative', '{"x":-1}'),
+    ('negative', '{"x":2}'),
+    ('null_missing', '{"x":null}'),
+    ('null_missing', '{}'),
+    ('null_missing', '{"x":7}'),
+    ('object_array', '{"x":{"a":1}}'),
+    ('object_array', '{"x":[2]}')
+) AS rows(group_id, payload);
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE jsono_optimizer_extrema_expected AS
+SELECT group_id,
+       MIN(j->>'$.x') AS min_x,
+       MAX(j->>'$.x') AS max_x
+FROM jsono_optimizer_extrema_probe
+GROUP BY group_id
+ORDER BY group_id;
+
+statement ok
+RESET disabled_optimizers;
+
+query II
+EXPLAIN SELECT group_id, MIN(j->>'$.x') AS min_x
+FROM jsono_optimizer_extrema_probe
+GROUP BY group_id;
+----
+physical_plan	<REGEX>:.*__jsono_internal_min_varcha.*
+
+query II
+EXPLAIN SELECT group_id, MAX(j->>'$.x') AS max_x
+FROM jsono_optimizer_extrema_probe
+GROUP BY group_id;
+----
+physical_plan	<REGEX>:.*__jsono_internal_max_varcha.*
+
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_optimizer_extrema_expected EXCEPT
+   SELECT group_id,
+          MIN(j->>'$.x') AS min_x,
+          MAX(j->>'$.x') AS max_x
+   FROM jsono_optimizer_extrema_probe
+   GROUP BY group_id)
+  UNION ALL
+  (SELECT group_id,
+          MIN(j->>'$.x') AS min_x,
+          MAX(j->>'$.x') AS max_x
+   FROM jsono_optimizer_extrema_probe
+   GROUP BY group_id
+   EXCEPT SELECT * FROM jsono_optimizer_extrema_expected)
+);
+----
+0
+
+# The optimizer injects __jsono_internal_match / _project / _*_varchar_fast fully
+# bound and unregistered in the catalog. Debug builds verify every optimized plan
+# by round-tripping its expressions through (de)serialization, and verify_serializer
+# forces the same round-trip here. Each helper must decline serialization instead of
+# failing a catalog lookup for its (unregistered) name. The probes below keep simple,
+# fully-serializable plans so verify_serializer actually exercises the round-trip.
+statement ok
+PRAGMA verify_serializer;
+
+# __jsono_internal_min_varchar_fast / __jsono_internal_max_varchar_fast
+query TTT
+SELECT group_id,
+       MIN(j->>'$.x') AS min_x,
+       MAX(j->>'$.x') AS max_x
+FROM jsono_optimizer_extrema_probe
+GROUP BY group_id
+ORDER BY group_id;
+----
+different_width	10	9
+leading_zero_strings	001	010
+negative	-1	2
+null_missing	7	7
+object_array	[2]	{"a":1}
+same_width	100	200
+
+# __jsono_internal_match
+query T
+SELECT j->>'$.did' AS user_id
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create')
+  AND (j->>'$.commit.collection' = 'app.bsky.feed.post')
+ORDER BY user_id;
+----
+u1
+u1
+
+# __jsono_internal_project
+query TI
+SELECT j->>'$.commit.collection' AS event,
+       count() AS count
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create')
+  AND (j->>'$.commit.collection' IN ['app.bsky.feed.post', 'app.bsky.feed.like'])
+GROUP BY event
+ORDER BY event;
+----
+app.bsky.feed.like	1
+app.bsky.feed.post	2
+
+statement ok
+PRAGMA disable_verify_serializer;

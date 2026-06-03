@@ -182,6 +182,24 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
             query.timed_sql,
         )
 
+    def test_jsono_optimizer_project_query_exercises_repeated_extracts(self) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "optimizer_project",
+                "scenario": "repeated_filter_project",
+                "json_column": "json_nested",
+                "targets": ["jsono"],
+            },
+            Path("events.parquet"),
+        )
+
+        self.assertIn("t->>'$.event_name' = 'page_view'", query.timed_sql)
+        self.assertIn("t->>'$.device_type' = 'mobile'", query.timed_sql)
+        self.assertIn("t->>'$.geo_country' IN ['US', 'DE', 'ES']", query.timed_sql)
+        self.assertIn("t->>'$.user_id' AS user_id", query.timed_sql)
+        self.assertIn("MIN(CAST(t->>'$.event_ts' AS BIGINT))", query.timed_sql)
+        self.assertIn("GROUP BY user_id", query.timed_sql)
+
     def test_core_extract_string_query_uses_core_json_baseline(self) -> None:
         query = run_benchmarks.build_json_query(
             {

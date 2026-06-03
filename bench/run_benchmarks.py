@@ -24,6 +24,7 @@ from config import (
     URL_SIZES,
 )
 from environment import collect_environment
+from sql_literals import sql_identifier, sql_json, sql_string, sql_typed_literal
 
 DEFAULT_SEED = 42
 TargetKind = Literal["jsono", "json"]
@@ -40,41 +41,6 @@ class Target:
 class BenchmarkQuery:
     prepare_sql: tuple[str, ...]
     timed_sql: str
-
-
-def sql_string(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
-def sql_identifier(value: str) -> str:
-    return '"' + value.replace('"', '""') + '"'
-
-
-def sql_json(value: object) -> str:
-    return sql_string(json.dumps(value, separators=(",", ":")))
-
-
-def sql_typed_literal(value: object) -> str:
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str):
-        return sql_string(value)
-    if isinstance(value, int | float):
-        return str(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(sql_typed_literal(item) for item in value) + "]"
-    if isinstance(value, dict):
-        fields = []
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError(
-                    f"typed struct literal key must be a string, got: {key!r}"
-                )
-            fields.append(f"{sql_string(key)}: {sql_typed_literal(item)}")
-        return "{" + ", ".join(fields) + "}"
-    raise ValueError(f"unsupported typed literal value: {value!r}")
 
 
 def table_sql(data_path: Path) -> str:
@@ -343,349 +309,470 @@ def extract_call_sql(function_name: str, value_sql: str, path: object) -> str:
     return f"{function_name}({value_sql}, {extract_path_sql(path)})"
 
 
+def build_jsono_parse_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    json_column = scenario_config["json_column"]
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono({json_column}::VARCHAR) AS r
+            FROM {table_sql(data_path)}
+        """,
+    )
+
+
+def build_jsono_parse_struct_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono(payload) AS r
+            FROM _bench_struct_in
+        """,
+    )
+
+
+def build_jsono_parse_struct_roundtrip_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono(to_json(payload)::VARCHAR) AS r
+            FROM _bench_struct_in
+        """,
+    )
+
+
+def build_jsono_parse_struct_json_roundtrip_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono(to_json(payload)) AS r
+            FROM _bench_struct_in
+        """,
+    )
+
+
+def build_jsono_object_jsono_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono(payload) AS r
+            FROM _bench_struct_in
+        """,
+    )
+
+
+def build_jsono_object_json_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    field_names = list(scenario_config["struct_spec"].keys())
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT json_object(
+                {object_args_sql(field_names)}
+            ) AS r
+            FROM _bench_struct_in
+        """,
+    )
+
+
+def build_jsono_parse_copy_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    json_column = scenario_config["json_column"]
+    copy_path = scenario_config["copy_path"]
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            COPY (
+                SELECT jsono({json_column}::VARCHAR) AS r
+                FROM {table_sql(data_path)}
+            )
+            TO {sql_string(str(copy_path))}
+            (
+                FORMAT parquet,
+                COMPRESSION {scenario_config["copy_compression"]},
+                COMPRESSION_LEVEL {scenario_config["copy_compression_level"]},
+                ROW_GROUP_SIZE {scenario_config["copy_row_group_size"]},
+                OVERWRITE_OR_IGNORE true
+            )
+        """,
+    )
+
+
+def build_jsono_scan_text_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    json_column = scenario_config["json_column"]
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {json_column}::VARCHAR AS r
+            FROM {table_sql(data_path)}
+        """,
+    )
+
+
+def build_jsono_validate_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    if "jsono_column" in scenario_config:
+        return BenchmarkQuery(
+            prepare_sql=(),
+            timed_sql=f"""
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT jsono_validate({scenario_config["jsono_column"]}) AS r
+                FROM {table_sql(data_path)}
+            """,
+        )
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono_validate(t) AS r
+            FROM _bench_in
+        """,
+    )
+
+
+def build_jsono_storage_size_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    if "jsono_column" in scenario_config:
+        return BenchmarkQuery(
+            prepare_sql=(),
+            timed_sql=f"""
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT jsono_storage_size({scenario_config["jsono_column"]}) AS r
+                FROM {table_sql(data_path)}
+            """,
+        )
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono_storage_size(t) AS r
+            FROM _bench_in
+        """,
+    )
+
+
+def build_jsono_transform_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    spec = get_transform_spec(scenario_config)
+    if "jsono_column" in scenario_config:
+        return BenchmarkQuery(
+            prepare_sql=(),
+            timed_sql=f"""
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT jsono_transform({scenario_config["jsono_column"]}, {sql_json(spec)}) AS r
+                FROM {table_sql(data_path)}
+            """,
+        )
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono_transform(t, {sql_json(spec)}) AS r
+            FROM _bench_in
+        """,
+    )
+
+
+def build_jsono_group_merge_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono_with_group(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT to_json(jsono_group_merge(t, 'IGNORE NULLS')) AS r
+            FROM _bench_in
+            GROUP BY {scenario_config["group_col"]}
+        """,
+    )
+
+
+def build_jsono_group_merge_jsono_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono_with_group(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono_group_merge(t, 'IGNORE NULLS') AS r
+            FROM _bench_in
+            GROUP BY {scenario_config["group_col"]}
+        """,
+    )
+
+
+def build_jsono_optimizer_project_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT
+                t->>'$.user_id' AS user_id,
+                MIN(CAST(t->>'$.event_ts' AS BIGINT)) AS first_event_ts,
+                MAX(CAST(t->>'$.event_ts' AS BIGINT)) AS last_event_ts,
+                count() AS count
+            FROM _bench_in
+            WHERE (t->>'$.event_name' = 'page_view')
+              AND (t->>'$.device_type' = 'mobile')
+              AND (t->>'$.geo_country' IN ['US', 'DE', 'ES'])
+            GROUP BY user_id
+        """,
+    )
+
+
+def build_jsono_merge_patch_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    json_column = scenario_config["json_column"]
+    patch_sql = f"jsono({sql_typed_literal(scenario_config['patch_object'])})"
+    return BenchmarkQuery(
+        prepare_sql=(
+            f"""
+            CREATE OR REPLACE TEMP TABLE _bench_in AS
+            SELECT
+                jsono({json_column}::VARCHAR) AS base
+            FROM {table_sql(data_path)}
+            """,
+        ),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono_merge_patch(base, {patch_sql}) AS r
+            FROM _bench_in
+        """,
+    )
+
+
+def build_jsono_entries_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono_entries(t, 'dotted') AS r
+            FROM _bench_in
+        """,
+    )
+
+
+def build_jsono_extract_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    spec = scenario_config["spec"]
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono_transform(t, {sql_json(spec)}) AS r
+            FROM _bench_in
+        """,
+    )
+
+
+def build_jsono_extract_jsono_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    value_sql = "t"
+    if "base_path" in scenario_config:
+        value_sql = extract_call_sql(
+            "jsono_extract", value_sql, scenario_config["base_path"]
+        )
+    result_sql = extract_call_sql("jsono_extract", value_sql, scenario_config["path"])
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {result_sql} AS r
+            FROM _bench_in
+        """,
+    )
+
+
+def build_jsono_extract_string_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    value_sql = "t"
+    if "base_path" in scenario_config:
+        value_sql = extract_call_sql(
+            "jsono_extract", value_sql, scenario_config["base_path"]
+        )
+    result_sql = extract_call_sql(
+        "jsono_extract_string", value_sql, scenario_config["path"]
+    )
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {result_sql} AS r
+            FROM _bench_in
+        """,
+    )
+
+
 def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     operation = scenario_config["operation"]
-    source_table = table_sql(data_path)
 
     match operation:
         case "parse":
-            json_column = scenario_config["json_column"]
-            return BenchmarkQuery(
-                prepare_sql=(),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono({json_column}::VARCHAR) AS r
-                    FROM {source_table}
-                """,
-            )
-
+            return build_jsono_parse_query(scenario_config, data_path)
         case "parse_struct":
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
-                timed_sql="""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono(payload) AS r
-                    FROM _bench_struct_in
-                """,
-            )
-
+            return build_jsono_parse_struct_query(scenario_config, data_path)
         case "parse_struct_roundtrip":
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
-                timed_sql="""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono(to_json(payload)::VARCHAR) AS r
-                    FROM _bench_struct_in
-                """,
-            )
-
+            return build_jsono_parse_struct_roundtrip_query(scenario_config, data_path)
         case "parse_struct_json_roundtrip":
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
-                timed_sql="""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono(to_json(payload)) AS r
-                    FROM _bench_struct_in
-                """,
+            return build_jsono_parse_struct_json_roundtrip_query(
+                scenario_config, data_path
             )
-
         case "object_jsono":
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
-                timed_sql="""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono(payload) AS r
-                    FROM _bench_struct_in
-                """,
-            )
-
+            return build_jsono_object_jsono_query(scenario_config, data_path)
         case "object_json":
-            field_names = list(scenario_config["struct_spec"].keys())
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT json_object(
-                        {object_args_sql(field_names)}
-                    ) AS r
-                    FROM _bench_struct_in
-                """,
-            )
-
+            return build_jsono_object_json_query(scenario_config, data_path)
         case "parse_copy":
-            json_column = scenario_config["json_column"]
-            copy_path = scenario_config["copy_path"]
-            return BenchmarkQuery(
-                prepare_sql=(),
-                timed_sql=f"""
-                    COPY (
-                        SELECT jsono({json_column}::VARCHAR) AS r
-                        FROM {source_table}
-                    )
-                    TO {sql_string(str(copy_path))}
-                    (
-                        FORMAT parquet,
-                        COMPRESSION {scenario_config["copy_compression"]},
-                        COMPRESSION_LEVEL {scenario_config["copy_compression_level"]},
-                        ROW_GROUP_SIZE {scenario_config["copy_row_group_size"]},
-                        OVERWRITE_OR_IGNORE true
-                    )
-                """,
-            )
-
+            return build_jsono_parse_copy_query(scenario_config, data_path)
         case "scan_text":
-            json_column = scenario_config["json_column"]
-            return BenchmarkQuery(
-                prepare_sql=(),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT {json_column}::VARCHAR AS r
-                    FROM {source_table}
-                """,
-            )
-
+            return build_jsono_scan_text_query(scenario_config, data_path)
         case "validate":
-            if "jsono_column" in scenario_config:
-                return BenchmarkQuery(
-                    prepare_sql=(),
-                    timed_sql=f"""
-                        CREATE OR REPLACE TEMP TABLE _bench_out AS
-                        SELECT jsono_validate({scenario_config["jsono_column"]}) AS r
-                        FROM {source_table}
-                    """,
-                )
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
-                timed_sql="""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono_validate(t) AS r
-                    FROM _bench_in
-                """,
-            )
-
+            return build_jsono_validate_query(scenario_config, data_path)
         case "storage_size":
-            if "jsono_column" in scenario_config:
-                return BenchmarkQuery(
-                    prepare_sql=(),
-                    timed_sql=f"""
-                        CREATE OR REPLACE TEMP TABLE _bench_out AS
-                        SELECT jsono_storage_size({scenario_config["jsono_column"]}) AS r
-                        FROM {source_table}
-                    """,
-                )
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
-                timed_sql="""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono_storage_size(t) AS r
-                    FROM _bench_in
-                """,
-            )
-
+            return build_jsono_storage_size_query(scenario_config, data_path)
         case "transform":
-            spec = get_transform_spec(scenario_config)
-            if "jsono_column" in scenario_config:
-                return BenchmarkQuery(
-                    prepare_sql=(),
-                    timed_sql=f"""
-                        CREATE OR REPLACE TEMP TABLE _bench_out AS
-                        SELECT jsono_transform({scenario_config["jsono_column"]}, {sql_json(spec)}) AS r
-                        FROM {source_table}
-                    """,
-                )
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono_transform(t, {sql_json(spec)}) AS r
-                    FROM _bench_in
-                """,
-            )
-
+            return build_jsono_transform_query(scenario_config, data_path)
         case "group_merge":
-            return BenchmarkQuery(
-                prepare_sql=(
-                    jsono_prepare_jsono_with_group(scenario_config, data_path),
-                ),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT to_json(jsono_group_merge(t, 'IGNORE NULLS')) AS r
-                    FROM _bench_in
-                    GROUP BY {scenario_config["group_col"]}
-                """,
-            )
-
+            return build_jsono_group_merge_query(scenario_config, data_path)
         case "group_merge_jsono":
-            return BenchmarkQuery(
-                prepare_sql=(
-                    jsono_prepare_jsono_with_group(scenario_config, data_path),
-                ),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono_group_merge(t, 'IGNORE NULLS') AS r
-                    FROM _bench_in
-                    GROUP BY {scenario_config["group_col"]}
-                """,
-            )
-
+            return build_jsono_group_merge_jsono_query(scenario_config, data_path)
+        case "optimizer_project":
+            return build_jsono_optimizer_project_query(scenario_config, data_path)
         case "merge_patch":
-            json_column = scenario_config["json_column"]
-            patch_object = scenario_config["patch_object"]
-            patch_sql = f"jsono({sql_typed_literal(patch_object)})"
-            return BenchmarkQuery(
-                prepare_sql=(
-                    f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_in AS
-                    SELECT
-                        jsono({json_column}::VARCHAR) AS base
-                    FROM {source_table}
-                    """,
-                ),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono_merge_patch(base, {patch_sql}) AS r
-                    FROM _bench_in
-                """,
-            )
-
+            return build_jsono_merge_patch_query(scenario_config, data_path)
         case "entries":
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
-                timed_sql="""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono_entries(t, 'dotted') AS r
-                    FROM _bench_in
-                """,
-            )
-
+            return build_jsono_entries_query(scenario_config, data_path)
         case "extract":
-            spec = scenario_config["spec"]
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT jsono_transform(t, {sql_json(spec)}) AS r
-                    FROM _bench_in
-                """,
-            )
-
+            return build_jsono_extract_query(scenario_config, data_path)
         case "extract_jsono":
-            value_sql = "t"
-            if "base_path" in scenario_config:
-                value_sql = extract_call_sql(
-                    "jsono_extract", value_sql, scenario_config["base_path"]
-                )
-            result_sql = extract_call_sql(
-                "jsono_extract", value_sql, scenario_config["path"]
-            )
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT {result_sql} AS r
-                    FROM _bench_in
-                """,
-            )
-
+            return build_jsono_extract_jsono_query(scenario_config, data_path)
         case "extract_string":
-            value_sql = "t"
-            if "base_path" in scenario_config:
-                value_sql = extract_call_sql(
-                    "jsono_extract", value_sql, scenario_config["base_path"]
-                )
-            result_sql = extract_call_sql(
-                "jsono_extract_string", value_sql, scenario_config["path"]
-            )
-            return BenchmarkQuery(
-                prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT {result_sql} AS r
-                    FROM _bench_in
-                """,
-            )
-
+            return build_jsono_extract_string_query(scenario_config, data_path)
         case _:
             raise ValueError(f"jsono target does not support operation: {operation}")
 
 
+def build_core_merge_patch_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    json_column = scenario_config["json_column"]
+    patch_object = scenario_config["patch_object"]
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT json_merge_patch({json_column}, {sql_json(patch_object)}) AS r
+            FROM {table_sql(data_path)}
+        """,
+    )
+
+
+def build_core_entries_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    json_column = scenario_config["json_column"]
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT
+                map_entries(
+                    json_transform({json_column}, '"map(string, string)"')
+                ) AS r
+            FROM {table_sql(data_path)}
+        """,
+    )
+
+
+def build_core_extract_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    json_column = scenario_config["json_column"]
+    spec = scenario_config["spec"]
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT json_transform({json_column}, {sql_json(spec)}) AS r
+            FROM {table_sql(data_path)}
+        """,
+    )
+
+
+def build_core_extract_jsono_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    value_sql = scenario_config["json_column"]
+    if "base_path" in scenario_config:
+        value_sql = extract_call_sql(
+            "json_extract", value_sql, scenario_config["base_path"]
+        )
+    result_sql = extract_call_sql("json_extract", value_sql, scenario_config["path"])
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {result_sql} AS r
+            FROM {table_sql(data_path)}
+        """,
+    )
+
+
+def build_core_extract_string_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    value_sql = scenario_config["json_column"]
+    if "base_path" in scenario_config:
+        value_sql = extract_call_sql(
+            "json_extract", value_sql, scenario_config["base_path"]
+        )
+    result_sql = extract_call_sql(
+        "json_extract_string", value_sql, scenario_config["path"]
+    )
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {result_sql} AS r
+            FROM {table_sql(data_path)}
+        """,
+    )
+
+
 def build_json_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     operation = scenario_config["operation"]
-    json_column = scenario_config["json_column"]
-    source_table = table_sql(data_path)
 
     match operation:
         case "merge_patch":
-            patch_object = scenario_config["patch_object"]
-            return BenchmarkQuery(
-                prepare_sql=(),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT json_merge_patch({json_column}, {sql_json(patch_object)}) AS r
-                    FROM {source_table}
-                """,
-            )
-
+            return build_core_merge_patch_query(scenario_config, data_path)
         case "entries":
-            return BenchmarkQuery(
-                prepare_sql=(),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT
-                        map_entries(
-                            json_transform({json_column}, '"map(string, string)"')
-                        ) AS r
-                    FROM {source_table}
-                """,
-            )
-
+            return build_core_entries_query(scenario_config, data_path)
         case "extract":
-            spec = scenario_config["spec"]
-            return BenchmarkQuery(
-                prepare_sql=(),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT json_transform({json_column}, {sql_json(spec)}) AS r
-                    FROM {source_table}
-                """,
-            )
-
+            return build_core_extract_query(scenario_config, data_path)
         case "extract_jsono":
-            value_sql = json_column
-            if "base_path" in scenario_config:
-                value_sql = extract_call_sql(
-                    "json_extract", value_sql, scenario_config["base_path"]
-                )
-            result_sql = extract_call_sql(
-                "json_extract", value_sql, scenario_config["path"]
-            )
-            return BenchmarkQuery(
-                prepare_sql=(),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT {result_sql} AS r
-                    FROM {source_table}
-                """,
-            )
-
+            return build_core_extract_jsono_query(scenario_config, data_path)
         case "extract_string":
-            value_sql = json_column
-            if "base_path" in scenario_config:
-                value_sql = extract_call_sql(
-                    "json_extract", value_sql, scenario_config["base_path"]
-                )
-            result_sql = extract_call_sql(
-                "json_extract_string", value_sql, scenario_config["path"]
-            )
-            return BenchmarkQuery(
-                prepare_sql=(),
-                timed_sql=f"""
-                    CREATE OR REPLACE TEMP TABLE _bench_out AS
-                    SELECT {result_sql} AS r
-                    FROM {source_table}
-                """,
-            )
-
+            return build_core_extract_string_query(scenario_config, data_path)
         case _:
             raise ValueError(f"json target does not support operation: {operation}")
 

@@ -21,8 +21,18 @@ add_compile_definitions(nssv_CONFIG_USR_SV_OPERATOR=0)
 set(EXTENSION_SOURCES
     src/jsono_extension.cpp
     src/jsono_ops.cpp
+    src/jsono_path_ops.cpp
+    src/jsono_entries.cpp
+    src/jsono_storage_size.cpp
+    src/jsono_validate.cpp
+    src/jsono_merge.cpp
     src/jsono_transform.cpp
+    src/jsono_optimizer.cpp
     src/jsono_number.cpp
+    src/jsono_dom.cpp
+    src/jsono_parse.cpp
+    src/jsono_struct_constructor.cpp
+    src/jsono_to_json.cpp
     src/jsono.cpp
     src/jsono_extract.cpp)
 
