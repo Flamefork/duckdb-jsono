@@ -53,11 +53,17 @@ void JsonoStorageSizeExecute(DataChunk &args, ExpressionState &state, Vector &re
 
 void RegisterJsonoStorageSize(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
-	auto storage_size_type = LogicalType::STRUCT({{"jsono_slots", LogicalType::UBIGINT},
-	                                              {"jsono_key_heap", LogicalType::UBIGINT},
-	                                              {"jsono_string_heap", LogicalType::UBIGINT},
-	                                              {"jsono_skips", LogicalType::UBIGINT},
-	                                              {"total", LogicalType::UBIGINT}});
+	// Per-BLOB byte counts share the physical layout's field names, so derive
+	// them from JsonoRawStructType() instead of re-listing, then append `total`.
+	// The field order must stay slots/key_heap/string_heap/skips — Execute writes
+	// the child vectors by that positional order.
+	auto raw_struct = JsonoRawStructType();
+	child_list_t<LogicalType> size_children;
+	for (auto &field : StructType::GetChildTypes(raw_struct)) {
+		size_children.emplace_back(field.first, LogicalType::UBIGINT);
+	}
+	size_children.emplace_back("total", LogicalType::UBIGINT);
+	auto storage_size_type = LogicalType::STRUCT(std::move(size_children));
 	ScalarFunction fun("jsono_storage_size", {jsono_type}, storage_size_type, JsonoStorageSizeExecute);
 	loader.RegisterFunction(fun);
 }

@@ -346,6 +346,7 @@ jsono_type(value[, path])     -> VARCHAR    -- OBJECT/ARRAY/VARCHAR/BIGINT/UBIGI
 jsono_keys(value[, path])     -> VARCHAR[]  -- object keys
 jsono_validate(value)         -> BOOLEAN    -- strict current-format validation
 jsono_storage_size(value)     -> STRUCT     -- physical four-BLOB byte sizes
+jsono_storage_type()          -> VARCHAR    -- DDL of the physical STRUCT backing JSONO
 ```
 
 `jsono_type` and `jsono_keys` inspect the shape of unknown JSON before extracting it with `jsono_transform`. The optional `path` is a constant JSONPath (same grammar as `jsono_transform`, without wildcards) that points at a nested position; a missing path yields `NULL`.
@@ -360,6 +361,13 @@ SELECT jsono_type(jsono('{"items":[1,2,3]}'), '$.items[0]');
 `jsono_validate` checks the current binary format contract: header flags, sorted unique keys, slots, heaps, navigation metadata, UTF-8 strings, and raw number text. It returns `false` for malformed physical blobs and `NULL` for SQL `NULL`.
 
 `jsono_storage_size` reports `jsono_slots`, `jsono_key_heap`, `jsono_string_heap`, `jsono_skips`, and `total` byte counts. It is a physical diagnostic and does not validate the value.
+
+`jsono_storage_type` returns the DDL of the physical `STRUCT` backing `JSONO` with the alias dropped — the form stores that reject user-defined type aliases (DuckLake, plain Parquet) actually keep. Use it to declare storage columns without hardcoding the field names; a column of that exact shape binds to `jsono` ops and `to_json` without an explicit `::JSONO` cast.
+
+```sql
+SELECT jsono_storage_type();
+-- STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
+```
 
 These helpers are primarily used by the JSONO workflows and tests. Treat their exact surface as less stable than `jsono_transform`, `jsono`, and `to_json`.
 

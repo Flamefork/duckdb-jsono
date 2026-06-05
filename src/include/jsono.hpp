@@ -40,10 +40,16 @@ constexpr const char *JSONO_TYPE_NAME = "JSONO";
 // pluck-on-JSONO can agree on the exact STRUCT shape.
 LogicalType JsonoType();
 
+// The physical STRUCT(4 BLOB) backing JSONO, without the JSONO alias — the form
+// DuckLake/Parquet actually store, since they reject user-defined type aliases.
+// Single source of truth for the layout; `jsono_storage_type()` exposes its DDL
+// string so writers can declare storage columns without hardcoding the fields.
+LogicalType JsonoRawStructType();
+
 // True when `type` is the JSONO STRUCT — by alias, or structurally (the four
-// jsono_* BLOB children survive read_parquet, which drops the alias). Single
-// source of truth for the field-name contract shared by jsono.cpp and
-// jsono_ops.cpp.
+// jsono_* BLOB children survive read_parquet, which drops the alias). The
+// structural check compares against `JsonoRawStructType()`, so the field
+// contract shared by jsono.cpp and jsono_ops.cpp has one source.
 bool IsJsonoType(const LogicalType &type);
 
 //===--------------------------------------------------------------------===//

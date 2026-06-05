@@ -1,0 +1,60 @@
+# name: test/sql/jsono_storage_type.test
+# description: jsono_storage_type() exposes the physical STRUCT DDL backing JSONO
+# group: [sql]
+
+require jsono
+
+require parquet
+
+# The DDL string is the physical layout of a JSONO column with the alias dropped.
+# Changing it is a deliberate format change — update this expectation on purpose.
+query I
+SELECT jsono_storage_type();
+----
+STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
+
+# A column declared with that DDL is structurally a JSONO: jsono ops bind to it
+# without an explicit cast, so the round-trip from storage form works.
+statement ok
+CREATE TABLE t (props STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB));
+
+statement ok
+INSERT INTO t SELECT jsono('{"a":1}');
+
+query I
+SELECT jsono_extract_string(props, '$.a') FROM t;
+----
+1
+
+# The function emits the *real* storage form, not a separately-maintained string:
+# Parquet drops the JSONO alias, so the column reads back as its physical type,
+# and that type must print back to exactly jsono_storage_type().
+statement ok
+COPY (SELECT jsono('{"a":1}') AS props) TO '__TEST_DIR__/jsono_storage_type.parquet';
+
+query I
+SELECT typeof(props) = jsono_storage_type() FROM '__TEST_DIR__/jsono_storage_type.parquet';
+----
+true
+
+# Boundary of the structural match: a STRUCT that is close but not the exact
+# four jsono_* BLOB layout must NOT bind to jsono ops. Guards IsJsonoType against
+# accidentally widening (it compares names AND types against JsonoRawStructType).
+
+# Wrong field name (jsono_slot, not jsono_slots).
+statement error
+SELECT jsono_extract_string({'jsono_slot': ''::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}, '$.a');
+----
+No function matches
+
+# Wrong field type (INTEGER where BLOB is required).
+statement error
+SELECT jsono_extract_string({'jsono_slots': 0, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}, '$.a');
+----
+No function matches
+
+# Wrong field count (three BLOBs, not four).
+statement error
+SELECT jsono_extract_string({'jsono_slots': ''::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB}, '$.a');
+----
+No function matches

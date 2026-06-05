@@ -1,6 +1,7 @@
 #include "jsono.hpp"
 
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -23,6 +24,16 @@ void JsonoNullExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 void JsonoIdentityExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)state;
 	result.Reference(args.data[0]);
+}
+
+// jsono_storage_type() -> the DDL string of the physical STRUCT backing JSONO.
+// DuckLake rejects the JSONO alias, so writers declare storage columns with this
+// struct; exposing it here keeps the layout owned by the extension.
+void JsonoStorageTypeExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)args;
+	(void)state;
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	result.SetValue(0, Value(JsonoRawStructType().ToString()));
 }
 
 // Retype between the raw STRUCT(4 BLOB) and JSONO. The two are physically
@@ -60,20 +71,23 @@ bool IsJsonoType(const LogicalType &type) {
 	if (type.HasAlias() && type.GetAlias() == JSONO_TYPE_NAME) {
 		return true;
 	}
-	auto &children = StructType::GetChildTypes(type);
-	return children.size() == 4 && children[0].first == "jsono_slots" && children[0].second == LogicalType::BLOB &&
-	       children[1].first == "jsono_key_heap" && children[1].second == LogicalType::BLOB &&
-	       children[2].first == "jsono_string_heap" && children[2].second == LogicalType::BLOB &&
-	       children[3].first == "jsono_skips" && children[3].second == LogicalType::BLOB;
+	// Structural match: the four jsono_* BLOB children survive read_parquet,
+	// which drops the alias. Compare field names and types against the canonical
+	// layout so JsonoRawStructType stays the single source of the field contract.
+	return StructType::GetChildTypes(type) == StructType::GetChildTypes(JsonoRawStructType());
 }
 
-LogicalType JsonoType() {
+LogicalType JsonoRawStructType() {
 	child_list_t<LogicalType> children;
 	children.emplace_back("jsono_slots", LogicalType::BLOB);
 	children.emplace_back("jsono_key_heap", LogicalType::BLOB);
 	children.emplace_back("jsono_string_heap", LogicalType::BLOB);
 	children.emplace_back("jsono_skips", LogicalType::BLOB);
-	auto t = LogicalType::STRUCT(std::move(children));
+	return LogicalType::STRUCT(std::move(children));
+}
+
+LogicalType JsonoType() {
+	auto t = JsonoRawStructType();
 	t.SetAlias(JSONO_TYPE_NAME);
 	return t;
 }
@@ -93,6 +107,10 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 		set.AddFunction(ScalarFunction({LogicalType::SQLNULL}, jsono_type, JsonoNullExecute));
 		loader.RegisterFunction(set);
 	}
+	{
+		ScalarFunction fun("jsono_storage_type", {}, LogicalType::VARCHAR, JsonoStorageTypeExecute);
+		loader.RegisterFunction(fun);
+	}
 
 	RegisterJsonoStructConstructor(loader);
 	RegisterJsonoParse(loader);
@@ -102,12 +120,7 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 	// alias. Reading the column back from a plain Parquet file drops the
 	// alias — we still want transform/to_json on it. Register a no-op
 	// reinterpret cast both ways so the structural shape implicitly converts.
-	child_list_t<LogicalType> raw_children;
-	raw_children.emplace_back("jsono_slots", LogicalType::BLOB);
-	raw_children.emplace_back("jsono_key_heap", LogicalType::BLOB);
-	raw_children.emplace_back("jsono_string_heap", LogicalType::BLOB);
-	raw_children.emplace_back("jsono_skips", LogicalType::BLOB);
-	auto raw_struct = LogicalType::STRUCT(raw_children);
+	auto raw_struct = JsonoRawStructType();
 	loader.RegisterCastFunction(raw_struct, jsono_type, JsonoStructRetypeCast, 1);
 	loader.RegisterCastFunction(jsono_type, raw_struct, JsonoStructRetypeCast, 1);
 }
