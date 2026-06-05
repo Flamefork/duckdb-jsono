@@ -317,3 +317,44 @@ query I
 SELECT jsono_transform(jsono('{"a.b":"flat","a":{"b":"nested"}}'), '{"out":{"type":"VARCHAR","path":"$.a.b"}}');
 ----
 {'out': nested}
+
+# Shredded input (constructor default-shred): jsono_transform reads lane-backed scalar
+# fields transparently. event_name lifts to a VARCHAR lane, n to a BIGINT lane, while the
+# nested object stays in the residual tape and is navigated as usual.
+query I
+SELECT jsono_transform(jsono({'event_name': 'click', 'n': 5::BIGINT, 'nested': {'k': 1}}),
+                       '{"event_name":"VARCHAR","n":"BIGINT","k":{"type":"BIGINT","path":"$.nested.k"}}');
+----
+{'event_name': click, 'n': 5, 'k': 1}
+
+# Differential: transforming a shredded value equals transforming the same document as a
+# plain tape ({shred: false}).
+query I
+SELECT jsono_transform(jsono({'event_name': 'click', 'n': 5::BIGINT}),
+                       '{"event_name":"VARCHAR","n":"BIGINT"}')
+     = jsono_transform(jsono({'event_name': 'click', 'n': 5::BIGINT}, {'shred': false}),
+                       '{"event_name":"VARCHAR","n":"BIGINT"}');
+----
+true
+
+# A lane absent on a row is NULL, not a spurious value (account-style row without n).
+query I
+SELECT jsono_transform(jsono({'event_name': 'view'}), '{"event_name":"VARCHAR","n":"BIGINT"}');
+----
+{'event_name': view, 'n': NULL}
+
+# residual-first: a VARCHAR lane sitting over a non-string value keeps the number in the
+# residual (lane holds only the ->> text), so a VARCHAR field over that path yields NULL
+# exactly like the plain tape — the lane is not read in preference to the residual.
+query I
+SELECT jsono_transform(jsono_shred(jsono('{"k":5}'), '{"$.k":"VARCHAR"}'), '{"k":"VARCHAR"}')
+     = jsono_transform(jsono('{"k":5}'), '{"k":"VARCHAR"}');
+----
+true
+
+# A stripped string lane reads back through transform: the residual lacks the key and the
+# lane refills it.
+query I
+SELECT jsono_transform(jsono_shred(jsono('{"k":"hi"}'), '{"$.k":"VARCHAR"}'), '{"k":"VARCHAR"}');
+----
+{'k': hi}

@@ -33,6 +33,7 @@ set(EXTENSION_SOURCES
     src/jsono_parse.cpp
     src/jsono_struct_constructor.cpp
     src/jsono_to_json.cpp
+    src/jsono_shred.cpp
     src/jsono.cpp
     src/jsono_extract.cpp)
 

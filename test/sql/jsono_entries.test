@@ -142,3 +142,21 @@ SELECT jsono_entries(jsono('{}'), 'invalid');
 statement error
 SELECT jsono_entries(jsono('{"a":1}'), key_style) FROM (VALUES ('dotted')) t(key_style);
 ----
+
+# --- lane-aware: a shredded value flattens its residual tape AND its lane columns ---
+query I
+SELECT jsono_entries(
+  jsono_shred(jsono('{"a":1,"event_name":"page_view"}'), '{"event_name":"VARCHAR"}'),
+  'dotted'
+);
+----
+[{'key': a, 'value': 1}, {'key': event_name, 'value': page_view}]
+
+# absent lane (NULL) contributes no entry
+query I
+SELECT jsono_entries(
+  jsono_shred(jsono('{"a":1}'), '{"event_name":"VARCHAR"}'),
+  'dotted'
+);
+----
+[{'key': a, 'value': 1}]

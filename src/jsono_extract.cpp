@@ -593,6 +593,17 @@ ScalarFunction MakeExtractStringFunction(string name, LogicalType path_type) {
 
 } // namespace
 
+// Native jsono extract functions, exposed so the optimizer can read a non-lane path
+// straight off the shredded residual (a JSONO value) instead of routing it through
+// core json's serialize-then-parse path.
+ScalarFunction JsonoExtractStringFunction(const LogicalType &path_type) {
+	return MakeExtractStringFunction("jsono_extract_string", path_type);
+}
+
+ScalarFunction JsonoExtractFunction(const LogicalType &path_type) {
+	return MakeExtractFunction("jsono_extract", path_type);
+}
+
 void RegisterJsonoExtract(ExtensionLoader &loader) {
 	ScalarFunctionSet extract("jsono_extract");
 	extract.AddFunction(MakeExtractFunction("jsono_extract", LogicalType::VARCHAR));

@@ -1,11 +1,14 @@
 #include "jsono_ops.hpp"
 #include "jsono.hpp"
+#include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_shred.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function.hpp"
@@ -27,7 +30,11 @@ namespace {
 
 using namespace jsono;
 
-enum class MergeMode : uint8_t { Patch, IgnoreNulls };
+// Patch: RFC 7396 merge_patch (B wins, B-null deletes). IgnoreNulls: jsono_group_merge
+// (B wins, null members dropped). Overlay: A (the first argument) is authoritative —
+// B only fills keys absent from A, B-null is a no-op, A's own nulls are kept. Overlay
+// powers shredded reconstruction: the residual (A) wins, lanes (B) fill stripped paths.
+enum class MergeMode : uint8_t { Patch, IgnoreNulls, Overlay };
 
 // One object child captured in a single pass: its key, the value's slot/string
 // position, and the value's slot tag. Capturing the tag here lets the merge loop
@@ -398,19 +405,30 @@ void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, 
 			cmp = CompareJsonoKeys(children_a[ia].key, children_b[ib].key);
 		}
 		if (cmp < 0) {
-			// A-only key. Under Patch mode (RFC 7396 merge_patch) A is the target
-			// document, copied verbatim — its explicit nulls are values, not deletions.
-			// Under IGNORE NULLS (jsono_group_merge) a null member is dropped.
-			if (merge_mode == MergeMode::Patch || children_a[ia].tag != tag::VAL_NULL) {
+			// A-only key. Patch and Overlay copy A verbatim — its explicit nulls are
+			// values, not deletions. Under IGNORE NULLS a null member is dropped.
+			if (merge_mode != MergeMode::IgnoreNulls || children_a[ia].tag != tag::VAL_NULL) {
 				plan.push_back(MergePlanEntry {children_a[ia].key, MergeSrc::A, ia, 0});
 			}
 			ia++;
 		} else if (cmp > 0) {
-			// B-only key: emit unless null, or (IGNORE NULLS) an object that strips to empty.
+			// B-only key. Patch keeps every non-null member (RFC 7396 may leave `{}`);
+			// Overlay and IGNORE NULLS drop a member whose object value strips to empty.
 			if (children_b[ib].tag != tag::VAL_NULL &&
 			    (merge_mode == MergeMode::Patch || ValueSurvivesIgnoreNulls(vb, children_b[ib].pos))) {
 				plan.push_back(MergePlanEntry {children_b[ib].key, MergeSrc::B, 0, ib});
 			}
+			ib++;
+		} else if (merge_mode == MergeMode::Overlay) {
+			// Both sides have the key. A (the residual) is authoritative. If both are
+			// objects, recurse so B can still fill nested keys A dropped (A wins every
+			// leaf conflict); otherwise keep A verbatim, including an explicit null.
+			if (children_a[ia].tag == tag::OBJ_START && children_b[ib].tag == tag::OBJ_START) {
+				plan.push_back(MergePlanEntry {children_a[ia].key, MergeSrc::Recurse, ia, ib});
+			} else {
+				plan.push_back(MergePlanEntry {children_a[ia].key, MergeSrc::A, ia, ib});
+			}
+			ia++;
 			ib++;
 		} else {
 			if (children_b[ib].tag != tag::VAL_NULL) {
@@ -491,9 +509,10 @@ void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, 
 			builder.EmitObjectChildStart();
 			size_t p = csrc[rank].pos;
 			size_t sc = csrc[rank].string_cursor;
-			// A-side under Patch mode is the verbatim target (keep nested nulls); the
-			// B-side patch and IGNORE NULLS still strip null members.
-			if (src == MergeSrc::A && merge_mode == MergeMode::Patch) {
+			// A-side under Patch/Overlay is the verbatim target (A authoritative, keep
+			// its nested nulls); the B-side under any mode strips null members so an
+			// Overlay lane refill never re-introduces a null the residual dropped.
+			if (src == MergeSrc::A && (merge_mode == MergeMode::Overlay || merge_mode == MergeMode::Patch)) {
 				EmitValueVerbatim(vsrc, p, sc, builder, depth + 1);
 			} else {
 				EmitValueStrip(vsrc, p, sc, builder, merge_mode, depth + 1);
@@ -615,27 +634,68 @@ JsonoView ViewOfBlob(const OwnedJsonoBlob &b) {
 // (the accumulator is the target — its nulls are kept; the patch's nulls delete
 // keys), while onto a non-object or SQL NULL accumulator it is merged onto an empty
 // object (its own nulls stripped). A non-object patch replaces the accumulator.
-bool MergePatchFoldStep(bool acc_is_sqlnull, const JsonoView &acc_view, bool patch_present, const JsonoView &patch_view,
-                        JsonoBuilder &builder, std::vector<MergeChild> &children_a, std::vector<MergeChild> &children_b,
-                        std::vector<MergePlanEntry> &plan) {
+bool MergeFoldStep(MergeMode mode, bool acc_is_sqlnull, const JsonoView &acc_view, bool patch_present,
+                   const JsonoView &patch_view, JsonoBuilder &builder, std::vector<MergeChild> &children_a,
+                   std::vector<MergeChild> &children_b, std::vector<MergePlanEntry> &plan) {
 	if (!patch_present) {
-		return true;
+		// Patch: a SQL NULL patch nullifies the result. Overlay: A is authoritative, so
+		// a missing B leaves the accumulator untouched.
+		return mode == MergeMode::Overlay ? acc_is_sqlnull : true;
 	}
 	builder.Reset();
 	size_t p = 0;
 	size_t sc = 0;
-	if (SlotTag(patch_view.SlotAt(0)) != tag::OBJ_START) {
-		EmitValueVerbatim(patch_view, p, sc, builder, 0);
+	bool acc_is_object = !acc_is_sqlnull && SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START;
+	bool patch_is_object = SlotTag(patch_view.SlotAt(0)) == tag::OBJ_START;
+	if (acc_is_object && patch_is_object) {
+		MergeTwoObjectsWithScratch(acc_view, 0, 0, patch_view, 0, 0, builder, mode, 0, children_a, children_b, plan);
 		return false;
 	}
-	if (!acc_is_sqlnull && SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START) {
-		MergeTwoObjectsWithScratch(acc_view, 0, 0, patch_view, 0, 0, builder, MergeMode::Patch, 0, children_a,
-		                           children_b, plan);
+	if (mode == MergeMode::Overlay) {
+		// A authoritative: keep the accumulator if present, otherwise fall to the patch.
+		const JsonoView &src = acc_is_sqlnull ? patch_view : acc_view;
+		size_t sp = 0;
+		size_t ssc = 0;
+		EmitValueVerbatim(src, sp, ssc, builder, 0);
+		return false;
+	}
+	if (!patch_is_object) {
+		EmitValueVerbatim(patch_view, p, sc, builder, 0);
 	} else {
 		EmitValueStrip(patch_view, p, sc, builder, MergeMode::Patch, 0);
 	}
 	return false;
 }
+
+// A lane carried through a lane-aware merge: its name, the result struct child index it
+// lands in, and its type. The merge folds the four-BLOB residuals (existing logic) and
+// copies each union lane from the last input that declares it. Lane keys are assumed
+// disjoint from residual keys (true when lanes are computed fields lifted into columns).
+struct MergeLane {
+	string name;
+	idx_t result_child_index;
+	LogicalType type;
+};
+
+struct JsonoMergeBindData : public FunctionData {
+	vector<MergeLane> lanes;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<JsonoMergeBindData>(*this);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<JsonoMergeBindData>();
+		if (lanes.size() != other.lanes.size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < lanes.size(); i++) {
+			if (lanes[i].name != other.lanes[i].name || lanes[i].type != other.lanes[i].type) {
+				return false;
+			}
+		}
+		return true;
+	}
+};
 
 unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunction &bound_function,
                                              vector<unique_ptr<Expression>> &arguments) {
@@ -643,28 +703,243 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 	if (arguments.empty()) {
 		throw BinderException("jsono_merge_patch() requires at least one argument");
 	}
+	// Union the lanes of any shredded inputs (later inputs win a name conflict, matching
+	// the patch-wins fold). A shredded input keeps its type so the executor can read its
+	// lane columns; a plain input is bound as JSONO and contributes only its residual.
+	auto bind_data = make_uniq<JsonoMergeBindData>();
+	auto &lanes = bind_data->lanes;
+	auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
 	for (auto &argument : arguments) {
 		if (argument->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
-		if (argument->return_type.id() != LogicalTypeId::SQLNULL && !IsJsonoType(argument->return_type)) {
-			throw BinderException("jsono_merge_patch() arguments must be JSONO");
+		auto &type = argument->return_type;
+		if (type.id() == LogicalTypeId::SQLNULL) {
+			bound_function.arguments.push_back(JsonoType());
+			continue;
 		}
-		bound_function.arguments.push_back(JsonoType());
+		if (IsShreddedJsonoType(type)) {
+			auto &children = StructType::GetChildTypes(type);
+			for (idx_t i = prefix; i < children.size(); i++) {
+				bool found = false;
+				for (auto &lane : lanes) {
+					if (lane.name == children[i].first) {
+						lane.type = children[i].second;
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					lanes.push_back(MergeLane {children[i].first, 0, children[i].second});
+				}
+			}
+			bound_function.arguments.push_back(type);
+			continue;
+		}
+		if (IsJsonoType(type)) {
+			bound_function.arguments.push_back(JsonoType());
+			continue;
+		}
+		throw BinderException("jsono_merge_patch() arguments must be JSONO");
 	}
-	return nullptr;
+	if (lanes.empty()) {
+		bound_function.return_type = JsonoType();
+		return std::move(bind_data);
+	}
+	child_list_t<LogicalType> children = StructType::GetChildTypes(JsonoRawStructType());
+	idx_t next = children.size();
+	for (auto &lane : lanes) {
+		lane.result_child_index = next++;
+		children.emplace_back(lane.name, lane.type);
+	}
+	bound_function.return_type = LogicalType::STRUCT(std::move(children));
+	return std::move(bind_data);
 }
 
-void JsonoMergePatchExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoOpsLocalState>();
-	auto count = args.size();
-	vector<JsonoVectorData> inputs(args.ColumnCount());
-	for (idx_t i = 0; i < args.ColumnCount(); i++) {
-		InitJsonoVectorData(args.data[i], count, inputs[i]);
+struct ReconLane {
+	idx_t child;
+	LogicalType type;
+	vector<PathStep> steps; // object-key path; size 1 is a top-level key
+};
+
+void EmitReconLaneScalar(JsonoBuilder &builder, const ReconLane &lane, const UnifiedVectorFormat &fmt, idx_t idx) {
+	switch (lane.type.id()) {
+	case LogicalTypeId::VARCHAR: {
+		auto value = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
+		builder.EmitString(nonstd::string_view(value.GetData(), value.GetSize()));
+		return;
+	}
+	case LogicalTypeId::BIGINT:
+		builder.EmitInt(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx]);
+		return;
+	case LogicalTypeId::UBIGINT:
+		builder.EmitUInt(UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx]);
+		return;
+	case LogicalTypeId::DOUBLE:
+		builder.EmitDouble(UnifiedVectorFormat::GetData<double>(fmt)[idx]);
+		return;
+	case LogicalTypeId::BOOLEAN:
+		builder.EmitBool(UnifiedVectorFormat::GetData<bool>(fmt)[idx]);
+		return;
+	default:
+		throw InternalException("jsono reconstruct: unexpected lane type '%s'", lane.type.ToString());
+	}
+}
+
+// Reconstruct a shredded JSONO `input` (four-BLOB residual + lane columns) into the plain
+// JSONO `result` by overlaying each row's lane values back onto its residual object. Lanes
+// are disjoint from residual keys (the shred invariant), so the overlay re-inserts them.
+// Top-level lanes are emitted as one flat patch (the common jsono({...}) case); nested-path
+// lanes (`$.a.b`) accumulate a one-path chain overlay each so any depth round-trips.
+void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result) {
+	auto &input_types = StructType::GetChildTypes(input.GetType());
+	auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
+	vector<ReconLane> lanes;
+	bool all_top_level = true;
+	for (idx_t i = prefix; i < input_types.size(); i++) {
+		auto &name = input_types[i].first;
+		vector<PathStep> steps;
+		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
+			steps = ParseJsonoPath(name, "jsono reconstruct");
+		} else {
+			steps.push_back(PathStep {PathStepKind::Key, name, 0});
+		}
+		for (auto &step : steps) {
+			if (step.kind != PathStepKind::Key) {
+				throw InvalidInputException("jsono reconstruct: lane path '%s' is not an object-key path", name);
+			}
+		}
+		if (steps.size() != 1) {
+			all_top_level = false;
+		}
+		lanes.push_back(ReconLane {i, input_types[i].second, std::move(steps)});
+	}
+	std::sort(lanes.begin(), lanes.end(), [](const ReconLane &a, const ReconLane &b) {
+		auto n = std::min(a.steps.size(), b.steps.size());
+		for (size_t i = 0; i < n; i++) {
+			if (a.steps[i].key != b.steps[i].key) {
+				return a.steps[i].key < b.steps[i].key;
+			}
+		}
+		return a.steps.size() < b.steps.size();
+	});
+
+	JsonoVectorData residual;
+	InitJsonoVectorData(input, count, residual);
+	vector<UnifiedVectorFormat> lane_fmt(lanes.size());
+	auto &struct_children = StructVector::GetEntries(input);
+	for (idx_t k = 0; k < lanes.size(); k++) {
+		struct_children[lanes[k].child]->ToUnifiedFormat(count, lane_fmt[k]);
 	}
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &children = StructVector::GetEntries(result);
+	auto &out_children = StructVector::GetEntries(result);
+	auto &slots_vec = *out_children[0];
+	auto &key_heap_vec = *out_children[1];
+	auto &string_heap_vec = *out_children[2];
+	auto &skips_vec = *out_children[3];
+	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
+	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
+	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
+	auto skips_out = FlatVector::GetData<string_t>(skips_vec);
+
+	JsonoBuilder patch_builder;
+	JsonoBuilder out_builder;
+	OwnedJsonoBlob patch_storage;
+	OwnedJsonoBlob acc_storage;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob {};
+		if (!ReadJsonoRow(residual, row, blob)) {
+			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+			continue;
+		}
+		JsonoView residual_view = MakeJsonoView(blob);
+		if (!residual_view.ParseHeader() || residual_view.Slots() == 0) {
+			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+			continue;
+		}
+		if (all_top_level) {
+			// One flat patch object of the present lanes, overlaid in a single pass.
+			patch_builder.Reset();
+			idx_t present = 0;
+			for (idx_t k = 0; k < lanes.size(); k++) {
+				present += RowIsValid(lane_fmt[k], row) ? 1 : 0;
+			}
+			patch_builder.EmitObjectStart(present);
+			for (idx_t k = 0; k < lanes.size(); k++) {
+				if (RowIsValid(lane_fmt[k], row)) {
+					patch_builder.EmitKeySlot(lanes[k].steps[0].key);
+				}
+			}
+			for (idx_t k = 0; k < lanes.size(); k++) {
+				if (!RowIsValid(lane_fmt[k], row)) {
+					continue;
+				}
+				patch_builder.EmitObjectChildStart();
+				EmitReconLaneScalar(patch_builder, lanes[k], lane_fmt[k], RowIndex(lane_fmt[k], row));
+			}
+			patch_builder.EmitObjectEnd();
+			SerializeBuilderToBlob(patch_builder, patch_storage);
+			JsonoView patch_view = ViewOfBlob(patch_storage);
+			patch_view.ParseHeader();
+			out_builder.Reset();
+			MergeTwoObjects(residual_view, 0, 0, patch_view, 0, 0, out_builder, MergeMode::Overlay, 0);
+			WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out,
+			                 string_heap_out, skips_out, row, out_builder);
+			continue;
+		}
+		// Nested lanes: overlay one single-path chain at a time onto the accumulator. The
+		// residual is authoritative; each disjoint lane path fills in where it was stripped.
+		const JsonoView *acc = &residual_view;
+		JsonoView acc_view = residual_view;
+		bool any = false;
+		for (idx_t k = 0; k < lanes.size(); k++) {
+			if (!RowIsValid(lane_fmt[k], row)) {
+				continue;
+			}
+			patch_builder.Reset();
+			for (auto &step : lanes[k].steps) {
+				patch_builder.EmitObjectStart(1);
+				patch_builder.EmitKeySlot(step.key);
+				patch_builder.EmitObjectChildStart();
+			}
+			EmitReconLaneScalar(patch_builder, lanes[k], lane_fmt[k], RowIndex(lane_fmt[k], row));
+			for (idx_t s = 0; s < lanes[k].steps.size(); s++) {
+				patch_builder.EmitObjectEnd();
+			}
+			SerializeBuilderToBlob(patch_builder, patch_storage);
+			JsonoView patch_view = ViewOfBlob(patch_storage);
+			patch_view.ParseHeader();
+			out_builder.Reset();
+			MergeTwoObjects(*acc, 0, 0, patch_view, 0, 0, out_builder, MergeMode::Overlay, 0);
+			SerializeBuilderToBlob(out_builder, acc_storage);
+			acc_view = ViewOfBlob(acc_storage);
+			acc_view.ParseHeader();
+			acc = &acc_view;
+			any = true;
+		}
+		out_builder.Reset();
+		if (any) {
+			size_t p = 0;
+			size_t sc = 0;
+			EmitValueVerbatim(*acc, p, sc, out_builder, 0);
+		} else {
+			size_t p = 0;
+			size_t sc = 0;
+			EmitValueVerbatim(residual_view, p, sc, out_builder, 0);
+		}
+		WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out, string_heap_out,
+		                 skips_out, row, out_builder);
+	}
+}
+
+// Fold the residual views in `inputs` left-to-right under `mode` and write the merged plain
+// JSONO into `out` (the four-BLOB residual). Shared by the lane-aware fast path (raw residuals)
+// and the reshred fallback (reconstructed values).
+void RunResidualFold(MergeMode mode, vector<JsonoVectorData> &inputs, idx_t ncols, idx_t count, Vector &out,
+                     JsonoOpsLocalState &lstate) {
+	out.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &children = StructVector::GetEntries(out);
 	auto &slots_vec = *children[0];
 	auto &key_heap_vec = *children[1];
 	auto &string_heap_vec = *children[2];
@@ -673,13 +948,8 @@ void JsonoMergePatchExecute(DataChunk &args, ExpressionState &state, Vector &res
 	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
 	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
 	auto skips_out = FlatVector::GetData<string_t>(skips_vec);
-
-	idx_t ncols = args.ColumnCount();
 	// jsono_merge_patch folds left to right (RFC 7396): the first argument is the
 	// target document (kept verbatim — its nulls are values), the rest are patches.
-	// Every step reuses the cursor MergeTwoObjects via MergePatchFoldStep, serializing
-	// the running accumulator into a reused blob between steps; the dominant two-object
-	// case runs a single merge straight into the output builder with no round-trip.
 	static thread_local OwnedJsonoBlob acc_storage;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow target_blob {};
@@ -691,7 +961,7 @@ void JsonoMergePatchExecute(DataChunk &args, ExpressionState &state, Vector &res
 		if (ncols == 1) {
 			// A lone target is returned verbatim (its nulls survive).
 			if (acc_is_sqlnull) {
-				SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+				SetJsonoStructNull(out, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
 			} else {
 				lstate.builder.Reset();
 				size_t p = 0;
@@ -710,12 +980,12 @@ void JsonoMergePatchExecute(DataChunk &args, ExpressionState &state, Vector &res
 				patch_present = false;
 			}
 			bool result_sqlnull =
-			    MergePatchFoldStep(acc_is_sqlnull, acc_view, patch_present, patch_view, lstate.builder,
-			                       lstate.merge_children_a, lstate.merge_children_b, lstate.merge_plan);
+			    MergeFoldStep(mode, acc_is_sqlnull, acc_view, patch_present, patch_view, lstate.builder,
+			                  lstate.merge_children_a, lstate.merge_children_b, lstate.merge_plan);
 			if (i + 1 == ncols) {
 				// Last step writes straight to the output builder — no serialize round-trip.
 				if (result_sqlnull) {
-					SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+					SetJsonoStructNull(out, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
 				} else {
 					WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out,
 					                 string_heap_out, skips_out, row, lstate.builder);
@@ -730,9 +1000,197 @@ void JsonoMergePatchExecute(DataChunk &args, ExpressionState &state, Vector &res
 			}
 		}
 	}
+}
+
+// True if the residual object has `key` at top level (binary search over the sorted keys).
+bool ResidualHasTopLevelKey(const JsonoView &view, const string &key) {
+	if (view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+		return false;
+	}
+	auto layout = ReadObjectLayout(view, 0);
+	nonstd::string_view target(key);
+	size_t lo = 0;
+	size_t hi = layout.key_count;
+	while (lo < hi) {
+		auto mid = lo + (hi - lo) / 2;
+		auto ks = view.SlotAt(layout.key_start + mid);
+		if (SlotTag(ks) != tag::KEY) {
+			return false;
+		}
+		if (view.KeyAt(SlotPayload(ks)) < target) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	if (lo >= layout.key_count) {
+		return false;
+	}
+	auto ks = view.SlotAt(layout.key_start + lo);
+	return SlotTag(ks) == tag::KEY && view.KeyAt(SlotPayload(ks)) == target;
+}
+
+// Copy a lane column from the winning input into the result lane, then null it where the
+// merged value is SQL NULL. Patch takes the last input that declares the lane (RFC 7396
+// last-wins); Overlay takes the first (base-authoritative).
+void FastCopyLane(DataChunk &args, idx_t ncols, idx_t count, MergeMode mode, const MergeLane &lane, Vector &dst,
+                  const ValidityMask &result_validity) {
+	idx_t src_arg = DConstants::INVALID_INDEX;
+	idx_t src_child = 0;
+	for (idx_t i = 0; i < ncols; i++) {
+		auto &t = args.data[i].GetType();
+		if (t.id() != LogicalTypeId::STRUCT) {
+			continue;
+		}
+		auto &ch = StructType::GetChildTypes(t);
+		for (idx_t c = 0; c < ch.size(); c++) {
+			if (ch[c].first == lane.name && (mode != MergeMode::Overlay || src_arg == DConstants::INVALID_INDEX)) {
+				src_arg = i;
+				src_child = c;
+			}
+		}
+	}
+	dst.SetVectorType(VectorType::FLAT_VECTOR);
+	if (src_arg == DConstants::INVALID_INDEX) {
+		auto &dv = FlatVector::Validity(dst);
+		for (idx_t row = 0; row < count; row++) {
+			dv.SetInvalid(row);
+		}
+		return;
+	}
+	args.data[src_arg].Flatten(count);
+	VectorOperations::Copy(*StructVector::GetEntries(args.data[src_arg])[src_child], dst, count, 0, 0);
+	if (!result_validity.AllValid()) {
+		dst.Flatten(count);
+		auto &dv = FlatVector::Validity(dst);
+		for (idx_t row = 0; row < count; row++) {
+			if (!result_validity.RowIsValid(row)) {
+				dv.SetInvalid(row);
+			}
+		}
+	}
+}
+
+void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, MergeMode mode) {
+	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoOpsLocalState>();
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoMergeBindData>();
+	auto count = args.size();
+	idx_t ncols = args.ColumnCount();
+	bool has_lanes = !bind_data.lanes.empty();
+
+	if (!has_lanes) {
+		// Plain merge: fold straight into the result.
+		vector<JsonoVectorData> inputs(ncols);
+		for (idx_t i = 0; i < ncols; i++) {
+			InitJsonoVectorData(args.data[i], count, inputs[i]);
+		}
+		RunResidualFold(mode, inputs, ncols, count, result, lstate);
+		if (args.AllConstant()) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		}
+		return;
+	}
+
+	// Fast path: when every input is shredded (no plain residual can shadow a lane key) and
+	// every lane is a top-level key, fold the raw residuals and copy lanes directly — skipping
+	// the reconstruct+reshred — as long as no lane key collides into the merged residual.
+	bool fast_viable = true;
+	for (idx_t i = 0; i < ncols; i++) {
+		auto &t = args.data[i].GetType();
+		if (t.id() != LogicalTypeId::SQLNULL && !IsShreddedJsonoType(t)) {
+			fast_viable = false;
+		}
+	}
+	for (auto &lane : bind_data.lanes) {
+		if (!lane.name.empty() && lane.name[0] == '$') {
+			fast_viable = false;
+		}
+	}
+
+	if (fast_viable) {
+		vector<JsonoVectorData> raw(ncols);
+		for (idx_t i = 0; i < ncols; i++) {
+			InitJsonoVectorData(args.data[i], count, raw[i]);
+		}
+		Vector fast_residual(JsonoType(), count);
+		RunResidualFold(mode, raw, ncols, count, fast_residual, lstate);
+		JsonoVectorData fr;
+		InitJsonoVectorData(fast_residual, count, fr);
+		bool conflict = false;
+		for (idx_t row = 0; row < count && !conflict; row++) {
+			JsonoBlobRow blob {};
+			if (!ReadJsonoRow(fr, row, blob)) {
+				continue;
+			}
+			JsonoView v = MakeJsonoView(blob);
+			if (!v.ParseHeader()) {
+				continue;
+			}
+			for (auto &lane : bind_data.lanes) {
+				if (ResidualHasTopLevelKey(v, lane.name)) {
+					conflict = true;
+					break;
+				}
+			}
+		}
+		if (!conflict) {
+			// Capture constness before FastCopyLane flattens any input (which would otherwise
+			// make AllConstant() spuriously false and trip the constant-fold assertion).
+			bool all_constant = args.AllConstant();
+			result.SetVectorType(VectorType::FLAT_VECTOR);
+			fast_residual.Flatten(count);
+			auto &rc = StructVector::GetEntries(result);
+			auto &frc = StructVector::GetEntries(fast_residual);
+			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
+			for (idx_t b = 0; b < 4; b++) {
+				rc[b]->SetVectorType(VectorType::FLAT_VECTOR);
+				VectorOperations::Copy(*frc[b], *rc[b], count, 0, 0);
+			}
+			auto &result_validity = FlatVector::Validity(result);
+			for (auto &lane : bind_data.lanes) {
+				FastCopyLane(args, ncols, count, mode, lane, *rc[lane.result_child_index], result_validity);
+			}
+			if (all_constant) {
+				result.SetVectorType(VectorType::CONSTANT_VECTOR);
+			}
+			return;
+		}
+		// A lane key landed in the residual (conflict) — fall through to the correct reshred path.
+	}
+
+	// Reshred fallback: reconstruct shredded inputs to plain, fold, reshred. Correct for any
+	// lane/residual key overlap and for plain inputs that can shadow a lane.
+	vector<unique_ptr<Vector>> reconstructed;
+	vector<JsonoVectorData> inputs(ncols);
+	for (idx_t i = 0; i < ncols; i++) {
+		if (IsShreddedJsonoType(args.data[i].GetType())) {
+			auto plain = make_uniq<Vector>(JsonoType(), count);
+			ReconstructShreddedToPlainImpl(args.data[i], count, *plain);
+			InitJsonoVectorData(*plain, count, inputs[i]);
+			reconstructed.push_back(std::move(plain));
+		} else {
+			InitJsonoVectorData(args.data[i], count, inputs[i]);
+		}
+	}
+	Vector fold_out(JsonoType(), count);
+	RunResidualFold(mode, inputs, ncols, count, fold_out, lstate);
+	vector<std::pair<string, LogicalType>> lane_specs;
+	lane_specs.reserve(bind_data.lanes.size());
+	for (auto &lane : bind_data.lanes) {
+		lane_specs.emplace_back(lane.name, lane.type);
+	}
+	JsonoShredFromSpec(fold_out, count, lane_specs, result);
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
+}
+
+void JsonoMergePatchExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	JsonoFoldExecute(args, state, result, MergeMode::Patch);
+}
+
+void JsonoOverlayExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	JsonoFoldExecute(args, state, result, MergeMode::Overlay);
 }
 
 struct GroupMergeBindData : public FunctionData {
@@ -940,16 +1398,129 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 
 } // namespace
 
+// Public entry (declared in jsono.hpp): forwards to the in-TU implementation, which reuses
+// the merge overlay machinery. Lets the struct-constructor cast reconstruct a shredded value
+// losslessly without duplicating the overlay logic.
+void JsonoReconstructToPlain(Vector &input, idx_t count, Vector &result) {
+	ReconstructShreddedToPlainImpl(input, count, result);
+}
+
+// True if some active path ends on `key` at this depth — its leaf is the value to strip.
+static bool PathTerminatesOnKey(const std::vector<const std::vector<PathStep> *> &active, size_t depth,
+                                nonstd::string_view key) {
+	for (auto *path : active) {
+		auto &step = (*path)[depth];
+		if (depth + 1 == path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// One object level of the residual emit: copy `view`'s object at `obj_pos` minus the
+// leaves named by `active`. Each active path is a sequence of object keys, matched against
+// this object's keys at `depth`: a path that terminates here strips that key's value, a
+// longer path recurses into the child object so only its leaf is removed. Surrounding
+// keys are emitted verbatim. Every active path has length > depth by construction.
+static void EmitObjectStrippingPaths(const JsonoView &view, size_t obj_pos, size_t obj_string_cursor,
+                                     JsonoBuilder &builder, const std::vector<const std::vector<PathStep> *> &active,
+                                     size_t depth) {
+	auto layout = ReadObjectLayout(view, obj_pos);
+	auto key_at = [&](size_t i) {
+		auto key_slot = view.SlotAt(layout.key_start + i);
+		if (SlotTag(key_slot) != tag::KEY) {
+			throw InvalidInputException("malformed JSONO: expected KEY slot");
+		}
+		return view.KeyAt(SlotPayload(key_slot));
+	};
+	size_t surviving = 0;
+	for (size_t i = 0; i < layout.key_count; i++) {
+		if (!PathTerminatesOnKey(active, depth, key_at(i))) {
+			surviving++;
+		}
+	}
+	builder.EmitObjectStart(surviving);
+	for (size_t i = 0; i < layout.key_count; i++) {
+		auto key = key_at(i);
+		if (!PathTerminatesOnKey(active, depth, key)) {
+			builder.EmitKeySlot(key);
+		}
+	}
+	size_t value_pos = layout.value_start;
+	size_t value_string_cursor = obj_string_cursor;
+	for (size_t i = 0; i < layout.key_count; i++) {
+		auto key = key_at(i);
+		if (PathTerminatesOnKey(active, depth, key)) {
+			SkipValueFast(view, value_pos, value_string_cursor);
+			continue;
+		}
+		builder.EmitObjectChildStart();
+		// Paths that continue past this key descend into the child. A path can only have
+		// located through an object, so recurse only into an object child; otherwise the
+		// value is verbatim.
+		std::vector<const std::vector<PathStep> *> deeper;
+		for (auto *path : active) {
+			auto &step = (*path)[depth];
+			if (depth + 1 < path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
+				deeper.push_back(path);
+			}
+		}
+		if (!deeper.empty() && SlotTag(view.SlotAt(value_pos)) == tag::OBJ_START) {
+			EmitObjectStrippingPaths(view, value_pos, value_string_cursor, builder, deeper, depth + 1);
+			auto span = CheckedContainerSpan(view, value_pos, tag::OBJ_START);
+			value_pos += size_t(span.slot_span);
+			value_string_cursor += size_t(span.string_byte_span);
+		} else {
+			EmitValueVerbatim(view, value_pos, value_string_cursor, builder, depth + 1);
+		}
+	}
+	builder.EmitObjectEnd();
+}
+
+// Emit `view` into `builder` with the located leaf of each path removed, used by the
+// shredded writer to build the residual once it knows which paths were losslessly lifted
+// into lanes. Paths are object-key sequences: a top-level path drops a root key, a nested
+// path drops only its leaf and keeps the surrounding object. An empty path set or a
+// non-object value is copied verbatim. Reuses the cursor-walk and EmitValueVerbatim so the
+// residual's blocks/checkpoints are rebuilt correctly.
+void JsonoEmitObjectStrippingPaths(const JsonoView &view, const std::vector<const std::vector<PathStep> *> &paths,
+                                   JsonoBuilder &builder) {
+	if (paths.empty() || view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+		size_t pos = 0;
+		size_t string_cursor = 0;
+		EmitValueVerbatim(view, pos, string_cursor, builder, 0);
+		return;
+	}
+	EmitObjectStrippingPaths(view, 0, 0, builder, paths, 0);
+}
+
+// The jsono_merge_patch function, exposed so the optimizer's shredded
+// reconstruction can fold the lane patch into the residual without a catalog lookup.
+ScalarFunction JsonoMergePatchFunction() {
+	ScalarFunction fun("jsono_merge_patch", {}, JsonoType(), JsonoMergePatchExecute, JsonoMergePatchBind, nullptr,
+	                   nullptr, JsonoOpsLocalState::Init);
+	fun.varargs = LogicalType::ANY;
+	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	return fun;
+}
+
+// jsono_overlay(base, patch...): the base is authoritative, each patch fills only the
+// keys the base lacks (B-null is a no-op). Powers shredded reconstruction; exposed so
+// the optimizer can fold the lanes back onto the residual without a catalog lookup.
+ScalarFunction JsonoOverlayFunction() {
+	ScalarFunction fun("jsono_overlay", {}, JsonoType(), JsonoOverlayExecute, JsonoMergePatchBind, nullptr, nullptr,
+	                   JsonoOpsLocalState::Init);
+	fun.varargs = LogicalType::ANY;
+	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	return fun;
+}
+
 void RegisterJsonoMerge(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
-	{
-		ScalarFunction fun("jsono_merge_patch", {}, jsono_type, JsonoMergePatchExecute, JsonoMergePatchBind, nullptr,
-		                   nullptr, JsonoOpsLocalState::Init);
-		fun.varargs = LogicalType::ANY;
-		fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-		fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-		loader.RegisterFunction(fun);
-	}
+	{ loader.RegisterFunction(JsonoMergePatchFunction()); }
+	{ loader.RegisterFunction(JsonoOverlayFunction()); }
 	{
 		AggregateFunction fun("jsono_group_merge", {jsono_type, LogicalType::VARCHAR}, jsono_type,
 		                      AggregateFunction::StateSize<GroupMergeState>,

@@ -52,6 +52,26 @@ LogicalType JsonoRawStructType();
 // contract shared by jsono.cpp and jsono_ops.cpp has one source.
 bool IsJsonoType(const LogicalType &type);
 
+// True when the leading four children of `type` match the jsono_* BLOB contract,
+// i.e. `type` is an already-stored JSONO value — plain (exactly four children) or
+// shredded (four blobs followed by appended lane columns). The leading blobs are
+// the authoritative encoding; reinterpreting to JSONO drops the trailing lanes.
+bool HasJsonoBlobPrefix(const LogicalType &type);
+
+// True when `type` is a shredded JSONO struct: the four-blob prefix plus at least
+// one appended lane column. Distinct from the plain JSONO struct (exactly four
+// children), which the binder already resolves through the raw_struct->JSONO cast.
+bool IsShreddedJsonoType(const LogicalType &type);
+
+class Vector;
+
+// Reconstruct a shredded JSONO `input` (four-BLOB residual + lane columns) into the
+// lossless plain JSONO `result` by overlaying each row's lane values onto its residual.
+// This is how a shredded value becomes usable where a plain JSONO is required (an implicit
+// cast, an INSERT into a plain JSONO column) without dropping the lane data. Top-level
+// lanes only; a nested-path lane throws.
+void JsonoReconstructToPlain(Vector &input, idx_t count, Vector &result);
+
 //===--------------------------------------------------------------------===//
 // JSONO binary format
 //
@@ -81,7 +101,10 @@ bool IsJsonoType(const LogicalType &type);
 namespace jsono {
 
 constexpr uint32_t MAGIC = 0x4F4E534A; // 'JSNO' little-endian
-constexpr uint8_t VERSION = 0x01;
+// version 2: ContainerSpan carries a per-object shape_hash (sorted-key
+// fingerprint) so readers can trust a cached object key-rank by an int compare
+// instead of a key-heap read+string-compare. See docs/jsono_format.md.
+constexpr uint8_t VERSION = 0x02;
 
 namespace flags {
 constexpr uint8_t SORTED_KEYS = 0x01;
@@ -239,16 +262,62 @@ constexpr size_t JSONO_MAX_NESTING_DEPTH = 50;
 constexpr size_t JSONO_MAX_NESTING_DEPTH = 1000;
 #endif
 
+// Shape-hash helpers — short-input wyhash-inspired mixer. Both the writer (per
+// object shape fingerprint stored in ContainerSpan) and the DOM builder (DOM-order
+// key fingerprint for its shape cache) hash key bytes; one definition shared here.
+// 64-bit collision risk is negligible (~5e-20 per object) at any realistic scale,
+// so a matching shape_hash is treated as authoritative without re-validation.
+inline uint64_t HashMix64(uint64_t a, uint64_t b) {
+#if defined(__SIZEOF_INT128__)
+	__uint128_t r = static_cast<__uint128_t>(a) * b;
+	return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
+#else
+	uint64_t ah = a >> 32, al = a & 0xFFFFFFFFULL, bh = b >> 32, bl = b & 0xFFFFFFFFULL;
+	uint64_t low = al * bl;
+	uint64_t mid = ah * bl + al * bh + (low >> 32);
+	uint64_t high = ah * bh + (mid >> 32);
+	return (low & 0xFFFFFFFFULL) ^ (mid << 32) ^ high;
+#endif
+}
+
+constexpr uint64_t HASH_PRIME = 0x9E3779B97F4A7C15ULL;
+constexpr uint64_t HASH_SEED = 0xCBF29CE484222325ULL;
+
+inline uint64_t HashBytes(uint64_t state, const char *data, size_t len) {
+	while (len >= 8) {
+		uint64_t v;
+		std::memcpy(&v, data, 8);
+		state = HashMix64(state ^ v, HASH_PRIME);
+		data += 8;
+		len -= 8;
+	}
+	if (len > 0) {
+		uint64_t v = 0;
+		std::memcpy(&v, data, len);
+		state = HashMix64(state ^ v, HASH_PRIME);
+	}
+	return state;
+}
+
+inline uint64_t HashKey(uint64_t state, nonstd::string_view key) {
+	state = HashBytes(state, key.data(), key.size());
+	// Length-prefix so {"ab","c"} and {"a","bc"} don't collide on byte concat.
+	return HashMix64(state ^ uint64_t(key.size()), HASH_PRIME);
+}
+
 struct ContainerMetadataHeader {
 	uint32_t container_count;
 	uint32_t checkpoint_index_count;
 	uint32_t checkpoint_count;
 };
 
-// ContainerSpan carries the subtree slot span and string_heap byte span.
+// ContainerSpan carries the subtree slot span, string_heap byte span, and (for
+// objects) a shape_hash: the fingerprint of the object's sorted key sequence.
+// Arrays store shape_hash = 0 (never read — the rank cache only runs on objects).
 struct ContainerSpan {
 	uint32_t slot_span;
 	uint32_t string_byte_span;
+	uint64_t shape_hash;
 };
 
 struct ObjectCheckpointIndex {
@@ -264,9 +333,22 @@ struct ObjectCursorCheckpoint {
 };
 
 static_assert(sizeof(ContainerMetadataHeader) == 12, "ContainerMetadataHeader must be exactly 12 bytes");
-static_assert(sizeof(ContainerSpan) == 8, "ContainerSpan must be exactly 8 bytes");
+static_assert(sizeof(ContainerSpan) == 16, "ContainerSpan must be exactly 16 bytes");
 static_assert(sizeof(ObjectCheckpointIndex) == 12, "ObjectCheckpointIndex must be exactly 12 bytes");
 static_assert(sizeof(ObjectCursorCheckpoint) == 8, "ObjectCursorCheckpoint must be exactly 8 bytes");
+
+// Fingerprint an object's stored KEY slots (sorted order, length-prefixed) into a
+// shape_hash. Path-agnostic: every object-emitting writer routes through this on
+// the final KEY slots, so the stored hash is a pure function of the object's key
+// set regardless of how the keys were produced.
+inline uint64_t HashObjectKeySlots(const uint64_t *slots, size_t key_start, size_t child_count, const char *key_heap) {
+	uint64_t h = HASH_SEED;
+	for (size_t i = 0; i < child_count; i++) {
+		auto payload = SlotPayload(slots[key_start + i]);
+		h = HashKey(h, nonstd::string_view(key_heap + KeyOffset(payload), KeyLen(payload)));
+	}
+	return h;
+}
 
 inline uint64_t MakeContainerPayload(uint64_t container_id, uint64_t child_count) {
 	return (container_id << CONTAINER_CHILD_COUNT_BITS) | (child_count & CONTAINER_CHILD_COUNT_MASK);

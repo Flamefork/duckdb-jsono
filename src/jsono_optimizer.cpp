@@ -21,6 +21,8 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -35,10 +37,19 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
 namespace duckdb {
+
+// Exposed jsono function factories used to build the shredded reconstruction patch
+// and to read non-lane paths natively off the residual.
+ScalarFunction JsonoStructConstructorFunction();
+ScalarFunction JsonoOverlayFunction();
+ScalarFunction JsonoExtractStringFunction(const LogicalType &path_type);
+ScalarFunction JsonoExtractFunction(const LogicalType &path_type);
+
 namespace {
 
 using namespace jsono;
@@ -137,6 +148,7 @@ struct JsonoPathRankCacheEntry {
 	bool valid = false;
 	idx_t step_index = DConstants::INVALID_INDEX;
 	size_t key_count = 0;
+	uint64_t shape_hash = 0;
 	string key;
 	size_t rank = 0;
 	bool found = false;
@@ -144,11 +156,26 @@ struct JsonoPathRankCacheEntry {
 
 constexpr idx_t RANK_CACHE_SIZE = 4096;
 
+// Per-row ObjectLayout cache. A row's matcher/projector resolves several paths that
+// share a container (e.g. every root-key predicate re-reads the root object's layout;
+// every commit.* predicate re-reads commit's). ReadObjectLayout was the top JSONO
+// hotspot after H1 (~10% self-time on Q5), so cache it keyed by (generation, pos): a
+// generation bump per row invalidates the whole cache in O(1) without clearing.
+struct JsonoLayoutCacheEntry {
+	uint64_t generation = 0;
+	size_t pos = 0;
+	ObjectLayout layout {};
+};
+
+constexpr idx_t LAYOUT_CACHE_SIZE = 16;
+
 struct JsonoPathLocalState : public FunctionLocalState {
-	JsonoPathLocalState() : rank_cache(RANK_CACHE_SIZE) {
+	JsonoPathLocalState() : rank_cache(RANK_CACHE_SIZE), layout_cache(LAYOUT_CACHE_SIZE) {
 	}
 
 	vector<JsonoPathRankCacheEntry> rank_cache;
+	vector<JsonoLayoutCacheEntry> layout_cache;
+	uint64_t layout_generation = 0;
 	std::string scratch;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
@@ -203,6 +230,27 @@ bool PathStepsEqual(const vector<PathStep> &left, const vector<PathStep> &right)
 	}
 	for (idx_t step_index = 0; step_index < left.size(); step_index++) {
 		if (!PathStepEquals(left[step_index], right[step_index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// True if `prefix` is a proper prefix of the object-key path `full`. A json-valued read at
+// `prefix` would return a subtree that holds `full`'s leaf — which the shredded writer may
+// have stripped from the residual — so such a read must reconstruct rather than read the
+// residual directly. Only object-key lanes are stripped, so a non-key `full` is ignored.
+bool PathStepsObjectKeyPrefix(const vector<PathStep> &prefix, const vector<PathStep> &full) {
+	if (prefix.size() >= full.size()) {
+		return false;
+	}
+	for (auto &step : full) {
+		if (step.kind != PathStepKind::Key) {
+			return false;
+		}
+	}
+	for (idx_t i = 0; i < prefix.size(); i++) {
+		if (prefix[i].kind != PathStepKind::Key || prefix[i].key != full[i].key) {
 			return false;
 		}
 	}
@@ -472,31 +520,65 @@ JsonoPathRankCacheEntry &GetRankCacheEntry(vector<JsonoPathRankCacheEntry> &rank
 	return rank_cache[cache_index];
 }
 
+// Default fast path trusts the stored shape_hash; JSONO_RANK_VALIDATE=1 forces the
+// old key-heap validation, isolating the format's storage/read overhead from the
+// fast-path win in a single build (read once, not per row).
+inline bool TrustShapeHash() {
+	static const bool trust = []() {
+		const char *env = std::getenv("JSONO_RANK_VALIDATE");
+		return !(env && env[0] == '1');
+	}();
+	return trust;
+}
+
 bool FindPathObjectRank(JsonoPathLocalState &lstate, idx_t step_index, const JsonoView &view,
                         const ObjectLayout &layout, const string &key, size_t &rank) {
 	auto &entry = GetRankCacheEntry(lstate.rank_cache, step_index, layout.key_count);
-	auto cache_valid = entry.valid && entry.step_index == step_index && entry.key_count == layout.key_count &&
-	                   entry.key == key && ValidateCachedObjectRank(view, layout, key, entry.rank, entry.found);
-	if (!cache_valid) {
-		bool found = FindObjectKeyRank(view, layout, key, rank);
-		entry.valid = true;
-		entry.step_index = step_index;
-		entry.key_count = layout.key_count;
-		entry.key = key;
-		entry.rank = rank;
-		entry.found = found;
-		return found;
+	// The stored shape_hash uniquely identifies the object's sorted key sequence, so a
+	// matching (step_index, shape_hash, key) lets us trust the cached rank with a single
+	// int compare instead of re-reading the key heap (ValidateCachedObjectRank). This is
+	// the safe form of the H7 rank-cache fast path: the format carries shape identity, so
+	// it stays correct on non-shape-stable data where (step_index, key_count) collides.
+	bool hit;
+	if (TrustShapeHash()) {
+		hit =
+		    entry.valid && entry.step_index == step_index && entry.shape_hash == layout.shape_hash && entry.key == key;
+	} else {
+		hit = entry.valid && entry.step_index == step_index && entry.key_count == layout.key_count &&
+		      entry.key == key && ValidateCachedObjectRank(view, layout, key, entry.rank, entry.found);
 	}
-	rank = entry.rank;
-	return entry.found;
+	if (hit) {
+		rank = entry.rank;
+		return entry.found;
+	}
+	bool found = FindObjectKeyRank(view, layout, key, rank);
+	entry.valid = true;
+	entry.step_index = step_index;
+	entry.key_count = layout.key_count;
+	entry.shape_hash = layout.shape_hash;
+	entry.key = key;
+	entry.rank = rank;
+	entry.found = found;
+	return found;
 }
 
 bool LocateObjectKey(JsonoPathLocalState &lstate, idx_t step_index, const JsonoView &view, const string &key,
                      size_t &pos, size_t &string_cursor) {
-	if (pos >= view.Slots() || SlotTag(view.SlotAt(pos)) != tag::OBJ_START) {
+	if (pos >= view.Slots()) {
 		return false;
 	}
-	auto layout = ReadObjectLayout(view, pos);
+	// On a per-row cache hit the entry was stored only after a successful OBJ_START
+	// read, so both the tag check and ReadObjectLayout are skipped.
+	auto &entry = lstate.layout_cache[pos & (LAYOUT_CACHE_SIZE - 1)];
+	if (entry.generation != lstate.layout_generation || entry.pos != pos) {
+		if (SlotTag(view.SlotAt(pos)) != tag::OBJ_START) {
+			return false;
+		}
+		entry.generation = lstate.layout_generation;
+		entry.pos = pos;
+		entry.layout = ReadObjectLayout(view, pos);
+	}
+	const auto &layout = entry.layout;
 	size_t rank = 0;
 	if (!FindPathObjectRank(lstate, step_index, view, layout, key, rank)) {
 		return false;
@@ -1102,6 +1184,7 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 	}
 
 	for (idx_t row = 0; row < count; row++) {
+		lstate.layout_generation++;
 		JsonoBlobRow blob;
 		if (!ReadJsonoRow(input, row, blob)) {
 			SetProjectRowNull(result, children, row);
@@ -1183,6 +1266,7 @@ void JsonoInternalMatchExecute(DataChunk &args, ExpressionState &state, Vector &
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<bool>(result);
 	for (idx_t row = 0; row < count; row++) {
+		lstate.layout_generation++;
 		result_data[row] = false;
 		JsonoBlobRow blob;
 		if (!ReadJsonoRow(input, row, blob)) {
@@ -1480,11 +1564,19 @@ unique_ptr<Expression> MakeJsonoInternalProjectExpression(JsonoProjectRewriteSta
 	                                          std::move(children), std::move(bind_data));
 }
 
-bool RewriteAggregateProjector(OptimizerExtensionInput &input, LogicalAggregate &aggregate) {
-	if (aggregate.children.size() != 1 || aggregate.children[0]->type != LogicalOperatorType::LOGICAL_FILTER) {
+// Insert one __jsono_internal_project STRUCT projection between `parent` and its child
+// LOGICAL_FILTER (which must carry a >=2-predicate matcher), then rewrite every JSONO `->>`
+// in the parent's expression lists to a cheap struct_extract over that single shared pass.
+// The struct sits above the filter, so it materializes only surviving rows, and the shared
+// header-parse/root-layout read is paid once per row instead of once per extracted path.
+// Works for any parent that reads several constant `->>` paths off the same filtered column:
+// a grouped aggregate (groups + aggregate args) or a plain projection (select/order/window).
+bool RewriteJsonoProjector(OptimizerExtensionInput &input, LogicalOperator &parent,
+                           const vector<vector<unique_ptr<Expression>> *> &expression_lists) {
+	if (parent.children.size() != 1 || parent.children[0]->type != LogicalOperatorType::LOGICAL_FILTER) {
 		return false;
 	}
-	auto &filter = aggregate.children[0]->Cast<LogicalFilter>();
+	auto &filter = parent.children[0]->Cast<LogicalFilter>();
 	ColumnBinding source_binding;
 	LogicalType source_type;
 	string source_alias;
@@ -1492,7 +1584,7 @@ bool RewriteAggregateProjector(OptimizerExtensionInput &input, LogicalAggregate 
 	auto found_matcher = false;
 	for (auto &expression : filter.expressions) {
 		if (TryReadInternalMatchSource(*expression, source_binding, source_type, source_alias, predicate_count) &&
-		    predicate_count >= 3) {
+		    predicate_count >= 2) {
 			found_matcher = true;
 			break;
 		}
@@ -1502,11 +1594,10 @@ bool RewriteAggregateProjector(OptimizerExtensionInput &input, LogicalAggregate 
 	}
 
 	vector<JsonoProjectField> fields;
-	for (auto &group : aggregate.groups) {
-		CollectProjectFields(input.context, *group, source_binding, fields);
-	}
-	for (auto &expression : aggregate.expressions) {
-		CollectProjectFields(input.context, *expression, source_binding, fields);
+	for (auto *expression_list : expression_lists) {
+		for (auto &expression : *expression_list) {
+			CollectProjectFields(input.context, *expression, source_binding, fields);
+		}
 	}
 	if (fields.size() < 2) {
 		return false;
@@ -1536,22 +1627,411 @@ bool RewriteAggregateProjector(OptimizerExtensionInput &input, LogicalAggregate 
 	state.struct_binding = ColumnBinding(state.projection_index, projection_expressions.size());
 	projection_expressions.push_back(MakeJsonoInternalProjectExpression(state));
 
-	for (auto &group : aggregate.groups) {
-		RewriteProjectExpression(group, state);
-	}
-	for (auto &expression : aggregate.expressions) {
-		RewriteProjectExpression(expression, state);
+	for (auto *expression_list : expression_lists) {
+		for (auto &expression : *expression_list) {
+			RewriteProjectExpression(expression, state);
+		}
 	}
 
 	auto projection = make_uniq<LogicalProjection>(state.projection_index, std::move(projection_expressions));
 	if (filter.has_estimated_cardinality) {
 		projection->SetEstimatedCardinality(filter.estimated_cardinality);
 	}
-	projection->children.push_back(std::move(aggregate.children[0]));
+	projection->children.push_back(std::move(parent.children[0]));
 	projection->ResolveOperatorTypes();
-	aggregate.children[0] = std::move(projection);
-	aggregate.ResolveOperatorTypes();
+	parent.children[0] = std::move(projection);
+	parent.ResolveOperatorTypes();
 	return true;
+}
+
+bool RewriteAggregateProjector(OptimizerExtensionInput &input, LogicalAggregate &aggregate) {
+	return RewriteJsonoProjector(input, aggregate, {&aggregate.groups, &aggregate.expressions});
+}
+
+bool RewriteProjectionProjector(OptimizerExtensionInput &input, LogicalProjection &projection) {
+	return RewriteJsonoProjector(input, projection, {&projection.expressions});
+}
+
+//===--------------------------------------------------------------------===//
+// Shredded JSONO transparency
+//
+// A shredded JSONO column reaches the binder as a plain STRUCT (four BLOB prefix
+// followed by VARCHAR lane columns named by canonical path). No implicit cast turns
+// that struct into JSONO, so a bare `j->>'path'` / `to_json(j)` binds to core json's
+// STRUCT->JSON path, which serializes the raw struct (wrong: leaks the blobs, never
+// reads the value). This pre-optimize pass rewrites those bound expressions off the
+// lane manifest carried in the column type itself:
+//   - `->>`/json_extract_string on a lane path -> struct_extract of the lane column.
+//     The lane already holds the extracted text, so this skips the JSONO parse and
+//     lets projection/row-group pruning act on the lane column directly.
+//   - any CAST(shredded->JSON) and to_json(shredded) -> reinterpret(col->JSONO)::JSON,
+//     which reconstructs the authoritative value from the four-blob prefix. Because a
+//     non-lane extract's inner cast is rewritten too, correctness never depends on a
+//     path being shredded; lanes are purely a fast path.
+//===--------------------------------------------------------------------===//
+
+bool IsJsonTextType(const LogicalType &type) {
+	return type == LogicalType::JSON();
+}
+
+struct JsonoLane {
+	idx_t child_index;
+	LogicalType type;
+	vector<PathStep> steps;
+};
+
+// Trailing children past the four-blob prefix are the lanes, each named by its
+// canonical path. A lane may be typed (a hot number stored as BIGINT/DOUBLE), so
+// the type is carried: the `->>` text contract reads the lane and casts it to
+// VARCHAR, while reconstruction injects it back at its JSON type.
+vector<JsonoLane> CollectShreddedLanes(const LogicalType &shredded) {
+	vector<JsonoLane> lanes;
+	auto &children = StructType::GetChildTypes(shredded);
+	for (idx_t i = StructType::GetChildTypes(JsonoRawStructType()).size(); i < children.size(); i++) {
+		auto &name = children[i].first;
+		vector<PathStep> steps;
+		if (!name.empty() && name[0] == '$') {
+			steps = ParseJsonoPath(name, "__jsono_shredded_lane");
+		} else {
+			steps = LiteralKeyPath(name);
+		}
+		lanes.push_back(JsonoLane {i, children[i].second, std::move(steps)});
+	}
+	return lanes;
+}
+
+// A node in the lane reconstruction patch. Lanes are inserted by their path so the patch
+// rebuilds the original nesting as a struct_pack tree; a leaf (no children) carries the
+// lane's struct child index, a group carries nested keys.
+struct LanePatchNode {
+	idx_t child_index = 0;
+	vector<pair<string, LanePatchNode>> children;
+
+	LanePatchNode &Child(const string &key) {
+		for (auto &entry : children) {
+			if (entry.first == key) {
+				return entry.second;
+			}
+		}
+		children.emplace_back(key, LanePatchNode {});
+		return children.back().second;
+	}
+};
+
+class JsonoShreddedRewriter : public LogicalOperatorVisitor {
+public:
+	explicit JsonoShreddedRewriter(ClientContext &context) : context(context) {
+	}
+
+protected:
+	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *expr_ptr) override {
+		(void)expr_ptr;
+		// Whole-value conversion: reconstruct the full value from residual + lanes.
+		if ((expr.function.name == "to_json" || expr.function.name == "json_quote") && expr.children.size() == 1 &&
+		    IsShreddedJsonoType(expr.children[0]->return_type)) {
+			auto alias = expr.GetAlias();
+			auto rewritten = ReconstructShreddedToJson(std::move(expr.children[0]));
+			rewritten->SetAlias(alias);
+			return rewritten;
+		}
+		// Path extraction off a shredded value.
+		if (IsExtractFunction(expr.function.name) && expr.children.size() == 2) {
+			auto shredded_cast = ShreddedJsonCast(*expr.children[0]);
+			if (shredded_cast) {
+				return RewriteShreddedExtract(expr, *shredded_cast);
+			}
+		}
+		return nullptr;
+	}
+
+	unique_ptr<Expression> VisitReplace(BoundCastExpression &expr, unique_ptr<Expression> *expr_ptr) override {
+		(void)expr_ptr;
+		// Fold CAST(lane string extract AS T) where the lane is itself typed T: read the
+		// typed lane directly, skipping the BIGINT->VARCHAR->BIGINT round-trip and giving
+		// the planner the lane's typed column statistics.
+		auto folded = TryFoldTypedLaneCast(expr);
+		if (folded) {
+			return folded;
+		}
+		// Whole-value -> JSON: reconstruct from residual + lanes.
+		if (IsJsonTextType(expr.return_type) && IsShreddedJsonoType(expr.child->return_type)) {
+			auto alias = expr.GetAlias();
+			auto rewritten = ReconstructShreddedToJson(std::move(expr.child));
+			rewritten->SetAlias(alias);
+			return rewritten;
+		}
+		return nullptr;
+	}
+
+private:
+	static bool IsExtractFunction(const string &name) {
+		return name == "->>" || name == "json_extract_string" || name == "->" || name == "json_extract";
+	}
+
+	// The extract argument is `CAST(shredded->JSON)` from core json's STRUCT->JSON
+	// path; return that cast when its child is a shredded JSONO struct.
+	optional_ptr<BoundCastExpression> ShreddedJsonCast(Expression &arg) {
+		if (arg.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+			return nullptr;
+		}
+		auto &cast = arg.Cast<BoundCastExpression>();
+		if (IsJsonTextType(cast.return_type) && IsShreddedJsonoType(cast.child->return_type)) {
+			return &cast;
+		}
+		return nullptr;
+	}
+
+	// A constant-path read off a shredded value. A string extract of a lane reads the lane
+	// column directly. A non-lane path reads the residual natively (cheap): only lane leaves
+	// are stripped, so a non-lane path keeps its own value there. Two cases reconstruct
+	// instead: a json-valued extract of a lane (its value may be stripped from the residual),
+	// and a json-valued extract of a subtree that contains a stripped lane leaf.
+	unique_ptr<Expression> RewriteShreddedExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast) {
+		bool string_fn = expr.function.name == "->>" || expr.function.name == "json_extract_string";
+		string path;
+		vector<PathStep> steps;
+		if (TryReadExtractPath(context, *expr.children[1], path, steps)) {
+			for (auto &lane : CollectShreddedLanes(shredded_cast.child->return_type)) {
+				if (PathStepsEqual(lane.steps, steps)) {
+					if (string_fn) {
+						auto alias = expr.GetAlias();
+						return MakeLaneRead(std::move(shredded_cast.child), lane, std::move(expr.children[1]), alias);
+					}
+					return nullptr; // json-valued lane extract: reconstruct via the inner cast
+				}
+				// A json-valued read of a subtree holding a stripped lane leaf would miss it
+				// in the residual; reconstruct. (`->>` of an object is NULL regardless, and a
+				// stripped scalar leaf is itself a lane, handled by the exact match above.)
+				if (!string_fn && PathStepsObjectKeyPrefix(steps, lane.steps)) {
+					return nullptr;
+				}
+			}
+		}
+		return MakeResidualExtract(expr, shredded_cast, string_fn);
+	}
+
+	// Reinterpret only the four-BLOB residual prefix of a shredded column to JSONO, bypassing
+	// the public shredded->JSONO cast (which now reconstructs the full value losslessly).
+	// struct_pack of the four blobs is an exactly-four-blob struct, so casting it to JSONO
+	// stays a zero-copy reinterpret rather than a reconstruction.
+	unique_ptr<Expression> ResidualReinterpret(const Expression &column) {
+		FunctionBinder function_binder(context);
+		auto &child_types = StructType::GetChildTypes(column.return_type);
+		vector<unique_ptr<Expression>> pack_children;
+		for (idx_t i = 0; i < 4; i++) {
+			vector<unique_ptr<Expression>> se_children;
+			se_children.push_back(column.Copy());
+			se_children.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(int64_t(i + 1))));
+			auto extracted =
+			    function_binder.BindScalarFunction(StructExtractAtFun::GetFunction(), std::move(se_children));
+			extracted->SetAlias(child_types[i].first);
+			pack_children.push_back(std::move(extracted));
+		}
+		auto packed = function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(pack_children));
+		return BoundCastExpression::AddCastToType(context, std::move(packed), JsonoType());
+	}
+
+	// Extract a non-lane path natively from the residual JSONO, matching a
+	// non-shredded column's extract cost — no serialize/parse round-trip through core
+	// json. Correct because only lane leaves are stripped: a non-lane scalar keeps its
+	// value, and a json-valued read overlapping a stripped lane already reconstructed.
+	unique_ptr<Expression> MakeResidualExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast,
+	                                           bool string_fn) {
+		auto path_type = expr.children[1]->return_type;
+		auto residual = ResidualReinterpret(*shredded_cast.child);
+		vector<unique_ptr<Expression>> children;
+		children.push_back(std::move(residual));
+		children.push_back(std::move(expr.children[1]));
+		auto alias = expr.GetAlias();
+		FunctionBinder function_binder(context);
+		auto lane_path_type = path_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
+		if (string_fn) {
+			auto result =
+			    function_binder.BindScalarFunction(JsonoExtractStringFunction(lane_path_type), std::move(children));
+			result->SetAlias(alias);
+			return result;
+		}
+		// json-valued extract returns JSONO natively; cast back to the JSON the
+		// original `->`/json_extract produced.
+		auto extracted = function_binder.BindScalarFunction(JsonoExtractFunction(lane_path_type), std::move(children));
+		auto result = BoundCastExpression::AddCastToType(context, std::move(extracted), LogicalType::JSON());
+		result->SetAlias(alias);
+		return result;
+	}
+
+	// Detect CAST(string-lane-extract AS T) where the lane's own type is exactly T, and
+	// fold it to a direct typed read so the cast no longer round-trips through VARCHAR.
+	unique_ptr<Expression> TryFoldTypedLaneCast(BoundCastExpression &expr) {
+		auto &target = expr.return_type;
+		if (target.id() == LogicalTypeId::VARCHAR || IsJsonTextType(target) ||
+		    expr.child->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+			return nullptr;
+		}
+		auto &fn = expr.child->Cast<BoundFunctionExpression>();
+		if (!(fn.function.name == "->>" || fn.function.name == "json_extract_string") || fn.children.size() != 2) {
+			return nullptr;
+		}
+		auto shredded_cast = ShreddedJsonCast(*fn.children[0]);
+		if (!shredded_cast) {
+			return nullptr;
+		}
+		string path;
+		vector<PathStep> steps;
+		if (!TryReadExtractPath(context, *fn.children[1], path, steps)) {
+			return nullptr;
+		}
+		for (auto &lane : CollectShreddedLanes(shredded_cast->child->return_type)) {
+			if (!PathStepsEqual(lane.steps, steps) || lane.type != target) {
+				continue;
+			}
+			return MakeTypedLaneRead(std::move(shredded_cast->child), lane, std::move(fn.children[1]), target,
+			                         expr.try_cast, expr.GetAlias());
+		}
+		return nullptr;
+	}
+
+	// Read a typed lane directly as its own type T. The fallback re-extracts from the
+	// residual as text and casts to T, matching the original CAST's try/strict mode, so
+	// a value kept in the residual still resolves; COALESCE short-circuits so a
+	// homogeneous lane stays a plain typed struct_extract (with column statistics).
+	unique_ptr<Expression> MakeTypedLaneRead(unique_ptr<Expression> column, const JsonoLane &lane,
+	                                         unique_ptr<Expression> path, const LogicalType &target, bool try_cast,
+	                                         const string &alias) {
+		vector<unique_ptr<Expression>> se_children;
+		se_children.push_back(column->Copy());
+		se_children.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(int64_t(lane.child_index + 1))));
+		FunctionBinder function_binder(context);
+		auto lane_value = function_binder.BindScalarFunction(StructExtractAtFun::GetFunction(), std::move(se_children));
+		auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
+		auto residual = ResidualReinterpret(*column);
+		vector<unique_ptr<Expression>> ext_children;
+		ext_children.push_back(std::move(residual));
+		ext_children.push_back(std::move(path));
+		auto fallback_text =
+		    function_binder.BindScalarFunction(JsonoExtractStringFunction(path_type), std::move(ext_children));
+		auto fallback = BoundCastExpression::AddCastToType(context, std::move(fallback_text), target, try_cast);
+		auto coalesce = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, target);
+		coalesce->children.push_back(std::move(lane_value));
+		coalesce->children.push_back(std::move(fallback));
+		coalesce->SetAlias(alias);
+		return coalesce;
+	}
+
+	// Read a string-extracted lane. A VARCHAR lane holds the `->>` text for every row,
+	// so it reads directly. A typed lane holds only values of its type; rows whose value
+	// did not fit were kept in the residual with a NULL lane, so the typed read casts the
+	// lane to text and falls back to a native residual extract. COALESCE short-circuits
+	// per row, so a homogeneous lane (the common case) never evaluates the fallback.
+	unique_ptr<Expression> MakeLaneRead(unique_ptr<Expression> column, const JsonoLane &lane,
+	                                    unique_ptr<Expression> path, const string &alias) {
+		vector<unique_ptr<Expression>> se_children;
+		se_children.push_back(column->Copy());
+		se_children.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(int64_t(lane.child_index + 1))));
+		FunctionBinder function_binder(context);
+		auto lane_value = function_binder.BindScalarFunction(StructExtractAtFun::GetFunction(), std::move(se_children));
+		if (lane.type.id() == LogicalTypeId::VARCHAR) {
+			lane_value->SetAlias(alias);
+			return lane_value;
+		}
+		auto lane_text = BoundCastExpression::AddCastToType(context, std::move(lane_value), LogicalType::VARCHAR);
+		auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
+		auto residual = ResidualReinterpret(*column);
+		vector<unique_ptr<Expression>> ext_children;
+		ext_children.push_back(std::move(residual));
+		ext_children.push_back(std::move(path));
+		auto fallback =
+		    function_binder.BindScalarFunction(JsonoExtractStringFunction(path_type), std::move(ext_children));
+		auto coalesce = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, LogicalType::VARCHAR);
+		coalesce->children.push_back(std::move(lane_text));
+		coalesce->children.push_back(std::move(fallback));
+		coalesce->SetAlias(alias);
+		return coalesce;
+	}
+
+	// Build the lane patch as a nested struct_pack tree mirroring each lane's path: a leaf
+	// reads its lane column, a group packs its nested keys. jsono_struct_constructor turns
+	// it into a JSONO patch for the overlay.
+	unique_ptr<Expression> BuildPatchStruct(Expression &column, const vector<pair<string, LanePatchNode>> &children) {
+		FunctionBinder function_binder(context);
+		vector<unique_ptr<Expression>> pack_children;
+		for (auto &entry : children) {
+			unique_ptr<Expression> value;
+			if (entry.second.children.empty()) {
+				vector<unique_ptr<Expression>> extract_children;
+				extract_children.push_back(column.Copy());
+				extract_children.push_back(
+				    make_uniq<BoundConstantExpression>(Value::BIGINT(int64_t(entry.second.child_index + 1))));
+				value =
+				    function_binder.BindScalarFunction(StructExtractAtFun::GetFunction(), std::move(extract_children));
+			} else {
+				value = BuildPatchStruct(column, entry.second.children);
+			}
+			value->SetAlias(entry.first);
+			pack_children.push_back(std::move(value));
+		}
+		return function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(pack_children));
+	}
+
+	// Reconstruct the full JSONO value as JSON by overlaying the lanes onto the residual:
+	// the residual is authoritative and each lane only fills a path the residual dropped
+	// (jsono_overlay deep-merges, so nested lanes refill nested leaves). Correct for both
+	// storage modes — a PRESERVE residual keeps every path so the lanes are no-ops; a
+	// stripped residual is refilled from its lanes. Index/array lanes are never stripped,
+	// so they stay in the residual and sit out the patch; with no object-key lanes the
+	// overlay is skipped.
+	unique_ptr<Expression> ReconstructShreddedToJson(unique_ptr<Expression> column) {
+		auto lanes = CollectShreddedLanes(column->return_type);
+		LanePatchNode root;
+		for (auto &lane : lanes) {
+			bool object_key = !lane.steps.empty();
+			for (auto &step : lane.steps) {
+				if (step.kind != PathStepKind::Key) {
+					object_key = false;
+					break;
+				}
+			}
+			if (!object_key) {
+				continue;
+			}
+			auto *node = &root;
+			for (auto &step : lane.steps) {
+				node = &node->Child(step.key);
+			}
+			node->child_index = lane.child_index;
+		}
+		auto residual = ResidualReinterpret(*column);
+		if (root.children.empty()) {
+			// No object-key lanes to merge; the residual reinterpret already carries
+			// row validity, so a NULL value casts straight to a NULL JSON.
+			return BoundCastExpression::AddCastToType(context, std::move(residual), LogicalType::JSON());
+		}
+		FunctionBinder function_binder(context);
+		auto patch_struct = BuildPatchStruct(*column, root.children);
+		vector<unique_ptr<Expression>> ctor_children;
+		ctor_children.push_back(std::move(patch_struct));
+		auto patch = function_binder.BindScalarFunction(JsonoStructConstructorFunction(), std::move(ctor_children));
+		vector<unique_ptr<Expression>> merge_children;
+		merge_children.push_back(std::move(residual));
+		merge_children.push_back(std::move(patch));
+		auto merged = function_binder.BindScalarFunction(JsonoOverlayFunction(), std::move(merge_children));
+		auto merged_json = BoundCastExpression::AddCastToType(context, std::move(merged), LogicalType::JSON());
+		// struct_pack builds a non-null struct even when every field is NULL, so the
+		// merge would emit `{}` for a NULL value. Guard it: a NULL shredded value is NULL.
+		auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+		is_null->children.push_back(column->Copy());
+		auto null_json = make_uniq<BoundConstantExpression>(Value(LogicalType::JSON()));
+		return make_uniq<BoundCaseExpression>(std::move(is_null), std::move(null_json), std::move(merged_json));
+	}
+
+	ClientContext &context;
+};
+
+void RewriteShreddedJsono(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+	if (!plan) {
+		return;
+	}
+	JsonoShreddedRewriter rewriter(context);
+	rewriter.VisitOperator(*plan);
 }
 
 void RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
@@ -1565,6 +2045,10 @@ void RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &pl
 		RewriteFilter(input.context, plan->Cast<LogicalFilter>());
 		return;
 	}
+	if (plan->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		RewriteProjectionProjector(input, plan->Cast<LogicalProjection>());
+		return;
+	}
 	if (plan->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		auto &aggregate = plan->Cast<LogicalAggregate>();
 		RewriteExtractExtremaAggregates(input.context, aggregate);
@@ -1573,6 +2057,9 @@ void RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &pl
 }
 
 void JsonoOptimizerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	// Normalize shredded JSONO ops before the built-in pipeline so the lane
+	// struct_extract is visible to projection and row-group pruning.
+	RewriteShreddedJsono(input.context, plan);
 	RewritePlan(input, plan);
 }
 

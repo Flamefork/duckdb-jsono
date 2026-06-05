@@ -3,6 +3,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -34,6 +35,19 @@ void JsonoStorageTypeExecute(DataChunk &args, ExpressionState &state, Vector &re
 	(void)state;
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	result.SetValue(0, Value(JsonoRawStructType().ToString()));
+}
+
+// jsono_storage_type(lanes) -> the shredded storage type: the 4-BLOB prefix plus the
+// given lane columns, so a schema can declare a shredded jsono column from a readable lane
+// spec (e.g. 'event_name VARCHAR, goals MAP(VARCHAR, BIGINT)') without naming the blobs.
+void JsonoStorageTypeWithLanesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)state;
+	auto base = JsonoRawStructType().ToString();
+	auto prefix = base.substr(0, base.size() - 1); // drop the trailing ')'
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t lanes) {
+		auto out = prefix + ", " + lanes.GetString() + ")";
+		return StringVector::AddString(result, out);
+	});
 }
 
 // Retype between the raw STRUCT(4 BLOB) and JSONO. The two are physically
@@ -77,6 +91,29 @@ bool IsJsonoType(const LogicalType &type) {
 	return StructType::GetChildTypes(type) == StructType::GetChildTypes(JsonoRawStructType());
 }
 
+bool HasJsonoBlobPrefix(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::STRUCT) {
+		return false;
+	}
+	auto canonical = JsonoRawStructType();
+	auto &children = StructType::GetChildTypes(type);
+	auto &canonical_children = StructType::GetChildTypes(canonical);
+	if (children.size() < canonical_children.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < canonical_children.size(); i++) {
+		if (children[i] != canonical_children[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool IsShreddedJsonoType(const LogicalType &type) {
+	return HasJsonoBlobPrefix(type) &&
+	       StructType::GetChildTypes(type).size() > StructType::GetChildTypes(JsonoRawStructType()).size();
+}
+
 LogicalType JsonoRawStructType() {
 	child_list_t<LogicalType> children;
 	children.emplace_back("jsono_slots", LogicalType::BLOB);
@@ -108,8 +145,10 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 		loader.RegisterFunction(set);
 	}
 	{
-		ScalarFunction fun("jsono_storage_type", {}, LogicalType::VARCHAR, JsonoStorageTypeExecute);
-		loader.RegisterFunction(fun);
+		ScalarFunctionSet set("jsono_storage_type");
+		set.AddFunction(ScalarFunction({}, LogicalType::VARCHAR, JsonoStorageTypeExecute));
+		set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, JsonoStorageTypeWithLanesExecute));
+		loader.RegisterFunction(set);
 	}
 
 	RegisterJsonoStructConstructor(loader);

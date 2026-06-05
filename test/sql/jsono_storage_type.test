@@ -58,3 +58,23 @@ statement error
 SELECT jsono_extract_string({'jsono_slots': ''::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB}, '$.a');
 ----
 No function matches
+
+# jsono_storage_type(lanes) appends lane columns to the 4-blob prefix, so a shredded
+# storage column can be declared from a readable lane spec (the schema DSL).
+query I
+SELECT jsono_storage_type('event_name VARCHAR, n BIGINT');
+----
+STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, event_name VARCHAR, n BIGINT)
+
+# The declared shredded type is a valid storage column: a shredded value writes into it.
+statement ok
+CREATE TABLE probe_shred (e STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, event_name VARCHAR));
+
+statement ok
+INSERT INTO probe_shred SELECT jsono_shred(jsono('{"event_name":"page_view","a":1}'), '{"event_name":"VARCHAR"}');
+
+# the lane column holds the extracted value
+query I
+SELECT (e).event_name FROM probe_shred;
+----
+page_view

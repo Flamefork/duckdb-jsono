@@ -188,6 +188,55 @@ FROM (
 ----
 0
 
+# Projection-parent projector: a plain select-after-filter (no aggregate) folds its
+# repeated ->> paths into one __jsono_internal_project STRUCT above the filter.
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE jsono_optimizer_select_expected AS
+SELECT j->>'$.did' AS did,
+       j->>'$.commit.collection' AS event,
+       j->>'$.time_us' AS time_us
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create');
+
+statement ok
+RESET disabled_optimizers;
+
+query II
+EXPLAIN SELECT j->>'$.did' AS did,
+               j->>'$.commit.collection' AS event,
+               j->>'$.time_us' AS time_us
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create');
+----
+physical_plan	<REGEX>:.*__jsono_internal_project.*
+
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_optimizer_select_expected EXCEPT
+   SELECT j->>'$.did' AS did,
+          j->>'$.commit.collection' AS event,
+          j->>'$.time_us' AS time_us
+   FROM jsono_optimizer_probe
+   WHERE (j->>'$.kind' = 'commit')
+     AND (j->>'$.commit.operation' = 'create'))
+  UNION ALL
+  (SELECT j->>'$.did' AS did,
+          j->>'$.commit.collection' AS event,
+          j->>'$.time_us' AS time_us
+   FROM jsono_optimizer_probe
+   WHERE (j->>'$.kind' = 'commit')
+     AND (j->>'$.commit.operation' = 'create')
+   EXCEPT SELECT * FROM jsono_optimizer_select_expected)
+);
+----
+0
+
 statement ok
 CREATE TEMP TABLE jsono_optimizer_extrema_probe AS
 SELECT group_id, jsono(payload) AS j
@@ -307,6 +356,20 @@ ORDER BY event;
 ----
 app.bsky.feed.like	1
 app.bsky.feed.post	2
+
+# __jsono_internal_project inserted above a plain projection (select-after-filter)
+query TT
+SELECT j->>'$.did' AS did,
+       j->>'$.commit.collection' AS event
+FROM jsono_optimizer_probe
+WHERE (j->>'$.kind' = 'commit')
+  AND (j->>'$.commit.operation' = 'create')
+ORDER BY ALL;
+----
+u1	app.bsky.feed.post
+u1	app.bsky.feed.post
+u2	app.bsky.feed.like
+u5	NULL
 
 statement ok
 PRAGMA disable_verify_serializer;

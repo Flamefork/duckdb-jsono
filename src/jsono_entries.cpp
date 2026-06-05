@@ -45,16 +45,38 @@ void SetListRowNull(Vector &result, idx_t row) {
 
 enum class JsonoEntriesKeyStyle : uint8_t { JsonPath, Dotted };
 
+// A lane of a shredded input: its struct child index, type, and the entry key in both
+// styles (precomputed at bind). A top-level literal lane name `n` keys as `n` (dotted) or
+// `$.n` (jsonpath); a `$.`-prefixed path keys as itself (jsonpath) or without the prefix
+// (dotted). The stripped lane value is flattened alongside the residual entries.
+struct EntriesLane {
+	idx_t child_index;
+	LogicalType type;
+	string key_jsonpath;
+	string key_dotted;
+};
+
 struct JsonoEntriesBindData : public FunctionData {
-	explicit JsonoEntriesBindData(JsonoEntriesKeyStyle style_p) : style(style_p) {
+	JsonoEntriesBindData(JsonoEntriesKeyStyle style_p, vector<EntriesLane> lanes_p)
+	    : style(style_p), lanes(std::move(lanes_p)) {
 	}
 	JsonoEntriesKeyStyle style;
+	vector<EntriesLane> lanes;
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<JsonoEntriesBindData>(style);
+		return make_uniq<JsonoEntriesBindData>(style, lanes);
 	}
 	bool Equals(const FunctionData &other_p) const override {
-		return style == other_p.Cast<JsonoEntriesBindData>().style;
+		auto &other = other_p.Cast<JsonoEntriesBindData>();
+		if (style != other.style || lanes.size() != other.lanes.size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < lanes.size(); i++) {
+			if (lanes[i].child_index != other.lanes[i].child_index || lanes[i].type != other.lanes[i].type) {
+				return false;
+			}
+		}
+		return true;
 	}
 };
 
@@ -85,7 +107,27 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 			throw BinderException("jsono_entries: key_style must be 'jsonpath' or 'dotted'");
 		}
 	}
-	return make_uniq<JsonoEntriesBindData>(style);
+	auto &input_type = arguments[0]->return_type;
+	vector<EntriesLane> lanes;
+	if (IsShreddedJsonoType(input_type)) {
+		auto &children = StructType::GetChildTypes(input_type);
+		auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
+		for (idx_t i = prefix; i < children.size(); i++) {
+			auto &name = children[i].first;
+			EntriesLane lane {i, children[i].second, "", ""};
+			if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
+				lane.key_jsonpath = name;
+				lane.key_dotted = name.substr(2);
+			} else {
+				lane.key_jsonpath = "$." + name;
+				lane.key_dotted = name;
+			}
+			lanes.push_back(std::move(lane));
+		}
+	} else if (input_type.id() != LogicalTypeId::SQLNULL && !IsJsonoType(input_type)) {
+		throw BinderException("jsono_entries: argument must be JSONO");
+	}
+	return make_uniq<JsonoEntriesBindData>(style, std::move(lanes));
 }
 
 // A bare JSONPath key segment is parseable only while it avoids the grammar's
@@ -218,6 +260,24 @@ struct EntriesSink {
 		}
 		next_child++;
 	}
+
+	// Append a lane entry whose value is already rendered text (or SQL NULL).
+	void AppendText(nonstd::string_view key, bool value_null, nonstd::string_view value) {
+		if (next_child >= capacity) {
+			EnsureListCapacity(list, next_child + 1);
+			capacity = ListVector::GetListCapacity(list);
+			key_data = FlatVector::GetData<string_t>(*key_vec);
+			value_data = FlatVector::GetData<string_t>(*value_vec);
+		}
+		auto child_row = next_child;
+		key_data[child_row] = StringVector::AddString(*key_vec, key.data(), key.size());
+		if (value_null) {
+			FlatVector::SetNull(*value_vec, child_row, true);
+		} else {
+			value_data[child_row] = StringVector::AddString(*value_vec, value.data(), value.size());
+		}
+		next_child++;
+	}
 };
 
 // Depth-first walk that materializes one (path, value) struct per leaf. Object
@@ -273,16 +333,56 @@ void WalkEntries(const JsonoView &view, size_t &pos, size_t &string_cursor, std:
 	}
 }
 
+// Render a shredded lane's typed value as the text an entry carries. Lanes are limited
+// to the shred-primitive types, so a small switch covers them; VARCHAR returns the heap
+// string in place, the rest format into `scratch`.
+nonstd::string_view FormatLaneValue(const UnifiedVectorFormat &fmt, idx_t idx, const LogicalType &type,
+                                    std::string &scratch) {
+	switch (type.id()) {
+	case LogicalTypeId::VARCHAR: {
+		auto &s = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
+		return nonstd::string_view(s.GetData(), s.GetSize());
+	}
+	case LogicalTypeId::BIGINT:
+		scratch = std::to_string(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx]);
+		return scratch;
+	case LogicalTypeId::UBIGINT:
+		scratch = std::to_string(UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx]);
+		return scratch;
+	case LogicalTypeId::DOUBLE:
+		scratch = std::to_string(UnifiedVectorFormat::GetData<double>(fmt)[idx]);
+		return scratch;
+	case LogicalTypeId::BOOLEAN:
+		scratch = UnifiedVectorFormat::GetData<bool>(fmt)[idx] ? "true" : "false";
+		return scratch;
+	default:
+		scratch.clear();
+		return scratch;
+	}
+}
+
 void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
 	JsonoVectorData input;
 	InitJsonoVectorData(args.data[0], count, input);
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto style = func_expr.bind_info->Cast<JsonoEntriesBindData>().style;
+	auto &bind_data = func_expr.bind_info->Cast<JsonoEntriesBindData>();
+	auto style = bind_data.style;
+	auto &lanes = bind_data.lanes;
+
+	// Read each lane column once so the per-row loop can emit its stripped value.
+	vector<UnifiedVectorFormat> lane_fmt(lanes.size());
+	if (!lanes.empty()) {
+		auto &struct_children = StructVector::GetEntries(args.data[0]);
+		for (idx_t f = 0; f < lanes.size(); f++) {
+			struct_children[lanes[f].child_index]->ToUnifiedFormat(count, lane_fmt[f]);
+		}
+	}
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	ListVector::SetListSize(result, 0);
 	std::string path;
+	std::string lane_scratch;
 	EntriesSink sink(result);
 
 	for (idx_t row = 0; row < count; row++) {
@@ -291,19 +391,29 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 			SetListRowNull(result, row);
 			continue;
 		}
+		auto start = sink.next_child;
 		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader() || view.Slots() == 0) {
+		if (view.ParseHeader() && view.Slots() > 0) {
+			path.clear();
+			if (style == JsonoEntriesKeyStyle::JsonPath) {
+				path.push_back('$');
+			}
+			size_t pos = 0;
+			size_t string_cursor = 0;
+			WalkEntries(view, pos, string_cursor, path, style, sink, 0);
+		} else if (lanes.empty()) {
 			SetListRowNull(result, row);
 			continue;
 		}
-		auto start = sink.next_child;
-		path.clear();
-		if (style == JsonoEntriesKeyStyle::JsonPath) {
-			path.push_back('$');
+		for (idx_t f = 0; f < lanes.size(); f++) {
+			auto idx = lane_fmt[f].sel->get_index(row);
+			if (!lane_fmt[f].validity.RowIsValid(idx)) {
+				continue;
+			}
+			auto &key = style == JsonoEntriesKeyStyle::JsonPath ? lanes[f].key_jsonpath : lanes[f].key_dotted;
+			auto value = FormatLaneValue(lane_fmt[f], idx, lanes[f].type, lane_scratch);
+			sink.AppendText(nonstd::string_view(key.data(), key.size()), false, value);
 		}
-		size_t pos = 0;
-		size_t string_cursor = 0;
-		WalkEntries(view, pos, string_cursor, path, style, sink, 0);
 		FinishListRow(result, row, start, sink.next_child - start);
 	}
 	if (args.AllConstant()) {
@@ -317,10 +427,13 @@ void RegisterJsonoEntries(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
 	auto entry_type =
 	    LogicalType::LIST(LogicalType::STRUCT({{"key", LogicalType::VARCHAR}, {"value", LogicalType::VARCHAR}}));
+	(void)jsono_type;
+	// The input is ANY so a shredded jsono struct (whose type varies by lane set) also
+	// binds; JsonoEntriesBind validates it is JSONO or shredded and collects the lanes.
 	ScalarFunctionSet set("jsono_entries");
-	set.AddFunction(ScalarFunction({jsono_type}, entry_type, JsonoEntriesExecute, JsonoEntriesBind));
+	set.AddFunction(ScalarFunction({LogicalType::ANY}, entry_type, JsonoEntriesExecute, JsonoEntriesBind));
 	set.AddFunction(
-	    ScalarFunction({jsono_type, LogicalType::VARCHAR}, entry_type, JsonoEntriesExecute, JsonoEntriesBind));
+	    ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, entry_type, JsonoEntriesExecute, JsonoEntriesBind));
 	loader.RegisterFunction(set);
 }
 

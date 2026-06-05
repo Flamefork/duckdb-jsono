@@ -37,6 +37,7 @@ struct ObjectLayout {
 	size_t after_pos;
 	uint32_t checkpoint_offset;
 	uint16_t checkpoint_stride;
+	uint64_t shape_hash;
 };
 
 inline idx_t RowIndex(const UnifiedVectorFormat &fmt, idx_t row) {
@@ -127,7 +128,8 @@ inline ObjectLayout ReadObjectLayout(const JsonoView &view, size_t pos) {
 	                     key_start + key_count,
 	                     after_pos,
 	                     checkpoint_index.checkpoint_offset,
-	                     checkpoint_index.checkpoint_stride};
+	                     checkpoint_index.checkpoint_stride,
+	                     span.shape_hash};
 }
 
 inline size_t ReadArrayEndPos(const JsonoView &view, size_t pos) {

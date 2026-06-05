@@ -17,10 +17,53 @@ The `JSONO` alias survives round-trips through DuckDB-native storage (catalog
 metadata) but is lost through `read_parquet`, which delivers the structurally
 compatible STRUCT with the same four `jsono_*` BLOB fields.
 
+## Shredded layout
+
+For fast columnar reads of hot paths, a `JSONO` value can be stored *shredded*:
+the four blobs followed by one typed *lane* column per chosen path (produced by
+`jsono_shred`).
+
+```
+STRUCT(
+  jsono_slots       BLOB,        -- the residual JSONO value (this spec, unchanged)
+  jsono_key_heap    BLOB,
+  jsono_string_heap BLOB,
+  jsono_skips       BLOB,
+  "<path1>"         <type1>,     -- lane: value at <path1>, typed, named by the path
+  "<path2>"         <type2>,
+  …
+)
+```
+
+Shredding does **not** change the binary blob format. The four blobs are an
+ordinary JSONO value — the *residual* — so everything else in this spec applies
+to them unchanged, including `version`. Each appended column is a *lane*: the
+value at its canonical path (`$.kind`, `$.commit.operation`, …) materialized as a
+plain typed DuckDB column (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`),
+with the path as the field name. Nested lane paths are allowed. Because the lane
+is named by its path, the shredded shape survives a `read_parquet` round-trip
+(the alias is dropped, the field names are not).
+
+**Lossless invariant: the residual holds everything a lane cannot reproduce
+exactly.** A value is removed from the residual and kept only in its lane when it
+round-trips losslessly through the lane type (a JSON string in a `VARCHAR` lane,
+an integer in a `BIGINT` lane). A value that does not fit — a string in a `BIGINT`
+lane, an explicit JSON `null`, a missing key, or a number whose lane type would
+re-encode it differently — stays in the residual, and its lane is a redundant
+read copy. Only top-level (depth-1) paths are ever removed from the residual; a
+nested shredded path is read-accelerated but kept in the residual.
+
+The original value is recovered by overlaying the lanes onto the residual,
+**residual-authoritative**: a path absent from the residual is filled from its
+lane, and a path present in the residual wins (its lane is the redundant copy).
+Since the removed values are exactly those their lane reproduces byte-for-byte,
+the overlay reconstructs the value losslessly.
+
 ## Compatibility policy
 
 The on-disk binary format is versioned by the `version` byte in `jsono_slots`.
-Current `JSONO` files use `version = 1`.
+Current `JSONO` files use `version = 2` (version 2 added the per-object
+`shape_hash` field to `ContainerSpan`; see [Navigation](#navigation-jsono_skips)).
 
 This extension is still experimental, so compatibility is intentionally strict:
 an incompatible change to slot tags, payload semantics, heap layout, navigation
@@ -62,7 +105,7 @@ strings and keys. That is delegated to Parquet column-dictionary encoding — se
 | field | type | value |
 |---|---|---|
 | `magic` | u32 | `'JSNO'` = `0x4F4E534A` |
-| `version` | u8 | `1` |
+| `version` | u8 | `2` |
 | `flags` | u8 | bit0 = `SORTED_KEYS` |
 | `reserved` | u16 | `0` |
 
@@ -198,7 +241,7 @@ sections little-endian, fixed-size records):
 
 ```
 [ContainerMetadataHeader]            12 bytes
-[ContainerSpan        × container_count]        8 bytes each
+[ContainerSpan        × container_count]        16 bytes each
 [ObjectCheckpointIndex × checkpoint_index_count] 12 bytes each
 [ObjectCursorCheckpoint × checkpoint_count]      8 bytes each
 ```
@@ -213,16 +256,23 @@ One record per container, indexed by the `container_id` from the
 `OBJ_START`/`ARR_START` payload:
 
 ```
-ContainerSpan { u32 slot_span; u32 string_byte_span; }
+ContainerSpan { u32 slot_span; u32 string_byte_span; u64 shape_hash; }
 ```
 
 - `slot_span` — how many slots the whole container occupies, including `*_START`
   and `*_END`. Jump past the entire subtree: `pos += slot_span`.
 - `string_byte_span` — how many `jsono_string_heap` bytes this subtree consumes.
   Jump the string cursor: `string_cursor += string_byte_span`.
+- `shape_hash` — for objects, a 64-bit fingerprint of the object's sorted,
+  length-prefixed key sequence (`HashObjectKeySlots`); arrays store 0. Two
+  objects with equal `shape_hash` have the same sorted key set (collision risk
+  ~5e-20), so a reader's per-object key-rank cache can trust a cached rank by an
+  int compare instead of re-reading the key heap. This makes the rank-cache fast
+  path safe on non-shape-stable data, where objects with different key sets but
+  the same key count would otherwise collide in a `(step, key_count)` cache.
 
-Together they give O(1) `SkipValueFast` — skipping any value without descending
-into it.
+`slot_span`/`string_byte_span` together give O(1) `SkipValueFast` — skipping any
+value without descending into it.
 
 ### Object checkpoints
 

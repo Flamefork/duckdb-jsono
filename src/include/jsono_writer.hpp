@@ -163,7 +163,7 @@ struct JsonoBuilder {
 			    ObjectCheckpointIndex {uint32_t(id), checkpoint_offset, checkpoint_stride, 0});
 			object_checkpoints.resize(object_checkpoints.size() + checkpoint_count);
 		}
-		skips.push_back(ContainerSpan {0, 0});
+		skips.push_back(ContainerSpan {0, 0, 0});
 		open_containers.push_back(OpenContainer {id, container_tag, child_count, checkpoint_offset,
 		                                         checkpoint_index_pos, checkpoint_stride, 0, slots.size(),
 		                                         string_heap.size()});
@@ -208,7 +208,20 @@ struct JsonoBuilder {
 		    string_byte_span > std::numeric_limits<uint32_t>::max()) {
 			throw InvalidInputException("jsono: container span exceeds storage limits");
 		}
-		skips[open.id] = ContainerSpan {uint32_t(slot_span), uint32_t(string_byte_span)};
+		// Objects carry a shape_hash over their stored (sorted) KEY slots; arrays leave it 0.
+		// The struct constructor's external_root_keys fast path writes KEY slots whose
+		// offsets point into a shared external key_heap (not this builder's), so guard the
+		// fingerprint on the last key being in-bounds; that owner patches skips afterward.
+		uint64_t shape_hash = 0;
+		if (open.tag == tag::OBJ_START && open.child_count > 0) {
+			auto last_key_payload = SlotPayload(slots[open.start_slot + open.child_count]);
+			if (KeyOffset(last_key_payload) + KeyLen(last_key_payload) <= key_heap.size()) {
+				shape_hash = HashObjectKeySlots(slots.data(), open.start_slot + 1, open.child_count, key_heap.data());
+			}
+		} else if (open.tag == tag::OBJ_START) {
+			shape_hash = HASH_SEED; // empty object: stable constant, matches HashObjectKeySlots(0 keys)
+		}
+		skips[open.id] = ContainerSpan {uint32_t(slot_span), uint32_t(string_byte_span), shape_hash};
 	}
 
 	void EmitObjectStart(uint64_t N) {

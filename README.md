@@ -5,10 +5,11 @@
 
 Experimental DuckDB extension for JSON extraction and JSON-shaped intermediate storage built on top of [yyjson](https://github.com/ibireme/yyjson).
 
-The extension has two main goals:
+The extension has three main goals:
 
 - spec-driven multi-field extraction from a JSON document into a typed `STRUCT` with `jsono_transform`;
-- a pre-parsed `JSONO` representation for repeated reads over the same JSON column.
+- a pre-parsed `JSONO` representation for repeated reads over the same JSON column;
+- path-shredded `JSONO` storage (`jsono_shred`) that lifts hot paths into typed lane columns for fast columnar reads while keeping `->>` and `to_json` working transparently.
 
 **Warning:** this extension is experimental and maintained on a best-effort basis by a developer who doesn't write C++ professionally, so expect rough edges. It has not been hardened for production, and the `JSONO` binary format and SQL API are still being designed and may change between revisions. Validate behavior and performance on your own data before relying on it. Feedback and contributions are welcome via GitHub.
 
@@ -21,9 +22,11 @@ The extension has two main goals:
 - `jsono_extract(value, path)` / `value -> path` extracts one value as `JSONO`.
 - `jsono_extract_string(value, path)` / `value ->> path` extracts one value as `VARCHAR`.
 - `jsono_transform(value, spec)` extracts multiple fields into a typed `STRUCT`.
+- `jsono_shred(value, spec)` rewrites `JSONO` into a shredded `STRUCT` whose hot paths are typed lane columns; `->>` and `to_json` stay transparent and read the lanes.
 - `jsono_entries(value[, key_style])` flattens scalar leaves into `STRUCT(key VARCHAR, value VARCHAR)[]`.
 - `jsono_group_merge(value, 'IGNORE NULLS' [ORDER BY ...])` aggregates JSON patches.
 - `jsono_merge_patch(...)` applies RFC 7396-style merge patch to JSONO values.
+- `jsono_overlay(...)` merges patches base-wins (fills only keys missing from the base).
 
 ## Quick Start
 
@@ -50,7 +53,7 @@ FROM events;
 
 ## Installation
 
-> **Note:** This extension is not yet published in DuckDB's extension repository, and the `JSONO` binary format and SQL API are still being designed (see [CHANGELOG.md](CHANGELOG.md)). Build it from source and load the produced local extension.
+> **Note:** This extension is not yet published in DuckDB's extension repository, and the `JSONO` binary format and SQL API are still being designed. Build it from source and load the produced local extension.
 
 ### CLI
 
@@ -242,6 +245,37 @@ SELECT jsono_transform(
 
 The object keys `type`, `path`, and `join_separator` are reserved inside a wrapper object.
 
+### `jsono_shred(value, spec) -> struct`
+
+Rewrites a `JSONO` value into a *shredded* `STRUCT`: the four-BLOB `JSONO` residual followed by one typed lane column per path in `spec`. Reads stay transparent — `->>`, `jsono_extract_string`, `to_json`, and casts work on the shredded value exactly as on a plain `JSONO` column — but extracting a shredded path becomes a direct read of its typed lane instead of a per-row parse, which the planner can push down and prune on.
+
+`spec` is a constant JSON object mapping each path to its lane type (same path grammar as `jsono_transform`, no wildcards; lane types `VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`):
+
+```sql
+CREATE TABLE events AS
+SELECT jsono_shred(
+    jsono(payload),
+    '{"$.kind":"VARCHAR","$.did":"VARCHAR","$.time_us":"BIGINT"}'
+) AS payload
+FROM read_parquet('events.parquet');
+
+-- queried like any JSONO column; the planner reads the lanes
+SELECT payload ->> '$.kind' AS kind, count(*) AS n
+FROM events GROUP BY kind;
+
+SELECT max(CAST(payload ->> '$.time_us' AS BIGINT)) FROM events;
+```
+
+The conversion is lossless: `to_json(payload)` reconstructs the original document, and any path not in `spec` still reads from the residual. A value that does not fit its lane type (a string in a `BIGINT` lane, an explicit JSON `null`, a missing key) is kept in the residual unchanged, so reconstruction never loses or coerces data. Top-level shredded paths are stored once — in the lane rather than duplicated in the residual — so the shredded column is typically smaller than the plain `JSONO` column for the same data while answering hot-path queries from narrow typed columns.
+
+```sql
+SELECT to_json(jsono_shred(jsono('{"kind":"commit","time_us":1700,"extra":"e1"}'),
+                           '{"$.kind":"VARCHAR","$.time_us":"BIGINT"}'));
+-- {"extra":"e1","kind":"commit","time_us":1700}
+```
+
+Transparent reads over a shredded value go through the bundled `json` extension (present in every standard DuckDB distribution) and the extension's query optimizer. The shredded shape — four BLOBs plus the named lane columns — survives a plain Parquet round-trip and reads back transparently.
+
 ### `jsono_entries(value[, key_style]) -> STRUCT(key VARCHAR, value VARCHAR)[]`
 
 Flattens scalar leaves of a `JSONO` document into a list of key/value structs. The default `key_style` is `'jsonpath'`; pass constant `'dotted'` for dot-separated keys:
@@ -339,6 +373,21 @@ SELECT to_json(jsono_merge_patch(
 
 Unlike `jsono_group_merge`, this is a scalar function over a fixed set of patch arguments rather than an aggregate over rows.
 
+### `jsono_overlay(base, patch[, ...]) -> JSONO`
+
+Overlays one or more patches onto a base value, base-wins: a patch only fills object keys absent from the base, a `null` patch member is a no-op (it does not delete), and the base's own values — including explicit nulls — are kept. This is the complement of `jsono_merge_patch`, where the patch wins and a `null` member deletes.
+
+```sql
+SELECT to_json(jsono_overlay(
+    jsono('{"a":1,"b":2}'),
+    jsono('{"b":99,"c":3}')
+));
+```
+*Result:*
+```json
+{"a":1,"b":2,"c":3}
+```
+
 ### Introspection
 
 ```sql
@@ -415,6 +464,7 @@ Use power-of-two values when comparing performance. The default is tuned for loc
 ## Error Handling and Caveats
 
 - `jsono_transform` requires a constant spec string.
+- `jsono_shred` requires a constant spec string and rejects wildcard paths; only top-level paths are physically stripped from the residual (nested shredded paths are read-accelerated but kept in the residual). Transparent `->>`/`to_json` over a shredded value need the query optimizer; reading one with the optimizer fully disabled (`PRAGMA disable_optimizer`) is not supported.
 - `jsono_extract` / `->` / `jsono_extract_string` / `->>` require a constant path, do not support wildcard list extraction yet, and do not support negative array indexes.
 - Unsupported scalar types in `jsono_transform` fail at bind time.
 - `jsono_group_merge` currently requires constant `'IGNORE NULLS'`.

@@ -185,7 +185,7 @@ NULL
 # to_json on a structurally valid header with missing container span should fail, not crash.
 statement error
 SELECT to_json({
-  'jsono_slots': unhex('4A534E4F010100000000000000000000'),
+  'jsono_slots': unhex('4A534E4F020100000000000000000000'),
   'jsono_key_heap': ''::BLOB,
   'jsono_string_heap': ''::BLOB,
   'jsono_skips': ''::BLOB
@@ -196,10 +196,10 @@ container span
 # to_json on a structurally valid header with truncated slot data should fail, not crash.
 statement error
 SELECT to_json({
-  'jsono_slots': unhex('4A534E4F010100000000000000000020'),
+  'jsono_slots': unhex('4A534E4F020100000000000000000020'),
   'jsono_key_heap': ''::BLOB,
   'jsono_string_heap': ''::BLOB,
-  'jsono_skips': unhex('0100000000000000000000000100000000000000')
+  'jsono_skips': unhex('01000000000000000000000001000000000000000000000000000000')
 }::JSONO);
 ----
 malformed JSONO
@@ -215,17 +215,17 @@ SELECT
 ----
 true	true	true	true
 
-# The writer emits a metadata header plus one fixed-width span per object/array container.
+# The writer emits a metadata header (12 B) plus one 16-byte span per object/array container.
 query I
 SELECT octet_length((jsono('{"a":"x","b":["yy"]}')::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)).jsono_skips);
 ----
-28
+44
 
 # One cursor checkpoint is added for an object with 17 keys.
 query I
 SELECT octet_length((jsono('{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":"x"}')::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)).jsono_skips);
 ----
-40
+48
 
 # JSONO has the documented STRUCT shape
 query I

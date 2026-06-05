@@ -18,55 +18,11 @@ namespace jsono_dom {
 using namespace jsono;
 using namespace duckdb_yyjson;
 
-// Hash helpers — short-input wyhash-inspired mixer. The writer hashes each
-// object's DOM-order key sequence into a 64-bit fingerprint and looks the
-// result up in JsonoBuilder.shape_cache; on hit, the precomputed sort
-// permutation is reused and std::sort is skipped entirely.
-//
-// 64-bit collision risk is negligible (~5e-20 per row) for any realistic
-// data scale, so cache hits are treated as authoritative without a separate
-// verification pass.
-inline uint64_t HashMix64(uint64_t a, uint64_t b) {
-#if defined(__SIZEOF_INT128__)
-	__uint128_t r = static_cast<__uint128_t>(a) * b;
-	return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
-#else
-	// Portable fallback — slower but correct.
-	uint64_t ah = a >> 32;
-	uint64_t al = a & 0xFFFFFFFFULL;
-	uint64_t bh = b >> 32;
-	uint64_t bl = b & 0xFFFFFFFFULL;
-	uint64_t low = al * bl;
-	uint64_t mid = ah * bl + al * bh + (low >> 32);
-	uint64_t high = ah * bh + (mid >> 32);
-	return (low & 0xFFFFFFFFULL) ^ (mid << 32) ^ high;
-#endif
-}
-
-constexpr uint64_t HASH_PRIME = 0x9E3779B97F4A7C15ULL;
-constexpr uint64_t HASH_SEED = 0xCBF29CE484222325ULL;
-
-inline uint64_t HashBytes(uint64_t state, const char *data, size_t len) {
-	while (len >= 8) {
-		uint64_t v;
-		std::memcpy(&v, data, 8);
-		state = HashMix64(state ^ v, HASH_PRIME);
-		data += 8;
-		len -= 8;
-	}
-	if (len > 0) {
-		uint64_t v = 0;
-		std::memcpy(&v, data, len);
-		state = HashMix64(state ^ v, HASH_PRIME);
-	}
-	return state;
-}
-
-inline uint64_t HashKey(uint64_t state, nonstd::string_view key) {
-	state = HashBytes(state, key.data(), key.size());
-	// Length-prefix so {"ab","c"} and {"a","bc"} don't collide on byte concat.
-	return HashMix64(state ^ uint64_t(key.size()), HASH_PRIME);
-}
+// Shape-hash helpers (HashMix64/HashBytes/HashKey, HASH_SEED/HASH_PRIME) live in
+// jsono.hpp and are visible via `using namespace jsono`. The DOM builder hashes
+// each object's DOM-order key sequence into a 64-bit fingerprint and looks it up
+// in JsonoBuilder.shape_cache; on hit, the precomputed sort permutation is reused
+// and std::sort is skipped. 64-bit collision risk is negligible (~5e-20 per row).
 
 struct ShapeCacheEntry {
 	uint64_t hash = 0;
