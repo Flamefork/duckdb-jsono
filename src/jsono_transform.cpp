@@ -449,6 +449,7 @@ bool PathStepsEqual(const vector<PathStep> &left, const vector<PathStep> &right)
 void AssignShreddedLanes(TransformBindData &bind_data, const LogicalType &input_type) {
 	auto &children = StructType::GetChildTypes(input_type);
 	auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
+	auto suffix = JsonoLaneSuffix(input_type);
 	for (idx_t i = prefix; i < children.size(); i++) {
 		TransformPrimitive lane_primitive;
 		if (!LaneTypeToPrimitive(children[i].second, lane_primitive)) {
@@ -456,7 +457,7 @@ void AssignShreddedLanes(TransformBindData &bind_data, const LogicalType &input_
 			// residual, where the value remains.
 			continue;
 		}
-		auto &name = children[i].first;
+		auto name = JsonoStripLaneSuffix(children[i].first, suffix);
 		auto steps = !name.empty() && name[0] == '$' ? ParseJsonoPath(name, "jsono_transform") : LiteralKeyPath(name);
 		for (idx_t field_index = 0; field_index < bind_data.fields.size(); field_index++) {
 			auto &field = bind_data.fields[field_index];

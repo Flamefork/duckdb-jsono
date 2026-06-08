@@ -267,13 +267,13 @@ query I
 SELECT typeof(jsono_merge_patch(
   jsono('{"a":1}'),
   jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'})
-));
+)) = typeof(jsono('{}', shredding := {'event_name':'VARCHAR'}));
 ----
-STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, event_name VARCHAR)
+true
 
 # the merged value reconstructs the full document and the lane carries the value
 query II
-SELECT to_json(m), (m).event_name FROM (
+SELECT to_json(m), m ->> 'event_name' FROM (
   SELECT jsono_merge_patch(
     jsono('{"a":1}'),
     jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'})
@@ -331,11 +331,11 @@ SELECT to_json(jsono_merge_patch(jsono('{"event_name":"a","x":1}'),
 
 # The merged value still round-trips its lane via the typed accessor (result stays shredded).
 query II
-SELECT typeof(m), (m).event_name FROM (
+SELECT typeof(m) = typeof(jsono('{}', shredding := {'event_name':'VARCHAR'})), m ->> 'event_name' FROM (
   SELECT jsono_merge_patch(jsono('{"event_name":"search","x":1}'), jsono({'event_name': 'page_view'})) AS m
 );
 ----
-STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, event_name VARCHAR)	page_view
+true	page_view
 
 # A NULL base with a shredded patch reconstructs to just the patch.
 query I
@@ -347,11 +347,11 @@ SELECT to_json(jsono_merge_patch(jsono(NULL), jsono({'event_name': 'x'})));
 
 # Disjoint shredded base + shredded patch: both stay lanes, result is shredded.
 query II
-SELECT to_json(m), typeof(m) FROM (
+SELECT to_json(m), typeof(m) = jsono_storage_type('a VARCHAR, b VARCHAR, c VARCHAR') FROM (
   SELECT jsono_merge_patch(jsono({'a': '1', 'b': '2'}), jsono({'c': '3'})) AS m
 );
 ----
-{"a":"1","b":"2","c":"3"}	STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, a VARCHAR, b VARCHAR, c VARCHAR)
+{"a":"1","b":"2","c":"3"}	true
 
 # Same lane key in both shredded inputs: patch wins (RFC 7396), handled on the fast path
 # because the key lives in the lanes, never the residual.

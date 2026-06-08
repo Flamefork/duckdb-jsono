@@ -116,8 +116,9 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 	if (IsShreddedJsonoType(input_type)) {
 		auto &children = StructType::GetChildTypes(input_type);
 		auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
+		auto suffix = JsonoLaneSuffix(input_type);
 		for (idx_t i = prefix; i < children.size(); i++) {
-			auto &name = children[i].first;
+			auto name = JsonoStripLaneSuffix(children[i].first, suffix);
 			EntriesLane lane {i, children[i].second, "", ""};
 			if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
 				lane.key_jsonpath = name;

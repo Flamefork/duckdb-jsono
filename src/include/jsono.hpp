@@ -46,16 +46,37 @@ LogicalType JsonoType();
 // can declare storage columns without hardcoding the fields.
 LogicalType JsonoRawStructType();
 
+// The physical STRUCT of a shredded JSONO value: the four jsono_* BLOB residual plus one lane
+// column per `lanes` entry (each lane is a base path name and its lane type). Every field name —
+// the four blobs included — carries a common "#<fingerprint>" suffix derived from the whole lane
+// set (names and types, order-independent). This is the single source of truth for the shredded
+// shape: the constructor and `jsono_storage_type` both build it here, so a column declared from
+// the same lanes is byte-identical to the value's type. The suffix is what makes a lane mismatch
+// fail loud: DuckDB's generic struct cast matches fields by name and requires at least one match,
+// so two shredded types with different lane sets share no field name and the cast is rejected
+// instead of silently dropping/NULL-filling lanes. Lane field order follows `lanes`; callers pass
+// them in canonical (name-sorted) order so the type is a pure function of the lane set, and they
+// write lanes in that same order (lanes are written by index, so field and value order must agree).
+LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &lanes);
+
+// The common field-name suffix of a jsono-prefixed `type` ("" for a plain value, "#<fp>" for a
+// shredded one). Lane field names are the base path plus this suffix; strip it to recover the path.
+string JsonoLaneSuffix(const LogicalType &type);
+
+// Recover a lane's base path by stripping the shared `suffix` (from JsonoLaneSuffix) off a shredded
+// field name; a no-op when the suffix is empty or absent.
+string JsonoStripLaneSuffix(const string &field_name, const string &suffix);
+
 // True when `type` is the JSONO STRUCT — by alias, or structurally (the four
 // jsono_* BLOB children survive read_parquet, which drops the alias). The
 // structural check compares against `JsonoRawStructType()`, so the field
 // contract shared by jsono.cpp and jsono_ops.cpp has one source.
 bool IsJsonoType(const LogicalType &type);
 
-// True when the leading four children of `type` match the jsono_* BLOB contract,
-// i.e. `type` is an already-stored JSONO value — plain (exactly four children) or
-// shredded (four blobs followed by appended lane columns). The leading blobs are
-// the authoritative encoding; reinterpreting to JSONO drops the trailing lanes.
+// True when the leading four children of `type` are the jsono_* BLOB contract, sharing a common
+// name suffix: `type` is an already-stored JSONO value — plain (exactly four clean-named blobs) or
+// shredded (four "#<fp>"-suffixed blobs followed by suffixed lane columns). The leading blobs are
+// the authoritative encoding; reinterpreting to plain JSONO drops the trailing lanes.
 bool HasJsonoBlobPrefix(const LogicalType &type);
 
 // True when `type` is a shredded JSONO struct: the four-blob prefix plus at least
@@ -464,17 +485,29 @@ public:
 	      skips_(reinterpret_cast<const uint8_t *>(skips)), skips_size_(skips_size) {
 	}
 
+	// Returns false only for an *absent* value: the slots blob is too short to even hold a
+	// header (a NULL/empty jsono_slots field), which callers map to SQL NULL. A real jsono
+	// value always has a header plus at least one slot, so any blob that has a header but is
+	// unreadable — wrong magic, a different format version, misaligned slots, or a metadata
+	// blob shorter than its declared spans — is corruption or non-JSONO bytes and must fail
+	// loud, never silently read as SQL NULL. The validate function recovers a boolean by
+	// catching these (see ValidateJsonoBlob); read/extract paths let them propagate.
 	bool ParseHeader() {
 		if (slots_size_ < JSONO_HEADER_SIZE) {
 			return false;
 		}
 		std::memcpy(&header_, slots_, JSONO_HEADER_SIZE);
-		if (header_.magic != MAGIC || header_.version != VERSION) {
-			return false;
+		if (header_.magic != MAGIC) {
+			throw InvalidInputException("not a JSONO value: header magic mismatch (the column holds non-JSONO bytes)");
+		}
+		if (header_.version != VERSION) {
+			throw InvalidInputException("JSONO format version mismatch: stored value is v%d, this extension reads v%d. "
+			                            "Re-materialize the jsono column with the current extension.",
+			                            int(header_.version), int(VERSION));
 		}
 		auto slots_bytes = slots_size_ - JSONO_HEADER_SIZE;
 		if (slots_bytes % sizeof(uint64_t) != 0) {
-			return false;
+			throw InvalidInputException("malformed JSONO: slots blob is not a whole number of 8-byte slots");
 		}
 		if (skips_size_ >= sizeof(ContainerMetadataHeader)) {
 			std::memcpy(&metadata_header_, skips_, sizeof(metadata_header_));
@@ -484,7 +517,7 @@ public:
 			auto required_bytes =
 			    uint64_t(sizeof(ContainerMetadataHeader)) + spans_bytes + index_bytes + checkpoints_bytes;
 			if (required_bytes > skips_size_) {
-				return false;
+				throw InvalidInputException("malformed JSONO: metadata blob is shorter than its declared spans");
 			}
 		} else {
 			metadata_header_ = {};

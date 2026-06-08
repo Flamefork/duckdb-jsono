@@ -1678,8 +1678,10 @@ struct JsonoLane {
 vector<JsonoLane> CollectShreddedLanes(const LogicalType &shredded) {
 	vector<JsonoLane> lanes;
 	auto &children = StructType::GetChildTypes(shredded);
+	auto suffix = JsonoLaneSuffix(shredded);
 	for (idx_t i = StructType::GetChildTypes(JsonoRawStructType()).size(); i < children.size(); i++) {
-		auto &name = children[i].first;
+		// Lane field names carry the shared "#<fp>" lane-set suffix; strip it to recover the path.
+		auto name = JsonoStripLaneSuffix(children[i].first, suffix);
 		vector<PathStep> steps;
 		if (!name.empty() && name[0] == '$') {
 			steps = ParseJsonoPath(name, "__jsono_shredded_lane");
@@ -1807,7 +1809,11 @@ private:
 	// stays a zero-copy reinterpret rather than a reconstruction.
 	unique_ptr<Expression> ResidualReinterpret(const Expression &column) {
 		FunctionBinder function_binder(context);
-		auto &child_types = StructType::GetChildTypes(column.return_type);
+		// Alias with the clean blob names so the packed struct IS plain JSONO. The shredded column's
+		// blob fields carry the lane-set suffix; aliasing them as-is would make the cast to JSONO a
+		// name mismatch (and on a shredded source DuckDB would reject it as having no matching member).
+		auto raw_type = JsonoRawStructType();
+		auto &blob_names = StructType::GetChildTypes(raw_type);
 		vector<unique_ptr<Expression>> pack_children;
 		for (idx_t i = 0; i < 4; i++) {
 			vector<unique_ptr<Expression>> se_children;
@@ -1815,7 +1821,7 @@ private:
 			se_children.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(int64_t(i + 1))));
 			auto extracted =
 			    function_binder.BindScalarFunction(StructExtractAtFun::GetFunction(), std::move(se_children));
-			extracted->SetAlias(child_types[i].first);
+			extracted->SetAlias(blob_names[i].first);
 			pack_children.push_back(std::move(extracted));
 		}
 		auto packed = function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(pack_children));

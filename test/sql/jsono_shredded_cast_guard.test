@@ -1,0 +1,66 @@
+# name: test/sql/jsono_shredded_cast_guard.test
+# description: a shredded JSONO value carries its lane set in every field name (a fingerprint suffix), so DuckDB's own struct cast rejects a lane mismatch instead of silently dropping/NULL-filling lanes
+# group: [sql]
+
+require jsono
+
+require json
+
+# A shredded column is declared by inferring the value's type (CTAS): every field name — the four
+# residual blobs included — carries the lane-set fingerprint suffix, so the column type encodes its
+# exact lanes. A value shredded on the identical lane set has the same type and inserts directly.
+statement ok
+CREATE TABLE shred_ab AS SELECT jsono('{"a":"AAA","b":"BBB"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS e;
+
+statement ok
+INSERT INTO shred_ab SELECT jsono('{"a":"CCC","b":"DDD"}', shredding := {'a':'VARCHAR','b':'VARCHAR'});
+
+# SAFE: the same lane set in reverse spec order has the same fingerprint (it is order-independent),
+# so it is accepted and remapped by name — a pure reorder is lossless, not a mismatch.
+statement ok
+INSERT INTO shred_ab SELECT jsono('{"a":"EEE","b":"FFF"}', shredding := {'b':'VARCHAR','a':'VARCHAR'});
+
+query II
+SELECT e ->> 'a', e ->> 'b' FROM shred_ab ORDER BY 1;
+----
+AAA	BBB
+CCC	DDD
+EEE	FFF
+
+# UNSAFE: a different lane NAME -> every field name differs (different fingerprint), so DuckDB's
+# struct cast finds no matching member and rejects the insert instead of silently losing lanes.
+statement error
+INSERT INTO shred_ab SELECT jsono('{"x":"y"}', shredding := {'x':'VARCHAR'});
+----
+at least one matching member
+
+# UNSAFE: a different lane COUNT (a subset of the column's lanes) is a different fingerprint too.
+statement error
+INSERT INTO shred_ab SELECT jsono('{"a":"q"}', shredding := {'a':'VARCHAR'});
+----
+at least one matching member
+
+# UNSAFE: a lane name kept but its type changed folds into the fingerprint as well.
+statement error
+INSERT INTO shred_ab SELECT jsono('{"a":"1","b":"x"}', shredding := {'a':'BIGINT','b':'VARCHAR'});
+----
+at least one matching member
+
+# UNSAFE: a plain JSONO value (no lanes, clean field names) cannot be coerced into a shredded column.
+statement error
+INSERT INTO shred_ab SELECT jsono('{"a":"AAA","b":"BBB"}');
+----
+at least one matching member
+
+# The protection is on the struct cast (INSERT into a typed column, explicit CAST). It does NOT
+# cover set-operation type reconciliation: DuckDB merges two structs with disjoint field names into
+# a wider struct (union of fields) rather than casting one to the other, so a UNION of differently
+# shredded values produces a malformed wider struct instead of an error. That is not silent data
+# loss (each row keeps its own lanes), and it is an exotic operation, so it is left uncovered here.
+
+# SAFE: shredded -> plain JSON is the lossless reconstruction path (the target is not a shredded
+# struct), so it is never blocked.
+query I
+SELECT to_json(jsono('{"a":"AAA","b":"BBB"}', shredding := {'a':'VARCHAR'}));
+----
+{"a":"AAA","b":"BBB"}

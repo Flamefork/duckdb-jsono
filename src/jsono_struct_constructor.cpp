@@ -10,6 +10,7 @@
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -1104,7 +1105,13 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 	auto plan = BuildStructConstructorPlan(input_type, "jsono()");
 	idx_t next_key_cache_index = 0;
 	AssignStructConstructorKeyCacheIndexes(plan, next_key_cache_index);
-	bound_function.arguments[0] = plan.bound_type;
+	// Keep the argument type the RAW input struct, not plan.bound_type. The lane set is selected
+	// from the raw field types (below), and DuckDB re-binds this constructor from its serialized
+	// argument type during plan verification. A promoted argument (INTEGER->BIGINT, UBIGINT->VARCHAR)
+	// would flip lane eligibility on re-bind, producing a different lane manifest than the serialized
+	// return type and a fatal STRUCT cast. The promotion the plan's strategies need is applied inside
+	// execution instead (JsonoStructExecute), mirroring the cast entry point.
+	bound_function.arguments[0] = input_type;
 	auto bind_data = make_uniq<JsonoStructBindData>(std::move(plan));
 	if (allow_shred) {
 		for (auto &child : StructType::GetChildTypes(input_type)) {
@@ -1114,11 +1121,17 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 		}
 	}
 	if (!bind_data->lanes.empty()) {
-		child_list_t<LogicalType> children = StructType::GetChildTypes(JsonoRawStructType());
+		// Canonical lane order (sorted by name) so the shredded type is a pure function of the lane
+		// set, not of struct field order: the executor writes lanes by index, so the field write order
+		// (bind_data->lanes) and the type's lane order must agree. The fingerprint is order-independent.
+		std::sort(
+		    bind_data->lanes.begin(), bind_data->lanes.end(),
+		    [](const pair<string, LogicalType> &a, const pair<string, LogicalType> &b) { return a.first < b.first; });
+		child_list_t<LogicalType> lane_types;
 		for (auto &lane : bind_data->lanes) {
-			children.emplace_back(lane.first, lane.second);
+			lane_types.emplace_back(lane.first, lane.second);
 		}
-		bound_function.return_type = LogicalType::STRUCT(std::move(children));
+		bound_function.return_type = JsonoShreddedStructType(lane_types);
 	}
 	return std::move(bind_data);
 }
@@ -1141,13 +1154,23 @@ void JsonoStructExecute(DataChunk &args, ExpressionState &state, Vector &result)
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoStructLocalState>();
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = func_expr.bind_info->Cast<JsonoStructBindData>();
+	auto count = args.size();
+
+	// The argument keeps the raw input struct type (see JsonoStructBindShared); promote it to the
+	// plan's bound type here, where the plan's strategies expect fixed widths.
+	Vector *input = &args.data[0];
+	Vector casted(bind_data.plan.bound_type, count);
+	if (args.data[0].GetType() != bind_data.plan.bound_type) {
+		VectorOperations::Cast(state.GetContext(), args.data[0], casted, count);
+		input = &casted;
+	}
+
 	if (bind_data.lanes.empty()) {
-		ExecuteStructConstructor(args.data[0], args.size(), result, bind_data.plan, lstate);
+		ExecuteStructConstructor(*input, count, result, bind_data.plan, lstate);
 		return;
 	}
-	auto count = args.size();
 	Vector plain(JsonoType(), count);
-	ExecuteStructConstructor(args.data[0], count, plain, bind_data.plan, lstate);
+	ExecuteStructConstructor(*input, count, plain, bind_data.plan, lstate);
 	JsonoShredFromSpec(plain, count, bind_data.lanes, result);
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);

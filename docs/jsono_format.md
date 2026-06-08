@@ -25,12 +25,12 @@ the four blobs followed by one typed *lane* column per chosen path (produced by
 
 ```
 STRUCT(
-  jsono_slots       BLOB,        -- the residual JSONO value (this spec, unchanged)
-  jsono_key_heap    BLOB,
-  jsono_string_heap BLOB,
-  jsono_skips       BLOB,
-  "<path1>"         <type1>,     -- lane: value at <path1>, typed, named by the path
-  "<path2>"         <type2>,
+  jsono_slots#<fp>       BLOB,    -- the residual JSONO value (this spec, unchanged)
+  jsono_key_heap#<fp>    BLOB,
+  jsono_string_heap#<fp> BLOB,
+  jsono_skips#<fp>       BLOB,
+  "<path1>#<fp>"         <type1>, -- lane: value at <path1>, typed, named by the path
+  "<path2>#<fp>"         <type2>,
   …
 )
 ```
@@ -40,9 +40,22 @@ ordinary JSONO value — the *residual* — so everything else in this spec appl
 to them unchanged, including `version`. Each appended column is a *lane*: the
 value at its canonical path (`$.kind`, `$.commit.operation`, …) materialized as a
 plain typed DuckDB column (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`),
-with the path as the field name. Nested lane paths are allowed. Because the lane
-is named by its path, the shredded shape survives a `read_parquet` round-trip
-(the alias is dropped, the field names are not).
+with the path as the field name. Nested lane paths are allowed.
+
+Every field name — the four blobs included — carries a common `#<fp>` suffix: a
+fingerprint of the whole lane set (each lane's path and type, order-independent).
+A plain (unshredded) value has no suffix. The suffix makes two shredded types
+with different lanes share **no** field name, so DuckDB's by-name struct cast
+rejects coercing one into the other (it requires at least one matching member)
+instead of silently dropping or `NULL`-filling lanes on an INSERT or CAST — the
+residual is stripped in lockstep, so a lane mismatch would otherwise lose data.
+The fingerprint lives in the field names, which survive a `read_parquet` round-trip
+(the alias is dropped, the field names are not), so the shape — and this
+protection — travel with the data. Lane fields are emitted in canonical order
+(sorted by name), so the type is a pure function of the lane *set*:
+`jsono_storage_type(<lane DDL>)` and the constructor produce the identical type for
+the same lanes regardless of the order they are listed in, so a column declared
+from one accepts a value built from the other.
 
 **Lossless invariant: the residual holds everything a lane cannot reproduce
 exactly.** A value is removed from the residual and kept only in its lane when it
@@ -68,12 +81,18 @@ Current `JSONO` files use `version = 2` (version 2 added the per-object
 This extension is still experimental, so compatibility is intentionally strict:
 an incompatible change to slot tags, payload semantics, heap layout, navigation
 metadata, or required header flags must bump `jsono::VERSION`. Readers accept
-only the current version and do not attempt a silent best-effort decode.
-Public helpers expose a version/header mismatch through their normal invalid
-blob behavior: `jsono_validate` returns `false`, while extraction/serialization
-helpers that treat malformed headers as absent values return SQL `NULL`.
-Backward readers or migration functions should be added explicitly when
-persisted old JSONO files become a supported contract.
+only the current version and do not attempt a silent best-effort decode; the
+current version is also exposed in SQL as `jsono_version()`.
+
+Public helpers distinguish an *absent* value from a *corrupt* one. A slots blob
+too short to hold a header is an absent value and reads as SQL `NULL`. A present
+blob whose header is unreadable — wrong `magic`, a different `version`, misaligned
+slots, or a metadata blob shorter than its declared spans — is corruption or
+non-JSONO bytes bound to a jsono op, so extraction/serialization helpers raise an
+error rather than silently reading as `NULL`. `jsono_validate` recovers a boolean
+from these errors and returns `false`. Backward readers or migration functions
+should be added explicitly when persisted old JSONO files become a supported
+contract.
 
 ## Data model
 
@@ -109,9 +128,11 @@ strings and keys. That is delegated to Parquet column-dictionary encoding — se
 | `flags` | u8 | bit0 = `SORTED_KEYS` |
 | `reserved` | u16 | `0` |
 
-Header parsing fails if `magic`/`version` do not match, or if the slot length
-minus the Header is not a multiple of 8. Public functions then follow the invalid
-blob behavior described in [Compatibility policy](#compatibility-policy).
+A slots blob too short to hold a header is an absent value (SQL `NULL`).
+Otherwise header parsing raises if `magic`/`version` do not match, if the slot
+length minus the Header is not a multiple of 8, or if the metadata blob is shorter
+than its declared spans — see the invalid blob behavior in
+[Compatibility policy](#compatibility-policy).
 
 ## Slot
 

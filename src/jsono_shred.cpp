@@ -19,6 +19,7 @@
 #include "string_view.hpp"
 #include "yyjson.hpp"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -180,11 +181,6 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec) {
 	auto &child_values = StructValue::GetChildren(spec);
 
 	auto bind_data = make_uniq<ShredBindData>();
-	child_list_t<LogicalType> children;
-	children.emplace_back("jsono_slots", LogicalType::BLOB);
-	children.emplace_back("jsono_key_heap", LogicalType::BLOB);
-	children.emplace_back("jsono_string_heap", LogicalType::BLOB);
-	children.emplace_back("jsono_skips", LogicalType::BLOB);
 
 	for (idx_t i = 0; i < child_types.size(); i++) {
 		auto &path = child_types[i].first;
@@ -203,13 +199,23 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec) {
 		}
 		field.primitive = ParseShredType(type_name);
 		field.logical_type = ShredLogicalType(field.primitive);
-		children.emplace_back(path, field.logical_type);
 		bind_data->fields.push_back(std::move(field));
 	}
 	if (bind_data->fields.empty()) {
 		throw BinderException("jsono shred: empty shredding spec");
 	}
-	bind_data->return_type = LogicalType::STRUCT(std::move(children));
+	// Canonical lane order (sorted by path) makes the shredded type a pure function of the lane set,
+	// not of spec order: the execution writes lanes by index, so the field write order and the type's
+	// lane order must agree — sort both here. The fingerprint suffix is already order-independent.
+	std::sort(bind_data->fields.begin(), bind_data->fields.end(),
+	          [](const ShredField &a, const ShredField &b) { return a.path_name < b.path_name; });
+	child_list_t<LogicalType> lanes;
+	for (auto &field : bind_data->fields) {
+		lanes.emplace_back(field.path_name, field.logical_type);
+	}
+	// JsonoShreddedStructType names every field (blobs included) with the lane-set fingerprint, so a
+	// column declared from the same lanes is byte-identical and a mismatched cast fails loud.
+	bind_data->return_type = JsonoShreddedStructType(lanes);
 	return bind_data;
 }
 

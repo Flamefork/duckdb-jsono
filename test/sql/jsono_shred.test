@@ -9,12 +9,14 @@ require json
 # Peek the raw residual tape: the four blobs read as a plain jsono with the lanes ignored.
 # This is the white-box view of what shredding stripped — distinct from casting a shredded
 # value to the plain jsono STRUCT, which losslessly reconstructs by overlaying the lanes.
+# Extract the four residual blobs by position (their field names carry the lane-set fingerprint
+# suffix) and repack them under the clean names so the result is a plain JSONO value.
 statement ok
 CREATE MACRO jsono_residual(j) AS struct_pack(
-    jsono_slots := struct_extract(j, 'jsono_slots'),
-    jsono_key_heap := struct_extract(j, 'jsono_key_heap'),
-    jsono_string_heap := struct_extract(j, 'jsono_string_heap'),
-    jsono_skips := struct_extract(j, 'jsono_skips'));
+    jsono_slots := struct_extract_at(j, 1),
+    jsono_key_heap := struct_extract_at(j, 2),
+    jsono_string_heap := struct_extract_at(j, 3),
+    jsono_skips := struct_extract_at(j, 4));
 
 # jsono(j, shredding := spec) returns the shredded STRUCT: four blob residual + one lane per
 # spec path (named by the path, typed by the spec). The read side reconstructs the
@@ -181,26 +183,46 @@ SELECT jsono('{"a":1}', {'$.a':'BIGINT'});
 unknown argument
 
 # jsono(struct) lifts top-level scalar fields of lane types into lanes directly (no spec):
-# scalars of lane types become columns, the rest stays in the residual tape.
+# scalars of lane types become columns, the rest stays in the residual tape. The type is the same
+# one jsono_storage_type builds from the same lanes (asserted by equality, fingerprint and all).
 query I
-SELECT typeof(jsono({'a': 1::BIGINT, 'name': 'x', 'nested': {'k': 2}}));
+SELECT typeof(jsono({'a': 1::BIGINT, 'name': 'x', 'nested': {'k': 2}}))
+     = jsono_storage_type('a BIGINT, "name" VARCHAR');
 ----
-STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, a BIGINT, "name" VARCHAR)
+true
 
 # the lanes carry the values and to_json round-trips the whole document (incl nested tape)
 query III
-SELECT (s).a, (s).name, to_json(s) FROM (
+SELECT s ->> 'a', s ->> 'name', to_json(s) FROM (
   SELECT jsono({'a': 1::BIGINT, 'name': 'x', 'nested': {'k': 2}}) AS s
 );
 ----
 1	x	{"a":1,"name":"x","nested":{"k":2}}
 
+# Same reconstruct path when the only residual key is a non-object container — a list, then a
+# JSON subtree. Lifting the lone top-level scalar leaves a single-key residual, which the
+# to_json overlay must round-trip whole rather than mis-walking the residual tape.
+query II
+SELECT s ->> 'k', to_json(s) FROM (
+  SELECT jsono({'k': 'c', 'tags': [1::BIGINT, 2::BIGINT]}) AS s
+);
+----
+c	{"k":"c","tags":[1,2]}
+
+query II
+SELECT s ->> 'k', to_json(s) FROM (
+  SELECT jsono({'k': 'c', 'raw': '{"z":1}'::JSON}) AS s
+);
+----
+c	{"k":"c","raw":{"z":1}}
+
 # the struct constructor lifts only top-level lane-typed scalars. (Here `a` is INTEGER, not a
 # lane type, so only the VARCHAR `name` lifts; the residual keeps `a`.)
 query I
-SELECT typeof(jsono({'a': 1, 'name': 'x'}));
+SELECT typeof(jsono({'a': 1, 'name': 'x'}))
+     = jsono_storage_type('"name" VARCHAR');
 ----
-STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, "name" VARCHAR)
+true
 
 # the shredded value still round-trips the whole document through to_json
 query I

@@ -6,6 +6,8 @@ require jsono
 
 require parquet
 
+require json
+
 # The DDL string is the physical STRUCT layout of a jsono value (no type alias exists).
 # Changing it is a deliberate format change — update this expectation on purpose.
 query I
@@ -59,22 +61,41 @@ SELECT jsono_extract_string({'jsono_slots': ''::BLOB, 'jsono_key_heap': ''::BLOB
 ----
 No function matches
 
-# jsono_storage_type(lanes) appends lane columns to the 4-blob prefix, so a shredded
-# storage column can be declared from a readable lane spec (the schema DSL).
+# jsono_storage_type(lanes) emits the shredded storage DDL: the 4-blob residual plus one lane
+# column per spec entry. Every field name carries the lane-set fingerprint suffix, so the DDL is
+# byte-identical to the type the constructor produces from the same lanes (asserted by equality
+# rather than a hardcoded fingerprint).
 query I
-SELECT jsono_storage_type('event_name VARCHAR, n BIGINT');
+SELECT jsono_storage_type('event_name VARCHAR, n BIGINT')
+     = typeof(jsono('{}', shredding := {'event_name':'VARCHAR','n':'BIGINT'}));
 ----
-STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, event_name VARCHAR, n BIGINT)
+true
 
-# The declared shredded type is a valid storage column: a shredded value writes into it.
-statement ok
-CREATE TABLE probe_shred (e STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, event_name VARCHAR));
-
-statement ok
-INSERT INTO probe_shred SELECT jsono('{"event_name":"page_view","a":1}', shredding := {'event_name':'VARCHAR'});
-
-# the lane column holds the extracted value
+# Lane order is canonicalized (sorted by name), so the shredded type is a pure function of the lane
+# set: a reversed lane order in the DDL or the spec yields the exact same type, not just a compatible
+# one. This keeps jsono_storage_type and CREATE TABLE AS SELECT in lockstep regardless of order.
 query I
-SELECT (e).event_name FROM probe_shred;
+SELECT jsono_storage_type('n BIGINT, event_name VARCHAR')
+     = jsono_storage_type('event_name VARCHAR, n BIGINT')
+   AND jsono_storage_type('n BIGINT, event_name VARCHAR')
+     = typeof(jsono('{}', shredding := {'event_name':'VARCHAR','n':'BIGINT'}));
+----
+true
+
+# A column declared from that DDL is a valid storage column for a value shredded on the same
+# lanes (CTAS infers the fingerprinted type); the lane reads back transparently through ->>.
+statement ok
+CREATE TABLE probe_shred AS
+SELECT jsono('{"event_name":"page_view","a":1}', shredding := {'event_name':'VARCHAR'}) AS e;
+
+query I
+SELECT e ->> 'event_name' FROM probe_shred;
 ----
 page_view
+
+# A value shredded on a different lane set is rejected rather than silently coerced into the
+# column: the fingerprint suffix makes every field name differ, so the struct cast finds no match.
+statement error
+INSERT INTO probe_shred SELECT jsono('{"x":"y"}', shredding := {'x':'VARCHAR'});
+----
+at least one matching member

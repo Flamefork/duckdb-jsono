@@ -718,17 +718,21 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 		}
 		if (IsShreddedJsonoType(type)) {
 			auto &children = StructType::GetChildTypes(type);
+			auto suffix = JsonoLaneSuffix(type);
 			for (idx_t i = prefix; i < children.size(); i++) {
+				// Union by the clean base path; JsonoShreddedStructType re-applies the merged
+				// fingerprint suffix to the result type (the inputs may carry different ones).
+				auto lane_name = JsonoStripLaneSuffix(children[i].first, suffix);
 				bool found = false;
 				for (auto &lane : lanes) {
-					if (lane.name == children[i].first) {
+					if (lane.name == lane_name) {
 						lane.type = children[i].second;
 						found = true;
 						break;
 					}
 				}
 				if (!found) {
-					lanes.push_back(MergeLane {children[i].first, 0, children[i].second});
+					lanes.push_back(MergeLane {lane_name, 0, children[i].second});
 				}
 			}
 			bound_function.arguments.push_back(type);
@@ -744,13 +748,17 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 		bound_function.return_type = JsonoType();
 		return std::move(bind_data);
 	}
-	child_list_t<LogicalType> children = StructType::GetChildTypes(JsonoRawStructType());
-	idx_t next = children.size();
+	// Canonical lane order (sorted by name) so the merged type is a pure function of the lane set,
+	// not of argument order: the executor writes lanes by result_child_index, so the index order and
+	// the type's lane order must agree. The fingerprint suffix is already order-independent.
+	std::sort(lanes.begin(), lanes.end(), [](const MergeLane &a, const MergeLane &b) { return a.name < b.name; });
+	child_list_t<LogicalType> lane_types;
+	idx_t next = StructType::GetChildTypes(JsonoRawStructType()).size();
 	for (auto &lane : lanes) {
 		lane.result_child_index = next++;
-		children.emplace_back(lane.name, lane.type);
+		lane_types.emplace_back(lane.name, lane.type);
 	}
-	bound_function.return_type = LogicalType::STRUCT(std::move(children));
+	bound_function.return_type = JsonoShreddedStructType(lane_types);
 	return std::move(bind_data);
 }
 
@@ -792,10 +800,12 @@ void EmitReconLaneScalar(JsonoBuilder &builder, const ReconLane &lane, const Uni
 void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result) {
 	auto &input_types = StructType::GetChildTypes(input.GetType());
 	auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
+	auto suffix = JsonoLaneSuffix(input.GetType());
 	vector<ReconLane> lanes;
 	bool all_top_level = true;
 	for (idx_t i = prefix; i < input_types.size(); i++) {
-		auto &name = input_types[i].first;
+		// Lane field names carry the shared "#<fp>" lane-set suffix; strip it to recover the path.
+		auto name = JsonoStripLaneSuffix(input_types[i].first, suffix);
 		vector<PathStep> steps;
 		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
 			steps = ParseJsonoPath(name, "jsono reconstruct");
@@ -1037,12 +1047,15 @@ void FastCopyLane(DataChunk &args, idx_t ncols, idx_t count, MergeMode mode, con
 	idx_t src_child = 0;
 	for (idx_t i = 0; i < ncols; i++) {
 		auto &t = args.data[i].GetType();
-		if (t.id() != LogicalTypeId::STRUCT) {
+		if (t.id() != LogicalTypeId::STRUCT || !HasJsonoBlobPrefix(t)) {
 			continue;
 		}
 		auto &ch = StructType::GetChildTypes(t);
+		auto suffix = JsonoLaneSuffix(t);
 		for (idx_t c = 0; c < ch.size(); c++) {
-			if (ch[c].first == lane.name && (mode != MergeMode::Overlay || src_arg == DConstants::INVALID_INDEX)) {
+			// Input lane fields carry their own "#<fp>" suffix; compare on the clean base path.
+			if (JsonoStripLaneSuffix(ch[c].first, suffix) == lane.name &&
+			    (mode != MergeMode::Overlay || src_arg == DConstants::INVALID_INDEX)) {
 				src_arg = i;
 				src_child = c;
 			}

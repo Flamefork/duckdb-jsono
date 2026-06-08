@@ -1,0 +1,65 @@
+# name: test/sql/jsono_shredded_verification.test
+# description: Auto-shred jsono({...}) survives plan serialization re-bind (debug plan verification)
+# group: [sql]
+
+require jsono
+
+require json
+
+# DEBUG builds verify the plan by serializing it and re-binding each expression from its serialized
+# argument type. The jsono(struct) constructor selects lanes from the raw field types, so its
+# argument type must stay raw: a promoted argument (INTEGER->BIGINT, SMALLINT->BIGINT,
+# UBIGINT->VARCHAR, HUGEINT->VARCHAR, FLOAT->DOUBLE) would flip which fields qualify as lanes on
+# re-bind, yielding a different lane manifest than the serialized return type and a fatal
+# "STRUCT to STRUCT cast must have at least one matching member". These round-trips assert the
+# value is correct in release and exercise the re-bind under `make test_debug`. The promotion-
+# flipping types are the regression surface; an already-canonical lane type (VARCHAR, BIGINT) is
+# stable and not retested here.
+
+# INTEGER / SMALLINT promote to BIGINT (a lane type). Only the VARCHAR `name` lifts; the integer
+# stays a residual scalar and the lane set must not change on re-bind.
+query I
+SELECT to_json(jsono({'a': 1, 'name': 'x'}));
+----
+{"a":1,"name":"x"}
+
+query I
+SELECT to_json(jsono({'s': 1::SMALLINT, 'name': 'x'}));
+----
+{"name":"x","s":1}
+
+# UBIGINT is a lane type but its constructor bound type is VARCHAR; the UBIGINT lane manifest must
+# survive re-bind even with no residual key at all.
+query I
+SELECT to_json(jsono({'u': 7::UBIGINT}));
+----
+{"u":7}
+
+query I
+SELECT to_json(jsono({'u': 7::UBIGINT, 'name': 'x'}));
+----
+{"name":"x","u":7}
+
+# HUGEINT and FLOAT are not lane types raw but promote to VARCHAR / DOUBLE (lane types); the
+# re-bind must not lift them into lanes.
+query I
+SELECT to_json(jsono({'h': 123::HUGEINT, 'name': 'x'}));
+----
+{"h":123,"name":"x"}
+
+query I
+SELECT to_json(jsono({'f': 1.5::FLOAT, 'name': 'x'}));
+----
+{"f":1.5,"name":"x"}
+
+# Transparent extraction over the same shredded value (lane read and native residual read).
+query II
+SELECT j ->> 'name', j ->> 'a' FROM (SELECT jsono({'a': 1, 'name': 'x'}) AS j);
+----
+x	1
+
+# Lossless round-trip through the shredded->plain reconstruct cast (optimizer-independent path).
+query I
+SELECT to_json(jsono({'a': 1, 'name': 'x'})::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB));
+----
+{"a":1,"name":"x"}

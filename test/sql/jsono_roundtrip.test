@@ -175,11 +175,13 @@ SELECT
 ----
 {"a":1}	{"a":1}
 
-# to_json on a STRUCT with wrong magic bytes - NULL
-query I
+# to_json on a STRUCT with wrong magic bytes is non-JSONO data bound to a jsono op, not an
+# absent value: it must fail loud, not silently read as NULL (same class as the bad metadata
+# case below). Only a slots blob too short to hold a header reads as NULL.
+statement error
 SELECT to_json({'jsono_slots': 'not jsono'::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB});
 ----
-NULL
+not a JSONO value
 
 # to_json on a structurally valid header with missing container span should fail, not crash.
 statement error
