@@ -12,24 +12,22 @@ CREATE TABLE events AS
          jsono('{"id":' || i || ',"name":"row_' || i || '","score":' || (i * 0.5) || '}') AS j
   FROM range(100) t(i);
 
-# Native column carries the JSONO alias
+# The native column is the bare jsono STRUCT — there is no type alias to carry.
 query I
 SELECT typeof(j) FROM events LIMIT 1;
 ----
-JSONO
+STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
 
 statement ok
 COPY events TO '__TEST_DIR__/events_jsono.parquet';
 
-# After Parquet round-trip the alias is dropped — the column comes back as the
-# structural shape STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB).
+# Parquet stores the STRUCT natively, so it reads back as exactly the same shape.
 query I
 SELECT typeof(j) FROM '__TEST_DIR__/events_jsono.parquet' LIMIT 1;
 ----
 STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
 
-# Implicit cast lets to_json work on the bare-STRUCT shape directly,
-# so the user doesn't have to remember to ::JSONO-cast after read.
+# jsono ops bind to the STRUCT structurally, so to_json works on the read-back value directly.
 query II
 SELECT rid, to_json(j)
 FROM '__TEST_DIR__/events_jsono.parquet'
@@ -45,9 +43,9 @@ SELECT count(*) FROM '__TEST_DIR__/events_jsono.parquet';
 ----
 100
 
-# Native table value byte-identical to the value read back from Parquet. Both
-# sides cast through the bare STRUCT to make field access dispatch cleanly
-# (struct_extract doesn't follow extension-type aliases yet).
+# Native table value byte-identical to the value read back from Parquet. Both are the same
+# bare STRUCT, so the BLOB children are read directly (the native-side cast is a no-op kept
+# for symmetry with the read side).
 query I
 WITH src AS (SELECT j::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS native
              FROM events WHERE rid = 42),

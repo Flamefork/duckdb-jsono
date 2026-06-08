@@ -23,7 +23,7 @@ $.d	true
 # Same document, dotted keys.
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"},"d":true}'), 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"},"d":true}'), key_style := 'dotted')) u)
 ORDER BY u.key;
 ----
 a	1
@@ -41,7 +41,7 @@ $.arr[1]	20
 
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"arr":[10,20]}'), 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"arr":[10,20]}'), key_style := 'dotted')) u)
 ORDER BY u.key;
 ----
 arr.0	10
@@ -58,7 +58,7 @@ $[1]	2
 
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('[1,2]'), 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('[1,2]'), key_style := 'dotted')) u)
 ORDER BY u.key;
 ----
 0	1
@@ -67,7 +67,7 @@ ORDER BY u.key;
 # --- nested arrays of objects ---
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"a":[1,{"b":2},[3,4]]}'), 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"a":[1,{"b":2},[3,4]]}'), key_style := 'dotted')) u)
 ORDER BY u.key;
 ----
 a.0	1
@@ -82,14 +82,14 @@ SELECT u.key FROM (SELECT unnest(jsono_entries(jsono('{"a.b":1}'))) u);
 $."a.b"
 
 query I
-SELECT u.key FROM (SELECT unnest(jsono_entries(jsono('{"a.b":1}'), 'dotted')) u);
+SELECT u.key FROM (SELECT unnest(jsono_entries(jsono('{"a.b":1}'), key_style := 'dotted')) u);
 ----
 a.b
 
 # A literal dotted key and a nested path collapse to the same dotted key (duplicate preserved).
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":1},"a.b":2}'), 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":1},"a.b":2}'), key_style := 'dotted')) u)
 ORDER BY u.value;
 ----
 a.b	1
@@ -104,7 +104,7 @@ SELECT count(*) FROM (SELECT unnest(jsono_entries(jsono('{"a":{},"b":[],"c":1}')
 # --- null leaf: key is kept, value is SQL NULL ---
 query IT
 SELECT u.key, coalesce(u.value, '<NULL>')
-FROM (SELECT unnest(jsono_entries(jsono('{"keep":1,"n":null}'), 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"keep":1,"n":null}'), key_style := 'dotted')) u)
 ORDER BY u.key;
 ----
 keep	1
@@ -113,7 +113,7 @@ n	<NULL>
 # --- value stringification: ints, big ints, decimals, bool, string ---
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"i":42,"big":9223372036854775807,"f":3.14,"b":false,"s":"hi"}'), 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"i":42,"big":9223372036854775807,"f":3.14,"b":false,"s":"hi"}'), key_style := 'dotted')) u)
 ORDER BY u.key;
 ----
 b	false
@@ -124,7 +124,7 @@ s	hi
 
 # --- NULL input yields NULL ---
 query I
-SELECT jsono_entries(NULL::jsono) IS NULL;
+SELECT jsono_entries(jsono(NULL)) IS NULL;
 ----
 true
 
@@ -136,18 +136,26 @@ SELECT len(jsono_entries(jsono('{}')));
 
 # --- bind errors ---
 statement error
-SELECT jsono_entries(jsono('{}'), 'invalid');
+SELECT jsono_entries(jsono('{}'), key_style := 'invalid');
 ----
+key_style must be 'jsonpath' or 'dotted'
 
 statement error
-SELECT jsono_entries(jsono('{"a":1}'), key_style) FROM (VALUES ('dotted')) t(key_style);
+SELECT jsono_entries(jsono('{"a":1}'), key_style := key_style) FROM (VALUES ('dotted')) t(key_style);
 ----
+key_style must be constant
+
+# key_style is a named argument: a bare positional value is rejected.
+statement error
+SELECT jsono_entries(jsono('{}'), 'dotted');
+----
+unknown argument
 
 # --- lane-aware: a shredded value flattens its residual tape AND its lane columns ---
 query I
 SELECT jsono_entries(
-  jsono_shred(jsono('{"a":1,"event_name":"page_view"}'), '{"event_name":"VARCHAR"}'),
-  'dotted'
+  jsono('{"a":1,"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}),
+  key_style := 'dotted'
 );
 ----
 [{'key': a, 'value': 1}, {'key': event_name, 'value': page_view}]
@@ -155,8 +163,8 @@ SELECT jsono_entries(
 # absent lane (NULL) contributes no entry
 query I
 SELECT jsono_entries(
-  jsono_shred(jsono('{"a":1}'), '{"event_name":"VARCHAR"}'),
-  'dotted'
+  jsono('{"a":1}', shredding := {'event_name':'VARCHAR'}),
+  key_style := 'dotted'
 );
 ----
 [{'key': a, 'value': 1}]

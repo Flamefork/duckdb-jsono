@@ -30,23 +30,17 @@ SELECT to_json(jsono({'outer': {'b': 2, 'a': [1, NULL, 3]}, 'z': true}));
 ----
 {"outer":{"a":[1,null,3],"b":2},"z":true}
 
-# Options are available through the second argument. nulls=omit removes SQL NULL object fields.
+# SQL NULL object fields always serialize as JSON null (lossless; matches core to_json).
 query I
-SELECT to_json(jsono({'b': NULL, 'a': 1, 'nested': {'x': NULL, 'y': 2}}, {'nulls': 'omit'}));
+SELECT to_json(jsono({'b': NULL, 'a': 1, 'nested': {'x': NULL, 'y': 2}}));
 ----
-{"a":1,"nested":{"y":2}}
+{"a":1,"b":null,"nested":{"x":null,"y":2}}
 
-# The same internal option is exposed as omit_nulls for future named-argument parity.
-query I
-SELECT to_json(jsono({'b': NULL, 'a': 1}, {'omit_nulls': true}));
-----
-{"a":1}
-
-# STRUCT -> JSONO cast uses the same default constructor semantics.
+# jsono(STRUCT) uses the same default constructor semantics as the bare STRUCT cast did.
 query II
-SELECT typeof({'a': 1}::JSONO), to_json({'b': 2, 'a': 'x'}::JSONO);
+SELECT typeof(jsono({'a': 1})), to_json(jsono({'b': 2, 'a': 'x'}));
 ----
-JSONO	{"a":"x","b":2}
+STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)	{"a":"x","b":2}
 
 # Top-level NULL STRUCT becomes SQL NULL, matching jsono(NULL).
 query I
@@ -72,15 +66,11 @@ SELECT to_json(jsono('{"b":2,"a":1}'::JSON));
 ----
 {"a":1,"b":2}
 
+# The constructor takes a single STRUCT argument; the former options struct is gone.
 statement error
-SELECT jsono({'a': 1}, {'nulls': 'bad'});
+SELECT jsono({'a': 1}, {'nulls': 'omit'});
 ----
-jsono() option 'nulls' must be 'include' or 'omit'
-
-statement error
-SELECT jsono({'a': 1}, {'unknown': 'x'});
-----
-jsono() unknown option 'unknown'
+No function matches
 
 # Non-finite doubles have no JSON representation and are rejected at construction.
 statement error

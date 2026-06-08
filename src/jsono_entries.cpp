@@ -86,6 +86,10 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 	auto style = JsonoEntriesKeyStyle::JsonPath;
 	if (arguments.size() >= 2) {
 		auto &style_arg = arguments[1];
+		if (style_arg->GetAlias() != "key_style") {
+			throw BinderException("jsono_entries: unknown argument '%s' (pass key_style := 'jsonpath' | 'dotted')",
+			                      style_arg->GetAlias());
+		}
 		if (style_arg->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}

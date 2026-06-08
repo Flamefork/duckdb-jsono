@@ -33,10 +33,14 @@ SELECT struct_pack(
 ) AS j
 FROM res;
 
-# Control: reinterpreting the residual alone (the raw four blobs, bypassing the lossless
-# JSONO reconstruct) shows the top-level hot paths really are gone from the four blobs.
+# Control: reading the residual alone (the raw four blobs repacked, bypassing the lossless
+# reconstruct) shows the top-level hot paths really are gone from the four blobs.
 query I
-SELECT to_json(j::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)::JSONO) FROM stripped;
+SELECT to_json(struct_pack(
+    jsono_slots := struct_extract(j, 'jsono_slots'),
+    jsono_key_heap := struct_extract(j, 'jsono_key_heap'),
+    jsono_string_heap := struct_extract(j, 'jsono_string_heap'),
+    jsono_skips := struct_extract(j, 'jsono_skips'))) FROM stripped;
 ----
 {"commit":{"collection":"c1","operation":"create"},"extra":"e1"}
 

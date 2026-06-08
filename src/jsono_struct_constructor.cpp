@@ -5,13 +5,11 @@
 #include "jsono_shred.hpp"
 #include "jsono_writer.hpp"
 
-#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -32,16 +30,6 @@ namespace {
 
 using namespace jsono;
 using namespace jsono_dom;
-
-struct JsonoConstructorOptions {
-	bool omit_nulls = false;
-	// When set, top-level scalar fields of lane types are lifted into lane columns and the
-	// result is a shredded JSONO struct. On by default: `jsono({...})` over a struct with
-	// scalar fields transparently shreds them; opt out with {shred: false}. The optimizer's
-	// reconstruction patch constructor (JsonoStructConstructorFunction) binds with shred
-	// forced off so its plain JSONO patch is unaffected by this default.
-	bool shred = true;
-};
 
 enum class StructValueStrategy : uint8_t {
 	Null,
@@ -106,7 +94,6 @@ struct JsonoStructPlan {
 	vector<uint64_t> string_object_slot_template;
 	vector<JsonoStructPlan> children;
 	idx_t key_cache_index = DConstants::INVALID_INDEX;
-	bool omit_nulls = false;
 	bool flat_scalar_object = false;
 	bool string_object = false;
 	bool primitive_list = false;
@@ -133,8 +120,7 @@ struct JsonoStructBindData : public FunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<JsonoStructBindData>();
-		return plan.bound_type == other.plan.bound_type && plan.omit_nulls == other.plan.omit_nulls &&
-		       lanes == other.lanes;
+		return plan.bound_type == other.plan.bound_type && lanes == other.lanes;
 	}
 };
 
@@ -203,10 +189,8 @@ bool IsJsonType(const LogicalType &type) {
 	return type.id() == LogicalTypeId::VARCHAR && type.HasAlias() && type.GetAlias() == LogicalType::JSON_TYPE_NAME;
 }
 
-JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const JsonoConstructorOptions &options,
-                                           const char *function_name) {
+JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const char *function_name) {
 	JsonoStructPlan plan;
-	plan.omit_nulls = options.omit_nulls;
 
 	switch (source_type.id()) {
 	case LogicalTypeId::UNKNOWN:
@@ -265,12 +249,12 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 		plan.children.reserve(children.size());
 		plan.field_names.reserve(children.size());
 		plan.field_perm.reserve(children.size());
-		plan.flat_scalar_object = !plan.omit_nulls;
-		plan.string_object = !plan.omit_nulls;
-		plan.one_list_flat_scalar_object = !plan.omit_nulls && children.size() <= OBJECT_CHECKPOINT_STRIDE;
+		plan.flat_scalar_object = true;
+		plan.string_object = true;
+		plan.one_list_flat_scalar_object = children.size() <= OBJECT_CHECKPOINT_STRIDE;
 		idx_t list_flat_scalar_object_count = 0;
 		for (idx_t i = 0; i < children.size(); i++) {
-			auto child_plan = BuildStructConstructorPlan(children[i].second, options, function_name);
+			auto child_plan = BuildStructConstructorPlan(children[i].second, function_name);
 			switch (child_plan.strategy) {
 			case StructValueStrategy::Null:
 			case StructValueStrategy::Int:
@@ -303,14 +287,11 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 		}
 		std::sort(plan.field_perm.begin(), plan.field_perm.end(),
 		          [&](uint32_t left, uint32_t right) { return plan.field_names[left] < plan.field_names[right]; });
-		if (!plan.omit_nulls) {
-			for (auto field_idx : plan.field_perm) {
-				auto &field_name = plan.field_names[field_idx];
-				auto offset = plan.key_heap.size();
-				plan.key_heap.insert(plan.key_heap.end(), field_name.begin(), field_name.end());
-				plan.key_slots.push_back(
-				    MakeSlot(tag::KEY, MakeKeyPayload(uint64_t(offset), uint64_t(field_name.size()))));
-			}
+		for (auto field_idx : plan.field_perm) {
+			auto &field_name = plan.field_names[field_idx];
+			auto offset = plan.key_heap.size();
+			plan.key_heap.insert(plan.key_heap.end(), field_name.begin(), field_name.end());
+			plan.key_slots.push_back(MakeSlot(tag::KEY, MakeKeyPayload(uint64_t(offset), uint64_t(field_name.size()))));
 		}
 		plan.shape_hash = HashObjectKeySlots(plan.key_slots.data(), 0, plan.key_slots.size(), plan.key_heap.data());
 		if (plan.string_object) {
@@ -330,16 +311,14 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 	}
 	case LogicalTypeId::LIST: {
 		plan.strategy = StructValueStrategy::List;
-		plan.children.push_back(
-		    BuildStructConstructorPlan(ListType::GetChildType(source_type), options, function_name));
+		plan.children.push_back(BuildStructConstructorPlan(ListType::GetChildType(source_type), function_name));
 		plan.primitive_list = IsPrimitiveConstructorListChild(plan.children[0].strategy);
 		plan.bound_type = LogicalType::LIST(plan.children[0].bound_type);
 		return plan;
 	}
 	case LogicalTypeId::ARRAY: {
 		plan.strategy = StructValueStrategy::List;
-		plan.children.push_back(
-		    BuildStructConstructorPlan(ArrayType::GetChildType(source_type), options, function_name));
+		plan.children.push_back(BuildStructConstructorPlan(ArrayType::GetChildType(source_type), function_name));
 		plan.primitive_list = IsPrimitiveConstructorListChild(plan.children[0].strategy);
 		plan.bound_type = LogicalType::LIST(plan.children[0].bound_type);
 		return plan;
@@ -350,78 +329,12 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 }
 
 void AssignStructConstructorKeyCacheIndexes(JsonoStructPlan &plan, idx_t &next_key_cache_index) {
-	if (plan.strategy == StructValueStrategy::Struct && !plan.omit_nulls) {
+	if (plan.strategy == StructValueStrategy::Struct) {
 		plan.key_cache_index = next_key_cache_index++;
 	}
 	for (auto &child : plan.children) {
 		AssignStructConstructorKeyCacheIndexes(child, next_key_cache_index);
 	}
-}
-
-void ApplyConstructorOption(const string &name, Value value, JsonoConstructorOptions &options) {
-	auto lower_name = StringUtil::Lower(name);
-	if (value.IsNull()) {
-		throw BinderException("jsono() option '%s' cannot be NULL", name);
-	}
-	if (lower_name == "nulls") {
-		if (!value.DefaultTryCastAs(LogicalType::VARCHAR)) {
-			throw BinderException("jsono() option 'nulls' must be VARCHAR");
-		}
-		auto nulls = StringUtil::Lower(StringValue::Get(value));
-		if (nulls == "include") {
-			options.omit_nulls = false;
-			return;
-		}
-		if (nulls == "omit") {
-			options.omit_nulls = true;
-			return;
-		}
-		throw BinderException("jsono() option 'nulls' must be 'include' or 'omit'");
-	}
-	if (lower_name == "omit_nulls") {
-		if (!value.DefaultTryCastAs(LogicalType::BOOLEAN)) {
-			throw BinderException("jsono() option 'omit_nulls' must be BOOLEAN");
-		}
-		options.omit_nulls = BooleanValue::Get(value);
-		return;
-	}
-	if (lower_name == "shred") {
-		if (!value.DefaultTryCastAs(LogicalType::BOOLEAN)) {
-			throw BinderException("jsono() option 'shred' must be BOOLEAN");
-		}
-		options.shred = BooleanValue::Get(value);
-		return;
-	}
-	throw BinderException("jsono() unknown option '%s'", name);
-}
-
-JsonoConstructorOptions ParseConstructorOptions(ClientContext &context, vector<unique_ptr<Expression>> &arguments) {
-	JsonoConstructorOptions options;
-	if (arguments.size() == 1) {
-		return options;
-	}
-	if (arguments.size() != 2) {
-		throw BinderException("jsono() STRUCT constructor requires one STRUCT argument and optional STRUCT options");
-	}
-	if (arguments[1]->HasParameter()) {
-		throw ParameterNotResolvedException();
-	}
-	if (arguments[1]->return_type.id() != LogicalTypeId::STRUCT) {
-		throw BinderException("jsono() options must be a STRUCT");
-	}
-	if (!arguments[1]->IsFoldable()) {
-		throw BinderException("jsono() options must be constant");
-	}
-	auto options_value = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
-	if (options_value.IsNull()) {
-		return options;
-	}
-	auto &option_types = StructType::GetChildTypes(options_value.type());
-	auto &option_values = StructValue::GetChildren(options_value);
-	for (idx_t i = 0; i < option_types.size(); i++) {
-		ApplyConstructorOption(option_types[i].first, option_values[i], options);
-	}
-	return options;
 }
 
 void InitStructConstructorVectorData(Vector &input, idx_t count, const JsonoStructPlan &plan,
@@ -723,45 +636,38 @@ void FinishConstructorDirectContainer(DomJsonoBuilder &builder, uint64_t contain
 }
 
 void EmitConstructorObjectKeys(const JsonoStructPlan &plan, DomJsonoBuilder &builder) {
-	if (!plan.omit_nulls) {
-		if (builder.external_root_keys) {
-			builder.external_root_keys = false;
-			builder.slots.insert(builder.slots.end(), plan.key_slots.begin(), plan.key_slots.end());
-			return;
+	if (builder.external_root_keys) {
+		builder.external_root_keys = false;
+		builder.slots.insert(builder.slots.end(), plan.key_slots.begin(), plan.key_slots.end());
+		return;
+	}
+	size_t key_offset;
+	if (plan.key_cache_index != DConstants::INVALID_INDEX) {
+		auto cache_index = plan.key_cache_index;
+		if (builder.static_key_offsets.size() <= cache_index) {
+			builder.static_key_offsets.resize(cache_index + 1);
+			builder.static_key_offset_valid.resize(cache_index + 1, 0);
 		}
-		size_t key_offset;
-		if (plan.key_cache_index != DConstants::INVALID_INDEX) {
-			auto cache_index = plan.key_cache_index;
-			if (builder.static_key_offsets.size() <= cache_index) {
-				builder.static_key_offsets.resize(cache_index + 1);
-				builder.static_key_offset_valid.resize(cache_index + 1, 0);
-			}
-			if (builder.static_key_offset_valid[cache_index]) {
-				key_offset = builder.static_key_offsets[cache_index];
-			} else {
-				key_offset = builder.key_heap.size();
-				builder.key_heap.insert(builder.key_heap.end(), plan.key_heap.begin(), plan.key_heap.end());
-				builder.static_key_offsets[cache_index] = key_offset;
-				builder.static_key_offset_valid[cache_index] = 1;
-			}
+		if (builder.static_key_offset_valid[cache_index]) {
+			key_offset = builder.static_key_offsets[cache_index];
 		} else {
 			key_offset = builder.key_heap.size();
 			builder.key_heap.insert(builder.key_heap.end(), plan.key_heap.begin(), plan.key_heap.end());
+			builder.static_key_offsets[cache_index] = key_offset;
+			builder.static_key_offset_valid[cache_index] = 1;
 		}
-		if (key_offset == 0) {
-			builder.slots.insert(builder.slots.end(), plan.key_slots.begin(), plan.key_slots.end());
-		} else {
-			for (auto slot : plan.key_slots) {
-				auto payload = SlotPayload(slot);
-				auto rebased_slot =
-				    MakeSlot(tag::KEY, MakeKeyPayload(KeyOffset(payload) + key_offset, KeyLen(payload)));
-				builder.slots.push_back(rebased_slot);
-			}
-		}
-		return;
+	} else {
+		key_offset = builder.key_heap.size();
+		builder.key_heap.insert(builder.key_heap.end(), plan.key_heap.begin(), plan.key_heap.end());
 	}
-	for (auto field_idx : plan.field_perm) {
-		builder.EmitKeySlot(plan.field_names[field_idx]);
+	if (key_offset == 0) {
+		builder.slots.insert(builder.slots.end(), plan.key_slots.begin(), plan.key_slots.end());
+	} else {
+		for (auto slot : plan.key_slots) {
+			auto payload = SlotPayload(slot);
+			auto rebased_slot = MakeSlot(tag::KEY, MakeKeyPayload(KeyOffset(payload) + key_offset, KeyLen(payload)));
+			builder.slots.push_back(rebased_slot);
+		}
 	}
 }
 
@@ -900,32 +806,9 @@ void EmitConstructorObject(const JsonoStructVectorData &data, idx_t row, JsonoSt
 		return;
 	}
 
-	idx_t field_count = 0;
-	if (plan.omit_nulls) {
-		for (auto field_idx : plan.field_perm) {
-			if (!ConstructorValueRowIsNull(data.children[field_idx], row)) {
-				field_count++;
-			}
-		}
-	} else {
-		field_count = plan.field_perm.size();
-	}
-
-	builder.EmitObjectStart(field_count);
-	if (plan.omit_nulls) {
-		for (auto field_idx : plan.field_perm) {
-			if (ConstructorValueRowIsNull(data.children[field_idx], row)) {
-				continue;
-			}
-			builder.EmitKeySlot(plan.field_names[field_idx]);
-		}
-	} else {
-		EmitConstructorObjectKeys(plan, builder);
-	}
+	builder.EmitObjectStart(plan.field_perm.size());
+	EmitConstructorObjectKeys(plan, builder);
 	for (auto field_idx : plan.field_perm) {
-		if (plan.omit_nulls && ConstructorValueRowIsNull(data.children[field_idx], row)) {
-			continue;
-		}
 		builder.EmitObjectChildStart();
 		EmitConstructorValue(data.children[field_idx], row, lstate, builder);
 	}
@@ -1163,7 +1046,7 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 	}
 
 	string_t static_keys;
-	auto use_static_keys = plan.strategy == StructValueStrategy::Struct && plan.flat_scalar_object && !plan.omit_nulls;
+	auto use_static_keys = plan.strategy == StructValueStrategy::Struct && plan.flat_scalar_object;
 	auto use_direct_string_object = use_static_keys && plan.string_object;
 	if (use_static_keys) {
 		static_keys = WriteBlobInto(key_heap_vec, plan.key_heap.data(), plan.key_heap.size());
@@ -1212,22 +1095,18 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 	}
 }
 
-unique_ptr<FunctionData> JsonoStructBindShared(ClientContext &context, ScalarFunction &bound_function,
+unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
                                                vector<unique_ptr<Expression>> &arguments, bool allow_shred) {
 	if (arguments.empty() || arguments[0]->return_type.id() != LogicalTypeId::STRUCT) {
 		throw BinderException("jsono() STRUCT constructor requires a STRUCT argument");
 	}
-	auto options = ParseConstructorOptions(context, arguments);
 	auto &input_type = arguments[0]->return_type;
-	auto plan = BuildStructConstructorPlan(input_type, options, "jsono()");
+	auto plan = BuildStructConstructorPlan(input_type, "jsono()");
 	idx_t next_key_cache_index = 0;
 	AssignStructConstructorKeyCacheIndexes(plan, next_key_cache_index);
 	bound_function.arguments[0] = plan.bound_type;
-	if (arguments.size() == 2) {
-		Function::EraseArgument(bound_function, arguments, 1);
-	}
 	auto bind_data = make_uniq<JsonoStructBindData>(std::move(plan));
-	if (allow_shred && options.shred) {
+	if (allow_shred) {
 		for (auto &child : StructType::GetChildTypes(input_type)) {
 			if (IsShredLaneType(child.second)) {
 				bind_data->lanes.emplace_back(child.first, child.second);
@@ -1246,16 +1125,16 @@ unique_ptr<FunctionData> JsonoStructBindShared(ClientContext &context, ScalarFun
 
 unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction &bound_function,
                                          vector<unique_ptr<Expression>> &arguments) {
-	return JsonoStructBindShared(context, bound_function, arguments, true);
+	return JsonoStructBindShared(bound_function, arguments, true);
 }
 
 // The optimizer's shredded reconstruction builds a JSONO patch via JsonoStructConstructorFunction;
 // that patch must stay plain JSONO so the overlay merges plain residual + plain patch. This bind
-// forces shred off regardless of the global default (the patch's top-level fields are lane-typed
-// scalars, which a shredding bind would otherwise lift back into lanes and break the overlay).
+// forces shred off (the patch's top-level fields are lane-typed scalars, which the always-on
+// auto-shred would otherwise lift back into lanes and break the overlay).
 unique_ptr<FunctionData> JsonoStructBindPlain(ClientContext &context, ScalarFunction &bound_function,
                                               vector<unique_ptr<Expression>> &arguments) {
-	return JsonoStructBindShared(context, bound_function, arguments, false);
+	return JsonoStructBindShared(bound_function, arguments, false);
 }
 
 void JsonoStructExecute(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1294,9 +1173,12 @@ bool JsonoStructCastToJsono(Vector &source, Vector &result, idx_t count, CastPar
 	return true;
 }
 
-// Reinterpret a jsono-prefixed struct to JSONO by aliasing the leading four BLOB
-// children and dropping any trailing lane columns. Per-child Reinterpret, not a
-// nested Vector::Reinterpret, for the reason documented on JsonoStructRetypeCast.
+// Reinterpret a jsono-prefixed struct to the plain jsono STRUCT by carrying over the
+// leading four BLOB children and dropping any trailing lane columns. Per-child
+// Reinterpret, not a nested Vector::Reinterpret: the latter is defined only for
+// non-nested types (it shares the child buffer by pointer without retyping it) and a
+// debug build asserts on a nested reinterpret; reinterpreting the scalar BLOB children
+// individually is allowed, and the parent vector type/validity carry across unchanged.
 bool JsonoPrefixReinterpretCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	(void)parameters;
 	if (source.GetVectorType() == VectorType::CONSTANT_VECTOR) {
@@ -1341,8 +1223,7 @@ BoundCastInfo JsonoStructCastBind(BindCastInput &input, const LogicalType &sourc
 		// without reconstructing from struct data.
 		return BoundCastInfo(JsonoPrefixReinterpretCast);
 	}
-	JsonoConstructorOptions options;
-	auto plan = BuildStructConstructorPlan(source, options, "JSONO cast");
+	auto plan = BuildStructConstructorPlan(source, "JSONO cast");
 	idx_t next_key_cache_index = 0;
 	AssignStructConstructorKeyCacheIndexes(plan, next_key_cache_index);
 	unique_ptr<BoundCastInfo> source_cast;
@@ -1376,13 +1257,6 @@ void RegisterJsonoStructConstructor(ExtensionLoader &loader) {
 		struct_ctor.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		struct_ctor.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 		set.AddFunction(struct_ctor);
-
-		ScalarFunction struct_ctor_with_options({LogicalTypeId::STRUCT, LogicalTypeId::STRUCT}, jsono_type,
-		                                        JsonoStructExecute, JsonoStructBind, nullptr, nullptr,
-		                                        JsonoStructLocalState::Init);
-		struct_ctor_with_options.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-		struct_ctor_with_options.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-		set.AddFunction(struct_ctor_with_options);
 
 		loader.RegisterFunction(set);
 	}

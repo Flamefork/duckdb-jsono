@@ -21,7 +21,7 @@ compatible STRUCT with the same four `jsono_*` BLOB fields.
 
 For fast columnar reads of hot paths, a `JSONO` value can be stored *shredded*:
 the four blobs followed by one typed *lane* column per chosen path (produced by
-`jsono_shred`).
+`jsono(value, shredding := spec)`).
 
 ```
 STRUCT(

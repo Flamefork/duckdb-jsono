@@ -22,11 +22,11 @@ namespace duckdb {
 
 class ExtensionLoader;
 
-// Logical type name registered with DuckDB. The physical layout is a STRUCT of
-// four BLOB children (exact shape: see JsonoType()); the alias survives
-// round-trips through DuckDB-native storage (catalog metadata) but is lost
-// through plain read_parquet, which delivers the structurally-compatible
-// STRUCT.
+// A jsono value is physically a STRUCT of four BLOB children (exact shape: see
+// JsonoRawStructType). There is no user-defined logical-type alias: such an alias
+// cannot survive Parquet (stripped) or DuckLake (rejected), so every stored value —
+// DuckDB-native, Parquet or DuckLake — is just this STRUCT, recognised structurally
+// (see IsJsonoType). Dispatch is structural rather than name-based.
 //
 // Split heap design: keys (which are byte-identical across rows that share
 // a schema) live in key_heap; per-row string values live in string_heap.
@@ -34,16 +34,16 @@ class ExtensionLoader;
 // entry per column chunk for shape-stable data, and KEY slot byte patterns
 // become identical across rows (the offset into key_heap for "browser" is
 // always the same byte position when the keys section is the same).
-constexpr const char *JSONO_TYPE_NAME = "JSONO";
 
-// Materialise the JSONO logical type. Helper so writers/readers and
-// pluck-on-JSONO can agree on the exact STRUCT shape.
+// Materialise the jsono STRUCT type. Helper so writers/readers and
+// pluck-on-jsono can agree on the exact STRUCT shape; identical to
+// JsonoRawStructType (kept as the name the function registrations read against).
 LogicalType JsonoType();
 
-// The physical STRUCT(4 BLOB) backing JSONO, without the JSONO alias — the form
-// DuckLake/Parquet actually store, since they reject user-defined type aliases.
-// Single source of truth for the layout; `jsono_storage_type()` exposes its DDL
-// string so writers can declare storage columns without hardcoding the fields.
+// The physical STRUCT(4 BLOB) that a jsono value is. There is no logical-type alias on top
+// (DuckLake/Parquet reject user-defined aliases, so jsono carries none); this is the single
+// source of truth for the layout. `jsono_storage_type()` exposes its DDL string so writers
+// can declare storage columns without hardcoding the fields.
 LogicalType JsonoRawStructType();
 
 // True when `type` is the JSONO STRUCT — by alias, or structurally (the four
@@ -71,6 +71,11 @@ class Vector;
 // cast, an INSERT into a plain JSONO column) without dropping the lane data. Top-level
 // lanes only; a nested-path lane throws.
 void JsonoReconstructToPlain(Vector &input, idx_t count, Vector &result);
+
+// Parse a VARCHAR/JSON `source` vector into a plain JSONO `result` vector, throwing on
+// invalid JSON (the jsono() text contract). Exposed so the shred constructor overload can
+// parse-then-shred in one pass without duplicating the parser.
+void JsonoParseTextVector(Vector &source, idx_t count, Vector &result);
 
 //===--------------------------------------------------------------------===//
 // JSONO binary format
@@ -431,10 +436,6 @@ inline double Dec60ToDouble(bool negative, uint64_t mantissa, uint64_t scale) {
 		value = -value;
 	}
 	return value / DEC60_POW10[scale];
-}
-
-inline double DecodeDec60(uint64_t payload) {
-	return Dec60ToDouble(Dec60Negative(payload), Dec60Mantissa(payload), Dec60Scale(payload));
 }
 
 // Header (8 bytes) prepended to the slots BLOB.

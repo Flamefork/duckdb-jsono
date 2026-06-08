@@ -5,11 +5,9 @@
 #include "jsono_shred.hpp"
 #include "jsono_writer.hpp"
 
-#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -1228,31 +1226,15 @@ struct GroupMergeFunction {
 	}
 };
 
-string NormalizeGroupMergeMode(string mode) {
-	StringUtil::Trim(mode);
-	return StringUtil::Lower(mode);
-}
-
 unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFunction &function,
                                              vector<unique_ptr<Expression>> &arguments) {
+	(void)context;
 	(void)function;
-	if (arguments.size() != 2) {
-		throw BinderException("jsono_group_merge() requires JSONO plus constant 'IGNORE NULLS'");
+	if (arguments.size() != 1) {
+		throw BinderException("jsono_group_merge() requires a single JSONO argument");
 	}
 	if (arguments[0]->return_type.id() != LogicalTypeId::SQLNULL && !IsJsonoType(arguments[0]->return_type)) {
 		throw BinderException("jsono_group_merge() input must be JSONO");
-	}
-	auto &mode_arg = arguments[1];
-	if (mode_arg->HasParameter()) {
-		throw ParameterNotResolvedException();
-	}
-	if (!mode_arg->IsFoldable()) {
-		throw BinderException("jsono_group_merge() null handling mode must be constant");
-	}
-	auto mode_value = ExpressionExecutor::EvaluateScalar(context, *mode_arg);
-	if (mode_value.IsNull() || mode_value.type().id() != LogicalTypeId::VARCHAR ||
-	    NormalizeGroupMergeMode(StringValue::Get(mode_value)) != "ignore nulls") {
-		throw InvalidInputException("jsono_group_merge(): null handling mode must be IGNORE NULLS");
 	}
 	return make_uniq<GroupMergeBindData>(MergeMode::IgnoreNulls);
 }
@@ -1506,8 +1488,11 @@ ScalarFunction JsonoMergePatchFunction() {
 }
 
 // jsono_overlay(base, patch...): the base is authoritative, each patch fills only the
-// keys the base lacks (B-null is a no-op). Powers shredded reconstruction; exposed so
-// the optimizer can fold the lanes back onto the residual without a catalog lookup.
+// keys the base lacks (B-null is a no-op). This is the shredded-reconstruction primitive
+// (residual wins, lanes refill stripped paths), not a headline user operation — the
+// optimizer binds it directly via this factory. It is registered in the catalog (see
+// RegisterJsonoMerge) only so the optimizer-injected reconstruction expression survives
+// plan (de)serialization via a name lookup; it is intentionally left out of the docs.
 ScalarFunction JsonoOverlayFunction() {
 	ScalarFunction fun("jsono_overlay", {}, JsonoType(), JsonoOverlayExecute, JsonoMergePatchBind, nullptr, nullptr,
 	                   JsonoOpsLocalState::Init);
@@ -1520,15 +1505,15 @@ ScalarFunction JsonoOverlayFunction() {
 void RegisterJsonoMerge(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
 	{ loader.RegisterFunction(JsonoMergePatchFunction()); }
+	// Internal reconstruction helper, registered for serialization (see JsonoOverlayFunction).
 	{ loader.RegisterFunction(JsonoOverlayFunction()); }
 	{
-		AggregateFunction fun("jsono_group_merge", {jsono_type, LogicalType::VARCHAR}, jsono_type,
-		                      AggregateFunction::StateSize<GroupMergeState>,
-		                      AggregateFunction::StateInitialize<GroupMergeState, GroupMergeFunction>,
-		                      JsonoGroupMergeUpdate, JsonoGroupMergeCombine, JsonoGroupMergeFinalize,
-		                      FunctionNullHandling::DEFAULT_NULL_HANDLING, JsonoGroupMergeSimpleUpdate,
-		                      JsonoGroupMergeBind,
-		                      AggregateFunction::StateDestroy<GroupMergeState, GroupMergeFunction>);
+		AggregateFunction fun(
+		    "jsono_group_merge", {jsono_type}, jsono_type, AggregateFunction::StateSize<GroupMergeState>,
+		    AggregateFunction::StateInitialize<GroupMergeState, GroupMergeFunction>, JsonoGroupMergeUpdate,
+		    JsonoGroupMergeCombine, JsonoGroupMergeFinalize, FunctionNullHandling::DEFAULT_NULL_HANDLING,
+		    JsonoGroupMergeSimpleUpdate, JsonoGroupMergeBind,
+		    AggregateFunction::StateDestroy<GroupMergeState, GroupMergeFunction>);
 		fun.order_dependent = AggregateOrderDependent::ORDER_DEPENDENT;
 		loader.RegisterFunction(std::move(fun));
 	}

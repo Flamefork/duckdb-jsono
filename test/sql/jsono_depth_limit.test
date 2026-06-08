@@ -6,18 +6,18 @@ require jsono
 
 # Moderately deep nesting (under the limit) round-trips through parse and to_json.
 query I
-SELECT to_json((repeat('[', 30) || repeat(']', 30))::JSONO) IS NOT NULL;
+SELECT to_json(jsono(repeat('[', 30) || repeat(']', 30))) IS NOT NULL;
 ----
 true
 
 # Array nesting beyond the limit is rejected at construction, not crashed.
 statement error
-SELECT (repeat('[', 1001) || repeat(']', 1001))::JSONO;
+SELECT jsono(repeat('[', 1001) || repeat(']', 1001));
 ----
 nesting depth exceeds maximum
 
 # Object nesting beyond the limit is rejected the same way.
 statement error
-SELECT (repeat('{"a":', 1001) || '1' || repeat('}', 1001))::JSONO;
+SELECT jsono(repeat('{"a":', 1001) || '1' || repeat('}', 1001));
 ----
 nesting depth exceeds maximum

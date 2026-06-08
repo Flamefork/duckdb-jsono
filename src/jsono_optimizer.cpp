@@ -939,15 +939,6 @@ bool ExtremaNumericCandidateWins(JsonoExtremaKind kind, uint64_t current, uint64
 	return candidate > current;
 }
 
-uint32_t DecimalDigitCount(uint64_t value) {
-	uint32_t width = 1;
-	while (value >= 10) {
-		value /= 10;
-		width++;
-	}
-	return width;
-}
-
 bool TryParseUnsignedIntegerText(nonstd::string_view text, uint64_t &value) {
 	if (text.empty()) {
 		return false;

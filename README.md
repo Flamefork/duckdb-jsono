@@ -1,59 +1,80 @@
-# DuckDB JSONO Extension
+# DuckDB JSONO
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Main Extension Distribution Pipeline](https://github.com/Flamefork/duckdb-jsono/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/Flamefork/duckdb-jsono/actions/workflows/MainDistributionPipeline.yml)
 
-Experimental DuckDB extension for JSON extraction and JSON-shaped intermediate storage built on top of [yyjson](https://github.com/ibireme/yyjson).
+A DuckDB extension for analytics-optimized JSON storage and querying.
 
 The extension has three main goals:
 
 - spec-driven multi-field extraction from a JSON document into a typed `STRUCT` with `jsono_transform`;
-- a pre-parsed `JSONO` representation for repeated reads over the same JSON column;
-- path-shredded `JSONO` storage (`jsono_shred`) that lifts hot paths into typed lane columns for fast columnar reads while keeping `->>` and `to_json` working transparently.
+- a pre-parsed JSONO representation for repeated reads over the same JSON column;
+- path-shredded JSONO storage (`jsono(value, shredding := spec)`) that lifts hot paths into typed lane columns for fast columnar reads while keeping `->>` and `to_json` working transparently.
 
-**Warning:** this extension is experimental and maintained on a best-effort basis by a developer who doesn't write C++ professionally, so expect rough edges. It has not been hardened for production, and the `JSONO` binary format and SQL API are still being designed and may change between revisions. Validate behavior and performance on your own data before relying on it. Feedback and contributions are welcome via GitHub.
+> [!WARNING]
+> This extension is experimental and maintained on a best-effort basis by a developer who doesn't write C++ professionally, so expect rough edges. It has not been hardened for production, and the JSONO binary format and SQL API are still being designed and may change between revisions. Validate behavior and performance on your own data before relying on it. Feedback and contributions are welcome via GitHub.
 
-## Core Features
+## Functions
 
-- `jsono(json)` parses JSON text or `JSON` into `JSONO`.
-- `jsono(struct[, options])` constructs `JSONO` directly from typed DuckDB values.
-- `try_jsono(json)` parses JSON text or `JSON` into `JSONO`, returning `NULL` for malformed input.
-- `to_json(value)` serializes `JSONO` back to compact `JSON`.
-- `jsono_extract(value, path)` / `value -> path` extracts one value as `JSONO`.
-- `jsono_extract_string(value, path)` / `value ->> path` extracts one value as `VARCHAR`.
-- `jsono_transform(value, spec)` extracts multiple fields into a typed `STRUCT`.
-- `jsono_shred(value, spec)` rewrites `JSONO` into a shredded `STRUCT` whose hot paths are typed lane columns; `->>` and `to_json` stay transparent and read the lanes.
-- `jsono_entries(value[, key_style])` flattens scalar leaves into `STRUCT(key VARCHAR, value VARCHAR)[]`.
-- `jsono_group_merge(value, 'IGNORE NULLS' [ORDER BY ...])` aggregates JSON patches.
-- `jsono_merge_patch(...)` applies RFC 7396-style merge patch to JSONO values.
-- `jsono_overlay(...)` merges patches base-wins (fills only keys missing from the base).
+Build and convert:
+
+- [`jsono(json)`](#jsonojson) / [`try_jsono(json)`](#jsonojson) — parse JSON text or `JSON` into JSONO (`try_` returns `NULL` on malformed input instead of raising).
+- [`jsono(struct)`](#jsonostruct) — construct JSONO directly from typed DuckDB values, without serializing through JSON text first.
+- [`to_json(value)`](#to_json) — serialize JSONO back to compact `JSON` (also available as a `CAST`).
+
+Extract and project:
+
+- [`jsono_extract(value, path)` / `value -> path`](#jsono_extract) — extract one value as JSONO.
+- [`jsono_extract_string(value, path)` / `value ->> path`](#jsono_extract_string) — extract one value as `VARCHAR`.
+- [`jsono_transform(value, spec)`](#jsono_transform) — project many fields into a typed `STRUCT` in one pass (`spec` is a `STRUCT` literal).
+- [`jsono_entries(value[, key_style])`](#jsono_entries) — flatten scalar leaves into `STRUCT(key VARCHAR, value VARCHAR)[]`.
+
+Merge and aggregate:
+
+- [`jsono_merge_patch(target, patch[, ...])`](#jsono_merge_patch) — RFC 7396 merge patch (later patches win; a `null` member deletes the key).
+- [`jsono_group_merge(value [ORDER BY ...])`](#jsono_group_merge) — aggregate a stream of patches into one value.
+
+Shredded storage:
+
+- [`jsono(value, shredding := spec)`](#jsonovalue-shredding) — build a *shredded* `STRUCT` from JSON text or an existing JSONO, lifting hot paths into typed lane columns; `->>` and `to_json` stay transparent and read the lanes.
+
+Inspect:
+
+- [`jsono_type(value[, path])`](#introspection) — the value's JSON type as `VARCHAR` (`OBJECT`, `ARRAY`, a scalar type, or `NULL`).
+- [`jsono_keys(value[, path])`](#introspection) — object keys as `VARCHAR[]`.
+- [`jsono_validate(value)`](#introspection) — strict current-format validation as `BOOLEAN`.
+- [`jsono_storage_size(value)`](#introspection) — physical four-BLOB byte sizes as a `STRUCT`.
+- [`jsono_storage_type()`](#introspection) — DDL of the physical `STRUCT` backing a JSONO value.
 
 ## Quick Start
+
+> [!NOTE]
+> JSONO is a format, not a SQL type. A JSONO value is this extension's pre-parsed binary representation of a JSON document — physically a `STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)`, with no registered type name. There is no `JSONO` to name in a `CAST` or a column definition. Instead: build a value with `jsono(...)` / `try_jsono(...)`, declare storage columns with `jsono_storage_type()`, and let the functions, the `->` / `->>` operators, and `to_json` recognise that `STRUCT` shape structurally — a value read back from Parquet or DuckLake works with no cast.
 
 Build and load the extension first (see [Installation](#installation)), then:
 
 ```sql
 SELECT jsono_transform(
     jsono('{"id": 42, "name": "duck", "active": true}'),
-    '{"id":"BIGINT","name":"VARCHAR","active":"BOOLEAN"}'
+    {id: 'BIGINT', name: 'VARCHAR', active: 'BOOLEAN'}
 );
 -- {'id': 42, 'name': duck, 'active': true}
 ```
 
-Convert to `JSONO` when the same JSON values will be read repeatedly:
+Convert to JSONO when the same JSON values will be read repeatedly:
 
 ```sql
 CREATE TABLE events AS
 SELECT jsono(payload) AS payload_jsono
 FROM read_parquet('events.parquet');
 
-SELECT (jsono_transform(payload_jsono, '{"user_id":"VARCHAR","event_ts":"BIGINT"}')).*
+SELECT (jsono_transform(payload_jsono, {user_id: 'VARCHAR', event_ts: 'BIGINT'})).*
 FROM events;
 ```
 
 ## Installation
 
-> **Note:** This extension is not yet published in DuckDB's extension repository, and the `JSONO` binary format and SQL API are still being designed. Build it from source and load the produced local extension.
+> **Note:** This extension is not yet published in DuckDB's extension repository, and the JSONO binary format and SQL API are still being designed. Build it from source and load the produced local extension.
 
 ### CLI
 
@@ -77,41 +98,39 @@ con.execute("LOAD './build/release/extension/jsono/jsono.duckdb_extension'")
 
 ## Usage
 
-### `jsono(json) -> JSONO`
+### `jsono(json)`
 
-Strictly parses JSON text or `JSON` into `JSONO`.
+Strictly parses JSON text or `JSON` into JSONO.
 
 ```sql
 SELECT jsono('{"a":1,"b":"x"}');
 ```
 
-Use SQL casts for the same strict parse behavior:
-
-```sql
-SELECT '{"a":1}'::JSONO;
-SELECT CAST('{"a":1}' AS JSONO);
-```
-
-Malformed or empty input raises an error. Use `try_jsono` or `TRY_CAST` when malformed input should become `NULL`:
+Malformed or empty input raises an error. Use `try_jsono` when malformed input should become `NULL`:
 
 ```sql
 SELECT try_jsono('{not json') IS NULL;
-SELECT TRY_CAST('{not json' AS JSONO) IS NULL;
 ```
 
-`JSONO` physically stores as:
+To parse and shred hot paths into typed lane columns in one pass, supply a constant `shredding := {...}` spec — the same option documented under the shredding constructor below:
+
+```sql
+SELECT jsono('{"kind":"commit","time_us":1700}', shredding := {'$.kind': 'VARCHAR', '$.time_us': 'BIGINT'});
+```
+
+A JSONO value is physically this `STRUCT` — the four BLOBs every storage layer (DuckDB-native, Parquet, DuckLake) sees:
 
 ```text
 STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
 ```
 
-DuckDB storage can expose the physical struct shape after Parquet round-trips. The extension accepts that struct shape implicitly in `to_json`, `jsono_transform`, and JSONO functions.
+The JSONO functions (`to_json`, `jsono_transform`, …) recognise this STRUCT structurally, so a value read back from Parquet or DuckLake binds to them with no cast. `jsono_storage_type()` returns the DDL string above for declaring storage columns.
 
 The binary layout of each BLOB (slot encoding, tag table, string-heap cursor, and the `jsono_skips` navigation metadata) is specified in [docs/jsono_format.md](docs/jsono_format.md).
 
-### `jsono(struct[, options]) -> JSONO`
+### `jsono(struct)`
 
-Constructs `JSONO` directly from typed DuckDB values without serializing the whole input through JSON text first.
+Constructs JSONO directly from typed DuckDB values without serializing the whole input through JSON text first.
 
 ```sql
 SELECT to_json(jsono({'b': 2, 'a': 'x', 'n': NULL, 'arr': ['c', NULL, 'd']}));
@@ -121,32 +140,11 @@ SELECT to_json(jsono({'b': 2, 'a': 'x', 'n': NULL, 'arr': ['c', NULL, 'd']}));
 {"a":"x","arr":["c",null,"d"],"b":2,"n":null}
 ```
 
-`STRUCT` fields become JSON object keys, `LIST` values become arrays, `JSON` children are parsed as JSON subtrees, and `VARCHAR` children remain JSON strings. Exact integer and decimal values are preserved; non-finite `DOUBLE` values are rejected because JSON has no NaN/Infinity representation.
+`STRUCT` fields become JSON object keys, `LIST` values become arrays, `JSON` children are parsed as JSON subtrees, and `VARCHAR` children remain JSON strings. Exact integer and decimal values are preserved; non-finite `DOUBLE` values are rejected because JSON has no NaN/Infinity representation. SQL `NULL` object fields are serialized as JSON nulls.
 
-SQL `NULL` object fields are included as JSON nulls by default. Use a constant options struct to omit SQL `NULL` object fields:
+### `to_json`
 
-```sql
-SELECT to_json(jsono({'b': NULL, 'a': 1}, {'nulls': 'omit'}));
-SELECT to_json(jsono({'b': NULL, 'a': 1}, {'omit_nulls': true}));
-```
-*Result:*
-```json
-{"a":1}
-```
-
-The `STRUCT -> JSONO` cast uses the same default constructor behavior:
-
-```sql
-SELECT to_json({'b': 2, 'a': 'x'}::JSONO);
-```
-*Result:*
-```json
-{"a":"x","b":2}
-```
-
-### `to_json(value) -> JSON`
-
-Serializes `JSONO` back to compact `JSON`.
+Serializes JSONO back to compact `JSON`.
 
 ```sql
 SELECT to_json(jsono('{"b":2,"a":1}'));
@@ -165,7 +163,7 @@ SELECT CAST(jsono('{"a":1}') AS VARCHAR);
 
 The `JSON` cast and `to_json` produce DuckDB's core `JSON` logical type, which is provided by the bundled `json` extension that ships with every standard DuckDB distribution — no manual setup is needed.
 
-### `jsono_extract(value, path) -> JSONO`
+### `jsono_extract`
 
 Extracts one value using a constant path. `value -> path` is an alias for the same operation. A bare string path names a literal top-level key, a string path starting with `$` uses JSONPath, and a `BIGINT` path indexes an array:
 
@@ -180,9 +178,9 @@ SELECT jsono('{"items":[{"name":"duck"}]}') -> 'items' -> 0 ->> 'name';
 -- duck
 ```
 
-JSON null at the selected path returns a `JSONO` null value. Missing paths return SQL `NULL`.
+JSON null at the selected path returns a JSONO null value. Missing paths return SQL `NULL`.
 
-### `jsono_extract_string(value, path) -> VARCHAR`
+### `jsono_extract_string`
 
 Extracts one value using a constant path. `value ->> path` is an alias for the same operation. Path rules match `jsono_extract`:
 
@@ -199,18 +197,18 @@ SELECT jsono_extract_string(jsono('{"a.b":"dot","a":{"b":"nested"}}'), '$.a.b');
 
 JSON strings return unquoted text, numbers and booleans return their JSON text, JSON null and missing paths return SQL `NULL`, and arrays/objects return compact JSON text.
 
-### `jsono_transform(value, spec) -> struct`
+### `jsono_transform`
 
-Extracts fields from `JSONO` into a typed DuckDB `STRUCT`. `spec` must be a constant JSON object mapping each output field name to an extraction rule.
+Extracts fields from JSONO into a typed DuckDB `STRUCT`. `spec` must be a constant `STRUCT` mapping each output field name to an extraction rule.
 
 ```sql
 SELECT jsono_transform(
     jsono('{"a":42,"b":3.5,"c":"hi","d":true}'),
-    '{"a":"BIGINT","b":"DOUBLE","c":"VARCHAR","d":"BOOLEAN"}'
+    {a: 'BIGINT', b: 'DOUBLE', c: 'VARCHAR', d: 'BOOLEAN'}
 );
 ```
 
-A rule is either a type shorthand string or a wrapper object. Supported scalar types:
+A rule is either a type shorthand string or a wrapper `STRUCT`. Supported scalar types:
 
 - `BIGINT`
 - `UBIGINT`
@@ -218,45 +216,42 @@ A rule is either a type shorthand string or a wrapper object. Supported scalar t
 - `VARCHAR`
 - `BOOLEAN`
 
-A shorthand reads the matching top-level key (path defaults to `$."field"`). A wrapper object reads from an explicit JSONPath:
+A shorthand reads the matching top-level key (path defaults to `$."field"`). A wrapper `STRUCT` reads from an explicit JSONPath:
 
 ```sql
 SELECT jsono_transform(
     jsono('{"event":{"timestamp":1234567890}}'),
-    '{"ts":{"type":"BIGINT","path":"$.event.timestamp"}}'
+    {ts: {type: 'BIGINT', path: '$.event.timestamp'}}
 );
 ```
 
 Paths support nested keys, array indices, quoted keys, and the `[*]` wildcard: `$.user.name`, `$.items[0].id`, `$."my-key"`, `$.tags[*]`.
 
-Collect array elements into a `VARCHAR[]` with an array type, or join them into one string with `join_separator`:
+Collect array elements into a `VARCHAR[]` with a single-element list type, or join them into one string with `join_separator`:
 
 ```sql
 SELECT jsono_transform(
     jsono('{"tags":["a","b","c"]}'),
-    '{"tags":{"type":["VARCHAR"],"path":"$.tags[*]"}}'
+    {tags: {type: ['VARCHAR'], path: '$.tags[*]'}}
 );
 
 SELECT jsono_transform(
     jsono('{"tags":["a","b","c"]}'),
-    '{"tags":{"type":"VARCHAR","path":"$.tags[*]","join_separator":","}}'
+    {tags: {type: 'VARCHAR', path: '$.tags[*]', join_separator: ','}}
 );
 ```
 
-The object keys `type`, `path`, and `join_separator` are reserved inside a wrapper object.
+The field names `type`, `path`, and `join_separator` are reserved inside a wrapper `STRUCT`.
 
-### `jsono_shred(value, spec) -> struct`
+### `jsono(value, shredding)`
 
-Rewrites a `JSONO` value into a *shredded* `STRUCT`: the four-BLOB `JSONO` residual followed by one typed lane column per path in `spec`. Reads stay transparent — `->>`, `jsono_extract_string`, `to_json`, and casts work on the shredded value exactly as on a plain `JSONO` column — but extracting a shredded path becomes a direct read of its typed lane instead of a per-row parse, which the planner can push down and prune on.
+The `shredding` named argument turns `jsono()` into a *shredding* constructor: it produces a *shredded* `STRUCT` — the four-BLOB JSONO residual followed by one typed lane column per path in `spec`. The primary form takes JSON text and parses + shreds in one pass; passing an existing JSONO value shreds it directly. Reads stay transparent — `->>`, `jsono_extract_string`, `to_json`, and casts work on the shredded value exactly as on a plain JSONO column — but extracting a shredded path becomes a direct read of its typed lane instead of a per-row parse, which the planner can push down and prune on.
 
-`spec` is a constant JSON object mapping each path to its lane type (same path grammar as `jsono_transform`, no wildcards; lane types `VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`):
+`spec` is a constant `STRUCT` mapping each path to its lane type string (the same shape as Parquet's `SHREDDING` option and `read_json`'s `columns`; same path grammar as `jsono_transform`, no wildcards; lane types `VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`):
 
 ```sql
 CREATE TABLE events AS
-SELECT jsono_shred(
-    jsono(payload),
-    '{"$.kind":"VARCHAR","$.did":"VARCHAR","$.time_us":"BIGINT"}'
-) AS payload
+SELECT jsono(payload, shredding := {'$.kind': 'VARCHAR', '$.did': 'VARCHAR', '$.time_us': 'BIGINT'}) AS payload
 FROM read_parquet('events.parquet');
 
 -- queried like any JSONO column; the planner reads the lanes
@@ -266,19 +261,19 @@ FROM events GROUP BY kind;
 SELECT max(CAST(payload ->> '$.time_us' AS BIGINT)) FROM events;
 ```
 
-The conversion is lossless: `to_json(payload)` reconstructs the original document, and any path not in `spec` still reads from the residual. A value that does not fit its lane type (a string in a `BIGINT` lane, an explicit JSON `null`, a missing key) is kept in the residual unchanged, so reconstruction never loses or coerces data. Top-level shredded paths are stored once — in the lane rather than duplicated in the residual — so the shredded column is typically smaller than the plain `JSONO` column for the same data while answering hot-path queries from narrow typed columns.
+The conversion is lossless: `to_json(payload)` reconstructs the original document, and any path not in `spec` still reads from the residual. A value that does not fit its lane type (a string in a `BIGINT` lane, an explicit JSON `null`, a missing key) is kept in the residual unchanged, so reconstruction never loses or coerces data. Top-level shredded paths are stored once — in the lane rather than duplicated in the residual — so the shredded column is typically smaller than the plain JSONO column for the same data while answering hot-path queries from narrow typed columns.
 
 ```sql
-SELECT to_json(jsono_shred(jsono('{"kind":"commit","time_us":1700,"extra":"e1"}'),
-                           '{"$.kind":"VARCHAR","$.time_us":"BIGINT"}'));
+SELECT to_json(jsono('{"kind":"commit","time_us":1700,"extra":"e1"}',
+                     shredding := {'$.kind': 'VARCHAR', '$.time_us': 'BIGINT'}));
 -- {"extra":"e1","kind":"commit","time_us":1700}
 ```
 
 Transparent reads over a shredded value go through the bundled `json` extension (present in every standard DuckDB distribution) and the extension's query optimizer. The shredded shape — four BLOBs plus the named lane columns — survives a plain Parquet round-trip and reads back transparently.
 
-### `jsono_entries(value[, key_style]) -> STRUCT(key VARCHAR, value VARCHAR)[]`
+### `jsono_entries`
 
-Flattens scalar leaves of a `JSONO` document into a list of key/value structs. The default `key_style` is `'jsonpath'`; pass constant `'dotted'` for dot-separated keys:
+Flattens scalar leaves of a JSONO document into a list of key/value structs. The default `key_style` is `'jsonpath'`; pass the named argument `key_style := 'dotted'` for dot-separated keys:
 
 ```sql
 SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"},"d":true}')));
@@ -286,16 +281,16 @@ SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"},"d":true}')));
 -- {'key': $.b.c, 'value': x}
 -- {'key': $.d, 'value': true}
 
-SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"}}'), 'dotted'));
+SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"}}'), key_style := 'dotted'));
 -- {'key': a, 'value': 1}
 -- {'key': b.c, 'value': x}
 ```
 
 JSON null leaves keep their key and return SQL `NULL` as `value`; empty objects and arrays do not produce entries. Dotted output can collide when a literal dotted key and a nested path render to the same string, for example `"a.b"` and `{"a":{"b":...}}`.
 
-### `jsono_group_merge(value, 'IGNORE NULLS' [ORDER BY ...]) -> JSONO`
+### `jsono_group_merge`
 
-Aggregates a stream of JSON object patches with [RFC 7396](https://datatracker.ietf.org/doc/html/rfc7396) merge semantics: later patches in the ordered stream overwrite earlier keys and arrays replace wholesale. The current implementation requires the constant mode `'IGNORE NULLS'`, which drops `null` object members before merging so existing keys stay untouched. Provide an `ORDER BY` clause to make the fold deterministic.
+Aggregates a stream of JSON object patches with [RFC 7396](https://datatracker.ietf.org/doc/html/rfc7396) merge semantics: later patches in the ordered stream overwrite earlier keys and arrays replace wholesale. `null` object members are dropped before merging so existing keys stay untouched. Provide an `ORDER BY` clause to make the fold deterministic.
 
 ```sql
 WITH patches(patch, ts) AS (
@@ -304,7 +299,7 @@ WITH patches(patch, ts) AS (
         (jsono('{"a":null,"b":{"y":2}}'), 2),
         (jsono('{"c":3}'), 3)
 )
-SELECT to_json(jsono_group_merge(patch, 'IGNORE NULLS' ORDER BY ts))
+SELECT to_json(jsono_group_merge(patch ORDER BY ts))
 FROM patches;
 ```
 *Result:*
@@ -316,7 +311,7 @@ Use `GROUP BY` for grouped state accumulation:
 
 ```sql
 SELECT session_id,
-       to_json(jsono_group_merge(patch, 'IGNORE NULLS' ORDER BY event_ts)) AS state
+       to_json(jsono_group_merge(patch ORDER BY event_ts)) AS state
 FROM session_patch_events
 GROUP BY session_id;
 ```
@@ -325,7 +320,7 @@ Use it as a window function to materialize the running state after each patch:
 
 ```sql
 SELECT id,
-       to_json(jsono_group_merge(patch, 'IGNORE NULLS' ORDER BY id)
+       to_json(jsono_group_merge(patch ORDER BY id)
            OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS state
 FROM (
     VALUES
@@ -342,7 +337,7 @@ ORDER BY id;
 3  {"lang":"en","theme":"light"}
 ```
 
-### `jsono_merge_patch(target, patch[, ...]) -> JSONO`
+### `jsono_merge_patch`
 
 Applies one or more [RFC 7396](https://datatracker.ietf.org/doc/html/rfc7396) merge patches left to right. The function is variadic and requires at least one argument; each `null` object member in a patch deletes that key from the result.
 
@@ -373,21 +368,6 @@ SELECT to_json(jsono_merge_patch(
 
 Unlike `jsono_group_merge`, this is a scalar function over a fixed set of patch arguments rather than an aggregate over rows.
 
-### `jsono_overlay(base, patch[, ...]) -> JSONO`
-
-Overlays one or more patches onto a base value, base-wins: a patch only fills object keys absent from the base, a `null` patch member is a no-op (it does not delete), and the base's own values — including explicit nulls — are kept. This is the complement of `jsono_merge_patch`, where the patch wins and a `null` member deletes.
-
-```sql
-SELECT to_json(jsono_overlay(
-    jsono('{"a":1,"b":2}'),
-    jsono('{"b":99,"c":3}')
-));
-```
-*Result:*
-```json
-{"a":1,"b":2,"c":3}
-```
-
 ### Introspection
 
 ```sql
@@ -411,7 +391,7 @@ SELECT jsono_type(jsono('{"items":[1,2,3]}'), '$.items[0]');
 
 `jsono_storage_size` reports `jsono_slots`, `jsono_key_heap`, `jsono_string_heap`, `jsono_skips`, and `total` byte counts. It is a physical diagnostic and does not validate the value.
 
-`jsono_storage_type` returns the DDL of the physical `STRUCT` backing `JSONO` with the alias dropped — the form stores that reject user-defined type aliases (DuckLake, plain Parquet) actually keep. Use it to declare storage columns without hardcoding the field names; a column of that exact shape binds to `jsono` ops and `to_json` without an explicit `::JSONO` cast.
+`jsono_storage_type` returns the DDL of the physical `STRUCT` that a JSONO value is — the form stored everywhere (DuckDB-native, DuckLake, plain Parquet). Use it to declare storage columns without hardcoding the field names; a column of that exact shape binds to `jsono` ops and `to_json` structurally, with no cast.
 
 ```sql
 SELECT jsono_storage_type();
@@ -463,23 +443,22 @@ Use power-of-two values when comparing performance. The default is tuned for loc
 
 ## Error Handling and Caveats
 
-- `jsono_transform` requires a constant spec string.
-- `jsono_shred` requires a constant spec string and rejects wildcard paths; only top-level paths are physically stripped from the residual (nested shredded paths are read-accelerated but kept in the residual). Transparent `->>`/`to_json` over a shredded value need the query optimizer; reading one with the optimizer fully disabled (`PRAGMA disable_optimizer`) is not supported.
+- Object keys inside JSONO output are sorted, so serialized JSON text may not preserve input object key order.
+- `jsono_transform` requires a constant `STRUCT` spec.
+- `jsono(value, shredding := spec)` requires a constant `STRUCT` spec and rejects wildcard paths; only top-level paths are physically stripped from the residual (nested shredded paths are read-accelerated but kept in the residual). Transparent `->>`/`to_json` over a shredded value need the query optimizer; reading one with the optimizer fully disabled (`PRAGMA disable_optimizer`) is not supported.
 - `jsono_extract` / `->` / `jsono_extract_string` / `->>` require a constant path, do not support wildcard list extraction yet, and do not support negative array indexes.
 - Unsupported scalar types in `jsono_transform` fail at bind time.
-- `jsono_group_merge` currently requires constant `'IGNORE NULLS'`.
 - JSON nested deeper than 1000 levels is rejected with an error (the limit is lowered to 50 under sanitizer builds).
 - The binary JSONO format is strict-versioned. Incompatible storage changes must bump `jsono::VERSION`; validation rejects mismatched versions, while extraction/serialization helpers treat invalid headers as SQL `NULL`.
-- Object keys inside `JSONO` output are sorted, so serialized JSON text may not preserve input object key order.
-- Malformed input raises DuckDB errors unless `try_jsono` or `TRY_CAST(... AS JSONO)` is used.
+- Malformed input raises DuckDB errors unless `try_jsono` is used.
 
 ## Known limitations
 
 The current surface is intentionally small. The following are not implemented:
 
-- No cast from `JSONO` to a scalar type (`jsono('42')::INTEGER` is unsupported). Project string values out with `->>` / `jsono_extract_string` or typed fields with `jsono_transform`.
-- No cast from `JSONO` to an arbitrary `STRUCT`. Only the physical four-BLOB shape is interchangeable with `JSONO`; field extraction goes through `jsono_transform`.
-- No dedicated table function that unnests a `JSONO` array or object into rows. Use `unnest(jsono_entries(...))` for flattened scalar leaves.
+- No cast from JSONO to a scalar type (`jsono('42')::INTEGER` is unsupported). Project string values out with `->>` / `jsono_extract_string` or typed fields with `jsono_transform`.
+- No cast from JSONO to an arbitrary `STRUCT`. Only the physical four-BLOB shape is interchangeable with JSONO; field extraction goes through `jsono_transform`.
+- No dedicated table function that unnests a JSONO array or object into rows. Use `unnest(jsono_entries(...))` for flattened scalar leaves.
 - Object key order is not preserved: keys are stored and emitted in sorted byte order (see [Error Handling and Caveats](#error-handling-and-caveats)).
 
 ## Contributing

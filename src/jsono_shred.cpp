@@ -44,7 +44,6 @@ struct ShredField {
 };
 
 struct ShredBindData : public FunctionData {
-	string spec;
 	vector<ShredField> fields;
 	LogicalType return_type;
 
@@ -53,7 +52,8 @@ struct ShredBindData : public FunctionData {
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
-		return spec == other_p.Cast<ShredBindData>().spec;
+		// return_type encodes every lane's name (the path) and type, so it fully identifies the spec.
+		return return_type == other_p.Cast<ShredBindData>().return_type;
 	}
 };
 
@@ -88,7 +88,7 @@ ShredPrimitive ParseShredType(const string &type) {
 	if (upper == "BOOLEAN") {
 		return ShredPrimitive::Boolean;
 	}
-	throw BinderException("jsono_shred: unsupported lane type '%s'", type);
+	throw BinderException("jsono shred:unsupported lane type '%s'", type);
 }
 
 bool TypeToShredPrimitive(const LogicalType &type, ShredPrimitive &out) {
@@ -131,7 +131,7 @@ LogicalType ShredLogicalType(ShredPrimitive primitive) {
 	case ShredPrimitive::Boolean:
 		return LogicalType::BOOLEAN;
 	}
-	throw InternalException("jsono_shred: unhandled lane type");
+	throw InternalException("jsono shred:unhandled lane type");
 }
 
 // A bare key names a literal top-level object key, not a JSONPath expression.
@@ -167,17 +167,17 @@ struct YyjsonDoc {
 	yyjson_doc *doc;
 };
 
-unique_ptr<ShredBindData> ParseShredSpec(const string &spec) {
-	yyjson_read_err read_err;
-	YyjsonDoc holder(
-	    yyjson_read_opts(const_cast<char *>(spec.data()), spec.size(), YYJSON_READ_NOFLAG, nullptr, &read_err));
-	if (!holder.doc) {
-		throw BinderException("jsono_shred: invalid spec JSON: %s", read_err.msg);
+// The shredding spec is a constant STRUCT mapping each path to its lane type string, e.g.
+// {'$.kind': 'VARCHAR', '$.commit.seq': 'BIGINT'} — the field name is the path, the field
+// value is the stringified lane type (same idea as read_json's `columns` and Parquet's
+// SHREDDING option).
+unique_ptr<ShredBindData> ParseShredSpec(const Value &spec) {
+	if (spec.IsNull() || spec.type().id() != LogicalTypeId::STRUCT) {
+		throw BinderException(
+		    "jsono shred: shredding spec must be a non-NULL STRUCT mapping path to type, e.g. {'$.kind': 'VARCHAR'}");
 	}
-	auto root = yyjson_doc_get_root(holder.doc);
-	if (!yyjson_is_obj(root)) {
-		throw BinderException("jsono_shred: spec must be a JSON object mapping path to type");
-	}
+	auto &child_types = StructType::GetChildTypes(spec.type());
+	auto &child_values = StructValue::GetChildren(spec);
 
 	auto bind_data = make_uniq<ShredBindData>();
 	child_list_t<LogicalType> children;
@@ -186,21 +186,19 @@ unique_ptr<ShredBindData> ParseShredSpec(const string &spec) {
 	children.emplace_back("jsono_string_heap", LogicalType::BLOB);
 	children.emplace_back("jsono_skips", LogicalType::BLOB);
 
-	yyjson_obj_iter iter = yyjson_obj_iter_with(root);
-	yyjson_val *key;
-	while ((key = yyjson_obj_iter_next(&iter))) {
-		auto value = yyjson_obj_iter_get_val(key);
-		string path(yyjson_get_str(key), yyjson_get_len(key));
-		if (!yyjson_is_str(value)) {
-			throw BinderException("jsono_shred: lane type for '%s' must be a type string", path);
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		auto &path = child_types[i].first;
+		auto type_value = child_values[i];
+		if (type_value.IsNull() || !type_value.DefaultTryCastAs(LogicalType::VARCHAR)) {
+			throw BinderException("jsono shred: type for '%s' must be a type string", path);
 		}
-		string type_name(yyjson_get_str(value), yyjson_get_len(value));
+		auto type_name = StringValue::Get(type_value);
 		ShredField field;
 		field.path_name = path;
-		field.steps = path.size() > 0 && path[0] == '$' ? ParseJsonoPath(path, "jsono_shred") : LiteralKeyPath(path);
+		field.steps = path.size() > 0 && path[0] == '$' ? ParseJsonoPath(path, "jsono shred") : LiteralKeyPath(path);
 		for (auto &step : field.steps) {
 			if (step.kind == PathStepKind::Wildcard) {
-				throw BinderException("jsono_shred: wildcard paths are not supported ('%s')", path);
+				throw BinderException("jsono shred: wildcard paths are not supported ('%s')", path);
 			}
 		}
 		field.primitive = ParseShredType(type_name);
@@ -209,7 +207,7 @@ unique_ptr<ShredBindData> ParseShredSpec(const string &spec) {
 		bind_data->fields.push_back(std::move(field));
 	}
 	if (bind_data->fields.empty()) {
-		throw BinderException("jsono_shred: empty spec");
+		throw BinderException("jsono shred: empty shredding spec");
 	}
 	bind_data->return_type = LogicalType::STRUCT(std::move(children));
 	return bind_data;
@@ -217,19 +215,18 @@ unique_ptr<ShredBindData> ParseShredSpec(const string &spec) {
 
 unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &bound_function,
                                         vector<unique_ptr<Expression>> &arguments) {
+	if (arguments[1]->GetAlias() != "shredding") {
+		throw BinderException("jsono(): unknown argument '%s' (pass shredding := {'<path>': '<type>', ...})",
+		                      arguments[1]->GetAlias());
+	}
 	if (arguments[1]->HasParameter()) {
 		throw ParameterNotResolvedException();
 	}
 	if (!arguments[1]->IsFoldable()) {
-		throw BinderException("jsono_shred: spec must be constant");
+		throw BinderException("jsono shred: shredding spec must be constant");
 	}
 	auto spec_value = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
-	if (spec_value.IsNull() || !spec_value.DefaultTryCastAs(LogicalType::VARCHAR)) {
-		throw BinderException("jsono_shred: spec must be a non-NULL string");
-	}
-	auto spec = StringValue::Get(spec_value);
-	auto bind_data = ParseShredSpec(spec);
-	bind_data->spec = std::move(spec);
+	auto bind_data = ParseShredSpec(spec_value);
 	bound_function.return_type = bind_data->return_type;
 	return std::move(bind_data);
 }
@@ -474,6 +471,22 @@ void JsonoShredExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 }
 
+// jsono(text, shredding := spec): parse the JSON text into a plain jsono value, then shred it
+// against the spec in the same call. The parse output is a throwaway plain vector; only the
+// shredded result is materialized.
+void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = expr.bind_info->Cast<ShredBindData>();
+	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ShredLocalState>();
+	auto count = args.size();
+	Vector plain(JsonoType(), count);
+	JsonoParseTextVector(args.data[0], count, plain);
+	ApplyShredFields(plain, count, bind_data.fields, result, lstate);
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
 } // namespace
 
 bool IsShredLaneType(const LogicalType &type) {
@@ -501,12 +514,30 @@ void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<strin
 	ApplyShredFields(input, count, fields, result, lstate);
 }
 
+// Shredding is exposed as a named argument on the jsono() constructor:
+// `shredding := {'<path>': '<type>', ...}` (a constant STRUCT, like Parquet's SHREDDING).
+// The primary form parses text and shreds in one pass; the secondary form shreds an existing
+// plain jsono value. Both reuse the same bind (spec parse + return type) and lane writer. The
+// spec slot is ANY so the STRUCT literal binds; the bind validates it is a STRUCT.
 void RegisterJsonoShred(ExtensionLoader &loader) {
-	ScalarFunction fun("jsono_shred", {JsonoType(), LogicalType::VARCHAR}, LogicalType::ANY, JsonoShredExecute,
-	                   JsonoShredBind, nullptr, nullptr, ShredLocalState::Init);
-	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	loader.RegisterFunction(fun);
+	auto jsono_type = JsonoType();
+	ScalarFunctionSet set("jsono");
+
+	// jsono(text, shredding := spec) — the primary entry point: parse + shred.
+	ScalarFunction from_text({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, JsonoShredFromTextExecute,
+	                         JsonoShredBind, nullptr, nullptr, ShredLocalState::Init);
+	from_text.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	from_text.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	set.AddFunction(from_text);
+
+	// jsono(jsono, shredding := spec) — shred a value that is already plain jsono.
+	ScalarFunction from_jsono({jsono_type, LogicalType::ANY}, LogicalType::ANY, JsonoShredExecute, JsonoShredBind,
+	                          nullptr, nullptr, ShredLocalState::Init);
+	from_jsono.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	from_jsono.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	set.AddFunction(from_jsono);
+
+	loader.RegisterFunction(set);
 }
 
 } // namespace duckdb

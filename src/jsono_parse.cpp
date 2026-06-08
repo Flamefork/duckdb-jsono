@@ -150,6 +150,11 @@ bool JsonoCastToJsono(Vector &source, Vector &result, idx_t count, CastParameter
 
 } // namespace
 
+void JsonoParseTextVector(Vector &source, idx_t count, Vector &result) {
+	JsonoParseLocalState lstate;
+	ParseJsonoVector(source, count, result, lstate, false);
+}
+
 void RegisterJsonoParse(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
 	{

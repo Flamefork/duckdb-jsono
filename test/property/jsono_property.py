@@ -388,7 +388,7 @@ def test_fuzz_blob_no_crash(slots: str, key: str, string: str, skips: str) -> No
         f"{{'jsono_slots': unhex('{slots}'), 'jsono_key_heap': unhex('{key}'), "
         f"'jsono_string_heap': unhex('{string}'), 'jsono_skips': unhex('{skips}')}}"
     )
-    SESSION.value(f"to_json({struct}::JSONO)")
+    SESSION.value(f"to_json({struct})")
 
 
 @settings(VALIDISH_PROPERTY_SETTINGS)
@@ -402,8 +402,8 @@ def test_fuzz_validish_blob_no_crash(text: str, mutation: str) -> None:
     assert len(parts) == 4
     blobs = (parts[0], parts[1], parts[2], parts[3])
     struct = jsono_struct_sql(mutate_jsono_blobs(blobs, mutation))
-    SESSION.value(f"jsono_validate({struct}::JSONO)")
-    SESSION.value(f"to_json({struct}::JSONO)")
+    SESSION.value(f"jsono_validate({struct})")
+    SESSION.value(f"to_json({struct})")
 
 
 PROPERTIES = [

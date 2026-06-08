@@ -17,18 +17,14 @@
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
-#include "yyjson.hpp"
-
 #include <algorithm>
 #include <cctype>
 #include <cstring>
-#include <unordered_set>
 
 namespace duckdb {
 namespace {
 
 using namespace jsono;
-using namespace duckdb_yyjson;
 
 enum class TransformPrimitive : uint8_t { Bigint, Ubigint, Double, Varchar, Boolean };
 enum class TransformMode : uint8_t { Scalar, List, Join };
@@ -237,7 +233,10 @@ TransformField ParseScalarShorthand(nonstd::string_view name, nonstd::string_vie
 	                 string());
 }
 
-TransformField ParseWrapperField(nonstd::string_view name, yyjson_val *wrapper) {
+// A wrapper field is a nested STRUCT {type: ..., path: '...', join_separator: '...'}: `type`
+// is a type string (scalar), or a single-element list `['VARCHAR']` (list mode); `path` and
+// `join_separator` are strings. Mirrors the scalar-vs-struct dispatch the JSON form had.
+TransformField ParseWrapperField(nonstd::string_view name, const Value &wrapper) {
 	bool has_type = false;
 	bool has_join_separator = false;
 	TransformPrimitive primitive = TransformPrimitive::Varchar;
@@ -246,53 +245,47 @@ TransformField ParseWrapperField(nonstd::string_view name, yyjson_val *wrapper) 
 	string path;
 	string join_separator;
 
-	yyjson_obj_iter iter = yyjson_obj_iter_with(wrapper);
-	yyjson_val *key;
-	while ((key = yyjson_obj_iter_next(&iter))) {
-		auto value = yyjson_obj_iter_get_val(key);
-		nonstd::string_view key_view(yyjson_get_str(key), yyjson_get_len(key));
-		if (key_view == "type") {
+	auto &wrapper_types = StructType::GetChildTypes(wrapper.type());
+	auto &wrapper_values = StructValue::GetChildren(wrapper);
+	for (idx_t i = 0; i < wrapper_types.size(); i++) {
+		auto &key = wrapper_types[i].first;
+		auto value = wrapper_values[i];
+		if (key == "type") {
 			has_type = true;
-			if (yyjson_is_str(value)) {
-				nonstd::string_view type_name(yyjson_get_str(value), yyjson_get_len(value));
-				primitive = ParsePrimitiveType(string(type_name));
-				continue;
-			}
-			if (yyjson_is_arr(value)) {
-				if (yyjson_arr_size(value) != 1) {
-					throw BinderException("jsono_transform: unsupported list item type");
-				}
-				auto item = yyjson_arr_get_first(value);
-				if (!yyjson_is_str(item)) {
-					throw BinderException("jsono_transform: unsupported list item type");
-				}
-				nonstd::string_view type_name(yyjson_get_str(item), yyjson_get_len(item));
-				if (StringUtil::Upper(string(type_name)) != "VARCHAR") {
+			if (value.type().id() == LogicalTypeId::LIST) {
+				auto &items = ListValue::GetChildren(value);
+				auto item = items.size() == 1 ? items[0] : Value();
+				if (items.size() != 1 || item.IsNull() || !item.DefaultTryCastAs(LogicalType::VARCHAR) ||
+				    StringUtil::Upper(StringValue::Get(item)) != "VARCHAR") {
 					throw BinderException("jsono_transform: unsupported list item type");
 				}
 				primitive = TransformPrimitive::Varchar;
 				mode = TransformMode::List;
 				continue;
 			}
-			throw BinderException("jsono_transform: type must be a string or single-item array");
+			if (value.IsNull() || !value.DefaultTryCastAs(LogicalType::VARCHAR)) {
+				throw BinderException("jsono_transform: type must be a string or single-item array");
+			}
+			primitive = ParsePrimitiveType(StringValue::Get(value));
+			continue;
 		}
-		if (key_view == "path") {
-			if (!yyjson_is_str(value)) {
+		if (key == "path") {
+			if (value.IsNull() || !value.DefaultTryCastAs(LogicalType::VARCHAR)) {
 				throw BinderException("jsono_transform: path must be a string");
 			}
 			has_path = true;
-			path.assign(yyjson_get_str(value), yyjson_get_len(value));
+			path = StringValue::Get(value);
 			continue;
 		}
-		if (key_view == "join_separator") {
-			if (!yyjson_is_str(value)) {
+		if (key == "join_separator") {
+			if (value.IsNull() || !value.DefaultTryCastAs(LogicalType::VARCHAR)) {
 				throw BinderException("jsono_transform: join_separator must be a string");
 			}
 			has_join_separator = true;
-			join_separator.assign(yyjson_get_str(value), yyjson_get_len(value));
+			join_separator = StringValue::Get(value);
 			continue;
 		}
-		throw BinderException("jsono_transform: unknown wrapper key '%s'", string(key_view));
+		throw BinderException("jsono_transform: unknown wrapper key '%s'", key);
 	}
 	if (!has_type) {
 		throw BinderException("jsono_transform: wrapper field must include type");
@@ -396,51 +389,30 @@ void BuildTransformTrie(TransformBindData &bind_data) {
 	}
 }
 
-struct YyjsonDoc {
-	explicit YyjsonDoc(yyjson_doc *doc_p) : doc(doc_p) {
+// The spec is a constant STRUCT mapping each output field to its type: a type string
+// (scalar shorthand) or a nested wrapper STRUCT {type, path, join_separator}. Field names are
+// unique by struct construction. Same shape as core json_transform's structure, but expressed
+// as a typed STRUCT literal rather than a JSON string.
+unique_ptr<TransformBindData> ParseTransformSpec(const Value &spec) {
+	if (spec.IsNull() || spec.type().id() != LogicalTypeId::STRUCT) {
+		throw BinderException(
+		    "jsono_transform: spec must be a non-NULL STRUCT mapping output field to type, e.g. {x: 'VARCHAR'}");
 	}
-	~YyjsonDoc() {
-		if (doc) {
-			yyjson_doc_free(doc);
-		}
-	}
-	YyjsonDoc(const YyjsonDoc &) = delete;
-	YyjsonDoc &operator=(const YyjsonDoc &) = delete;
-
-	yyjson_doc *doc;
-};
-
-unique_ptr<TransformBindData> ParseTransformSpec(const string &spec) {
-	yyjson_read_err read_err;
-	YyjsonDoc holder(
-	    yyjson_read_opts(const_cast<char *>(spec.data()), spec.size(), YYJSON_READ_NOFLAG, nullptr, &read_err));
-	if (!holder.doc) {
-		throw BinderException("jsono_transform: invalid spec JSON: %s", read_err.msg);
-	}
-	auto root = yyjson_doc_get_root(holder.doc);
-	if (!yyjson_is_obj(root)) {
-		throw BinderException("jsono_transform: spec must be a JSON object");
-	}
+	auto &child_types = StructType::GetChildTypes(spec.type());
+	auto &child_values = StructValue::GetChildren(spec);
 
 	auto bind_data = make_uniq<TransformBindData>();
 	child_list_t<LogicalType> children;
-	std::unordered_set<string> seen_names;
-	yyjson_obj_iter iter = yyjson_obj_iter_with(root);
-	yyjson_val *key;
-	while ((key = yyjson_obj_iter_next(&iter))) {
-		auto value = yyjson_obj_iter_get_val(key);
-		string name(yyjson_get_str(key), yyjson_get_len(key));
-		if (!seen_names.insert(name).second) {
-			throw BinderException("jsono_transform: duplicate output field '%s'", name);
-		}
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		auto &name = child_types[i].first;
+		auto value = child_values[i];
 		TransformField transform_field;
-		if (yyjson_is_str(value)) {
-			nonstd::string_view type_name(yyjson_get_str(value), yyjson_get_len(value));
-			transform_field = ParseScalarShorthand(name, type_name);
-		} else if (yyjson_is_obj(value)) {
+		if (value.type().id() == LogicalTypeId::STRUCT) {
 			transform_field = ParseWrapperField(name, value);
+		} else if (!value.IsNull() && value.DefaultTryCastAs(LogicalType::VARCHAR)) {
+			transform_field = ParseScalarShorthand(name, StringValue::Get(value));
 		} else {
-			throw BinderException("jsono_transform: field spec must be a type string or wrapper object");
+			throw BinderException("jsono_transform: field spec for '%s' must be a type string or wrapper struct", name);
 		}
 		children.emplace_back(transform_field.name, transform_field.logical_type);
 		bind_data->fields.push_back(std::move(transform_field));
@@ -512,15 +484,11 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 		throw BinderException("jsono_transform: spec must be constant");
 	}
 	auto spec_value = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
-	if (spec_value.IsNull()) {
-		throw BinderException("jsono_transform: spec must not be NULL");
-	}
-	if (!spec_value.DefaultTryCastAs(LogicalType::VARCHAR)) {
-		throw BinderException("jsono_transform: spec must be a string");
-	}
-	auto spec = StringValue::Get(spec_value);
-	auto bind_data = ParseTransformSpec(spec);
-	bind_data->spec = std::move(spec);
+	auto bind_data = ParseTransformSpec(spec_value);
+	// The struct's canonical string identifies the full spec (names, types, paths, joins) for
+	// expression caching — return_type alone is insufficient since a field's path may differ
+	// from its name.
+	bind_data->spec = spec_value.ToString();
 	auto &input_type = arguments[0]->return_type;
 	if (IsShreddedJsonoType(input_type)) {
 		AssignShreddedLanes(*bind_data, input_type);
@@ -1346,8 +1314,8 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 void RegisterJsonoTransform(ExtensionLoader &loader) {
 	// ANY input so a shredded JSONO struct (four BLOB prefix + lane columns) also binds; the
 	// bind validates it is a plain or shredded JSONO and maps lane columns to scalar fields.
-	ScalarFunction fun("jsono_transform", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::ANY,
-	                   JsonoTransformExecute, JsonoTransformBind, nullptr, nullptr, TransformLocalState::Init);
+	ScalarFunction fun("jsono_transform", {LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, JsonoTransformExecute,
+	                   JsonoTransformBind, nullptr, nullptr, TransformLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 	loader.RegisterFunction(fun);

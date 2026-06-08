@@ -6,7 +6,7 @@ require jsono
 
 require parquet
 
-# The DDL string is the physical layout of a JSONO column with the alias dropped.
+# The DDL string is the physical STRUCT layout of a jsono value (no type alias exists).
 # Changing it is a deliberate format change — update this expectation on purpose.
 query I
 SELECT jsono_storage_type();
@@ -27,7 +27,7 @@ SELECT jsono_extract_string(props, '$.a') FROM t;
 1
 
 # The function emits the *real* storage form, not a separately-maintained string:
-# Parquet drops the JSONO alias, so the column reads back as its physical type,
+# the column is already the physical STRUCT, so Parquet reads it back unchanged,
 # and that type must print back to exactly jsono_storage_type().
 statement ok
 COPY (SELECT jsono('{"a":1}') AS props) TO '__TEST_DIR__/jsono_storage_type.parquet';
@@ -71,7 +71,7 @@ statement ok
 CREATE TABLE probe_shred (e STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, event_name VARCHAR));
 
 statement ok
-INSERT INTO probe_shred SELECT jsono_shred(jsono('{"event_name":"page_view","a":1}'), '{"event_name":"VARCHAR"}');
+INSERT INTO probe_shred SELECT jsono('{"event_name":"page_view","a":1}', shredding := {'event_name':'VARCHAR'});
 
 # the lane column holds the extracted value
 query I

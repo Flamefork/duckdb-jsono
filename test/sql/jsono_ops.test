@@ -23,7 +23,7 @@ SELECT
   jsono_type(try_jsono('3.5')),
   jsono_type(try_jsono('true')),
   jsono_type(try_jsono('null')),
-  jsono_type(NULL::JSONO) IS NULL;
+  jsono_type(jsono(NULL)) IS NULL;
 ----
 OBJECT	ARRAY	VARCHAR	BIGINT	DOUBLE	BOOLEAN	NULL	true
 
@@ -31,7 +31,7 @@ OBJECT	ARRAY	VARCHAR	BIGINT	DOUBLE	BOOLEAN	NULL	true
 query II
 SELECT
   jsono_keys(try_jsono('{"b":2,"a":1,"c":3}')),
-  jsono_keys(NULL::JSONO) IS NULL;
+  jsono_keys(jsono(NULL)) IS NULL;
 ----
 [a, b, c]	true
 
@@ -39,14 +39,14 @@ SELECT
 query IIII
 SELECT
   jsono_validate(jsono('{"a":"x","b":[1,true,null]}')),
-  jsono_validate(NULL::JSONO) IS NULL,
-  jsono_validate({'jsono_slots': 'not jsono'::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}::JSONO),
+  jsono_validate(jsono(NULL)) IS NULL,
+  jsono_validate({'jsono_slots': 'not jsono'::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}),
   jsono_validate({
     'jsono_slots': unhex('4A534E4F020100000000000000000000'),
     'jsono_key_heap': ''::BLOB,
     'jsono_string_heap': ''::BLOB,
     'jsono_skips': ''::BLOB
-  }::JSONO);
+  });
 ----
 true	true	false	false
 
@@ -60,7 +60,7 @@ SELECT jsono_validate({
   'jsono_key_heap': ''::BLOB,
   'jsono_string_heap': unhex('78'),
   'jsono_skips': unhex('0200000000000000000000000400000001000000000000000000000003000000010000000000000000000000')
-}::JSONO);
+});
 ----
 false
 
@@ -76,7 +76,7 @@ SELECT
     'jsono_key_heap': unhex('FF'),
     'jsono_string_heap': raw.jsono_string_heap,
     'jsono_skips': raw.jsono_skips
-  }::JSONO)
+  })
 FROM base;
 ----
 true	false
@@ -89,7 +89,7 @@ SELECT
   s.jsono_string_heap,
   s.jsono_skips,
   s.total,
-  jsono_storage_size(NULL::JSONO) IS NULL
+  jsono_storage_size(jsono(NULL)) IS NULL
 FROM (SELECT jsono_storage_size(jsono('{"a":"x"}')) AS s);
 ----
 40	1	1	28	70	true
@@ -148,9 +148,9 @@ SELECT to_json(jsono_merge_patch(
 ----
 {"a":3,"b":2}
 
-# Ordered group merge keeps the latest non-null values under IGNORE NULLS.
+# Ordered group merge keeps the latest non-null values (nulls ignored).
 query I
-SELECT to_json(jsono_group_merge(patch, 'IGNORE NULLS' ORDER BY ts))
+SELECT to_json(jsono_group_merge(patch ORDER BY ts))
 FROM (VALUES
   (try_jsono('{"a":1,"b":{"x":1,"y":2}}'), 1),
   (try_jsono('{"a":null,"b":{"x":null,"z":3}}'), 2),
@@ -161,7 +161,7 @@ FROM (VALUES
 
 # Empty/all-NULL group merge returns an empty object, matching json_group_merge.
 query I
-SELECT to_json(jsono_group_merge(patch, 'IGNORE NULLS'))
-FROM (VALUES (NULL::JSONO)) AS t(patch);
+SELECT to_json(jsono_group_merge(patch))
+FROM (VALUES (jsono(NULL))) AS t(patch);
 ----
 {}

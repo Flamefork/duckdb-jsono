@@ -6,43 +6,31 @@ require jsono
 
 # Flat scalar shorthand and explicit nested paths
 query I
-SELECT jsono_transform(
-  jsono('{"event_type":"click","user":{"id":42},"score":3.5,"ok":true}'),
-  '{"event_type":"VARCHAR","user_id":{"type":"BIGINT","path":"$.user.id"},"score":"DOUBLE","ok":"BOOLEAN"}'
-);
+SELECT jsono_transform(jsono('{"event_type":"click","user":{"id":42},"score":3.5,"ok":true}'), {'event_type':'VARCHAR','user_id':{'type':'BIGINT','path':'$.user.id'},'score':'DOUBLE','ok':'BOOLEAN'});
 ----
 {'event_type': click, 'user_id': 42, 'score': 3.5, 'ok': true}
 
 # Output fields may be named type/path via scalar shorthand.
 query I
-SELECT jsono_transform(jsono('{"type":"page","path":"/home"}'), '{"type":"VARCHAR","path":"VARCHAR"}');
+SELECT jsono_transform(jsono('{"type":"page","path":"/home"}'), {'type':'VARCHAR','path':'VARCHAR'});
 ----
 {'type': page, 'path': /home}
 
 # Quoted key and fixed array index.
 query I
-SELECT jsono_transform(
-  jsono('{"items":[{"key.with.dots":"a"},{"key.with.dots":"b"}]}'),
-  '{"v":{"type":"VARCHAR","path":"$.items[1].\"key.with.dots\""}}'
-);
+SELECT jsono_transform(jsono('{"items":[{"key.with.dots":"a"},{"key.with.dots":"b"}]}'), {'v':{'type':'VARCHAR','path':'$.items[1]."key.with.dots"'}});
 ----
 {'v': b}
 
 # Multiple fixed array indexes share one array traversal.
 query I
-SELECT jsono_transform(
-  jsono('{"items":["a","b","c"]}'),
-  '{"first":{"type":"VARCHAR","path":"$.items[0]"},"third":{"type":"VARCHAR","path":"$.items[2]"}}'
-);
+SELECT jsono_transform(jsono('{"items":["a","b","c"]}'), {'first':{'type':'VARCHAR','path':'$.items[0]'},'third':{'type':'VARCHAR','path':'$.items[2]'}});
 ----
 {'first': a, 'third': c}
 
 # Large objects use storage-level rank to value cursor checkpoints.
 query I
-SELECT jsono_transform(
-  jsono('{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":16,"k17":"seventeen","k18":18,"k19":19,"k20":"twenty"}'),
-  '{"late":{"type":"VARCHAR","path":"$.k17"},"last":{"type":"VARCHAR","path":"$.k20"},"missing":{"type":"VARCHAR","path":"$.k21"}}'
-);
+SELECT jsono_transform(jsono('{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":16,"k17":"seventeen","k18":18,"k19":19,"k20":"twenty"}'), {'late':{'type':'VARCHAR','path':'$.k17'},'last':{'type':'VARCHAR','path':'$.k20'},'missing':{'type':'VARCHAR','path':'$.k21'}});
 ----
 {'late': seventeen, 'last': twenty, 'missing': NULL}
 
@@ -141,8 +129,8 @@ WITH j AS (
   SELECT jsono('{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":16,"k17":"seventeen","k18":"eighteen"}') AS v
 )
 SELECT
-  (jsono_transform(v, '{"x":{"type":"VARCHAR","path":"$.k17"}}')).x,
-  (jsono_transform(v, '{"x":{"type":"VARCHAR","path":"$.k18"}}')).x
+  (jsono_transform(v, {'x':{'type':'VARCHAR','path':'$.k17'}})).x,
+  (jsono_transform(v, {'x':{'type':'VARCHAR','path':'$.k18'}})).x
 FROM j;
 ----
 seventeen	eighteen
@@ -153,30 +141,27 @@ WITH j AS (
   SELECT jsono('{"a":"left","b":"right"}') AS v
 )
 SELECT
-  (jsono_transform(v, '{"x":{"type":"VARCHAR","path":"$.a"}}')).x,
-  (jsono_transform(v, '{"x":{"type":"VARCHAR","path":"$.b"}}')).x
+  (jsono_transform(v, {'x':{'type':'VARCHAR','path':'$.a'}})).x,
+  (jsono_transform(v, {'x':{'type':'VARCHAR','path':'$.b'}})).x
 FROM j;
 ----
 left	right
 
 # Missing path, JSON null, container leaf, and type mismatch become NULL fields.
 query I
-SELECT jsono_transform(
-  jsono('{"a":null,"b":{"x":1},"c":"not_int","d":2}'),
-  '{"a":"VARCHAR","b":"VARCHAR","c":"BIGINT","missing":"BOOLEAN","d":"DOUBLE"}'
-);
+SELECT jsono_transform(jsono('{"a":null,"b":{"x":1},"c":"not_int","d":2}'), {'a':'VARCHAR','b':'VARCHAR','c':'BIGINT','missing':'BOOLEAN','d':'DOUBLE'});
 ----
 {'a': NULL, 'b': NULL, 'c': NULL, 'missing': NULL, 'd': 2.0}
 
 # NULL JSONO row returns NULL struct.
 query I
-SELECT jsono_transform(NULL::JSONO, '{"a":"BIGINT"}');
+SELECT jsono_transform(jsono(NULL), {'a':'BIGINT'});
 ----
 NULL
 
 # Spec must be constant.
 statement ok
-CREATE TABLE transform_specs AS SELECT '{"a":"BIGINT"}' AS s;
+CREATE TABLE transform_specs AS SELECT {'a':'BIGINT'} AS s;
 
 statement error
 SELECT jsono_transform(jsono('{"a":1}'), s) FROM transform_specs;
@@ -185,56 +170,48 @@ constant
 
 # Unsupported and malformed specs fail at bind time.
 statement error
-SELECT jsono_transform(jsono('{"a":1}'), '{"a":"JSON"}');
+SELECT jsono_transform(jsono('{"a":1}'), {'a':'JSON'});
 ----
 unsupported scalar type
 
 statement error
-SELECT jsono_transform(jsono('{"a":1}'), '{"a":{"type":"BIGINT","path":"$.a","extra":1}}');
+SELECT jsono_transform(jsono('{"a":1}'), {'a':{'type':'BIGINT','path':'$.a','extra':1}});
 ----
 unknown wrapper key
 
+# A non-STRUCT spec is rejected (the spec must be a STRUCT literal, not a string).
 statement error
-SELECT jsono_transform(jsono('{"a":1}'), '{}');
+SELECT jsono_transform(jsono('{"a":1}'), '{"a":"BIGINT"}');
 ----
-empty
+must be a non-NULL STRUCT
 
 # Wildcard list preserves positional NULLs.
 query I
-SELECT jsono_transform(
-  jsono('{"purchase":{"products":[{"category":"books"},{"x":1},{"category":null},{"category":2},{"category":"games"}]}}'),
-  '{"categories":{"type":["VARCHAR"],"path":"$.purchase.products[*].category"}}'
-);
+SELECT jsono_transform(jsono('{"purchase":{"products":[{"category":"books"},{"x":1},{"category":null},{"category":2},{"category":"games"}]}}'), {'categories':{'type':['VARCHAR'],'path':'$.purchase.products[*].category'}});
 ----
 {'categories': [books, NULL, NULL, NULL, games]}
 
 # Wildcard item objects also use storage-level rank to value cursor checkpoints.
 query I
-SELECT jsono_transform(
-  jsono('{"items":[{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":16,"k17":"a"},{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":16,"k18":"b"}]}'),
-  '{"late":{"type":["VARCHAR"],"path":"$.items[*].k17"}}'
-);
+SELECT jsono_transform(jsono('{"items":[{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":16,"k17":"a"},{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":16,"k18":"b"}]}'), {'late':{'type':['VARCHAR'],'path':'$.items[*].k17'}});
 ----
 {'late': [a, NULL]}
 
 # Missing wildcard container yields NULL list.
 query I
-SELECT jsono_transform(jsono('{"purchase":{}}'), '{"categories":{"type":["VARCHAR"],"path":"$.purchase.products[*].category"}}');
+SELECT jsono_transform(jsono('{"purchase":{}}'), {'categories':{'type':['VARCHAR'],'path':'$.purchase.products[*].category'}});
 ----
 {'categories': NULL}
 
 # Empty wildcard array yields empty list.
 query I
-SELECT jsono_transform(jsono('{"purchase":{"products":[]}}'), '{"categories":{"type":["VARCHAR"],"path":"$.purchase.products[*].category"}}');
+SELECT jsono_transform(jsono('{"purchase":{"products":[]}}'), {'categories':{'type':['VARCHAR'],'path':'$.purchase.products[*].category'}});
 ----
 {'categories': []}
 
 # Join mode skips NULL, missing, non-string, and container leaves.
 query I
-SELECT jsono_transform(
-  jsono('{"purchase":{"products":[{"category":"books"},{"x":1},{"category":null},{"category":2},{"category":["bad"]},{"category":"games"}]}}'),
-  '{"categories":{"type":"VARCHAR","path":"$.purchase.products[*].category","join_separator":"|"}}'
-);
+SELECT jsono_transform(jsono('{"purchase":{"products":[{"category":"books"},{"x":1},{"category":null},{"category":2},{"category":["bad"]},{"category":"games"}]}}'), {'categories':{'type':'VARCHAR','path':'$.purchase.products[*].category','join_separator':'|'}});
 ----
 {'categories': books|games}
 
@@ -242,14 +219,8 @@ SELECT jsono_transform(
 query II
 WITH extracted AS (
   SELECT
-    jsono_transform(
-      jsono('{"items":[{"name":""},{"name":"x"}]}'),
-      '{"names":{"type":"VARCHAR","path":"$.items[*].name","join_separator":"|"}}'
-    ) AS joined,
-    jsono_transform(
-      jsono('{"items":[{"name":""}]}'),
-      '{"names":{"type":"VARCHAR","path":"$.items[*].name","join_separator":"|"}}'
-    ) AS single_empty
+    jsono_transform(jsono('{"items":[{"name":""},{"name":"x"}]}'), {'names':{'type':'VARCHAR','path':'$.items[*].name','join_separator':'|'}}) AS joined,
+    jsono_transform(jsono('{"items":[{"name":""}]}'), {'names':{'type':'VARCHAR','path':'$.items[*].name','join_separator':'|'}}) AS single_empty
 )
 SELECT joined.names = '|x', single_empty.names = ''
 FROM extracted;
@@ -258,38 +229,32 @@ true	true
 
 # Wildcard traversal keeps positional NULLs when one node has object-key and array-index paths.
 query I
-SELECT jsono_transform(
-  jsono('{"items":[{"name":"obj"},["arr"],{"name":"obj2"}]}'),
-  '{"names":{"type":["VARCHAR"],"path":"$.items[*].name"},"firsts":{"type":["VARCHAR"],"path":"$.items[*][0]"}}'
-);
+SELECT jsono_transform(jsono('{"items":[{"name":"obj"},["arr"],{"name":"obj2"}]}'), {'names':{'type':['VARCHAR'],'path':'$.items[*].name'},'firsts':{'type':['VARCHAR'],'path':'$.items[*][0]'}});
 ----
 {'names': [obj, NULL, obj2], 'firsts': [NULL, arr, NULL]}
 
 # Wildcard scalar without list/join mode is rejected.
 statement error
-SELECT jsono_transform(jsono('{"items":[]}'), '{"x":{"type":"VARCHAR","path":"$.items[*].name"}}');
+SELECT jsono_transform(jsono('{"items":[]}'), {'x':{'type':'VARCHAR','path':'$.items[*].name'}});
 ----
 wildcard
 
 # Multiple wildcard levels are rejected.
 statement error
-SELECT jsono_transform(jsono('{"items":[]}'), '{"x":{"type":["VARCHAR"],"path":"$.items[*].children[*].name"}}');
+SELECT jsono_transform(jsono('{"items":[]}'), {'x':{'type':['VARCHAR'],'path':'$.items[*].children[*].name'}});
 ----
 multiple wildcard
 
 # UINT64-range integers extract losslessly as UBIGINT; a small int also fits UBIGINT.
 # BIGINT cannot hold a UINT64-range value, so that target yields NULL rather than data.
 query I
-SELECT jsono_transform(
-  jsono('{"u":10000000000000000000,"s":42}'),
-  '{"u":{"type":"UBIGINT","path":"$.u"},"s":{"type":"UBIGINT","path":"$.s"},"big":{"type":"BIGINT","path":"$.u"}}'
-);
+SELECT jsono_transform(jsono('{"u":10000000000000000000,"s":42}'), {'u':{'type':'UBIGINT','path':'$.u'},'s':{'type':'UBIGINT','path':'$.s'},'big':{'type':'BIGINT','path':'$.u'}});
 ----
 {'u': 10000000000000000000, 's': 42, 'big': NULL}
 
 # NUMBER-encoded numbers (exponent form) extract to DOUBLE without locale-dependent parsing.
 query I
-SELECT jsono_transform(jsono('{"x":1.5e3}'), '{"x":{"type":"DOUBLE","path":"$.x"}}');
+SELECT jsono_transform(jsono('{"x":1.5e3}'), {'x':{'type':'DOUBLE','path':'$.x'}});
 ----
 {'x': 1500.0}
 
@@ -303,18 +268,18 @@ out of range
 # nested path: "a.b" extracts the "a.b" key, not $.a.b. Dotted top-level keys
 # (utm.source, page.title) are common in analytics payloads.
 query I
-SELECT jsono_transform(jsono('{"a.b":"flat","a":{"b":"nested"}}'), '{"a.b":"VARCHAR"}');
+SELECT jsono_transform(jsono('{"a.b":"flat","a":{"b":"nested"}}'), {'a.b':'VARCHAR'});
 ----
 {'a.b': flat}
 
 query I
-SELECT jsono_transform(jsono('{"a.b":"flat","a":{"b":"nested"}}'), '{"a.b":{"type":"VARCHAR"}}');
+SELECT jsono_transform(jsono('{"a.b":"flat","a":{"b":"nested"}}'), {'a.b':{'type':'VARCHAR'}});
 ----
 {'a.b': flat}
 
 # An explicit path still navigates nested structure.
 query I
-SELECT jsono_transform(jsono('{"a.b":"flat","a":{"b":"nested"}}'), '{"out":{"type":"VARCHAR","path":"$.a.b"}}');
+SELECT jsono_transform(jsono('{"a.b":"flat","a":{"b":"nested"}}'), {'out':{'type':'VARCHAR','path':'$.a.b'}});
 ----
 {'out': nested}
 
@@ -322,24 +287,21 @@ SELECT jsono_transform(jsono('{"a.b":"flat","a":{"b":"nested"}}'), '{"out":{"typ
 # fields transparently. event_name lifts to a VARCHAR lane, n to a BIGINT lane, while the
 # nested object stays in the residual tape and is navigated as usual.
 query I
-SELECT jsono_transform(jsono({'event_name': 'click', 'n': 5::BIGINT, 'nested': {'k': 1}}),
-                       '{"event_name":"VARCHAR","n":"BIGINT","k":{"type":"BIGINT","path":"$.nested.k"}}');
+SELECT jsono_transform(jsono({'event_name': 'click', 'n': 5::BIGINT, 'nested': {'k': 1}}), {'event_name':'VARCHAR','n':'BIGINT','k':{'type':'BIGINT','path':'$.nested.k'}});
 ----
 {'event_name': click, 'n': 5, 'k': 1}
 
-# Differential: transforming a shredded value equals transforming the same document as a
-# plain tape ({shred: false}).
+# Differential: transforming a shredded value equals transforming the same document parsed
+# as a plain tape (the parse path produces no lanes).
 query I
-SELECT jsono_transform(jsono({'event_name': 'click', 'n': 5::BIGINT}),
-                       '{"event_name":"VARCHAR","n":"BIGINT"}')
-     = jsono_transform(jsono({'event_name': 'click', 'n': 5::BIGINT}, {'shred': false}),
-                       '{"event_name":"VARCHAR","n":"BIGINT"}');
+SELECT jsono_transform(jsono({'event_name': 'click', 'n': 5::BIGINT}), {'event_name':'VARCHAR','n':'BIGINT'})
+     = jsono_transform(jsono('{"event_name":"click","n":5}'), {'event_name':'VARCHAR','n':'BIGINT'});
 ----
 true
 
 # A lane absent on a row is NULL, not a spurious value (account-style row without n).
 query I
-SELECT jsono_transform(jsono({'event_name': 'view'}), '{"event_name":"VARCHAR","n":"BIGINT"}');
+SELECT jsono_transform(jsono({'event_name': 'view'}), {'event_name':'VARCHAR','n':'BIGINT'});
 ----
 {'event_name': view, 'n': NULL}
 
@@ -347,14 +309,14 @@ SELECT jsono_transform(jsono({'event_name': 'view'}), '{"event_name":"VARCHAR","
 # residual (lane holds only the ->> text), so a VARCHAR field over that path yields NULL
 # exactly like the plain tape — the lane is not read in preference to the residual.
 query I
-SELECT jsono_transform(jsono_shred(jsono('{"k":5}'), '{"$.k":"VARCHAR"}'), '{"k":"VARCHAR"}')
-     = jsono_transform(jsono('{"k":5}'), '{"k":"VARCHAR"}');
+SELECT jsono_transform(jsono('{"k":5}', shredding := {'$.k':'VARCHAR'}), {'k':'VARCHAR'})
+     = jsono_transform(jsono('{"k":5}'), {'k':'VARCHAR'});
 ----
 true
 
 # A stripped string lane reads back through transform: the residual lacks the key and the
 # lane refills it.
 query I
-SELECT jsono_transform(jsono_shred(jsono('{"k":"hi"}'), '{"$.k":"VARCHAR"}'), '{"k":"VARCHAR"}');
+SELECT jsono_transform(jsono('{"k":"hi"}', shredding := {'$.k':'VARCHAR'}), {'k':'VARCHAR'});
 ----
 {'k': hi}

@@ -172,10 +172,10 @@ SELECT to_json(jsono_merge_patch(jsono('{"a":1}'), jsono('{"b":2}'), NULL));
 ----
 NULL
 
-# Group merge folds each row's view straight into the accumulator. IGNORE NULLS
+# Group merge folds each row's view straight into the accumulator, ignoring nulls:
 # keeps the latest non-null; array values are replaced verbatim, not merged.
 query I
-SELECT to_json(jsono_group_merge(j, 'IGNORE NULLS' ORDER BY ts))
+SELECT to_json(jsono_group_merge(j ORDER BY ts))
 FROM (VALUES
   (jsono('{"a":[1,2],"b":1}'), 1),
   (jsono('{"a":null,"c":3}'), 2)
@@ -266,7 +266,7 @@ SELECT to_json(jsono_overlay(jsono('{"a":null}'), jsono('{"a":"x","b":"y"}')));
 query I
 SELECT typeof(jsono_merge_patch(
   jsono('{"a":1}'),
-  jsono_shred(jsono('{"event_name":"page_view"}'), '{"event_name":"VARCHAR"}')
+  jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'})
 ));
 ----
 STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB, event_name VARCHAR)
@@ -276,7 +276,7 @@ query II
 SELECT to_json(m), (m).event_name FROM (
   SELECT jsono_merge_patch(
     jsono('{"a":1}'),
-    jsono_shred(jsono('{"event_name":"page_view"}'), '{"event_name":"VARCHAR"}')
+    jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'})
   ) AS m
 );
 ----
@@ -339,7 +339,7 @@ STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skip
 
 # A NULL base with a shredded patch reconstructs to just the patch.
 query I
-SELECT to_json(jsono_merge_patch(NULL::JSONO, jsono({'event_name': 'x'})));
+SELECT to_json(jsono_merge_patch(jsono(NULL), jsono({'event_name': 'x'})));
 ----
 {"event_name":"x"}
 

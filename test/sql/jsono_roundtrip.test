@@ -34,7 +34,7 @@ query IIII
 SELECT
   to_json(jsono('{"a":1,"a":2}')),
   jsono_type(jsono('{"a":1,"a":2}'), '$.a'),
-  (jsono_transform(jsono('{"a":1,"a":2}'), '{"a":{"type":"BIGINT","path":"$.a"}}')).a,
+  (jsono_transform(jsono('{"a":1,"a":2}'), {'a':{'type':'BIGINT','path':'$.a'}})).a,
   to_json(jsono_merge_patch(jsono('{"a":1,"a":2}')));
 ----
 {"a":2}	BIGINT	2	{"a":2}
@@ -127,7 +127,7 @@ SELECT try_jsono(NULL);
 NULL
 
 query I
-SELECT to_json(NULL::JSONO);
+SELECT to_json(jsono(NULL));
 ----
 NULL
 
@@ -155,17 +155,16 @@ true
 
 require json
 
-# SQL casts use the same strict/tolerant split.
-query III
+# The strict and tolerant constructors share the parse path; the result is the jsono STRUCT.
+query II
 SELECT
-  typeof('{"a":1}'::JSONO),
-  typeof(CAST('{"a":1}' AS JSONO)),
-  TRY_CAST('{bad' AS JSONO) IS NULL;
+  typeof(jsono('{"a":1}')),
+  try_jsono('{bad') IS NULL;
 ----
-JSONO	JSONO	true
+STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)	true
 
 statement error
-SELECT CAST('{bad' AS JSONO);
+SELECT jsono('{bad');
 ----
 jsono: invalid JSON
 
@@ -178,7 +177,7 @@ SELECT
 
 # to_json on a STRUCT with wrong magic bytes - NULL
 query I
-SELECT to_json({'jsono_slots': 'not jsono'::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}::JSONO);
+SELECT to_json({'jsono_slots': 'not jsono'::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB});
 ----
 NULL
 
@@ -189,7 +188,7 @@ SELECT to_json({
   'jsono_key_heap': ''::BLOB,
   'jsono_string_heap': ''::BLOB,
   'jsono_skips': ''::BLOB
-}::JSONO);
+});
 ----
 container span
 
@@ -200,12 +199,12 @@ SELECT to_json({
   'jsono_key_heap': ''::BLOB,
   'jsono_string_heap': ''::BLOB,
   'jsono_skips': unhex('01000000000000000000000001000000000000000000000000000000')
-}::JSONO);
+});
 ----
 malformed JSONO
 
-# Slots, heaps, and skips are non-empty for a valid document. Cast
-# through the bare STRUCT shape because struct_extract doesn't follow the JSONO alias.
+# Slots, heaps, and skips are non-empty for a valid document. jsono() yields the bare
+# STRUCT, so the BLOB children are read directly (the cast below is a no-op shape annotation).
 query IIII
 SELECT
   octet_length((jsono('{"a":1,"b":"hi"}')::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)).jsono_slots) > 0,
@@ -227,21 +226,15 @@ SELECT octet_length((jsono('{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k0
 ----
 48
 
-# JSONO has the documented STRUCT shape
+# jsono() yields the documented STRUCT shape directly (no type alias).
 query I
 SELECT typeof(jsono('{"a":1}'));
 ----
-JSONO
+STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
 
-# The alias is structurally compatible with STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) -
-# implicit cast lets bare STRUCTs (e.g. read from Parquet) flow into transform/to_json.
+# jsono() is exactly this STRUCT, so a bare STRUCT (e.g. read from Parquet, which carries no
+# alias) flows into to_json/transform unchanged — the cast here is a no-op shape annotation.
 query I
 SELECT to_json(jsono('{"a":1}')::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB));
 ----
 {"a":1}
-
-# Reverse cast: bare STRUCT -> JSONO
-query I
-SELECT typeof(jsono('{"a":1}')::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)::JSONO);
-----
-JSONO

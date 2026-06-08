@@ -23,9 +23,7 @@ top AS (
 		',' ORDER BY i) || '}' AS doc
 	FROM range(17) t(i)
 )
-SELECT jsono_transform(
-	doc::JSONO,
-	'{"a":{"path":"$.k08.c0500","type":"BIGINT"},"b":{"path":"$.k09","type":"BIGINT"}}')
+SELECT jsono_transform(jsono(doc), {'a':{'path':'$.k08.c0500','type':'BIGINT'},'b':{'path':'$.k09','type':'BIGINT'}})
 FROM top;
 ----
 {'a': 500, 'b': 900}
