@@ -1,12 +1,19 @@
 #include "jsono.hpp"
+#include "jsono_shred.hpp"
 
+#include "duckdb/common/enums/optimizer_type.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/expression.hpp"
 
 #include <algorithm>
 
@@ -52,141 +59,160 @@ void JsonoVersionExecute(DataChunk &args, ExpressionState &state, Vector &result
 	result.SetValue(0, Value::INTEGER(int32_t(jsono::VERSION)));
 }
 
-// jsono_storage_type(lanes) -> the shredded storage type's DDL: the 4-BLOB residual plus the
-// given lane columns, so a schema can declare a shredded jsono column from a readable lane spec
-// (e.g. 'event_name VARCHAR, n BIGINT') without computing the field-name fingerprint by hand. The
-// lane DDL is parsed into (name, type) and re-emitted through JsonoShreddedStructType, so the
-// declared column is byte-identical to a value built from the same lanes; declare lanes the same
-// way in the column and the shredding spec, or a generic struct cast on INSERT fails loud.
-void JsonoStorageTypeWithLanesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+// jsono_storage_type(shreds) -> the shredded storage type's DDL: the 4-BLOB residual plus the
+// given shred columns, so a schema can declare a shredded jsono column from a readable shred spec
+// (e.g. 'event_name VARCHAR, n BIGINT'). The shred DDL is parsed into (name, type) and re-emitted
+// through JsonoShreddedStructType, so the declared column is byte-identical to a value built from
+// the same shreds.
+void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)state;
-	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t lanes) {
-		auto columns = Parser::ParseColumnList(lanes.GetString());
-		child_list_t<LogicalType> lane_types;
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t shreds) {
+		auto columns = Parser::ParseColumnList(shreds.GetString());
+		child_list_t<LogicalType> shred_types;
 		for (auto &col : columns.Logical()) {
-			lane_types.emplace_back(col.Name(), col.Type());
+			shred_types.emplace_back(col.Name(), col.Type());
 		}
-		// Canonical lane order (sorted by name) so the DDL matches a value built from the same lanes
+		// Canonical shred order (sorted by name) so the DDL matches a value built from the same shreds
 		// regardless of the order they are written in here vs the shredding spec.
-		std::sort(lane_types.begin(), lane_types.end(),
+		std::sort(shred_types.begin(), shred_types.end(),
 		          [](const std::pair<string, LogicalType> &a, const std::pair<string, LogicalType> &b) {
 			          return a.first < b.first;
 		          });
-		return StringVector::AddString(result, JsonoShreddedStructType(lane_types).ToString());
+		return StringVector::AddString(result, JsonoShreddedStructType(shred_types).ToString());
 	});
 }
 
-// Order-independent fingerprint of a lane set, folding in lane types so a type change is also a
-// mismatch. Stable across processes and builds (a fixed FNV-1a, not std::hash, whose seed varies):
-// jsono_storage_type and the constructor must agree byte-for-byte on the suffix for the same lanes.
-string JsonoLaneFingerprint(const child_list_t<LogicalType> &lanes) {
-	vector<string> signatures;
-	signatures.reserve(lanes.size());
-	for (auto &lane : lanes) {
-		signatures.push_back(lane.first + '\x01' + lane.second.ToString());
+constexpr const char *JSONO_LAYOUT = "jsono";
+
+// Parse one layout field (top-level child name + its STRUCT type) into `out`. The body must be the
+// four-BLOB body struct as field 0; a shredded layout adds its typed shreds as the remaining sibling
+// fields. Shreds sit beside `body` (not in a nested struct) deliberately: `body` is then a field
+// every two JSONO types share, so DuckDB's by-name struct cast binds between ANY two of them —
+// including fully disjoint shred sets — and the optimizer can rewrite every such cast into the
+// lossless reconstruct + reshred.
+bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type, JsonoLayoutType &out) {
+	if (name != JSONO_LAYOUT) {
+		return false;
 	}
-	std::sort(signatures.begin(), signatures.end());
-	uint64_t hash = 1469598103934665603ULL;
-	for (auto &signature : signatures) {
-		for (unsigned char byte : signature) {
-			hash = (hash ^ byte) * 1099511628211ULL;
+	if (layout_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(layout_type)) {
+		return false;
+	}
+	auto &fields = StructType::GetChildTypes(layout_type);
+	if (fields.empty() || fields[0].first != "body" || fields[0].second != JsonoBodyStructType()) {
+		return false;
+	}
+	if (fields.size() == 1) {
+		out.kind = JsonoLayoutKind::Plain;
+		out.layout_name = name;
+		out.layout_type = layout_type;
+		out.shreds.clear();
+		return true;
+	}
+	// Every sibling of `body` must be a shred of a shred value type; anything else is not a
+	// JSONO struct (a user struct that happens to carry a body-shaped field stays theirs).
+	child_list_t<LogicalType> shreds;
+	for (idx_t i = 1; i < fields.size(); i++) {
+		if (!IsShredValueType(fields[i].second)) {
+			return false;
 		}
-		hash = (hash ^ 0xFFu) * 1099511628211ULL; // separator so {"ab"},{"a","b"} differ
+		shreds.push_back(fields[i]);
 	}
-	static const char *hex = "0123456789abcdef";
-	string suffix = "#";
-	for (int shift = 60; shift >= 0; shift -= 4) {
-		suffix += hex[(hash >> shift) & 0xF];
-	}
-	return suffix;
+	out.kind = JsonoLayoutKind::Shredded;
+	out.layout_name = name;
+	out.layout_type = layout_type;
+	out.shreds = std::move(shreds);
+	return true;
 }
 
 } // namespace
 
-bool IsJsonoType(const LogicalType &type) {
-	if (type.id() != LogicalTypeId::STRUCT) {
-		return false;
-	}
-	// A jsono value is recognised purely by structure: the four jsono_* BLOB children.
-	// There is no type alias to short-circuit on — a stored value (DuckDB-native, Parquet
-	// or DuckLake) is just this STRUCT. JsonoRawStructType is the single field contract.
-	return StructType::GetChildTypes(type) == StructType::GetChildTypes(JsonoRawStructType());
-}
-
-// The four residual BLOB field bases, in order. A jsono-prefixed type names them base+suffix,
-// where the suffix is "" for a plain value and "#<fp>" for a shredded one (carried by every field).
-static const char *const JSONO_BLOB_BASES[4] = {"jsono_slots", "jsono_key_heap", "jsono_string_heap", "jsono_skips"};
-
-bool HasJsonoBlobPrefix(const LogicalType &type) {
-	if (type.id() != LogicalTypeId::STRUCT) {
+bool TryParseJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out) {
+	if (type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(type)) {
 		return false;
 	}
 	auto &children = StructType::GetChildTypes(type);
-	if (children.size() < 4) {
-		return false;
+	if (children.size() != 1) {
+		return false; // an ordinary value has exactly one layout field
 	}
-	// The suffix is whatever follows "jsono_slots" in the first field; all four blobs must then be
-	// base+suffix and BLOB. This recognises both plain (suffix "") and shredded (suffix "#<fp>").
-	const string base0 = JSONO_BLOB_BASES[0];
-	const string &name0 = children[0].first;
-	if (name0.size() < base0.size() || name0.compare(0, base0.size(), base0) != 0) {
-		return false;
-	}
-	string suffix = name0.substr(base0.size());
-	for (idx_t i = 0; i < 4; i++) {
-		if (children[i].second.id() != LogicalTypeId::BLOB) {
-			return false;
-		}
-		if (children[i].first != string(JSONO_BLOB_BASES[i]) + suffix) {
-			return false;
-		}
-	}
-	return true;
+	return TryParseJsonoLayoutField(children[0].first, children[0].second, out);
+}
+
+bool IsJsonoType(const LogicalType &type) {
+	JsonoLayoutType layout;
+	return TryParseJsonoLayoutType(type, layout) && layout.kind == JsonoLayoutKind::Plain;
 }
 
 bool IsShreddedJsonoType(const LogicalType &type) {
-	return HasJsonoBlobPrefix(type) && StructType::GetChildTypes(type).size() > 4;
+	JsonoLayoutType layout;
+	return TryParseJsonoLayoutType(type, layout) && layout.kind == JsonoLayoutKind::Shredded;
 }
 
-LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &lanes) {
-	auto suffix = JsonoLaneFingerprint(lanes);
+void JsonoRequireExtensionOptimizerForShredded(ClientContext &context, const LogicalType &type,
+                                               const string &function_name) {
+	if (!IsShreddedJsonoType(type)) {
+		return;
+	}
+	auto &config = DBConfig::GetConfig(context);
+	if (config.options.disabled_optimizers.find(OptimizerType::EXTENSION) == config.options.disabled_optimizers.end()) {
+		return;
+	}
+	throw BinderException("%s on shredded JSONO requires the extension optimizer; unsafe STRUCT casts may corrupt "
+	                      "JSONO rows when it is disabled",
+	                      function_name);
+}
+
+LogicalType JsonoResolveJsonoArgument(ClientContext &context, const Expression &arg, const string &function_name,
+                                      bool reconstruct_shredded) {
+	if (arg.HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
+	auto &type = arg.return_type;
+	JsonoRequireExtensionOptimizerForShredded(context, type, function_name);
+	if (IsShreddedJsonoType(type)) {
+		return reconstruct_shredded ? JsonoType() : type;
+	}
+	if (type.id() == LogicalTypeId::SQLNULL || IsJsonoType(type)) {
+		return JsonoType();
+	}
+	throw BinderException("%s: argument must be JSONO", function_name);
+}
+
+LogicalType JsonoBodyStructType() {
 	child_list_t<LogicalType> children;
-	for (auto base : JSONO_BLOB_BASES) {
-		children.emplace_back(base + suffix, LogicalType::BLOB);
-	}
-	for (auto &lane : lanes) {
-		children.emplace_back(lane.first + suffix, lane.second);
-	}
+	children.emplace_back("slots", LogicalType::BLOB);
+	children.emplace_back("key_heap", LogicalType::BLOB);
+	children.emplace_back("string_heap", LogicalType::BLOB);
+	children.emplace_back("skips", LogicalType::BLOB);
 	return LogicalType::STRUCT(std::move(children));
 }
 
-string JsonoLaneSuffix(const LogicalType &type) {
-	// field[0] is "jsono_slots" + suffix; everything past the base is the shared suffix.
-	const string base0 = JSONO_BLOB_BASES[0];
-	return StructType::GetChildTypes(type)[0].first.substr(base0.size());
+string JsonoLayoutName() {
+	return JSONO_LAYOUT;
 }
 
-string JsonoStripLaneSuffix(const string &field_name, const string &suffix) {
-	if (!suffix.empty() && field_name.size() >= suffix.size() &&
-	    field_name.compare(field_name.size() - suffix.size(), suffix.size(), suffix) == 0) {
-		return field_name.substr(0, field_name.size() - suffix.size());
+LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds) {
+	child_list_t<LogicalType> layout_children;
+	layout_children.emplace_back("body", JsonoBodyStructType());
+	for (auto &shred : shreds) {
+		layout_children.push_back(shred);
 	}
-	return field_name;
+	child_list_t<LogicalType> top;
+	top.emplace_back(JsonoLayoutName(), LogicalType::STRUCT(std::move(layout_children)));
+	return LogicalType::STRUCT(std::move(top));
 }
 
 LogicalType JsonoRawStructType() {
-	child_list_t<LogicalType> children;
-	children.emplace_back("jsono_slots", LogicalType::BLOB);
-	children.emplace_back("jsono_key_heap", LogicalType::BLOB);
-	children.emplace_back("jsono_string_heap", LogicalType::BLOB);
-	children.emplace_back("jsono_skips", LogicalType::BLOB);
-	return LogicalType::STRUCT(std::move(children));
+	child_list_t<LogicalType> layout_children;
+	layout_children.emplace_back("body", JsonoBodyStructType());
+	child_list_t<LogicalType> top;
+	top.emplace_back(JsonoLayoutName(), LogicalType::STRUCT(std::move(layout_children)));
+	return LogicalType::STRUCT(std::move(top));
 }
 
 LogicalType JsonoType() {
 	// The JSONO type alias was dropped: a user-defined alias cannot round-trip through
 	// Parquet (stripped on read) or DuckLake (rejected as an unsupported user-defined type),
-	// so a stored jsono value is the physical STRUCT and nothing more. Function and cast
+	// so a stored jsono value is the physical nested STRUCT and nothing more. Function and cast
 	// dispatch is structural (IsJsonoType). Kept as the accessor the registrations read
 	// against; identical to JsonoRawStructType().
 	return JsonoRawStructType();
@@ -209,7 +235,8 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet set("jsono_storage_type");
 		set.AddFunction(ScalarFunction({}, LogicalType::VARCHAR, JsonoStorageTypeExecute));
-		set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, JsonoStorageTypeWithLanesExecute));
+		set.AddFunction(
+		    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, JsonoStorageTypeWithShredsExecute));
 		loader.RegisterFunction(set);
 	}
 	{

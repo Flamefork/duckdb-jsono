@@ -40,12 +40,14 @@ query IIII
 SELECT
   jsono_validate(jsono('{"a":"x","b":[1,true,null]}')),
   jsono_validate(jsono(NULL)) IS NULL,
-  jsono_validate({'jsono_slots': 'not jsono'::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}),
+  jsono_validate({'jsono': {'body': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB}}}),
   jsono_validate({
-    'jsono_slots': unhex('4A534E4F020100000000000000000000'),
-    'jsono_key_heap': ''::BLOB,
-    'jsono_string_heap': ''::BLOB,
-    'jsono_skips': ''::BLOB
+    'jsono': {'body': {
+      'slots': unhex('4A534E4F030100000000000000000000'),
+      'key_heap': ''::BLOB,
+      'string_heap': ''::BLOB,
+      'skips': ''::BLOB
+    }}
   });
 ----
 true	true	false	false
@@ -55,44 +57,68 @@ true	true	false	false
 # inner ARR_END would be reused by both arrays. VERSION=2 ContainerSpans are 16 bytes
 # (u32 slot_span, u32 string_byte_span, u64 shape_hash; arrays store shape_hash 0).
 query I
-SELECT jsono_validate({
-  'jsono_slots': unhex('4A534E4F020100000000000000000020000000010000002001000000000000800000000000000030'),
-  'jsono_key_heap': ''::BLOB,
-  'jsono_string_heap': unhex('78'),
-  'jsono_skips': unhex('0200000000000000000000000400000001000000000000000000000003000000010000000000000000000000')
-});
+SELECT jsono_validate({'jsono': {'body': {
+  'slots': unhex('4A534E4F030100000000000000000020000000010000002001000000000000800000000000000030'),
+  'key_heap': ''::BLOB,
+  'string_heap': unhex('78'),
+  'skips': unhex('0200000000000000000000000400000001000000000000000000000003000000010000000000000000000000')
+}}});
 ----
 false
 
 # High-bit keys still take the full UTF-8 validator; invalid key bytes are rejected.
 query II
 WITH base AS (
-  SELECT jsono('{"a":1}')::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS raw
+  SELECT jsono('{"a":1}') AS raw
 )
 SELECT
   jsono_validate(jsono('{"\u00e9":1}')),
-  jsono_validate({
-    'jsono_slots': raw.jsono_slots,
-    'jsono_key_heap': unhex('FF'),
-    'jsono_string_heap': raw.jsono_string_heap,
-    'jsono_skips': raw.jsono_skips
-  })
+  jsono_validate({'jsono': {'body': {
+    'slots': raw."jsono".body.slots,
+    'key_heap': unhex('FF'),
+    'string_heap': raw."jsono".body.string_heap,
+    'skips': raw."jsono".body.skips
+  }}})
 FROM base;
 ----
 true	false
 
-# jsono_storage_size reports the physical four-BLOB footprint without validating the value.
-query IIIIII
+# jsono_storage_size reports the physical footprint without validating the value: the four body
+# BLOBs, a `shreds` field (shredded shred payload bytes, 0 for a plain value) and their `total`.
+query IIIIIII
 SELECT
-  s.jsono_slots,
-  s.jsono_key_heap,
-  s.jsono_string_heap,
-  s.jsono_skips,
+  s.slots,
+  s.key_heap,
+  s.string_heap,
+  s.skips,
+  s.shreds,
   s.total,
   jsono_storage_size(jsono(NULL)) IS NULL
 FROM (SELECT jsono_storage_size(jsono('{"a":"x"}')) AS s);
 ----
-40	1	1	28	70	true
+40	1	1	28	0	70	true
+
+# A shredded value adds shred payload bytes: a VARCHAR shred counts its string length (5), a BIGINT
+# shred counts 8; total covers the body blobs plus the shreds.
+query II
+SELECT s.shreds, s.total = s.slots + s.key_heap + s.string_heap + s.skips + s.shreds
+FROM (SELECT jsono_storage_size(jsono('{"name":"hello","n":7,"b":{"c":2}}', shredding := {'name':'VARCHAR','$.n':'BIGINT'})) AS s);
+----
+13	true
+
+# A NULL shred value contributes 0 bytes; a plain value reports shreds = 0.
+query II
+SELECT
+  (jsono_storage_size(jsono('{"b":1}', shredding := {'name':'VARCHAR'}))).shreds,
+  (jsono_storage_size(jsono('{"a":"x"}'))).shreds;
+----
+0	0
+
+# jsono_validate accepts a shredded value, validating its residual encoding; NULL stays NULL.
+query II
+SELECT jsono_validate(jsono('{"name":"x"}', shredding := {'name':'VARCHAR'})), jsono_validate(jsono(NULL));
+----
+true	NULL
 
 # A constant JSONPath argument inspects a nested position; mirrors json_type(j, path) / json_keys(j, path).
 query IIIII

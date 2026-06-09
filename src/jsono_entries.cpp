@@ -1,6 +1,7 @@
 #include "jsono.hpp"
 #include "jsono_number.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_writer.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
@@ -45,11 +46,11 @@ void SetListRowNull(Vector &result, idx_t row) {
 
 enum class JsonoEntriesKeyStyle : uint8_t { JsonPath, Dotted };
 
-// A lane of a shredded input: its struct child index, type, and the entry key in both
-// styles (precomputed at bind). A top-level literal lane name `n` keys as `n` (dotted) or
+// A shred of a shredded input: its struct child index, type, and the entry key in both
+// styles (precomputed at bind). A top-level literal shred name `n` keys as `n` (dotted) or
 // `$.n` (jsonpath); a `$.`-prefixed path keys as itself (jsonpath) or without the prefix
-// (dotted). The stripped lane value is flattened alongside the residual entries.
-struct EntriesLane {
+// (dotted). The stripped shred value is flattened alongside the residual entries.
+struct EntriesShred {
 	idx_t child_index;
 	LogicalType type;
 	string key_jsonpath;
@@ -57,22 +58,22 @@ struct EntriesLane {
 };
 
 struct JsonoEntriesBindData : public FunctionData {
-	JsonoEntriesBindData(JsonoEntriesKeyStyle style_p, vector<EntriesLane> lanes_p)
-	    : style(style_p), lanes(std::move(lanes_p)) {
+	JsonoEntriesBindData(JsonoEntriesKeyStyle style_p, vector<EntriesShred> shreds_p)
+	    : style(style_p), shreds(std::move(shreds_p)) {
 	}
 	JsonoEntriesKeyStyle style;
-	vector<EntriesLane> lanes;
+	vector<EntriesShred> shreds;
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<JsonoEntriesBindData>(style, lanes);
+		return make_uniq<JsonoEntriesBindData>(style, shreds);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<JsonoEntriesBindData>();
-		if (style != other.style || lanes.size() != other.lanes.size()) {
+		if (style != other.style || shreds.size() != other.shreds.size()) {
 			return false;
 		}
-		for (idx_t i = 0; i < lanes.size(); i++) {
-			if (lanes[i].child_index != other.lanes[i].child_index || lanes[i].type != other.lanes[i].type) {
+		for (idx_t i = 0; i < shreds.size(); i++) {
+			if (shreds[i].child_index != other.shreds[i].child_index || shreds[i].type != other.shreds[i].type) {
 				return false;
 			}
 		}
@@ -82,7 +83,6 @@ struct JsonoEntriesBindData : public FunctionData {
 
 unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments) {
-	(void)bound_function;
 	auto style = JsonoEntriesKeyStyle::JsonPath;
 	if (arguments.size() >= 2) {
 		auto &style_arg = arguments[1];
@@ -112,27 +112,25 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 		}
 	}
 	auto &input_type = arguments[0]->return_type;
-	vector<EntriesLane> lanes;
+	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_entries", false);
+	vector<EntriesShred> shreds;
 	if (IsShreddedJsonoType(input_type)) {
-		auto &children = StructType::GetChildTypes(input_type);
-		auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
-		auto suffix = JsonoLaneSuffix(input_type);
-		for (idx_t i = prefix; i < children.size(); i++) {
-			auto name = JsonoStripLaneSuffix(children[i].first, suffix);
-			EntriesLane lane {i, children[i].second, "", ""};
+		JsonoLayoutType layout;
+		TryParseJsonoLayoutType(input_type, layout);
+		for (idx_t i = 0; i < layout.shreds.size(); i++) {
+			auto &name = layout.shreds[i].first;
+			EntriesShred shred {i, layout.shreds[i].second, "", ""};
 			if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
-				lane.key_jsonpath = name;
-				lane.key_dotted = name.substr(2);
+				shred.key_jsonpath = name;
+				shred.key_dotted = name.substr(2);
 			} else {
-				lane.key_jsonpath = "$." + name;
-				lane.key_dotted = name;
+				shred.key_jsonpath = "$." + name;
+				shred.key_dotted = name;
 			}
-			lanes.push_back(std::move(lane));
+			shreds.push_back(std::move(shred));
 		}
-	} else if (input_type.id() != LogicalTypeId::SQLNULL && !IsJsonoType(input_type)) {
-		throw BinderException("jsono_entries: argument must be JSONO");
 	}
-	return make_uniq<JsonoEntriesBindData>(style, std::move(lanes));
+	return make_uniq<JsonoEntriesBindData>(style, std::move(shreds));
 }
 
 // A bare JSONPath key segment is parseable only while it avoids the grammar's
@@ -266,7 +264,7 @@ struct EntriesSink {
 		next_child++;
 	}
 
-	// Append a lane entry whose value is already rendered text (or SQL NULL).
+	// Append a shred entry whose value is already rendered text (or SQL NULL).
 	void AppendText(nonstd::string_view key, bool value_null, nonstd::string_view value) {
 		if (next_child >= capacity) {
 			EnsureListCapacity(list, next_child + 1);
@@ -338,11 +336,11 @@ void WalkEntries(const JsonoView &view, size_t &pos, size_t &string_cursor, std:
 	}
 }
 
-// Render a shredded lane's typed value as the text an entry carries. Lanes are limited
+// Render a shredded shred's typed value as the text an entry carries. Shreds are limited
 // to the shred-primitive types, so a small switch covers them; VARCHAR returns the heap
 // string in place, the rest format into `scratch`.
-nonstd::string_view FormatLaneValue(const UnifiedVectorFormat &fmt, idx_t idx, const LogicalType &type,
-                                    std::string &scratch) {
+nonstd::string_view FormatShredValue(const UnifiedVectorFormat &fmt, idx_t idx, const LogicalType &type,
+                                     std::string &scratch) {
 	switch (type.id()) {
 	case LogicalTypeId::VARCHAR: {
 		auto &s = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
@@ -373,32 +371,43 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = func_expr.bind_info->Cast<JsonoEntriesBindData>();
 	auto style = bind_data.style;
-	auto &lanes = bind_data.lanes;
+	auto &shreds = bind_data.shreds;
 
-	// Read each lane column once so the per-row loop can emit its stripped value.
-	vector<UnifiedVectorFormat> lane_fmt(lanes.size());
-	if (!lanes.empty()) {
-		auto &struct_children = StructVector::GetEntries(args.data[0]);
-		for (idx_t f = 0; f < lanes.size(); f++) {
-			struct_children[lanes[f].child_index]->ToUnifiedFormat(count, lane_fmt[f]);
+	// Read each shred column once so the per-row loop can emit its stripped value.
+	vector<UnifiedVectorFormat> shred_fmt(shreds.size());
+	if (!shreds.empty()) {
+		for (idx_t f = 0; f < shreds.size(); f++) {
+			JsonoShredVector(args.data[0], shreds[f].child_index).ToUnifiedFormat(count, shred_fmt[f]);
 		}
 	}
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	ListVector::SetListSize(result, 0);
 	std::string path;
-	std::string lane_scratch;
+	std::string shred_scratch;
 	EntriesSink sink(result);
+
+	// The shreds this input type carries, verified against each row's shred manifest so a row
+	// narrowed by a raw struct cast fails loud instead of emitting incomplete entries.
+	JsonoLayoutType layout;
+	TryParseJsonoLayoutType(args.data[0].GetType(), layout);
+	vector<std::pair<std::string, std::string>> shred_signatures;
+	shred_signatures.reserve(layout.shreds.size());
+	for (auto &shred : layout.shreds) {
+		shred_signatures.emplace_back(shred.first, shred.second.ToString());
+	}
+	std::vector<jsono::ShredManifestEntry> manifest;
 
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
+		if (!ReadJsonoRowStrict(input, row, blob)) {
 			SetListRowNull(result, row);
 			continue;
 		}
 		auto start = sink.next_child;
 		JsonoView view = MakeJsonoView(blob);
 		if (view.ParseHeader() && view.Slots() > 0) {
+			jsono::VerifyShredManifest(view, shred_signatures, manifest);
 			path.clear();
 			if (style == JsonoEntriesKeyStyle::JsonPath) {
 				path.push_back('$');
@@ -406,17 +415,17 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 			size_t pos = 0;
 			size_t string_cursor = 0;
 			WalkEntries(view, pos, string_cursor, path, style, sink, 0);
-		} else if (lanes.empty()) {
+		} else if (shreds.empty()) {
 			SetListRowNull(result, row);
 			continue;
 		}
-		for (idx_t f = 0; f < lanes.size(); f++) {
-			auto idx = lane_fmt[f].sel->get_index(row);
-			if (!lane_fmt[f].validity.RowIsValid(idx)) {
+		for (idx_t f = 0; f < shreds.size(); f++) {
+			auto idx = shred_fmt[f].sel->get_index(row);
+			if (!shred_fmt[f].validity.RowIsValid(idx)) {
 				continue;
 			}
-			auto &key = style == JsonoEntriesKeyStyle::JsonPath ? lanes[f].key_jsonpath : lanes[f].key_dotted;
-			auto value = FormatLaneValue(lane_fmt[f], idx, lanes[f].type, lane_scratch);
+			auto &key = style == JsonoEntriesKeyStyle::JsonPath ? shreds[f].key_jsonpath : shreds[f].key_dotted;
+			auto value = FormatShredValue(shred_fmt[f], idx, shreds[f].type, shred_scratch);
 			sink.AppendText(nonstd::string_view(key.data(), key.size()), false, value);
 		}
 		FinishListRow(result, row, start, sink.next_child - start);
@@ -433,8 +442,8 @@ void RegisterJsonoEntries(ExtensionLoader &loader) {
 	auto entry_type =
 	    LogicalType::LIST(LogicalType::STRUCT({{"key", LogicalType::VARCHAR}, {"value", LogicalType::VARCHAR}}));
 	(void)jsono_type;
-	// The input is ANY so a shredded jsono struct (whose type varies by lane set) also
-	// binds; JsonoEntriesBind validates it is JSONO or shredded and collects the lanes.
+	// The input is ANY so a shredded jsono struct (whose type varies by shred set) also
+	// binds; JsonoEntriesBind validates it is JSONO or shredded and collects the shreds.
 	ScalarFunctionSet set("jsono_entries");
 	set.AddFunction(ScalarFunction({LogicalType::ANY}, entry_type, JsonoEntriesExecute, JsonoEntriesBind));
 	set.AddFunction(

@@ -1,66 +1,178 @@
 # name: test/sql/jsono_shredded_cast_guard.test
-# description: a shredded JSONO value carries its lane set in every field name (a fingerprint suffix), so DuckDB's own struct cast rejects a lane mismatch instead of silently dropping/NULL-filling lanes
+# description: casts between differently-shredded JSONO types are lossless with the extension optimizer (reconstruct + reshred); without it the raw by-name struct cast drops shreds, and the shred manifest stored in the residual turns every read of such a narrowed row into a loud error instead of silent data loss
 # group: [sql]
 
 require jsono
 
 require json
 
-# A shredded column is declared by inferring the value's type (CTAS): every field name — the four
-# residual blobs included — carries the lane-set fingerprint suffix, so the column type encodes its
-# exact lanes. A value shredded on the identical lane set has the same type and inserts directly.
 statement ok
 CREATE TABLE shred_ab AS SELECT jsono('{"a":"AAA","b":"BBB"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS e;
 
 statement ok
 INSERT INTO shred_ab SELECT jsono('{"a":"CCC","b":"DDD"}', shredding := {'a':'VARCHAR','b':'VARCHAR'});
 
-# SAFE: the same lane set in reverse spec order has the same fingerprint (it is order-independent),
-# so it is accepted and remapped by name — a pure reorder is lossless, not a mismatch.
+# The same shred set in reverse spec order produces the same canonical type (specs are sorted),
+# so it inserts directly.
 statement ok
 INSERT INTO shred_ab SELECT jsono('{"a":"EEE","b":"FFF"}', shredding := {'b':'VARCHAR','a':'VARCHAR'});
 
-query II
-SELECT e ->> 'a', e ->> 'b' FROM shred_ab ORDER BY 1;
-----
-AAA	BBB
-CCC	DDD
-EEE	FFF
-
-# UNSAFE: a different lane NAME -> every field name differs (different fingerprint), so DuckDB's
-# struct cast finds no matching member and rejects the insert instead of silently losing lanes.
-statement error
-INSERT INTO shred_ab SELECT jsono('{"x":"y"}', shredding := {'x':'VARCHAR'});
-----
-at least one matching member
-
-# UNSAFE: a different lane COUNT (a subset of the column's lanes) is a different fingerprint too.
-statement error
+# An overlapping shred set is NOT an error: the optimizer rewrites the lossy by-name cast into
+# reconstruct + reshred against the target spec, so the value lands losslessly — a path with no
+# shred in the target falls back into the residual.
+statement ok
 INSERT INTO shred_ab SELECT jsono('{"a":"q"}', shredding := {'a':'VARCHAR'});
-----
-at least one matching member
 
-# UNSAFE: a lane name kept but its type changed folds into the fingerprint as well.
-statement error
+statement ok
 INSERT INTO shred_ab SELECT jsono('{"a":"1","b":"x"}', shredding := {'a':'BIGINT','b':'VARCHAR'});
-----
-at least one matching member
 
-# UNSAFE: a plain JSONO value (no lanes, clean field names) cannot be coerced into a shredded column.
-statement error
+statement ok
 INSERT INTO shred_ab SELECT jsono('{"a":"AAA","b":"BBB"}');
+
+# A FULLY DISJOINT shred set works too: the shreds sit beside `body` inside the layout struct,
+# so `body` is a field every two JSONO types share and the struct cast always binds — the
+# optimizer then rewrites it into the same lossless reconstruct + reshred.
+statement ok
+INSERT INTO shred_ab SELECT jsono('{"x":"y"}', shredding := {'x':'VARCHAR'});
+
+query I
+SELECT to_json(e)::VARCHAR FROM shred_ab ORDER BY 1;
 ----
-at least one matching member
+{"a":"1","b":"x"}
+{"a":"AAA","b":"BBB"}
+{"a":"AAA","b":"BBB"}
+{"a":"CCC","b":"DDD"}
+{"a":"EEE","b":"FFF"}
+{"a":"q"}
+{"x":"y"}
 
-# The protection is on the struct cast (INSERT into a typed column, explicit CAST). It does NOT
-# cover set-operation type reconciliation: DuckDB merges two structs with disjoint field names into
-# a wider struct (union of fields) rather than casting one to the other, so a UNION of differently
-# shredded values produces a malformed wider struct instead of an error. That is not silent data
-# loss (each row keeps its own lanes), and it is an exotic operation, so it is left uncovered here.
+query II
+SELECT e ->> 'a', e ->> 'x' FROM shred_ab ORDER BY 1 NULLS LAST, 2;
+----
+1	NULL
+AAA	NULL
+AAA	NULL
+CCC	NULL
+EEE	NULL
+q	NULL
+NULL	y
 
-# SAFE: shredded -> plain JSON is the lossless reconstruction path (the target is not a shredded
-# struct), so it is never blocked.
+# Shredded -> plain JSON is the lossless reconstruction path; never blocked.
 query I
 SELECT to_json(jsono('{"a":"AAA","b":"BBB"}', shredding := {'a':'VARCHAR'}));
 ----
 {"a":"AAA","b":"BBB"}
+
+# --- Without the extension optimizer the raw by-name struct cast runs as core DuckDB binds it.
+# A widening cast (target carries more shreds) merely NULL-fills the new shreds — readers fall back
+# to the residual, so the value stays exact. A NARROWING cast drops a shred whose value was
+# stripped out of the residual at write time; the shred manifest records that, and every read of
+# such a row fails loud instead of silently losing the value. ---
+
+statement ok
+CREATE TABLE narrow_target AS SELECT jsono('{}', shredding := {'a':'VARCHAR'}) AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO narrow_target SELECT jsono('{"a":"v1","b":"v2"}', shredding := {'a':'VARCHAR','b':'VARCHAR'});
+
+statement ok
+RESET disabled_optimizers;
+
+# Reconstruction (to_json) of the narrowed row fails loud: the manifest lists shred 'b VARCHAR'
+# but the column type no longer carries it.
+statement error
+SELECT to_json(e)::VARCHAR FROM narrow_target;
+----
+narrowed by a raw struct cast
+
+# The dropped shred's path fails loud too (a silent NULL here would be the data loss).
+statement error
+SELECT e ->> 'b' FROM narrow_target;
+----
+narrowed by a raw struct cast
+
+# The surviving shred still reads.
+query I
+SELECT e ->> 'a' FROM narrow_target;
+----
+v1
+
+# Every other native reader of the narrowed row fails loud too (no silent partial output).
+statement error
+SELECT jsono_entries(e) FROM narrow_target;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT jsono_transform(e, {'b': 'VARCHAR'}) FROM narrow_target;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT jsono_keys(e) FROM narrow_target;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT to_json(jsono_merge_patch(e, jsono('{"z":"1"}'))) FROM narrow_target;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT jsono_group_merge(e) FROM narrow_target;
+----
+narrowed by a raw struct cast
+
+# An honest row in the same narrow type reads fine alongside (the manifest check is per row).
+statement ok
+INSERT INTO narrow_target SELECT jsono('{"a":"ok","b":"kept"}', shredding := {'a':'VARCHAR'});
+
+query I
+SELECT e ->> 'a' FROM narrow_target ORDER BY 1;
+----
+ok
+v1
+
+# Shredded operations that the extension binds directly require the extension optimizer. Plain
+# JSONO remains usable without it, but shredded values are unsafe because core DuckDB can
+# otherwise route them through generic STRUCT casts.
+statement ok
+SET disabled_optimizers='extension';
+
+statement error
+SELECT jsono_extract(e, '$.a') FROM shred_ab;
+----
+requires the extension optimizer
+
+statement error
+SELECT jsono_storage_size(e) FROM shred_ab;
+----
+requires the extension optimizer
+
+statement ok
+RESET disabled_optimizers;
+
+# The optimizer-injected expressions (__jsono_internal_checked_residual, the reshred rewrite)
+# must survive plan (de)serialization — they are registered in the catalog and re-bind by name.
+# Optimizer-injected functions that are not registered crash the DEBUG plan-serialize verifier.
+statement ok
+PRAGMA verify_serializer;
+
+query I
+SELECT e ->> 'b' FROM shred_ab WHERE e ->> 'a' = 'q';
+----
+NULL
+
+statement ok
+INSERT INTO narrow_target SELECT jsono('{"a":"ser","b":"ialized"}', shredding := {'a':'VARCHAR','b':'VARCHAR'});
+
+query I
+SELECT to_json(e)::VARCHAR FROM narrow_target WHERE e ->> 'a' = 'ser';
+----
+{"a":"ser","b":"ialized"}
+
+statement ok
+PRAGMA disable_verification;

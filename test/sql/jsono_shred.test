@@ -6,24 +6,22 @@ require jsono
 
 require json
 
-# Peek the raw residual tape: the four blobs read as a plain jsono with the lanes ignored.
+# Peek the raw residual tape: the four blobs read as a plain jsono with the shreds ignored.
 # This is the white-box view of what shredding stripped — distinct from casting a shredded
-# value to the plain jsono STRUCT, which losslessly reconstructs by overlaying the lanes.
-# Extract the four residual blobs by position (their field names carry the lane-set fingerprint
+# value to the plain jsono STRUCT, which losslessly reconstructs by overlaying the shreds.
+# Extract the four residual blobs by position (their field names carry the shred-set fingerprint
 # suffix) and repack them under the clean names so the result is a plain JSONO value.
 statement ok
 CREATE MACRO jsono_residual(j) AS struct_pack(
-    jsono_slots := struct_extract_at(j, 1),
-    jsono_key_heap := struct_extract_at(j, 2),
-    jsono_string_heap := struct_extract_at(j, 3),
-    jsono_skips := struct_extract_at(j, 4));
+    "jsono" := struct_pack(
+        body := struct_extract_at(struct_extract_at(j, 1), 1)));
 
-# jsono(j, shredding := spec) returns the shredded STRUCT: four blob residual + one lane per
+# jsono(j, shredding := spec) returns the shredded STRUCT: four blob residual + one shred per
 # spec path (named by the path, typed by the spec). The read side reconstructs the
 # original value, so to_json round-trips losslessly.
 
-# All-string lanes: both strip (a string round-trips through a VARCHAR lane), so the
-# residual is empty and the values live only in the lanes.
+# All-string shreds: both strip (a string round-trips through a VARCHAR shred), so the
+# residual is empty and the values live only in the shreds.
 query I
 SELECT to_json(jsono('{"did":"d1","kind":"commit"}', shredding := {'$.kind':'VARCHAR','$.did':'VARCHAR'}));
 ----
@@ -34,7 +32,7 @@ SELECT to_json(jsono_residual(jsono('{"did":"d1","kind":"commit"}', shredding :=
 ----
 {}
 
-# Typed lane: a BIGINT path strips and reconstructs as a JSON number; the residual
+# Typed shred: a BIGINT path strips and reconstructs as a JSON number; the residual
 # keeps only the non-hot key.
 query I
 SELECT to_json(jsono('{"extra":"e1","kind":"commit","time_us":1700}', shredding := {'$.kind':'VARCHAR','$.time_us':'BIGINT'}));
@@ -51,8 +49,8 @@ SELECT CAST(jsono('{"time_us":1700}', shredding := {'$.time_us':'BIGINT'}) ->> '
 ----
 1700
 
-# Heterogeneous: a string in a BIGINT-typed lane does not fit, so it is kept in the
-# residual (lane NULL) and the read falls back to the residual. Round-trip is faithful.
+# Heterogeneous: a string in a BIGINT-typed shred does not fit, so it is kept in the
+# residual (shred NULL) and the read falls back to the residual. Round-trip is faithful.
 query I
 SELECT to_json(jsono('{"n":"hello"}', shredding := {'$.n':'BIGINT'}));
 ----
@@ -63,7 +61,7 @@ SELECT jsono('{"n":"hello"}', shredding := {'$.n':'BIGINT'}) ->> '$.n';
 ----
 hello
 
-# A number in a VARCHAR lane: the lane holds the ->> text for reads, but the value is
+# A number in a VARCHAR shred: the shred holds the ->> text for reads, but the value is
 # not a string so it is not stripped — the residual keeps the number for a faithful
 # round-trip.
 query I
@@ -82,8 +80,8 @@ SELECT to_json(jsono('{"a":null,"b":"x"}', shredding := {'$.a':'VARCHAR'}));
 ----
 {"a":null,"b":"x"}
 
-# Nested paths strip too: a nested string lane leaves its leaf out of the residual and
-# is refilled from the lane on reconstruction, so the full value round-trips intact.
+# Nested paths strip too: a nested string shred leaves its leaf out of the residual and
+# is refilled from the shred on reconstruction, so the full value round-trips intact.
 query I
 SELECT to_json(jsono('{"commit":{"collection":"c1","operation":"create"},"kind":"commit"}', shredding := {'$.kind':'VARCHAR','$.commit.operation':'VARCHAR'}));
 ----
@@ -111,14 +109,14 @@ SELECT to_json(jsono_residual(jsono('{"commit":{"record":{"text":"hi","langs":["
 ----
 {"commit":{"record":{"langs":["en"]}}}
 
-# Stripping the only key of a nested object leaves it empty in the residual; the lane
+# Stripping the only key of a nested object leaves it empty in the residual; the shred
 # refills it on reconstruction.
 query I
 SELECT to_json(jsono_residual(jsono('{"commit":{"record":{"text":"only"}}}', shredding := {'$.commit.record.text':'VARCHAR'})));
 ----
 {"commit":{"record":{}}}
 
-# A nested non-string value is not lossless through a VARCHAR lane, so it stays in the
+# A nested non-string value is not lossless through a VARCHAR shred, so it stays in the
 # residual (read-accelerated, not stripped).
 query I
 SELECT to_json(jsono_residual(jsono('{"commit":{"seq":42}}', shredding := {'$.commit.seq':'VARCHAR'})));
@@ -126,7 +124,7 @@ SELECT to_json(jsono_residual(jsono('{"commit":{"seq":42}}', shredding := {'$.co
 {"commit":{"seq":42}}
 
 # A row missing the nested parent must not gain a spurious empty object: the all-absent
-# lanes contribute nothing, so the value round-trips to exactly its original shape.
+# shreds contribute nothing, so the value round-trips to exactly its original shape.
 query I
 SELECT to_json(jsono('{"kind":"account","did":"d2"}', shredding := {'$.kind':'VARCHAR','$.commit.operation':'VARCHAR','$.commit.cid':'VARCHAR'}));
 ----
@@ -182,16 +180,28 @@ SELECT jsono('{"a":1}', {'$.a':'BIGINT'});
 ----
 unknown argument
 
-# jsono(struct) lifts top-level scalar fields of lane types into lanes directly (no spec):
-# scalars of lane types become columns, the rest stays in the residual tape. The type is the same
-# one jsono_storage_type builds from the same lanes (asserted by equality, fingerprint and all).
+# No JSON key is reserved by the storage layout: keys that collide with layout names (body,
+# shreds, "jsono") or old flat field names shred and read back correctly — 'body' through its
+# path form (a bare 'body' shred name would duplicate the layout's residual field; see below).
+query IIIIII
+SELECT to_json(j), j ->> 'jsono_slots', j ->> 'jsono_slots_extra', j ->> 'body', j ->> 'shreds', j ->> 'jsono'
+FROM (
+  SELECT jsono('{"jsono_slots":"v1","jsono_slots_extra":"v2","body":"v3","shreds":"v4","jsono":"v5"}',
+               shredding := {'jsono_slots':'VARCHAR','$.body':'VARCHAR','shreds':'VARCHAR'}) AS j
+);
+----
+{"body":"v3","jsono":"v5","jsono_slots":"v1","jsono_slots_extra":"v2","shreds":"v4"}	v1	v2	v3	v4	v5
+
+# jsono(struct) lifts top-level scalar fields of shred types into shreds directly (no spec):
+# scalars of shred types become columns, the rest stays in the residual tape. The type is the same
+# one jsono_storage_type builds from the same shreds (asserted by equality, fingerprint and all).
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'name': 'x', 'nested': {'k': 2}}))
      = jsono_storage_type('a BIGINT, "name" VARCHAR');
 ----
 true
 
-# the lanes carry the values and to_json round-trips the whole document (incl nested tape)
+# the shreds carry the values and to_json round-trips the whole document (incl nested tape)
 query III
 SELECT s ->> 'a', s ->> 'name', to_json(s) FROM (
   SELECT jsono({'a': 1::BIGINT, 'name': 'x', 'nested': {'k': 2}}) AS s
@@ -216,8 +226,8 @@ SELECT s ->> 'k', to_json(s) FROM (
 ----
 c	{"k":"c","raw":{"z":1}}
 
-# the struct constructor lifts only top-level lane-typed scalars. (Here `a` is INTEGER, not a
-# lane type, so only the VARCHAR `name` lifts; the residual keeps `a`.)
+# the struct constructor lifts only top-level shred-typed scalars. (Here `a` is INTEGER, not a
+# shred type, so only the VARCHAR `name` lifts; the residual keeps `a`.)
 query I
 SELECT typeof(jsono({'a': 1, 'name': 'x'}))
      = jsono_storage_type('"name" VARCHAR');
@@ -231,9 +241,9 @@ SELECT to_json(jsono({'a': 1, 'name': 'x'}));
 {"a":1,"name":"x"}
 
 # Constant reconstruction with every field lifted (empty residual): the constant-folded
-# to_json copies the shredded constructor, so the bind-data lanes must survive the copy or
-# the lane children are left uninitialized. All keys lift, so the residual is {} and the
-# whole document must still rebuild from the lanes.
+# to_json copies the shredded constructor, so the bind-data shreds must survive the copy or
+# the shred children are left uninitialized. All keys lift, so the residual is {} and the
+# whole document must still rebuild from the shreds.
 query I
 SELECT to_json(jsono({'name': 'x', 'k': 'y'}));
 ----
@@ -245,23 +255,23 @@ SELECT to_json(jsono_residual(jsono({'name': 'x', 'k': 'y'})));
 {}
 
 # Casting a shredded value to the plain jsono STRUCT is LOSSLESS: it reconstructs the full
-# document (overlay the lanes back onto the residual), it does not expose the stripped
+# document (overlay the shreds back onto the residual), it does not expose the stripped
 # residual (which jsono_residual above shows is {}).
 query I
-SELECT to_json(jsono({'name': 'x', 'k': 'y'})::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB));
+SELECT to_json(jsono({'name': 'x', 'k': 'y'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB))));
 ----
 {"k":"y","name":"x"}
 
-# A nested-path lane round-trips through the reconstruct cast too.
+# A nested-path shred round-trips through the reconstruct cast too.
 query I
-SELECT to_json(jsono('{"commit":{"operation":"create"},"kind":"k"}', shredding := {'$.commit.operation':'VARCHAR','$.kind':'VARCHAR'})::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB));
+SELECT to_json(jsono('{"commit":{"operation":"create"},"kind":"k"}', shredding := {'$.commit.operation':'VARCHAR','$.kind':'VARCHAR'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB))));
 ----
 {"commit":{"operation":"create"},"kind":"k"}
 
-# Storing a shredded value into a plain jsono STRUCT column preserves the lane data (the
-# implicit cast reconstructs); the lanes must not be silently dropped.
+# Storing a shredded value into a plain jsono STRUCT column preserves the shred data (the
+# implicit cast reconstructs); the shreds must not be silently dropped.
 statement ok
-CREATE TABLE plain_store (params STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB));
+CREATE TABLE plain_store (params STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB))));
 
 statement ok
 INSERT INTO plain_store SELECT jsono({'a': 'x', 'b': 5::BIGINT, 'c': 'y'});
@@ -270,3 +280,54 @@ query I
 SELECT to_json(params) FROM plain_store;
 ----
 {"a":"x","b":5,"c":"y"}
+
+# A shred cannot be named 'body' (it would duplicate the layout's residual field); the path form
+# is a different field name and works. jsono({...}) auto-shred keeps a 'body' field in the
+# residual silently for the same reason.
+statement error
+SELECT jsono('{"body":"x"}', shredding := {'body':'VARCHAR'});
+----
+shred the JSON key through its path form
+
+query II
+SELECT to_json(jsono('{"body":"x","a":"y"}', shredding := {'$.body':'VARCHAR'})),
+       jsono('{"body":"x","a":"y"}', shredding := {'$.body':'VARCHAR'}) ->> 'body';
+----
+{"a":"y","body":"x"}	x
+
+query II
+SELECT typeof(jsono({'body': 'x', 'a': 'y'})) LIKE '%body VARCHAR%',
+       to_json(jsono({'body': 'x', 'a': 'y'}));
+----
+false	{"a":"y","body":"x"}
+
+# Reshredding to a smaller or retyped shred set is lossless: dropped shreds fold back into the
+# residual (single-pass partial overlay), a retyped shred returns and re-extracts at its new type,
+# and a row whose values never left the residual carries no stale manifest from its neighbours.
+query I
+SELECT to_json(jsono(jsono('{"a":"1","b":"2","c":"3","d":4}', shredding := {'a':'VARCHAR','b':'VARCHAR','c':'VARCHAR'}),
+                     shredding := {'a':'VARCHAR'}));
+----
+{"a":"1","b":"2","c":"3","d":4}
+
+query II
+SELECT to_json(jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})),
+       jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})."jsono"."a";
+----
+{"a":7,"b":"x"}	7
+
+query I
+SELECT to_json(jsono(e, shredding := {'a':'VARCHAR'}))::VARCHAR FROM (
+  SELECT jsono(j, shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS e
+  FROM (VALUES ('{"a":"s1","b":"s2"}'), ('{"a":7,"b":8}'), ('{"x":"noshreds"}')) t(j)
+) ORDER BY 1;
+----
+{"a":"s1","b":"s2"}
+{"a":7,"b":8}
+{"x":"noshreds"}
+
+query I
+SELECT to_json(jsono(jsono('{"p":{"q":"deep"},"r":"top"}', shredding := {'$.p.q':'VARCHAR'}),
+                     shredding := {'r':'VARCHAR'}));
+----
+{"p":{"q":"deep"},"r":"top"}

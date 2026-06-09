@@ -20,6 +20,8 @@ struct JsonoBlobRow {
 
 struct JsonoVectorData {
 	UnifiedVectorFormat struct_fmt;
+	UnifiedVectorFormat layout_fmt;
+	UnifiedVectorFormat body_fmt;
 	UnifiedVectorFormat slots_fmt;
 	UnifiedVectorFormat key_heap_fmt;
 	UnifiedVectorFormat string_heap_fmt;
@@ -49,21 +51,30 @@ inline bool RowIsValid(const UnifiedVectorFormat &fmt, idx_t row) {
 	return fmt.validity.RowIsValid(idx);
 }
 
+// Navigate a jsono value vector (plain or shredded) to its four body blob child vectors:
+// top-level layout field [0] -> body [0] -> {slots, key_heap, string_heap, skips}. The body is
+// identical for plain and shredded, so the rest of the reader never needs to know which it is.
 inline void InitJsonoVectorData(Vector &input, idx_t count, JsonoVectorData &data) {
 	input.ToUnifiedFormat(count, data.struct_fmt);
-	auto &children = StructVector::GetEntries(input);
-	children[0]->ToUnifiedFormat(count, data.slots_fmt);
-	children[1]->ToUnifiedFormat(count, data.key_heap_fmt);
-	children[2]->ToUnifiedFormat(count, data.string_heap_fmt);
-	children[3]->ToUnifiedFormat(count, data.skips_fmt);
+	auto &layout = *StructVector::GetEntries(input)[0];
+	layout.ToUnifiedFormat(count, data.layout_fmt);
+	auto &body = *StructVector::GetEntries(layout)[0];
+	body.ToUnifiedFormat(count, data.body_fmt);
+	auto &blobs = StructVector::GetEntries(body);
+	blobs[0]->ToUnifiedFormat(count, data.slots_fmt);
+	blobs[1]->ToUnifiedFormat(count, data.key_heap_fmt);
+	blobs[2]->ToUnifiedFormat(count, data.string_heap_fmt);
+	blobs[3]->ToUnifiedFormat(count, data.skips_fmt);
 	data.slots_data = UnifiedVectorFormat::GetData<string_t>(data.slots_fmt);
 	data.key_heap_data = UnifiedVectorFormat::GetData<string_t>(data.key_heap_fmt);
 	data.string_heap_data = UnifiedVectorFormat::GetData<string_t>(data.string_heap_fmt);
 	data.skips_data = UnifiedVectorFormat::GetData<string_t>(data.skips_fmt);
 }
 
+// Permissive row read for union-merged reconstruction: a dead layout group is expected to be NULL,
+// so any missing nested field is treated as an absent row.
 inline bool ReadJsonoRow(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
-	if (!RowIsValid(data.struct_fmt, row)) {
+	if (!RowIsValid(data.struct_fmt, row) || !RowIsValid(data.layout_fmt, row) || !RowIsValid(data.body_fmt, row)) {
 		return false;
 	}
 	auto slots_idx = RowIndex(data.slots_fmt, row);
@@ -73,6 +84,46 @@ inline bool ReadJsonoRow(const JsonoVectorData &data, idx_t row, JsonoBlobRow &o
 	if (!data.slots_fmt.validity.RowIsValid(slots_idx) || !data.key_heap_fmt.validity.RowIsValid(key_heap_idx) ||
 	    !data.string_heap_fmt.validity.RowIsValid(string_heap_idx) || !data.skips_fmt.validity.RowIsValid(skips_idx)) {
 		return false;
+	}
+	out.slots = data.slots_data[slots_idx];
+	out.key_heap = data.key_heap_data[key_heap_idx];
+	out.string_heap = data.string_heap_data[string_heap_idx];
+	out.skips = data.skips_data[skips_idx];
+	return true;
+}
+
+inline void ThrowCorruptJsonoRow(const char *field) {
+	throw InvalidInputException(
+	    "corrupt JSONO storage: top-level row is valid but %s is NULL; this can be produced by an unsafe "
+	    "STRUCT cast when the extension optimizer is disabled",
+	    field);
+}
+
+inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
+	if (!RowIsValid(data.struct_fmt, row)) {
+		return false;
+	}
+	if (!RowIsValid(data.layout_fmt, row)) {
+		ThrowCorruptJsonoRow("layout");
+	}
+	if (!RowIsValid(data.body_fmt, row)) {
+		ThrowCorruptJsonoRow("body");
+	}
+	auto slots_idx = RowIndex(data.slots_fmt, row);
+	auto key_heap_idx = RowIndex(data.key_heap_fmt, row);
+	auto string_heap_idx = RowIndex(data.string_heap_fmt, row);
+	auto skips_idx = RowIndex(data.skips_fmt, row);
+	if (!data.slots_fmt.validity.RowIsValid(slots_idx)) {
+		ThrowCorruptJsonoRow("slots blob");
+	}
+	if (!data.key_heap_fmt.validity.RowIsValid(key_heap_idx)) {
+		ThrowCorruptJsonoRow("key_heap blob");
+	}
+	if (!data.string_heap_fmt.validity.RowIsValid(string_heap_idx)) {
+		ThrowCorruptJsonoRow("string_heap blob");
+	}
+	if (!data.skips_fmt.validity.RowIsValid(skips_idx)) {
+		ThrowCorruptJsonoRow("skips blob");
 	}
 	out.slots = data.slots_data[slots_idx];
 	out.key_heap = data.key_heap_data[key_heap_idx];

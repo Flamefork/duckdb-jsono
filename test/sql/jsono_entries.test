@@ -151,7 +151,7 @@ SELECT jsono_entries(jsono('{}'), 'dotted');
 ----
 unknown argument
 
-# --- lane-aware: a shredded value flattens its residual tape AND its lane columns ---
+# --- shred-aware: a shredded value flattens its residual tape AND its shred columns ---
 query I
 SELECT jsono_entries(
   jsono('{"a":1,"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}),
@@ -160,7 +160,7 @@ SELECT jsono_entries(
 ----
 [{'key': a, 'value': 1}, {'key': event_name, 'value': page_view}]
 
-# absent lane (NULL) contributes no entry
+# absent shred (NULL) contributes no entry
 query I
 SELECT jsono_entries(
   jsono('{"a":1}', shredding := {'event_name':'VARCHAR'}),

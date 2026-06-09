@@ -57,9 +57,7 @@ def gate_columns(scenario_config: dict) -> tuple[str, str]:
         return jsono_expr, core_expr
 
     if operation == "entries":
-        jsono_expr = (
-            f"list_sort(jsono_entries(jsono({json_column}::VARCHAR), 'dotted'))"
-        )
+        jsono_expr = f"list_sort(jsono_entries(jsono({json_column}::VARCHAR), key_style := 'dotted'))"
         core_expr = (
             f"list_sort(map_entries("
             f"json_transform({json_column}, '\"map(string, string)\"')))"
@@ -67,9 +65,14 @@ def gate_columns(scenario_config: dict) -> tuple[str, str]:
         return jsono_expr, core_expr
 
     if operation == "extract":
-        spec = sql_json(scenario_config["spec"])
-        jsono_expr = f"jsono_transform(jsono({json_column}::VARCHAR), {spec})"
-        core_expr = f"json_transform({json_column}, {spec})"
+        # jsono_transform takes a STRUCT-literal spec; core json_transform takes the JSON-string spec.
+        jsono_expr = (
+            f"jsono_transform(jsono({json_column}::VARCHAR), "
+            f"{sql_typed_literal(scenario_config['spec'])})"
+        )
+        core_expr = (
+            f"json_transform({json_column}, {sql_json(scenario_config['spec'])})"
+        )
         return jsono_expr, core_expr
 
     if operation == "extract_jsono":

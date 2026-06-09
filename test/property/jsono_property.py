@@ -26,13 +26,6 @@ EXTENSION_DIR = BUILD_DIR / "extension" / "jsono"
 DEFAULT_BINARY = BUILD_DIR / "duckdb"
 DEFAULT_EXTENSION = EXTENSION_DIR / "jsono.duckdb_extension"
 JSONO_HEADER_SIZE = 8
-JSONO_STRUCT_FIELDS = [
-    "jsono_slots BLOB",
-    "jsono_key_heap BLOB",
-    "jsono_string_heap BLOB",
-    "jsono_skips BLOB",
-]
-JSONO_STRUCT_TYPE = "STRUCT(" + ", ".join(JSONO_STRUCT_FIELDS) + ")"
 BlobHex = tuple[str, str, str, str]
 
 # Statement boundaries are marked by a sentinel SELECT, not a `.print`: the CLI's
@@ -123,32 +116,45 @@ class JsonoSession:
         (cell,) = parsed[0].values()
         return None if cell is None else str(cell)
 
+    # Run one non-SELECT statement (DDL/DML/SET) for its side effect; an error is dropped
+    # (stderr is detached) — properties that need to observe one read through value().
+    def statement(self, sql: str) -> None:
+        if self.proc is None or self.proc.poll() is not None:
+            self.restart()
+        try:
+            self._send(sql)
+            self._drain()
+        except JsonoCrash:
+            self.restart()
+            raise
+
 
 def sql_literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
 def jsono_blob_hex_expr(text: str) -> str:
-    struct_expr = f"jsono({sql_literal(text)})::{JSONO_STRUCT_TYPE}"
+    body_expr = f'jsono({sql_literal(text)})."jsono".body'
     return " || '|' || ".join(
         [
-            f"hex(({struct_expr}).jsono_slots)",
-            f"hex(({struct_expr}).jsono_key_heap)",
-            f"hex(({struct_expr}).jsono_string_heap)",
-            f"hex(({struct_expr}).jsono_skips)",
+            f"hex(({body_expr}).slots)",
+            f"hex(({body_expr}).key_heap)",
+            f"hex(({body_expr}).string_heap)",
+            f"hex(({body_expr}).skips)",
         ]
     )
 
 
 def jsono_struct_sql(blobs: BlobHex) -> str:
     slots, key_heap, string_heap, skips = blobs
-    fields = [
-        f"'jsono_slots': unhex('{slots}')",
-        f"'jsono_key_heap': unhex('{key_heap}')",
-        f"'jsono_string_heap': unhex('{string_heap}')",
-        f"'jsono_skips': unhex('{skips}')",
+    body_fields = [
+        f"'slots': unhex('{slots}')",
+        f"'key_heap': unhex('{key_heap}')",
+        f"'string_heap': unhex('{string_heap}')",
+        f"'skips': unhex('{skips}')",
     ]
-    return "{" + ", ".join(fields) + "}"
+    body = "{" + ", ".join(body_fields) + "}"
+    return "{'jsono': {'body': " + body + "}}"
 
 
 def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
@@ -229,6 +235,50 @@ def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
     string_heap_hex = string_heap.hex().upper()
     skips_hex = skips.hex().upper()
     return (slots_hex, key_heap_hex, string_heap_hex, skips_hex)
+
+
+def shredded_blob_hex_expr(text: str, spec_sql: str) -> str:
+    body_expr = f'jsono({sql_literal(text)}, shredding := {spec_sql})."jsono".body'
+    return " || '|' || ".join(
+        [
+            f"hex(({body_expr}).slots)",
+            f"hex(({body_expr}).key_heap)",
+            f"hex(({body_expr}).string_heap)",
+            f"hex(({body_expr}).skips)",
+        ]
+    )
+
+
+def manifest_offset(skips: bytes) -> int:
+    # Mirrors ParseHeader: the manifest is the skips tail after the checkpoint sections.
+    if len(skips) < 12:
+        return len(skips)
+    container_count = int.from_bytes(skips[0:4], "little")
+    checkpoint_index_count = int.from_bytes(skips[4:8], "little")
+    checkpoint_count = int.from_bytes(skips[8:12], "little")
+    offset = 12 + container_count * 16 + checkpoint_index_count * 12 + checkpoint_count * 8
+    return min(offset, len(skips))
+
+
+def mutate_manifest(skips_hex: str, mutation: str) -> str:
+    skips = bytearray(bytes.fromhex(skips_hex))
+    offset = manifest_offset(bytes(skips))
+    if mutation == "count_inflate" and len(skips) >= offset + 4:
+        count = int.from_bytes(skips[offset : offset + 4], "little")
+        skips[offset : offset + 4] = (count + 1).to_bytes(4, "little")
+    elif mutation == "count_huge" and len(skips) >= offset + 4:
+        skips[offset : offset + 4] = b"\xff\xff\xff\xff"
+    elif mutation == "path_len_huge" and len(skips) >= offset + 6:
+        skips[offset + 4 : offset + 6] = b"\xff\xff"
+    elif mutation == "truncate_mid" and len(skips) > offset + 5:
+        skips = skips[: offset + 5]
+    elif mutation == "truncate_tail" and len(skips) > offset:
+        skips = skips[:-1]
+    elif mutation == "append_junk":
+        skips.extend(b"\x07garbage")
+    elif len(skips) > offset:
+        skips[-1] ^= 0xFF
+    return skips.hex().upper()
 
 
 def numbers_as_decimal(text: str) -> Any:
@@ -385,8 +435,8 @@ def test_fuzz_blob_no_crash(slots: str, key: str, string: str, skips: str) -> No
     # The four-BLOB physical shape is reachable from Parquet, so arbitrary bytes
     # must be rejected by the reader's bound checks, not dereferenced blindly.
     struct = (
-        f"{{'jsono_slots': unhex('{slots}'), 'jsono_key_heap': unhex('{key}'), "
-        f"'jsono_string_heap': unhex('{string}'), 'jsono_skips': unhex('{skips}')}}"
+        f"{{'jsono': {{'body': {{'slots': unhex('{slots}'), 'key_heap': unhex('{key}'), "
+        f"'string_heap': unhex('{string}'), 'skips': unhex('{skips}')}}}}}}"
     )
     SESSION.value(f"to_json({struct})")
 
@@ -406,13 +456,143 @@ def test_fuzz_validish_blob_no_crash(text: str, mutation: str) -> None:
     SESSION.value(f"to_json({struct})")
 
 
+# Shredding properties run on object documents whose top-level keys are plain identifiers
+# (shred paths are spec field names; quoting rules are not the property under test).
+shred_keys = st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=8).filter(lambda key: key != "body")
+shred_documents = st.dictionaries(shred_keys, json_scalars, min_size=1, max_size=6)
+shred_types = st.sampled_from(["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN"])
+
+
+def shred_spec_sql(spec: dict[str, str]) -> str:
+    return "{" + ", ".join(f"'{path}': '{stype}'" for path, stype in spec.items()) + "}"
+
+
+@settings(PROPERTY_SETTINGS)
+@given(doc=shred_documents, data=st.data())
+def test_shred_lossless(doc: dict[str, Any], data: Any) -> None:
+    # Shredding must never change the logical value, for any document and any spec —
+    # including paths absent from the document and shred types the values do not fit
+    # (the lossless gate keeps those in the residual).
+    text = json_dumps(doc)
+    keys = sorted(doc.keys())
+    paths = data.draw(
+        st.lists(
+            st.sampled_from(keys + ["missing_path"]),
+            min_size=1,
+            max_size=4,
+            unique=True,
+        )
+    )
+    spec = {path: data.draw(shred_types) for path in paths}
+    plain = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
+    shredded = SESSION.value(f"to_json(jsono({sql_literal(text)}, shredding := {shred_spec_sql(spec)}))")
+    assert plain == shredded, f"shredding changed the value: {text!r} spec {spec!r}: {plain!r} -> {shredded!r}"
+
+
+@settings(PROPERTY_SETTINGS)
+@given(doc=shred_documents, data=st.data())
+def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
+    # Reshredding a shredded value to another spec (the single-pass superset path and the
+    # reconstruct fallback alike) must preserve the logical value.
+    text = json_dumps(doc)
+    keys = sorted(doc.keys())
+    first_paths = data.draw(st.lists(st.sampled_from(keys), min_size=1, max_size=3, unique=True))
+    second_paths = data.draw(
+        st.lists(
+            st.sampled_from(keys + ["missing_path"]),
+            min_size=1,
+            max_size=4,
+            unique=True,
+        )
+    )
+    first = shred_spec_sql({path: data.draw(shred_types) for path in first_paths})
+    second = shred_spec_sql({path: data.draw(shred_types) for path in second_paths})
+    plain = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
+    reshredded = SESSION.value(
+        f"to_json(jsono(jsono({sql_literal(text)}, shredding := {first}), shredding := {second}))"
+    )
+    assert plain == reshredded, f"reshred changed the value: {text!r} {first} -> {second}: {plain!r} -> {reshredded!r}"
+
+
+@settings(VALIDISH_PROPERTY_SETTINGS)
+@given(doc=shred_documents, data=st.data())
+def test_narrowing_fails_loud(doc: dict[str, Any], data: Any) -> None:
+    # A raw narrowing struct cast (extension optimizer disabled) drops a shred; every read of
+    # such a row must fail loud — silently returning partial data is the defect class the
+    # shred manifest exists to catch. A shred whose value stayed in the residual (the lossless
+    # gate rejected it) is not in the manifest, so narrowing it away is harmless; the property
+    # therefore shreds string values as VARCHAR (always stripped).
+    str_keys = sorted(key for key, value in doc.items() if isinstance(value, str) and value)
+    if len(str_keys) < 2:
+        return
+    dropped = data.draw(st.sampled_from(str_keys))
+    kept = [key for key in str_keys if key != dropped]
+    text = json_dumps(doc)
+    wide_spec = shred_spec_sql({path: "VARCHAR" for path in str_keys})
+    narrow_spec = shred_spec_sql({path: "VARCHAR" for path in kept})
+    SESSION.statement("DROP TABLE IF EXISTS narrow_prop;")
+    SESSION.statement(f"CREATE TABLE narrow_prop AS SELECT jsono('{{}}', shredding := {narrow_spec}) AS e WHERE false;")
+    SESSION.statement("SET disabled_optimizers='extension';")
+    SESSION.statement(f"INSERT INTO narrow_prop SELECT jsono({sql_literal(text)}, shredding := {wide_spec});")
+    SESSION.statement("RESET disabled_optimizers;")
+    read = SESSION.value("(SELECT to_json(e)::VARCHAR FROM narrow_prop LIMIT 1)")
+    # The narrowed row must error (the session returns None for an errored query), never a
+    # partial document.
+    assert read is None, f"narrowed row read silently: {text!r} dropped {dropped!r} -> {read!r}"
+
+
+manifest_mutations = st.sampled_from(
+    [
+        "count_inflate",
+        "count_huge",
+        "path_len_huge",
+        "truncate_mid",
+        "truncate_tail",
+        "append_junk",
+        "flip_last",
+    ]
+)
+# (text, shred spec) pairs whose values pass the lossless gate, so the residual carries a
+# non-empty manifest for the mutations to target.
+manifest_documents = st.sampled_from(
+    [
+        ('{"s":"hello","t":"x"}', "{'s': 'VARCHAR'}"),
+        ('{"a":"1","b":"2","c":3}', "{'a': 'VARCHAR', 'b': 'VARCHAR'}"),
+        ('{"n":7,"o":{"x":1}}', "{'n': 'BIGINT'}"),
+        (wide_object_text, "{'k00': 'BIGINT', 'k16': 'VARCHAR'}"),
+    ]
+)
+
+
+@settings(VALIDISH_PROPERTY_SETTINGS)
+@given(doc=manifest_documents, mutation=manifest_mutations)
+def test_fuzz_manifest_no_crash(doc: tuple[str, str], mutation: str) -> None:
+    # A corrupted shred-manifest tail (reachable from Parquet like any other blob bytes) must
+    # yield a value, a NULL, or a clean SQL error from the manifest framing checks — never a
+    # crash. The mutated residual is read as a plain value: jsono_validate parses the manifest
+    # framing directly, and an extract miss consults the manifest for the narrowing check.
+    text, spec_sql = doc
+    encoded = SESSION.value(shredded_blob_hex_expr(text, spec_sql))
+    assert encoded is not None
+    parts = encoded.split("|")
+    assert len(parts) == 4
+    struct = jsono_struct_sql((parts[0], parts[1], parts[2], mutate_manifest(parts[3], mutation)))
+    SESSION.value(f"jsono_validate({struct})")
+    SESSION.value(f"jsono_extract_string({struct}, '$.no_such_key')")
+    SESSION.value(f"to_json({struct})")
+
+
 PROPERTIES = [
     test_round_trip_idempotent,
     test_value_parity,
     test_keys_sorted,
+    test_shred_lossless,
+    test_reshred_lossless,
+    test_narrowing_fails_loud,
     test_fuzz_text_no_crash,
     test_fuzz_blob_no_crash,
     test_fuzz_validish_blob_no_crash,
+    test_fuzz_manifest_no_crash,
 ]
 
 

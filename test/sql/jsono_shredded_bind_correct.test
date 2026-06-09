@@ -1,0 +1,76 @@
+# name: test/sql/jsono_shredded_bind_correct.test
+# description: shredded JSONO casts to VARCHAR correctly at bind time (no visitor); ::JSON gap is pinned
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE t AS SELECT jsono('{"a":1,"b":{"c":2}}', shredding := {'$.a':'BIGINT'}) AS j;
+
+# With the extension optimizer disabled (no visitor rewrite), casting a shredded value to VARCHAR is
+# bind-correct: the registered wildcard cast reconstructs the document and serializes it as JSON text.
+statement ok
+SET disabled_optimizers='extension';
+
+query I
+SELECT j::VARCHAR FROM t;
+----
+{"a":1,"b":{"c":2}}
+
+# Same result with the optimizer on (the visitor and the bind cast agree).
+statement ok
+RESET disabled_optimizers;
+
+query I
+SELECT j::VARCHAR FROM t;
+----
+{"a":1,"b":{"c":2}}
+
+# A plain (non-shredded) struct still uses the default struct->VARCHAR text cast: the wildcard bind
+# declines and the cast set falls through unchanged.
+query I
+SELECT {'x': 1, 'y': 'z'}::VARCHAR;
+----
+{'x': 1, 'y': z}
+
+# Plain JSONO casts are matched by their exact source entry, ahead of the wildcard, so ::VARCHAR and
+# ::JSON are unaffected.
+query II
+SELECT jsono('{"a":1}')::VARCHAR, (jsono('{"a":1}')::JSON)::VARCHAR;
+----
+{"a":1}	{"a":1}
+
+# Documented gap: core json owns STRUCT(any)->JSON and the cast registry keeps the first
+# registration, so without the optimizer a shredded ::JSON still serializes the physical fields
+# (the nested layout: the "jsono" wrapper, body, shreds).
+# This pins the limitation; if it ever changes (upstream, or load order), this test flags it.
+statement ok
+SET disabled_optimizers='extension';
+
+query I
+SELECT (j::JSON)::VARCHAR LIKE '%"jsono":%' FROM t;
+----
+true
+
+statement ok
+RESET disabled_optimizers;
+
+# With the optimizer on, to_json over a shredded column rewrites to a jsono_overlay reconstruction
+# (the visitor still owns ::JSON / to_json correctness), and the round-trip is correct.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT to_json(j) FROM t;
+----
+physical_plan	<REGEX>:.*jsono_overlay.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query I
+SELECT to_json(j) FROM t;
+----
+{"a":1,"b":{"c":2}}

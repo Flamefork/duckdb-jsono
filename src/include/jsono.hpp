@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
@@ -21,12 +22,23 @@
 namespace duckdb {
 
 class ExtensionLoader;
+class ClientContext;
 
-// A jsono value is physically a STRUCT of four BLOB children (exact shape: see
-// JsonoRawStructType). There is no user-defined logical-type alias: such an alias
-// cannot survive Parquet (stripped) or DuckLake (rejected), so every stored value —
-// DuckDB-native, Parquet or DuckLake — is just this STRUCT, recognised structurally
-// (see IsJsonoType). Dispatch is structural rather than name-based.
+// A jsono value is physically a nested STRUCT with exactly one layout field, named "jsono" for
+// both plain and shredded values. Inside the layout field live a `body` STRUCT of four BLOBs (the
+// binary JSONO body, see JsonoBodyStructType) and, for shredded values, a `shreds` STRUCT of typed
+// shred columns. The single layout name is deliberate: DuckDB reconciles set-operation branch
+// types by field name (CombineStructTypes), so differently-shredded branches merge into one
+// ordinary shredded type whose `shreds` is the union of the branches' shred sets — never a
+// field-superset "union-merged" double struct. The struct cast NULL-fills a branch's missing
+// shreds, which is exactly the writer's own "value stayed in the residual" encoding, so the merged
+// value reads losslessly by construction. The flip side — a by-name cast silently dropping shreds
+// when the target carries fewer shreds — is caught at read time by the shred manifest stored in the
+// residual (see docs/jsono_format.md), not by the type system. There is no user-defined
+// logical-type alias: such an alias cannot survive Parquet (stripped) or DuckLake (rejected), so
+// every stored value — DuckDB-native, Parquet or DuckLake — is just this nested STRUCT, recognised
+// structurally (see TryParseJsonoLayoutType / IsJsonoType). Dispatch is structural rather than
+// name-based; no JSON key or shred path is reserved, because user paths live only inside `.shreds`.
 //
 // Split heap design: keys (which are byte-identical across rows that share
 // a schema) live in key_heap; per-row string values live in string_heap.
@@ -35,63 +47,87 @@ class ExtensionLoader;
 // become identical across rows (the offset into key_heap for "browser" is
 // always the same byte position when the keys section is the same).
 
-// Materialise the jsono STRUCT type. Helper so writers/readers and
+// Materialise the plain jsono STRUCT type. Helper so writers/readers and
 // pluck-on-jsono can agree on the exact STRUCT shape; identical to
 // JsonoRawStructType (kept as the name the function registrations read against).
 LogicalType JsonoType();
 
-// The physical STRUCT(4 BLOB) that a jsono value is. There is no logical-type alias on top
-// (DuckLake/Parquet reject user-defined aliases, so jsono carries none); this is the single
-// source of truth for the layout. `jsono_storage_type()` exposes its DDL string so writers
-// can declare storage columns without hardcoding the fields.
+// The physical plain JSONO STRUCT: STRUCT("jsono" STRUCT(body STRUCT(4 BLOB))). There is no
+// logical-type alias on top (DuckLake/Parquet reject user-defined aliases, so jsono carries none);
+// this is the single source of truth for the plain layout. `jsono_storage_type()` exposes its DDL
+// string so writers can declare storage columns without hardcoding the fields.
 LogicalType JsonoRawStructType();
 
-// The physical STRUCT of a shredded JSONO value: the four jsono_* BLOB residual plus one lane
-// column per `lanes` entry (each lane is a base path name and its lane type). Every field name —
-// the four blobs included — carries a common "#<fingerprint>" suffix derived from the whole lane
-// set (names and types, order-independent). This is the single source of truth for the shredded
-// shape: the constructor and `jsono_storage_type` both build it here, so a column declared from
-// the same lanes is byte-identical to the value's type. The suffix is what makes a lane mismatch
-// fail loud: DuckDB's generic struct cast matches fields by name and requires at least one match,
-// so two shredded types with different lane sets share no field name and the cast is rejected
-// instead of silently dropping/NULL-filling lanes. Lane field order follows `lanes`; callers pass
-// them in canonical (name-sorted) order so the type is a pure function of the lane set, and they
-// write lanes in that same order (lanes are written by index, so field and value order must agree).
-LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &lanes);
+// The four-BLOB body STRUCT shared by every layout: STRUCT(slots BLOB, key_heap BLOB,
+// string_heap BLOB, skips BLOB). The binary JSONO body lives here, identical for plain and shredded.
+LogicalType JsonoBodyStructType();
 
-// The common field-name suffix of a jsono-prefixed `type` ("" for a plain value, "#<fp>" for a
-// shredded one). Lane field names are the base path plus this suffix; strip it to recover the path.
-string JsonoLaneSuffix(const LogicalType &type);
+// The physical STRUCT of a shredded JSONO value: STRUCT("jsono" STRUCT(body STRUCT(4 BLOB),
+// shreds STRUCT(<shred columns>))). One shred column per `shreds` entry (each a path name and its
+// shred type). This is the single source of truth for the shredded shape: the constructor and
+// `jsono_storage_type` both build it here, so a column declared from the same shreds is
+// byte-identical to the value's type. Shred field order follows `shreds`; callers pass them in
+// canonical (name-sorted) order so the type is a pure function of the shred set, and they write
+// shreds in that same order (shreds are written by index, so field and value order must agree).
+LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds);
 
-// Recover a lane's base path by stripping the shared `suffix` (from JsonoLaneSuffix) off a shredded
-// field name; a no-op when the suffix is empty or absent.
-string JsonoStripLaneSuffix(const string &field_name, const string &suffix);
+// The top-level field name of every layout (plain and shredded): "jsono".
+string JsonoLayoutName();
 
-// True when `type` is the JSONO STRUCT — by alias, or structurally (the four
-// jsono_* BLOB children survive read_parquet, which drops the alias). The
-// structural check compares against `JsonoRawStructType()`, so the field
-// contract shared by jsono.cpp and jsono_ops.cpp has one source.
+// The classification of one JSONO layout field.
+enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
+
+// A parsed JSONO layout field: its top-level name, the inner STRUCT(body[, shreds]) type, and its
+// shred (path, type) columns (empty for plain). The single grammar all predicates read against.
+struct JsonoLayoutType {
+	JsonoLayoutKind kind;
+	string layout_name;
+	LogicalType layout_type;
+	child_list_t<LogicalType> shreds;
+};
+
+// Parse `type` as an ordinary JSONO value: a top-level STRUCT with exactly one valid `jsono`
+// layout field (`body` only for plain, `body` + non-empty `shreds` for shredded).
+// The single classifier the thin predicates (IsJsonoType / IsShreddedJsonoType) delegate to.
+bool TryParseJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out);
+
+// True when `type` is the plain JSONO STRUCT (a `jsono` layout field carrying only `body`). Strict:
+// a shredded value is not a plain value (extending this to shredded would give silently wrong
+// results where call sites read only the residual body).
 bool IsJsonoType(const LogicalType &type);
 
-// True when the leading four children of `type` are the jsono_* BLOB contract, sharing a common
-// name suffix: `type` is an already-stored JSONO value — plain (exactly four clean-named blobs) or
-// shredded (four "#<fp>"-suffixed blobs followed by suffixed lane columns). The leading blobs are
-// the authoritative encoding; reinterpreting to plain JSONO drops the trailing lanes.
-bool HasJsonoBlobPrefix(const LogicalType &type);
-
-// True when `type` is a shredded JSONO struct: the four-blob prefix plus at least
-// one appended lane column. Distinct from the plain JSONO struct (exactly four
-// children), which the binder already resolves through the raw_struct->JSONO cast.
+// True when `type` is a shredded JSONO struct: a `jsono` layout field carrying `body` plus a
+// non-empty `shreds`. Set operations over differently-shredded values reconcile into this same
+// shape (the shred union), so there is no separate merged classification.
 bool IsShreddedJsonoType(const LogicalType &type);
+
+class Expression;
+
+// Resolve a function's first (JSONO) argument and return the type to assign to its
+// arguments[0]. SQLNULL/plain JSONO -> JsonoType(). Shredded -> JsonoType() when
+// `reconstruct_shredded` (the binder then inserts the lossless reconstruct cast so the executor
+// sees plain JSONO), else the shredded type itself (the executor reads its residual natively).
+// Throws BinderException naming the function for any non-JSONO type, so an arbitrary struct is
+// rejected loudly rather than silently routed through the struct constructor cast;
+// ParameterNotResolvedException for an unresolved prepared parameter.
+void JsonoRequireExtensionOptimizerForShredded(ClientContext &context, const LogicalType &type,
+                                               const string &function_name);
+LogicalType JsonoResolveJsonoArgument(ClientContext &context, const Expression &arg, const string &function_name,
+                                      bool reconstruct_shredded);
 
 class Vector;
 
-// Reconstruct a shredded JSONO `input` (four-BLOB residual + lane columns) into the
-// lossless plain JSONO `result` by overlaying each row's lane values onto its residual.
+// Reconstruct a shredded JSONO `input` (four-BLOB residual + shred columns) into the
+// lossless plain JSONO `result` by overlaying each row's shred values onto its residual.
 // This is how a shredded value becomes usable where a plain JSONO is required (an implicit
-// cast, an INSERT into a plain JSONO column) without dropping the lane data. Top-level
-// lanes only; a nested-path lane throws.
+// cast, an INSERT into a plain JSONO column) without dropping the shred data. Top-level shreds
+// overlay in one flat pass; a nested-path shred overlays its single key chain onto the residual.
 void JsonoReconstructToPlain(Vector &input, idx_t count, Vector &result);
+
+// Overlay only `shreds` (shred indices over the shred set) of the shredded `input` onto its
+// residual, producing plain JSONO. The single-pass narrowing reshred folds the shreds the target
+// type drops back into the residual with this, leaving the kept shreds untouched.
+void JsonoOverlayShredsToPlain(Vector &input, idx_t count, const vector<idx_t> &shreds, Vector &result);
 
 // Parse a VARCHAR/JSON `source` vector into a plain JSONO `result` vector, throwing on
 // invalid JSON (the jsono() text contract). Exposed so the shred constructor overload can
@@ -130,7 +166,11 @@ constexpr uint32_t MAGIC = 0x4F4E534A; // 'JSNO' little-endian
 // version 2: ContainerSpan carries a per-object shape_hash (sorted-key
 // fingerprint) so readers can trust a cached object key-rank by an int compare
 // instead of a key-heap read+string-compare. See docs/jsono_format.md.
-constexpr uint8_t VERSION = 0x02;
+// version 3: the skips blob may carry a trailing shred manifest — the (path, type)
+// entries this row's shred writer stripped out of the residual. Readers verify the
+// manifest against the shreds actually present, turning a shred silently dropped or
+// retyped by a raw struct cast into a loud read error. See docs/jsono_format.md.
+constexpr uint8_t VERSION = 0x03;
 
 namespace flags {
 constexpr uint8_t SORTED_KEYS = 0x01;
@@ -363,6 +403,21 @@ static_assert(sizeof(ContainerSpan) == 16, "ContainerSpan must be exactly 16 byt
 static_assert(sizeof(ObjectCheckpointIndex) == 12, "ObjectCheckpointIndex must be exactly 12 bytes");
 static_assert(sizeof(ObjectCursorCheckpoint) == 8, "ObjectCursorCheckpoint must be exactly 8 bytes");
 
+// One shred-manifest entry: a path the shred writer stripped out of this row's residual (its value
+// lives only in the shred) and the shred type it was written as. The views point into the skips blob.
+struct ShredManifestEntry {
+	nonstd::string_view path;
+	nonstd::string_view type;
+};
+
+// The shred manifest is the tail of the skips blob, after the checkpoint sections:
+//   u32 entry_count, then per entry: u16 path_len, path bytes, u16 type_len, type bytes.
+// Entries are sorted by path (the shred writer emits fields in canonical order). A plain value
+// writes no manifest (the skips blob ends at the checkpoints), which reads as zero entries.
+// The manifest is the write-time record of which paths are NOT in the residual: a reader holding
+// fewer (or differently typed) shreds than the manifest lists cannot reproduce the value — that row
+// was narrowed by a raw struct cast — and must fail loud instead of silently dropping the value.
+
 // Fingerprint an object's stored KEY slots (sorted order, length-prefixed) into a
 // shape_hash. Path-agnostic: every object-emitting writer routes through this on
 // the final KEY slots, so the stored hash is a pure function of the object's key
@@ -519,11 +574,60 @@ public:
 			if (required_bytes > skips_size_) {
 				throw InvalidInputException("malformed JSONO: metadata blob is shorter than its declared spans");
 			}
+			manifest_offset_ = size_t(required_bytes);
 		} else {
 			metadata_header_ = {};
+			manifest_offset_ = skips_size_;
 		}
 		slot_count_ = slots_bytes / sizeof(uint64_t);
 		return true;
+	}
+
+	// Parse the shred manifest from the skips tail into `entries`. Returns the entry count
+	// (zero for a plain value, whose skips blob ends at the checkpoints).
+	size_t ReadShredManifest(std::vector<ShredManifestEntry> &entries) const {
+		entries.clear();
+		if (manifest_offset_ >= skips_size_) {
+			return 0;
+		}
+		auto cursor = manifest_offset_;
+		auto read_bytes = [&](void *dst, size_t bytes) {
+			if (bytes > skips_size_ - cursor) {
+				throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+			}
+			std::memcpy(dst, skips_ + cursor, bytes);
+			cursor += bytes;
+		};
+		uint32_t entry_count;
+		read_bytes(&entry_count, sizeof(entry_count));
+		entries.reserve(entry_count);
+		for (uint32_t i = 0; i < entry_count; i++) {
+			uint16_t path_len;
+			read_bytes(&path_len, sizeof(path_len));
+			if (path_len > skips_size_ - cursor) {
+				throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+			}
+			auto path = nonstd::string_view(reinterpret_cast<const char *>(skips_) + cursor, path_len);
+			cursor += path_len;
+			uint16_t type_len;
+			read_bytes(&type_len, sizeof(type_len));
+			if (type_len > skips_size_ - cursor) {
+				throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+			}
+			auto type = nonstd::string_view(reinterpret_cast<const char *>(skips_) + cursor, type_len);
+			cursor += type_len;
+			entries.push_back(ShredManifestEntry {path, type});
+		}
+		if (cursor != skips_size_) {
+			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
+		}
+		return entries.size();
+	}
+
+	// True when this row's writer stripped at least one path out of the residual (cheap: a
+	// single offset compare, no manifest parse).
+	bool HasShredManifest() const {
+		return manifest_offset_ < skips_size_;
 	}
 
 	uint8_t HeaderFlags() const {
@@ -652,7 +756,50 @@ private:
 	JsonoHeader header_ {};
 	ContainerMetadataHeader metadata_header_ {};
 	size_t slot_count_ = 0;
+	size_t manifest_offset_ = 0;
 };
+
+// Verify a row's shred manifest against the shreds the reading type actually carries, given as
+// (path, type-string) pairs. Every manifest entry must have a shred of the same path and type:
+// the manifest lists the paths stripped out of this residual at write time, so a missing shred
+// means the value was narrowed by a raw struct cast (the shred was dropped) and a retyped shred
+// means its value was silently converted — either way the original value cannot be reproduced
+// and the read must fail loud. Extra shreds are fine (a widening cast NULL-fills them; readers
+// fall back to the residual). `manifest` is caller-provided scratch to keep the per-row parse
+// allocation-free.
+inline void VerifyShredManifest(const JsonoView &view,
+                                const std::vector<std::pair<std::string, std::string>> &shred_signatures,
+                                std::vector<ShredManifestEntry> &manifest) {
+	// Always reset the caller's scratch: a row without a manifest must not inherit the previous
+	// row's entries (callers also read `manifest` after this to learn the row's stripped paths).
+	manifest.clear();
+	if (!view.HasShredManifest()) {
+		return;
+	}
+	view.ReadShredManifest(manifest);
+	for (auto &entry : manifest) {
+		bool found = false;
+		for (auto &shred : shred_signatures) {
+			if (entry.path == nonstd::string_view(shred.first.data(), shred.first.size())) {
+				if (entry.type != nonstd::string_view(shred.second.data(), shred.second.size())) {
+					throw InvalidInputException(
+					    "JSONO: row was shredded with shred '%s %s' but the column carries it as a different type; "
+					    "the shred value was converted by a raw struct cast and the original cannot be reproduced",
+					    std::string(entry.path).c_str(), std::string(entry.type).c_str());
+				}
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			throw InvalidInputException(
+			    "JSONO: row was shredded with shred '%s %s' but the column no longer carries that shred; the value "
+			    "was narrowed by a raw struct cast and cannot be read losslessly. Reshred through "
+			    "jsono(value, shredding := {...}) (the extension optimizer does this automatically)",
+			    std::string(entry.path).c_str(), std::string(entry.type).c_str());
+		}
+	}
+}
 
 } // namespace jsono
 

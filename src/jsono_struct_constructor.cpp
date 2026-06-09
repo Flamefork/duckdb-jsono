@@ -104,24 +104,24 @@ struct JsonoStructPlan {
 struct JsonoStructBindData : public FunctionData {
 	JsonoStructPlan plan;
 	// When non-empty, the constructor builds a plain residual and then shreds these
-	// top-level scalar fields into lane columns (result is a shredded JSONO struct).
-	vector<std::pair<string, LogicalType>> lanes;
+	// top-level scalar fields into shred columns (result is a shredded JSONO struct).
+	vector<std::pair<string, LogicalType>> shreds;
 
 	explicit JsonoStructBindData(JsonoStructPlan plan_p) : plan(std::move(plan_p)) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		// lanes must travel with the copy: the optimizer's shredded reconstruction copies the
-		// constructor expression, and a copy that loses its lanes would take the plain path yet
-		// still allocate the shredded return type, leaving the lane children uninitialized.
+		// shreds must travel with the copy: the optimizer's shredded reconstruction copies the
+		// constructor expression, and a copy that loses its shreds would take the plain path yet
+		// still allocate the shredded return type, leaving the shred children uninitialized.
 		auto copy = make_uniq<JsonoStructBindData>(plan);
-		copy->lanes = lanes;
+		copy->shreds = shreds;
 		return std::move(copy);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<JsonoStructBindData>();
-		return plan.bound_type == other.plan.bound_type && lanes == other.lanes;
+		return plan.bound_type == other.plan.bound_type && shreds == other.shreds;
 	}
 };
 
@@ -179,11 +179,7 @@ struct JsonoStructVectorData {
 
 void SetJsonoRowNull(Vector &result, Vector &slots_vec, Vector &key_heap_vec, Vector &string_heap_vec,
                      Vector &skips_vec, idx_t row) {
-	FlatVector::SetNull(result, row, true);
-	FlatVector::SetNull(slots_vec, row, true);
-	FlatVector::SetNull(key_heap_vec, row, true);
-	FlatVector::SetNull(string_heap_vec, row, true);
-	FlatVector::SetNull(skips_vec, row, true);
+	jsono::SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
 }
 
 bool IsJsonType(const LogicalType &type) {
@@ -394,7 +390,7 @@ bool ConstructorValueRowIsNull(const JsonoStructVectorData &data, idx_t row) {
 		return true;
 	case StructValueStrategy::Jsono: {
 		JsonoBlobRow ignored;
-		return !ReadJsonoRow(data.jsono_data, row, ignored);
+		return !ReadJsonoRowStrict(data.jsono_data, row, ignored);
 	}
 	default:
 		return !RowIsValid(data.fmt, row);
@@ -824,7 +820,7 @@ void EmitConstructorValue(const JsonoStructVectorData &data, idx_t row, JsonoStr
 	}
 	if (data.plan->strategy == StructValueStrategy::Jsono) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(data.jsono_data, row, blob)) {
+		if (!ReadJsonoRowStrict(data.jsono_data, row, blob)) {
 			builder.EmitNull();
 			return;
 		}
@@ -1017,12 +1013,12 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 	JsonoStructVectorData input_data;
 	InitStructConstructorVectorData(input, count, plan, input_data);
 
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &result_children = StructVector::GetEntries(result);
-	auto &slots_vec = *result_children[0];
-	auto &key_heap_vec = *result_children[1];
-	auto &string_heap_vec = *result_children[2];
-	auto &skips_vec = *result_children[3];
+	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
+	jsono::InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
+	auto &slots_vec = *slots_p;
+	auto &key_heap_vec = *key_heap_p;
+	auto &string_heap_vec = *string_heap_p;
+	auto &skips_vec = *skips_p;
 	auto slots_data = FlatVector::GetData<string_t>(slots_vec);
 	auto key_heap_data = FlatVector::GetData<string_t>(key_heap_vec);
 	auto string_heap_data = FlatVector::GetData<string_t>(string_heap_vec);
@@ -1031,7 +1027,7 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 	if (plan.strategy == StructValueStrategy::Jsono) {
 		for (idx_t row = 0; row < count; row++) {
 			JsonoBlobRow blob;
-			if (!ReadJsonoRow(input_data.jsono_data, row, blob)) {
+			if (!ReadJsonoRowStrict(input_data.jsono_data, row, blob)) {
 				SetJsonoRowNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
 				continue;
 			}
@@ -1105,33 +1101,35 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 	auto plan = BuildStructConstructorPlan(input_type, "jsono()");
 	idx_t next_key_cache_index = 0;
 	AssignStructConstructorKeyCacheIndexes(plan, next_key_cache_index);
-	// Keep the argument type the RAW input struct, not plan.bound_type. The lane set is selected
+	// Keep the argument type the RAW input struct, not plan.bound_type. The shred set is selected
 	// from the raw field types (below), and DuckDB re-binds this constructor from its serialized
 	// argument type during plan verification. A promoted argument (INTEGER->BIGINT, UBIGINT->VARCHAR)
-	// would flip lane eligibility on re-bind, producing a different lane manifest than the serialized
+	// would flip shred eligibility on re-bind, producing a different shred manifest than the serialized
 	// return type and a fatal STRUCT cast. The promotion the plan's strategies need is applied inside
 	// execution instead (JsonoStructExecute), mirroring the cast entry point.
 	bound_function.arguments[0] = input_type;
 	auto bind_data = make_uniq<JsonoStructBindData>(std::move(plan));
 	if (allow_shred) {
 		for (auto &child : StructType::GetChildTypes(input_type)) {
-			if (IsShredLaneType(child.second)) {
-				bind_data->lanes.emplace_back(child.first, child.second);
+			// A field named 'body' would collide with the layout's residual field, so it stays in
+			// the residual instead of becoming a shred (auto-shred must not error on field names).
+			if (child.first != "body" && IsShredValueType(child.second)) {
+				bind_data->shreds.emplace_back(child.first, child.second);
 			}
 		}
 	}
-	if (!bind_data->lanes.empty()) {
-		// Canonical lane order (sorted by name) so the shredded type is a pure function of the lane
-		// set, not of struct field order: the executor writes lanes by index, so the field write order
-		// (bind_data->lanes) and the type's lane order must agree. The fingerprint is order-independent.
+	if (!bind_data->shreds.empty()) {
+		// Canonical shred order (sorted by name) so the shredded type is a pure function of the shred
+		// set, not of struct field order: the executor writes shreds by index, so the field write order
+		// (bind_data->shreds) and the type's shred order must agree.
 		std::sort(
-		    bind_data->lanes.begin(), bind_data->lanes.end(),
+		    bind_data->shreds.begin(), bind_data->shreds.end(),
 		    [](const pair<string, LogicalType> &a, const pair<string, LogicalType> &b) { return a.first < b.first; });
-		child_list_t<LogicalType> lane_types;
-		for (auto &lane : bind_data->lanes) {
-			lane_types.emplace_back(lane.first, lane.second);
+		child_list_t<LogicalType> shred_types;
+		for (auto &shred : bind_data->shreds) {
+			shred_types.emplace_back(shred.first, shred.second);
 		}
-		bound_function.return_type = JsonoShreddedStructType(lane_types);
+		bound_function.return_type = JsonoShreddedStructType(shred_types);
 	}
 	return std::move(bind_data);
 }
@@ -1143,8 +1141,8 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 
 // The optimizer's shredded reconstruction builds a JSONO patch via JsonoStructConstructorFunction;
 // that patch must stay plain JSONO so the overlay merges plain residual + plain patch. This bind
-// forces shred off (the patch's top-level fields are lane-typed scalars, which the always-on
-// auto-shred would otherwise lift back into lanes and break the overlay).
+// forces shred off (the patch's top-level fields are shred-typed scalars, which the always-on
+// auto-shred would otherwise lift back into shreds and break the overlay).
 unique_ptr<FunctionData> JsonoStructBindPlain(ClientContext &context, ScalarFunction &bound_function,
                                               vector<unique_ptr<Expression>> &arguments) {
 	return JsonoStructBindShared(bound_function, arguments, false);
@@ -1165,13 +1163,13 @@ void JsonoStructExecute(DataChunk &args, ExpressionState &state, Vector &result)
 		input = &casted;
 	}
 
-	if (bind_data.lanes.empty()) {
+	if (bind_data.shreds.empty()) {
 		ExecuteStructConstructor(*input, count, result, bind_data.plan, lstate);
 		return;
 	}
 	Vector plain(JsonoType(), count);
 	ExecuteStructConstructor(*input, count, plain, bind_data.plan, lstate);
-	JsonoShredFromSpec(plain, count, bind_data.lanes, result);
+	JsonoShredFromSpec(plain, count, bind_data.shreds, result);
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
@@ -1196,33 +1194,27 @@ bool JsonoStructCastToJsono(Vector &source, Vector &result, idx_t count, CastPar
 	return true;
 }
 
-// Reinterpret a jsono-prefixed struct to the plain jsono STRUCT by carrying over the
-// leading four BLOB children and dropping any trailing lane columns. Per-child
-// Reinterpret, not a nested Vector::Reinterpret: the latter is defined only for
-// non-nested types (it shares the child buffer by pointer without retyping it) and a
-// debug build asserts on a nested reinterpret; reinterpreting the scalar BLOB children
-// individually is allowed, and the parent vector type/validity carry across unchanged.
+// A plain JSONO value reaching the wildcard STRUCT(any)->JSONO cast: source and target are the
+// same nested type, so reference it through. The corrupt check first: a valid top-level row whose
+// layout/body/blobs are absent is the trace of a by-name struct cast NULL-filling a layout field
+// (a set operation over differently-shredded values), which must throw rather than read as SQL NULL.
 bool JsonoPrefixReinterpretCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	(void)parameters;
-	if (source.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-		result.SetVectorType(VectorType::CONSTANT_VECTOR);
-		ConstantVector::SetNull(result, ConstantVector::IsNull(source));
-	} else {
-		source.Flatten(count);
-		result.SetVectorType(VectorType::FLAT_VECTOR);
-		FlatVector::Validity(result) = FlatVector::Validity(source);
+	jsono::JsonoVectorData residual;
+	jsono::InitJsonoVectorData(source, count, residual);
+	for (idx_t row = 0; row < count; row++) {
+		jsono::JsonoBlobRow blob {};
+		if (!jsono::ReadJsonoRowStrict(residual, row, blob)) {
+			continue;
+		}
 	}
-	auto &source_children = StructVector::GetEntries(source);
-	auto &result_children = StructVector::GetEntries(result);
-	for (idx_t i = 0; i < result_children.size(); i++) {
-		result_children[i]->Reinterpret(*source_children[i]);
-	}
+	result.Reference(source);
 	return true;
 }
 
-// Cast a shredded JSONO struct to plain JSONO losslessly: overlay each row's lanes back onto
+// Cast a shredded JSONO struct to plain JSONO losslessly: overlay each row's shreds back onto
 // its residual. This is what an implicit cast / INSERT into a plain JSONO column needs — the
-// reinterpret path would silently drop the lane columns. The optimizer never reaches here for
+// reinterpret path would silently drop the shred columns. The optimizer never reaches here for
 // its residual extraction; it reinterprets the four-blob prefix directly.
 bool JsonoShreddedReconstructCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	(void)parameters;
@@ -1238,12 +1230,12 @@ BoundCastInfo JsonoStructCastBind(BindCastInput &input, const LogicalType &sourc
 	(void)target;
 	if (IsShreddedJsonoType(source)) {
 		// A shredded value reaching a plain-JSONO context (cast or INSERT): reconstruct the
-		// full value so the lane data is preserved rather than dropped.
+		// full value so the shred data is preserved rather than dropped.
 		return BoundCastInfo(JsonoShreddedReconstructCast);
 	}
-	if (HasJsonoBlobPrefix(source)) {
-		// A plain already-stored JSONO value (exactly four blobs): reinterpret the prefix
-		// without reconstructing from struct data.
+	if (IsJsonoType(source)) {
+		// A plain already-stored JSONO value (same nested type as the target): reference it through
+		// rather than rebuilding from struct data.
 		return BoundCastInfo(JsonoPrefixReinterpretCast);
 	}
 	auto plan = BuildStructConstructorPlan(source, "JSONO cast");
@@ -1261,7 +1253,7 @@ BoundCastInfo JsonoStructCastBind(BindCastInput &input, const LogicalType &sourc
 } // namespace
 
 // The bare jsono(STRUCT) constructor overload, exposed so the optimizer's shredded
-// reconstruction can build a JSONO patch from the lane columns without a catalog
+// reconstruction can build a JSONO patch from the shred columns without a catalog
 // lookup. Mirrors the single-argument overload registered below.
 ScalarFunction JsonoStructConstructorFunction() {
 	ScalarFunction fun("jsono", {LogicalTypeId::STRUCT}, JsonoType(), JsonoStructExecute, JsonoStructBindPlain, nullptr,

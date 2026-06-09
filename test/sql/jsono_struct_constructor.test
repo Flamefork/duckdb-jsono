@@ -40,7 +40,7 @@ SELECT to_json(jsono({'b': NULL, 'a': 1, 'nested': {'x': NULL, 'y': 2}}));
 query II
 SELECT typeof(jsono({'a': 1})), to_json(jsono({'b': 2, 'a': 'x'}));
 ----
-STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)	{"a":"x","b":2}
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))	{"a":"x","b":2}
 
 # Top-level NULL STRUCT becomes SQL NULL, matching jsono(NULL).
 query I
@@ -66,11 +66,12 @@ SELECT to_json(jsono('{"b":2,"a":1}'::JSON));
 ----
 {"a":1,"b":2}
 
-# The constructor takes a single STRUCT argument; the former options struct is gone.
+# The constructor takes a single STRUCT argument; the former options struct is gone — a second
+# argument is only accepted as the named shredding spec.
 statement error
 SELECT jsono({'a': 1}, {'nulls': 'omit'});
 ----
-No function matches
+pass shredding :=
 
 # Non-finite doubles have no JSON representation and are rejected at construction.
 statement error

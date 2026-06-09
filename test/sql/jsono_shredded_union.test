@@ -1,0 +1,399 @@
+# name: test/sql/jsono_shredded_union.test
+# description: set operations over differently-shredded jsono columns are lossless by construction: DuckDB merges the branch types into one shredded type on the union of the shred sets (the single "jsono" layout name makes the struct merge land there), and the optimizer reshredds each branch to it so encodings are byte-identical.
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE shred_a AS SELECT jsono('{"a":"AAA","b":"BBB"}', shredding := {'a':'VARCHAR'}) AS e;
+
+statement ok
+CREATE TABLE shred_b AS SELECT jsono('{"a":"XXX","b":"YYY"}', shredding := {'b':'VARCHAR'}) AS e;
+
+# Extracts see both branches' values (before the fix the second branch silently extracted NULL:
+# the merged struct was misread as the first branch's shredded type, whose residual is NULL there).
+query II
+SELECT e ->> 'a', e ->> 'b' FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b) ORDER BY 1;
+----
+AAA	BBB
+XXX	YYY
+
+query I
+SELECT to_json(e)::VARCHAR FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b) ORDER BY 1;
+----
+{"a":"AAA","b":"BBB"}
+{"a":"XXX","b":"YYY"}
+
+query I
+SELECT jsono_type(e) FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b);
+----
+OBJECT
+OBJECT
+
+# The optimizer reshredds both branches to the union of the shred sets, so the result is the
+# ordinary shredded type on {a, b} — not the union-merged double struct DuckDB builds by itself.
+# typeof() is folded to a constant at bind time (before the optimizer runs), so it would still
+# report the pre-normalization merged type; the materialized column type is the post-optimizer
+# truth, so observe it via a stored table's schema instead.
+statement ok
+CREATE TABLE ref_ab AS SELECT jsono('{}', shredding := {'a': 'VARCHAR', 'b': 'VARCHAR'}) AS e WHERE false;
+
+statement ok
+CREATE TABLE u_ab AS SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b;
+
+query I
+SELECT (SELECT column_type FROM (DESCRIBE u_ab)) = (SELECT column_type FROM (DESCRIBE ref_ab));
+----
+true
+
+# Inline set-operation consumers bind before the optimizer can normalize the union-merged type.
+# They must still accept the widened value and either reconstruct it or see the post-normalized
+# shredded type.
+query II
+SELECT u.key, u.value
+FROM (
+  SELECT unnest(jsono_entries(e, key_style := 'dotted')) AS u
+  FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b)
+)
+ORDER BY u.value;
+----
+a	AAA
+b	BBB
+a	XXX
+b	YYY
+
+query II
+SELECT t.a, t.b
+FROM (
+  SELECT jsono_transform(e, {'a': 'VARCHAR', 'b': 'VARCHAR'}) AS t
+  FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b)
+)
+ORDER BY t.a;
+----
+AAA	BBB
+XXX	YYY
+
+query I
+SELECT (jsono_storage_size(e)).shreds
+FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b)
+ORDER BY to_json(e)::VARCHAR;
+----
+6
+6
+
+# With the extension optimizer disabled, extension-bound shredded operations fail
+# before execution. The unsafe core STRUCT cast path is covered in jsono_shredded_cast_guard.test.
+statement ok
+SET disabled_optimizers='extension';
+
+statement error
+SELECT (jsono_storage_size(e)).shreds
+FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b)
+ORDER BY to_json(e)::VARCHAR;
+----
+requires the extension optimizer
+
+statement ok
+RESET disabled_optimizers;
+
+query II
+SELECT typeof(jsono_group_merge(e ORDER BY to_json(e)::VARCHAR)) = (SELECT column_type FROM (DESCRIBE ref_ab)),
+       to_json(jsono_group_merge(e ORDER BY to_json(e)::VARCHAR))::VARCHAR
+FROM (
+  SELECT jsono('{"a":"AAA"}', shredding := {'a':'VARCHAR'}) AS e
+  UNION ALL
+  SELECT jsono('{"b":"BBB"}', shredding := {'b':'VARCHAR'})
+);
+----
+true	{"a":"AAA","b":"BBB"}
+
+# The reshred makes row comparison honest again: one logical value shredded two different ways is
+# byte-identical after reshredding, so UNION (DISTINCT) collapses it (before the fix the two
+# encodings compared unequal and both survived).
+query I
+SELECT to_json(e)::VARCHAR FROM (
+  SELECT jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'}) AS e
+  UNION
+  SELECT jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'})
+);
+----
+{"a":"S","b":"T"}
+
+query I
+SELECT to_json(e)::VARCHAR FROM (
+  SELECT jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'}) AS e
+  INTERSECT
+  SELECT jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'})
+);
+----
+{"a":"S","b":"T"}
+
+query I
+SELECT count(*) FROM (
+  SELECT jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'}) AS e
+  EXCEPT
+  SELECT jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'})
+);
+----
+0
+
+# A path shredded with two different types: DuckDB reconciles the shred types (BIGINT joins
+# VARCHAR), the optimizer reshredds the BIGINT branch to the merged spec, and its number value
+# fails the VARCHAR shred's lossless gate — it stays in the residual (shred NULL) and reads back
+# exactly, JSON type included.
+statement ok
+CREATE TABLE ref_conflict AS SELECT jsono('{}', shredding := {'a':'VARCHAR'}) AS e WHERE false;
+
+statement ok
+CREATE TABLE u_conflict AS
+  SELECT jsono('{"a":"1","c":"x"}', shredding := {'a':'VARCHAR'}) AS e
+  UNION ALL
+  SELECT jsono('{"a":2,"c":"y"}', shredding := {'a':'BIGINT'});
+
+query I
+SELECT (SELECT column_type FROM (DESCRIBE u_conflict)) = (SELECT column_type FROM (DESCRIBE ref_conflict));
+----
+true
+
+query I
+SELECT to_json(e)::VARCHAR FROM u_conflict ORDER BY 1;
+----
+{"a":"1","c":"x"}
+{"a":2,"c":"y"}
+
+# Shredded UNION plain: the merged shred set is the shredded branch's; the plain branch is shredded.
+statement ok
+CREATE TABLE ref_a AS SELECT jsono('{}', shredding := {'a': 'VARCHAR'}) AS e WHERE false;
+
+statement ok
+CREATE TABLE u_shred_plain AS SELECT e FROM shred_a UNION ALL SELECT jsono('{"a":"PPP","b":"QQQ"}');
+
+query I
+SELECT (SELECT column_type FROM (DESCRIBE u_shred_plain)) = (SELECT column_type FROM (DESCRIBE ref_a));
+----
+true
+
+query II
+SELECT e ->> 'a', e ->> 'b' FROM u_shred_plain ORDER BY 1;
+----
+AAA	BBB
+PPP	QQQ
+
+# NULL rows pass through the reshred as NULL.
+query I
+SELECT e IS NULL FROM (SELECT jsono(NULL) AS e UNION ALL SELECT e FROM shred_b) ORDER BY 1;
+----
+false
+true
+
+# Identically-shredded branches share the type already; no rewrite, no widening (regression).
+statement ok
+CREATE TABLE u_same AS SELECT e FROM shred_a UNION ALL SELECT jsono('{"a":"ZZZ"}', shredding := {'a':'VARCHAR'});
+
+query I
+SELECT (SELECT column_type FROM (DESCRIBE u_same)) = (SELECT column_type FROM (DESCRIBE ref_a));
+----
+true
+
+# Materialising the union keeps every branch's data.
+statement ok
+CREATE TABLE merged AS SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b;
+
+query II
+SELECT e ->> 'a', e ->> 'b' FROM merged ORDER BY 1;
+----
+AAA	BBB
+XXX	YYY
+
+# Inserting the union into a table shredded on a *different* shred set: the optimizer rewrites
+# the lossy by-name cast into reconstruct + reshred, so the insert is lossless — the shred the
+# target type lacks ('b') falls back into the residual.
+statement ok
+CREATE TABLE ins_target AS SELECT e FROM shred_a WHERE false;
+
+statement ok
+INSERT INTO ins_target SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b;
+
+query I
+SELECT to_json(e)::VARCHAR FROM ins_target ORDER BY 1;
+----
+{"a":"AAA","b":"BBB"}
+{"a":"XXX","b":"YYY"}
+
+# A valid (non-NULL) row whose residual blob is NULL is corrupt — the writer nulls the whole
+# struct for a NULL value, so this is the trace of a struct cast NULL-filling the row's body.
+# The lossless reconstruct cast refuses to invent a value.
+statement error
+SELECT struct_pack(
+        "jsono" := struct_pack(
+            body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB),
+            a := 'v'))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)));
+----
+NULL residual
+
+# --- CASE/COALESCE also reconcile two differently shredded values: DuckDB merges their shred
+# sets into one shredded type and the optimizer reshredds each arm — values correct, type
+# normalized, dedup honest. ---
+
+# CASE over differently-shredded values reads each branch correctly and normalizes to one shredded type.
+query III
+SELECT to_json(CASE WHEN true THEN sa.e ELSE sb.e END)::VARCHAR,
+       to_json(CASE WHEN false THEN sa.e ELSE sb.e END)::VARCHAR,
+       (CASE WHEN false THEN sa.e ELSE sb.e END) ->> 'a'
+FROM shred_a AS sa, shred_b AS sb;
+----
+{"a":"AAA","b":"BBB"}	{"a":"XXX","b":"YYY"}	XXX
+
+# The reconciled type carries both shreds (DuckDB's expression reconciliation orders shreds by arm
+# order, so only the shred set — not the field order — is portable).
+statement ok
+CREATE TABLE case_out AS SELECT CASE WHEN true THEN sa.e ELSE sb.e END AS e FROM shred_a AS sa, shred_b AS sb;
+
+query I
+SELECT t LIKE '%a VARCHAR%' AND t LIKE '%b VARCHAR%'
+FROM (SELECT (SELECT column_type FROM (DESCRIBE case_out)) AS t);
+----
+true
+
+# COALESCE likewise — reads correctly and normalizes.
+query I
+SELECT to_json(COALESCE(sa.e, sb.e))::VARCHAR FROM shred_a AS sa, shred_b AS sb;
+----
+{"a":"AAA","b":"BBB"}
+
+statement ok
+CREATE TABLE coalesce_out AS SELECT COALESCE(sa.e, sb.e) AS e FROM shred_a AS sa, shred_b AS sb;
+
+query I
+SELECT t LIKE '%a VARCHAR%' AND t LIKE '%b VARCHAR%'
+FROM (SELECT (SELECT column_type FROM (DESCRIBE coalesce_out)) AS t);
+----
+true
+
+# Reshredding makes CASE/COALESCE dedup honest: the same value shredded two ways collapses under
+# DISTINCT (before normalization the two encodings compared unequal and both survived).
+query I
+SELECT count(*) FROM (
+  SELECT DISTINCT CASE WHEN g
+                       THEN jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'})
+                       ELSE jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'}) END AS e
+  FROM (VALUES (true), (false)) v(g)
+);
+----
+1
+
+# The same CASE must be normalized when it is nested under an aggregate DISTINCT argument or a
+# comparison predicate. Otherwise DuckDB compares the widened physical union-merged STRUCT and sees
+# two different encodings for the same logical JSONO value.
+query I
+SELECT count(DISTINCT CASE WHEN g
+                           THEN jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'})
+                           ELSE jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'}) END)
+FROM (VALUES (true), (false)) v(g);
+----
+1
+
+query I
+SELECT count(*)
+FROM (VALUES (true), (false)) v(g)
+WHERE CASE WHEN g
+           THEN jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'})
+           ELSE jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'}) END
+      = jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR','b':'VARCHAR'});
+----
+2
+
+query I
+SELECT count(DISTINCT COALESCE(
+  CASE WHEN g THEN jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'}) END,
+  jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'})
+))
+FROM (VALUES (true), (false)) v(g);
+----
+1
+
+query I
+SELECT count(*)
+FROM (VALUES (true), (false)) v(g)
+GROUP BY CASE WHEN g
+              THEN jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'})
+              ELSE jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'}) END;
+----
+2
+
+query I
+SELECT count(*)
+FROM (VALUES (true), (false)) left_values(g), (VALUES (true), (false)) right_values(g)
+WHERE CASE WHEN left_values.g
+           THEN jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'})
+           ELSE jsono('{"a":"U","b":"V"}', shredding := {'a':'VARCHAR'}) END
+      = CASE WHEN right_values.g
+             THEN jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'})
+             ELSE jsono('{"a":"U","b":"V"}', shredding := {'b':'VARCHAR'}) END;
+----
+2
+
+query I
+SELECT count(*)
+FROM (VALUES (true), (false)) v(g)
+WHERE CASE WHEN g
+           THEN jsono('{"a":"S","b":"T"}', shredding := {'a':'VARCHAR'})
+           ELSE jsono('{"a":"U","b":"V"}', shredding := {'a':'VARCHAR'}) END
+      IN (jsono('{"a":"S","b":"T"}', shredding := {'b':'VARCHAR'}),
+          jsono('{"a":"U","b":"V"}', shredding := {'b':'VARCHAR'}));
+----
+2
+
+# An INSERT of a CASE result into a differently-shredded column is lossless too: the INSERT cast
+# wraps the CASE, the optimizer rewrites it into reconstruct + reshred, and the shred the target
+# lacks falls back into the residual.
+statement ok
+CREATE TABLE case_ins AS SELECT e FROM shred_a WHERE false;
+
+statement ok
+INSERT INTO case_ins SELECT CASE WHEN false THEN sa.e ELSE sb.e END FROM shred_a AS sa, shred_b AS sb;
+
+query I
+SELECT to_json(e)::VARCHAR FROM case_ins;
+----
+{"a":"XXX","b":"YYY"}
+
+# A set operation whose branches are themselves reconciliations (CASE feeding a UNION).
+query I
+SELECT to_json(e)::VARCHAR FROM (
+  SELECT CASE WHEN true THEN sa.e ELSE sb.e END AS e FROM shred_a AS sa, shred_b AS sb
+  UNION ALL
+  SELECT CASE WHEN false THEN sa.e ELSE sb.e END FROM shred_a AS sa, shred_b AS sb
+) ORDER BY 1;
+----
+{"a":"AAA","b":"BBB"}
+{"a":"XXX","b":"YYY"}
+
+# --- The merged type is established at bind time (it is DuckDB's own struct reconciliation), so
+# the statement's frozen result types always match the plan: a raw shredded value can reach the
+# client from any plan shape without the optimizer retyping anything. ---
+
+# Bare set operation at the plan root (no wrapping projection): the raw struct reaches the client.
+statement ok
+SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b;
+
+# Forwarded raw through a projection.
+statement ok
+SELECT e FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b);
+
+# Forwarded raw through pass-through operators (ORDER BY / LIMIT). The order key consumes the value
+# in-plan, the output column forwards it raw — both must coexist.
+statement ok
+SELECT e FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b) ORDER BY to_json(e)::VARCHAR LIMIT 1;
+
+# A raw CASE result at the plan root.
+statement ok
+SELECT CASE WHEN true THEN sa.e ELSE sb.e END FROM shred_a AS sa, shred_b AS sb;
+
+query I
+SELECT to_json(e)::VARCHAR FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b) ORDER BY 1;
+----
+{"a":"AAA","b":"BBB"}
+{"a":"XXX","b":"YYY"}

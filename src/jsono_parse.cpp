@@ -59,12 +59,12 @@ bool ParseJsonoVector(Vector &input, idx_t count, Vector &result, JsonoParseLoca
 	input.ToUnifiedFormat(count, input_fmt);
 	auto inputs = UnifiedVectorFormat::GetData<string_t>(input_fmt);
 
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &result_children = StructVector::GetEntries(result);
-	auto &slots_vec = *result_children[0];
-	auto &key_heap_vec = *result_children[1];
-	auto &string_heap_vec = *result_children[2];
-	auto &skips_vec = *result_children[3];
+	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
+	InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
+	auto &slots_vec = *slots_p;
+	auto &key_heap_vec = *key_heap_p;
+	auto &string_heap_vec = *string_heap_p;
+	auto &skips_vec = *skips_p;
 	auto slots_data = FlatVector::GetData<string_t>(slots_vec);
 	auto key_heap_data = FlatVector::GetData<string_t>(key_heap_vec);
 	auto string_heap_data = FlatVector::GetData<string_t>(string_heap_vec);

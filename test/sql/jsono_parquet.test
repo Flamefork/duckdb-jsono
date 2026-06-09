@@ -16,7 +16,7 @@ CREATE TABLE events AS
 query I
 SELECT typeof(j) FROM events LIMIT 1;
 ----
-STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))
 
 statement ok
 COPY events TO '__TEST_DIR__/events_jsono.parquet';
@@ -25,7 +25,7 @@ COPY events TO '__TEST_DIR__/events_jsono.parquet';
 query I
 SELECT typeof(j) FROM '__TEST_DIR__/events_jsono.parquet' LIMIT 1;
 ----
-STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))
 
 # jsono ops bind to the STRUCT structurally, so to_json works on the read-back value directly.
 query II
@@ -47,15 +47,15 @@ SELECT count(*) FROM '__TEST_DIR__/events_jsono.parquet';
 # bare STRUCT, so the BLOB children are read directly (the native-side cast is a no-op kept
 # for symmetry with the read side).
 query I
-WITH src AS (SELECT j::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS native
+WITH src AS (SELECT j."jsono".body AS native
              FROM events WHERE rid = 42),
-     pq  AS (SELECT j AS roundtripped
+     pq  AS (SELECT j."jsono".body AS roundtripped
              FROM '__TEST_DIR__/events_jsono.parquet' WHERE rid = 42)
 SELECT
-  src.native.jsono_key_heap = pq.roundtripped.jsono_key_heap
-  AND src.native.jsono_string_heap = pq.roundtripped.jsono_string_heap
-  AND src.native.jsono_slots = pq.roundtripped.jsono_slots
-  AND src.native.jsono_skips = pq.roundtripped.jsono_skips
+  src.native.key_heap = pq.roundtripped.key_heap
+  AND src.native.string_heap = pq.roundtripped.string_heap
+  AND src.native.slots = pq.roundtripped.slots
+  AND src.native.skips = pq.roundtripped.skips
 FROM src, pq;
 ----
 true

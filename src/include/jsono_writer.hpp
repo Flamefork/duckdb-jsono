@@ -274,11 +274,14 @@ inline string_t WriteJsonoBlobInto(Vector &vec, const JsonoBuilder &builder) {
 	return slots_str;
 }
 
-inline string_t WriteSkipsBlobInto(Vector &vec, const JsonoBuilder &builder) {
+// `manifest` is the pre-serialized shred-manifest tail (see ShredManifestEntry in jsono.hpp),
+// appended after the checkpoint sections; only the shred writer passes one.
+inline string_t WriteSkipsBlobInto(Vector &vec, const JsonoBuilder &builder, const std::string *manifest = nullptr) {
 	auto spans_bytes = builder.skips.size() * sizeof(ContainerSpan);
 	auto index_bytes = builder.object_checkpoint_index.size() * sizeof(ObjectCheckpointIndex);
 	auto checkpoints_bytes = builder.object_checkpoints.size() * sizeof(ObjectCursorCheckpoint);
-	auto total = sizeof(ContainerMetadataHeader) + spans_bytes + index_bytes + checkpoints_bytes;
+	auto manifest_bytes = manifest ? manifest->size() : 0;
+	auto total = sizeof(ContainerMetadataHeader) + spans_bytes + index_bytes + checkpoints_bytes + manifest_bytes;
 	auto skips_str = StringVector::EmptyString(vec, total);
 	auto skips_dst = skips_str.GetDataWriteable();
 
@@ -302,19 +305,65 @@ inline string_t WriteSkipsBlobInto(Vector &vec, const JsonoBuilder &builder) {
 		std::memcpy(skips_dst + sizeof(header) + spans_bytes + index_bytes, builder.object_checkpoints.data(),
 		            checkpoints_bytes);
 	}
+	if (manifest_bytes > 0) {
+		std::memcpy(skips_dst + sizeof(header) + spans_bytes + index_bytes + checkpoints_bytes, manifest->data(),
+		            manifest_bytes);
+	}
 	skips_str.Finalize();
 	return skips_str;
 }
 
 inline void WriteJsonoStruct(Vector &slots_vec, Vector &key_heap_vec, Vector &string_heap_vec, Vector &skips_vec,
                              string_t *slots_data, string_t *key_heap_data, string_t *string_heap_data,
-                             string_t *skips_data, idx_t row, const JsonoBuilder &builder) {
+                             string_t *skips_data, idx_t row, const JsonoBuilder &builder,
+                             const std::string *manifest = nullptr) {
 	slots_data[row] = WriteJsonoBlobInto(slots_vec, builder);
 	key_heap_data[row] = WriteBlobInto(key_heap_vec, builder.key_heap.data(), builder.key_heap.size());
 	string_heap_data[row] = WriteBlobInto(string_heap_vec, builder.string_heap.data(), builder.string_heap.size());
-	skips_data[row] = WriteSkipsBlobInto(skips_vec, builder);
+	skips_data[row] = WriteSkipsBlobInto(skips_vec, builder, manifest);
 }
 
+// The body struct vector of a jsono result vector (plain or shredded): top-level layout field [0]
+// -> body [0]. The four blob vectors are its children.
+inline Vector &JsonoBodyVector(Vector &result) {
+	auto &layout = *StructVector::GetEntries(result)[0];
+	return *StructVector::GetEntries(layout)[0];
+}
+
+// Shred `shred_index` (0-based over the shred set) of a shredded jsono vector: the shreds are the
+// layout field's children after `body`, so shred k is layout child 1 + k.
+inline Vector &JsonoShredVector(Vector &result, idx_t shred_index) {
+	auto &layout = *StructVector::GetEntries(result)[0];
+	return *StructVector::GetEntries(layout)[1 + shred_index];
+}
+
+// Resolve a jsono result vector's four body blob child vectors, flattening the nested struct chain
+// (result -> layout -> body -> blobs) so the caller can write flat blob data. Mirrors
+// InitJsonoVectorData's navigation on the write side; the rest of the writer is layout-agnostic.
+// Only the result and the four leaf blobs are flattened — the intermediate layout/body (and shreds)
+// structs are never NULL-set by the writer (a NULL row nulls only the top level, which the reader
+// short-circuits on), so they need no per-chunk validity reset.
+inline void InitJsonoBodyWrite(Vector &result, Vector *&slots, Vector *&key_heap, Vector *&string_heap,
+                               Vector *&skips) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &layout = *StructVector::GetEntries(result)[0];
+	auto &body = *StructVector::GetEntries(layout)[0];
+	auto &blobs = StructVector::GetEntries(body);
+	for (auto &blob : blobs) {
+		blob->SetVectorType(VectorType::FLAT_VECTOR);
+	}
+	slots = blobs[0].get();
+	key_heap = blobs[1].get();
+	string_heap = blobs[2].get();
+	skips = blobs[3].get();
+}
+
+// Null a jsono row: the top-level struct plus its four body blobs. The top-level NULL is what makes
+// the row read back as SQL NULL (the reader short-circuits on it before any inner level), so the
+// intermediate layout/body structs are intentionally left untouched — nulling them per row showed up
+// as the dominant cost on extract scenarios with many absent-path rows. A shredded result's shred
+// columns are nulled by the caller (they are written per-row anyway). Mirrors the flat-layout writer:
+// result + four blobs.
 inline void SetJsonoStructNull(Vector &result, Vector &slots_vec, Vector &key_heap_vec, Vector &string_heap_vec,
                                Vector &skips_vec, idx_t row) {
 	FlatVector::SetNull(result, row, true);

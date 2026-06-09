@@ -1,5 +1,5 @@
 # name: test/sql/jsono_shredded.test
-# description: Transparent reads over a shredded JSONO struct (4-blob prefix + lane columns)
+# description: Transparent reads over a shredded JSONO struct (nested layout: body + shreds)
 # group: [sql]
 
 require jsono
@@ -8,26 +8,21 @@ require jsono
 # struct binds it via an implicit struct->JSON cast, which the optimizer rewrites.
 require json
 
-# A "shredded" JSONO value is a STRUCT whose first four BLOB children are the
-# authoritative JSONO encoding, followed by lane columns named by canonical path.
-# PRESERVE model: each lane holds j ->> path. The prefix here encodes
-# {"kind":"commit","did":"d1","extra":"e1"}; lanes cover $.kind and $.did.
+# A "shredded" JSONO value is a top-level STRUCT with one "jsono<fp>" layout field,
+# carrying a `body` STRUCT (the authoritative four-blob JSONO encoding) and a `shreds` STRUCT of
+# shred columns named by canonical path. PRESERVE model: the body encodes the full document and
+# each shred also holds j ->> path. The body here is {"kind":"commit","did":"d1","extra":"e1"};
+# shreds cover $.kind and $.did (layout fp jsono).
 statement ok
 CREATE TABLE shred AS
 SELECT struct_pack(
-    jsono_slots       := s.jsono_slots,
-    jsono_key_heap    := s.jsono_key_heap,
-    jsono_string_heap := s.jsono_string_heap,
-    jsono_skips       := s.jsono_skips,
-    "$.kind"          := 'commit',
-    "$.did"           := 'd1'
-) AS j
-FROM (
-    SELECT jsono('{"kind":"commit","did":"d1","extra":"e1"}')
-           ::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS s
-) src;
+    "jsono" := struct_pack(
+        body := jsono('{"kind":"commit","did":"d1","extra":"e1"}')."jsono".body,
+        "$.did"  := 'd1',
+            "$.kind" := 'commit')
+) AS j;
 
-# bare ->> on a lane path resolves transparently
+# bare ->> on a shred path resolves transparently
 query I
 SELECT j ->> '$.kind' FROM shred;
 ----
@@ -38,13 +33,13 @@ SELECT j ->> '$.did' FROM shred;
 ----
 d1
 
-# shorthand key form maps to the same lane as the canonical $.kind
+# shorthand key form maps to the same shred as the canonical $.kind
 query I
 SELECT j ->> 'kind' FROM shred;
 ----
 commit
 
-# a path not covered by a lane falls back to the authoritative 4-blob prefix
+# a path not covered by a shred falls back to the authoritative body
 query I
 SELECT j ->> '$.extra' FROM shred;
 ----
@@ -56,42 +51,36 @@ SELECT j ->> '$.missing' FROM shred;
 ----
 NULL
 
-# to_json reconstructs the full value from the prefix; lanes are never leaked
+# to_json reconstructs the full value from the body; shreds are never leaked
 query I
 SELECT to_json(j) FROM shred;
 ----
 {"did":"d1","extra":"e1","kind":"commit"}
 
-# transparent in a filter, including a non-lane path consumed elsewhere
+# transparent in a filter, including a non-shred path consumed elsewhere
 query I
 SELECT j ->> '$.extra' FROM shred WHERE j ->> '$.kind' = 'commit';
 ----
 e1
 
-# The lane is authoritative for its path: a lane intentionally desynced from the
-# prefix returns the lane value, proving the read hits the lane column directly.
+# The shred is authoritative for its path: a shred intentionally desynced from the
+# body returns the shred value, proving the read hits the shred column directly.
 statement ok
 CREATE TABLE shred_sentinel AS
 SELECT struct_pack(
-    jsono_slots       := s.jsono_slots,
-    jsono_key_heap    := s.jsono_key_heap,
-    jsono_string_heap := s.jsono_string_heap,
-    jsono_skips       := s.jsono_skips,
-    "$.kind"          := 'SENTINEL'
-) AS j
-FROM (
-    SELECT jsono('{"kind":"commit","did":"d1"}')
-           ::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS s
-) src;
+    "jsono" := struct_pack(
+        body := jsono('{"kind":"commit","did":"d1"}')."jsono".body,
+        "$.kind" := 'SENTINEL')
+) AS j;
 
 query I
 SELECT j ->> '$.kind' FROM shred_sentinel;
 ----
 SENTINEL
 
-# to_json overlays lanes onto the residual, which is authoritative: the desynced
-# $.kind lane is ignored for reconstruction (it still drives the ->> read above).
-# In a real shred the lane and residual never disagree.
+# to_json overlays shreds onto the body, which is authoritative: the desynced
+# $.kind shred is ignored for reconstruction (it still drives the ->> read above).
+# In a real shred the shred and body never disagree.
 query I
 SELECT to_json(j) FROM shred_sentinel;
 ----
@@ -99,7 +88,7 @@ SELECT to_json(j) FROM shred_sentinel;
 
 # Multi-row, a NULL struct row, and a Parquet round-trip (the DuckLake-shaped
 # path: the shredded struct loses no fields through Parquet and the rewrite still
-# fires on the read_parquet-sourced column). Lanes are computed from the value so
+# fires on the read_parquet-sourced column). Shreds are computed from the value so
 # the PRESERVE invariant holds for every row.
 require parquet
 
@@ -115,21 +104,13 @@ INSERT INTO docs VALUES
 statement ok
 CREATE TABLE multi AS
 SELECT id,
-  CASE WHEN doc IS NULL THEN NULL ELSE struct_pack(
-    jsono_slots       := r.jsono_slots,
-    jsono_key_heap    := r.jsono_key_heap,
-    jsono_string_heap := r.jsono_string_heap,
-    jsono_skips       := r.jsono_skips,
-    "$.kind"          := jsono(doc) ->> '$.kind',
-    "$.did"           := jsono(doc) ->> '$.did'
-  ) END AS j
-FROM docs,
-     LATERAL (SELECT jsono(doc)::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS r) sub;
+  jsono(doc, shredding := {'$.did':'VARCHAR','$.kind':'VARCHAR'}) AS j
+FROM docs;
 
 statement ok
 COPY multi TO '__TEST_DIR__/shredded.parquet' (FORMAT parquet);
 
-# lane, non-lane and to_json agree across the direct table and the Parquet copy,
+# shred, non-shred and to_json agree across the direct table and the Parquet copy,
 # including the NULL row.
 query ITTT
 SELECT id, j ->> '$.kind', j ->> '$.extra', to_json(j) FROM multi ORDER BY id;
@@ -145,34 +126,28 @@ SELECT id, j ->> '$.kind', j ->> '$.extra', to_json(j) FROM '__TEST_DIR__/shredd
 2	like	e2	{"did":"d2","extra":"e2","kind":"like"}
 3	NULL	NULL	NULL
 
-# a lane predicate over many rows filters transparently (the rewrite turns it into
+# a shred predicate over many rows filters transparently (the rewrite turns it into
 # a struct_extract the planner can push down)
 query I
 SELECT id FROM multi WHERE j ->> '$.kind' = 'like' ORDER BY id;
 ----
 2
 
-# A lane may be typed (not just VARCHAR): the writer can store a hot number as a
+# A shred may be typed (not just VARCHAR): the writer can store a hot number as a
 # native column so it compresses as a typed column and reconstructs faithfully.
-# The ->> contract still returns text, so a typed lane is read via struct_extract
-# then cast to VARCHAR. A typed sentinel desynced from the blob proves the typed
-# lane is the source, not the blob.
+# The ->> contract still returns text, so a typed shred is read via struct_extract
+# then cast to VARCHAR. A typed sentinel desynced from the body proves the typed
+# shred is the source, not the body.
 statement ok
 CREATE TABLE shred_typed AS
 SELECT struct_pack(
-    jsono_slots       := s.jsono_slots,
-    jsono_key_heap    := s.jsono_key_heap,
-    jsono_string_heap := s.jsono_string_heap,
-    jsono_skips       := s.jsono_skips,
-    "$.n"             := 999::BIGINT,
-    "$.s"             := 'lane_s'
-) AS j
-FROM (
-    SELECT jsono('{"n":5,"s":"blob_s"}')
-           ::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS s
-) src;
+    "jsono" := struct_pack(
+        body := jsono('{"n":5,"s":"blob_s"}')."jsono".body,
+        "$.n" := 999::BIGINT,
+            "$.s" := 'shred_s')
+) AS j;
 
-# typed BIGINT lane read through the ->> text contract returns the lane value
+# typed BIGINT shred read through the ->> text contract returns the shred value
 query I
 SELECT j ->> '$.n' FROM shred_typed;
 ----
@@ -184,28 +159,22 @@ SELECT CAST(j ->> '$.n' AS BIGINT) + 1 FROM shred_typed;
 ----
 1000
 
-# a VARCHAR lane alongside a typed one still reads directly
+# a VARCHAR shred alongside a typed one still reads directly
 query I
 SELECT j ->> '$.s' FROM shred_typed;
 ----
-lane_s
+shred_s
 
-# A typed lane only holds values of its type; a value that doesn't fit (here a
-# string in a BIGINT-typed lane) is kept in the residual and the lane is NULL. The
-# ->> read must fall back to the residual for those rows, not return NULL.
+# A typed shred only holds values of its type; a value that doesn't fit (here a
+# string in a BIGINT-typed shred) is kept in the body and the shred is NULL. The
+# ->> read must fall back to the body for those rows, not return NULL.
 statement ok
 CREATE TABLE typed_het AS
 SELECT struct_pack(
-    jsono_slots       := r.jsono_slots,
-    jsono_key_heap    := r.jsono_key_heap,
-    jsono_string_heap := r.jsono_string_heap,
-    jsono_skips       := r.jsono_skips,
-    "$.n"             := NULL::BIGINT
-) AS j
-FROM (
-    SELECT jsono('{"n":"hello"}')
-           ::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS r
-) src;
+    "jsono" := struct_pack(
+        body := jsono('{"n":"hello"}')."jsono".body,
+        "$.n" := NULL::BIGINT)
+) AS j;
 
 query I
 SELECT j ->> '$.n' FROM typed_het;

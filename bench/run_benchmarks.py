@@ -480,7 +480,7 @@ def build_jsono_transform_query(
             prepare_sql=(),
             timed_sql=f"""
                 CREATE OR REPLACE TEMP TABLE _bench_out AS
-                SELECT jsono_transform({scenario_config["jsono_column"]}, {sql_json(spec)}) AS r
+                SELECT jsono_transform({scenario_config["jsono_column"]}, {sql_typed_literal(spec)}) AS r
                 FROM {table_sql(data_path)}
             """,
         )
@@ -488,7 +488,7 @@ def build_jsono_transform_query(
         prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
         timed_sql=f"""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
-            SELECT jsono_transform(t, {sql_json(spec)}) AS r
+            SELECT jsono_transform(t, {sql_typed_literal(spec)}) AS r
             FROM _bench_in
         """,
     )
@@ -501,7 +501,7 @@ def build_jsono_group_merge_query(
         prepare_sql=(jsono_prepare_jsono_with_group(scenario_config, data_path),),
         timed_sql=f"""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
-            SELECT to_json(jsono_group_merge(t, 'IGNORE NULLS')) AS r
+            SELECT to_json(jsono_group_merge(t)) AS r
             FROM _bench_in
             GROUP BY {scenario_config["group_col"]}
         """,
@@ -515,7 +515,7 @@ def build_jsono_group_merge_jsono_query(
         prepare_sql=(jsono_prepare_jsono_with_group(scenario_config, data_path),),
         timed_sql=f"""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
-            SELECT jsono_group_merge(t, 'IGNORE NULLS') AS r
+            SELECT jsono_group_merge(t) AS r
             FROM _bench_in
             GROUP BY {scenario_config["group_col"]}
         """,
@@ -565,12 +565,36 @@ def build_jsono_merge_patch_query(
     )
 
 
+def build_jsono_reshred_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    # The INSERT-into-a-differently-shredded-column write path: the optimizer rewrites that
+    # cast into exactly this jsono(value, shredding := target) call, so timing the call times
+    # the path. source==target exercises the shred copy-through, a superset target the
+    # single-pass reshred, and a narrowing target the reconstruct+reshred fallback.
+    json_column = scenario_config["json_column"]
+    source_spec = sql_typed_literal(scenario_config["source_spec"])
+    target_spec = sql_typed_literal(scenario_config["target_spec"])
+    return BenchmarkQuery(
+        prepare_sql=(
+            f"""
+            CREATE OR REPLACE TEMP TABLE _bench_in AS
+            SELECT jsono({json_column}::VARCHAR, shredding := {source_spec}) AS t
+            FROM {table_sql(data_path)}
+            """,
+        ),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono(t, shredding := {target_spec}) AS r
+            FROM _bench_in
+        """,
+    )
+
+
 def build_jsono_entries_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
         timed_sql="""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
-            SELECT jsono_entries(t, 'dotted') AS r
+            SELECT jsono_entries(t, key_style := 'dotted') AS r
             FROM _bench_in
         """,
     )
@@ -582,7 +606,7 @@ def build_jsono_extract_query(scenario_config: dict, data_path: Path) -> Benchma
         prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
         timed_sql=f"""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
-            SELECT jsono_transform(t, {sql_json(spec)}) AS r
+            SELECT jsono_transform(t, {sql_typed_literal(spec)}) AS r
             FROM _bench_in
         """,
     )
@@ -664,6 +688,8 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_optimizer_project_query(scenario_config, data_path)
         case "merge_patch":
             return build_jsono_merge_patch_query(scenario_config, data_path)
+        case "reshred":
+            return build_jsono_reshred_query(scenario_config, data_path)
         case "entries":
             return build_jsono_entries_query(scenario_config, data_path)
         case "extract":

@@ -158,15 +158,24 @@ unique_ptr<FunctionData> JsonoPathBind(ClientContext &context, vector<unique_ptr
 	return make_uniq<JsonoPathBindData>(std::move(steps));
 }
 
+// Bind for the 1-argument jsono_type/jsono_keys overloads (ANY arg0): accept a shredded value by
+// redeclaring arg0 to plain JSONO (the binder inserts the lossless reconstruct cast) and reject a
+// non-JSONO argument loudly. Carries no path data.
+unique_ptr<FunctionData> JsonoArgOnlyBind(ClientContext &context, ScalarFunction &bound_function,
+                                          vector<unique_ptr<Expression>> &arguments) {
+	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, true);
+	return nullptr;
+}
+
 unique_ptr<FunctionData> JsonoTypePathBind(ClientContext &context, ScalarFunction &bound_function,
                                            vector<unique_ptr<Expression>> &arguments) {
-	(void)bound_function;
+	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_type", true);
 	return JsonoPathBind(context, arguments, "jsono_type");
 }
 
 unique_ptr<FunctionData> JsonoKeysPathBind(ClientContext &context, ScalarFunction &bound_function,
                                            vector<unique_ptr<Expression>> &arguments) {
-	(void)bound_function;
+	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_keys", true);
 	return JsonoPathBind(context, arguments, "jsono_keys");
 }
 
@@ -202,7 +211,7 @@ void JsonoTypeExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto result_data = FlatVector::GetData<string_t>(result);
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
+		if (!ReadJsonoRowStrict(input, row, blob)) {
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
@@ -239,7 +248,7 @@ void JsonoKeysExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
+		if (!ReadJsonoRowStrict(input, row, blob)) {
 			SetListRowNull(result, row);
 			continue;
 		}
@@ -279,19 +288,19 @@ void JsonoKeysExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 } // namespace
 
 void RegisterJsonoPathOps(ExtensionLoader &loader) {
-	auto jsono_type = JsonoType();
 	{
 		ScalarFunctionSet set("jsono_type");
-		set.AddFunction(ScalarFunction({jsono_type}, LogicalType::VARCHAR, JsonoTypeExecute));
-		set.AddFunction(ScalarFunction({jsono_type, LogicalType::VARCHAR}, LogicalType::VARCHAR, JsonoTypeExecute,
+		set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::VARCHAR, JsonoTypeExecute, JsonoArgOnlyBind));
+		set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::VARCHAR, JsonoTypeExecute,
 		                               JsonoTypePathBind));
 		loader.RegisterFunction(set);
 	}
 	{
 		ScalarFunctionSet set("jsono_keys");
-		set.AddFunction(ScalarFunction({jsono_type}, LogicalType::LIST(LogicalType::VARCHAR), JsonoKeysExecute));
-		set.AddFunction(ScalarFunction({jsono_type, LogicalType::VARCHAR}, LogicalType::LIST(LogicalType::VARCHAR),
-		                               JsonoKeysExecute, JsonoKeysPathBind));
+		set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::LIST(LogicalType::VARCHAR), JsonoKeysExecute,
+		                               JsonoArgOnlyBind));
+		set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR},
+		                               LogicalType::LIST(LogicalType::VARCHAR), JsonoKeysExecute, JsonoKeysPathBind));
 		loader.RegisterFunction(set);
 	}
 }

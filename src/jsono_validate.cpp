@@ -7,6 +7,8 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/expression.hpp"
 
 #include "string_view.hpp"
 
@@ -203,7 +205,10 @@ void ValidateValue(const JsonoView &view, size_t &pos, size_t &string_cursor, si
 void ValidateMetadata(const JsonoView &view, const std::vector<uint32_t> &container_child_counts) {
 	auto &metadata = view.MetadataHeader();
 	if (ExpectedSkipsSize(metadata) != view.SkipsSize()) {
-		throw InvalidInputException("malformed JSONO: skips blob has trailing or missing bytes");
+		// The only legal tail after the checkpoint sections is a shred manifest; parsing it
+		// validates the framing (and throws on trailing garbage).
+		std::vector<jsono::ShredManifestEntry> manifest;
+		view.ReadShredManifest(manifest);
 	}
 	if (metadata.container_count != container_child_counts.size()) {
 		throw InvalidInputException("malformed JSONO: container metadata count mismatch");
@@ -289,7 +294,7 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
+		if (!ReadJsonoRowStrict(input, row, blob)) {
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
@@ -300,11 +305,20 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 	}
 }
 
+// Accept ANY so a shredded value reaches bind; keep its shredded type (reconstruct_shredded=false)
+// so Execute validates the residual blobs directly. Validating a shredded value checks its residual
+// encoding — the typed shred columns are DuckDB-native, their integrity is not jsono's to assert.
+unique_ptr<FunctionData> JsonoValidateBind(ClientContext &context, ScalarFunction &bound_function,
+                                           vector<unique_ptr<Expression>> &arguments) {
+	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, false);
+	return nullptr;
+}
+
 } // namespace
 
 void RegisterJsonoValidate(ExtensionLoader &loader) {
-	auto jsono_type = JsonoType();
-	ScalarFunction fun("jsono_validate", {jsono_type}, LogicalType::BOOLEAN, JsonoValidateExecute);
+	ScalarFunction fun("jsono_validate", {LogicalType::ANY}, LogicalType::BOOLEAN, JsonoValidateExecute,
+	                   JsonoValidateBind);
 	loader.RegisterFunction(fun);
 }
 

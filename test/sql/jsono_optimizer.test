@@ -373,3 +373,97 @@ u5	NULL
 
 statement ok
 PRAGMA disable_verify_serializer;
+
+# --- jsono_extract / jsono_extract_string over a shredded value are shred/residual-rewritten,
+#     matching the core-named ->> / json_extract rewrite (no per-row reconstruct cast). ---
+
+statement ok
+CREATE TABLE jsono_extract_shredded AS
+SELECT jsono('{"kind":"commit","n":7,"o":{"x":1}}', shredding := {'$.kind':'VARCHAR','$.n':'BIGINT'}) AS j;
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# A shred string extract reads the shred column directly: the scan projects only the shred field, not
+# the whole shredded struct (the reconstruct path would project the entire value).
+query II
+EXPLAIN SELECT jsono_extract_string(j, '$.kind') AS r FROM jsono_extract_shredded;
+----
+physical_plan	<REGEX>:.*jsono\.\$\.kind.*
+
+# A json-valued non-shred extract still avoids reconstruction, but the residual wrapper also checks
+# the parent row validity so a NULL shredded value stays top-level NULL rather than
+# struct_pack(NULL body).
+query II
+EXPLAIN SELECT to_json(jsono_extract(j, '$.o')) AS r FROM jsono_extract_shredded;
+----
+physical_plan	<REGEX>:.*Projections: j.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Results match the same extracts over the plain-equivalent document (compared against plain rather
+# than the core-named ->> because ->> over a shredded value is only correct with the optimizer; the
+# jsono-named extracts are bind-correct and so survive the verifier's unoptimized re-run).
+query IIIII
+SELECT
+  jsono_extract_string(j, '$.kind'),
+  jsono_extract_string(j, '$.kind') = jsono_extract_string(jsono('{"kind":"commit","n":7,"o":{"x":1}}'), '$.kind'),
+  jsono_extract_string(j, '$.n'),
+  to_json(jsono_extract(j, '$.o')),
+  to_json(jsono_extract(j, '$.o')) = to_json(jsono_extract(jsono('{"kind":"commit","n":7,"o":{"x":1}}'), '$.o'))
+FROM jsono_extract_shredded;
+----
+commit	true	7	{"x":1}	true
+
+# A CAST(jsono_extract_string(shred) AS T) where the shred's own type is T folds to a typed shred read
+# (the COALESCE-with-residual-fallback shape), like the core ->> typed-shred fold.
+query I
+SELECT jsono_extract_string(j, '$.n')::BIGINT = 7 FROM jsono_extract_shredded;
+----
+true
+
+# --- jsono_type / jsono_keys over a shredded value read the residual natively when the path touches
+#     no shred (and jsono_type's whole-document form always does — the root type is shred-invariant),
+#     instead of reconstructing the full value. ---
+
+statement ok
+CREATE TABLE jsono_introspect_shredded AS
+SELECT jsono('{"a":1,"b":{"c":2},"name":"x"}', shredding := {'$.a':'BIGINT','name':'VARCHAR'}) AS j;
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# A residual (non-shred) path carries parent row validity so NULL shredded values stay top-level NULL.
+query II
+EXPLAIN SELECT jsono_type(j, '$.b') AS r FROM jsono_introspect_shredded;
+----
+physical_plan	<REGEX>:.*Projections: j.*
+
+# The whole-document type form uses the same parent-validity-preserving residual read.
+query II
+EXPLAIN SELECT jsono_type(j) AS r FROM jsono_introspect_shredded;
+----
+physical_plan	<REGEX>:.*Projections: j.*
+
+# jsono_keys of a residual subtree uses the same parent-validity-preserving residual read.
+query II
+EXPLAIN SELECT jsono_keys(j, '$.b') AS r FROM jsono_introspect_shredded;
+----
+physical_plan	<REGEX>:.*Projections: j.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Results match the plain-equivalent document — including the shred-path and whole-keys forms, which
+# still reconstruct (a shred leaf is stripped from the residual).
+query IIIII
+SELECT
+  jsono_type(j) = jsono_type(jsono('{"a":1,"b":{"c":2},"name":"x"}')),
+  jsono_type(j, '$.b') = jsono_type(jsono('{"a":1,"b":{"c":2},"name":"x"}'), '$.b'),
+  jsono_type(j, '$.a') = jsono_type(jsono('{"a":1,"b":{"c":2},"name":"x"}'), '$.a'),
+  jsono_keys(j, '$.b') = jsono_keys(jsono('{"a":1,"b":{"c":2},"name":"x"}'), '$.b'),
+  jsono_keys(j) = jsono_keys(jsono('{"a":1,"b":{"c":2},"name":"x"}'))
+FROM jsono_introspect_shredded;
+----
+true	true	true	true	true

@@ -2,6 +2,7 @@
 #include "jsono.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_writer.hpp"
 
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
@@ -36,11 +37,11 @@ struct TransformField {
 	vector<PathStep> path;
 	string join_separator;
 	LogicalType logical_type;
-	// When the input is a shredded JSONO whose lane path equals this scalar field's path,
-	// the field reads residual-first and falls back to this lane child (lane_primitive gives
-	// the lane's lossless kind for synthesizing the stripped value). INVALID = not lane-backed.
-	idx_t lane_child_index = DConstants::INVALID_INDEX;
-	TransformPrimitive lane_primitive = TransformPrimitive::Varchar;
+	// When the input is a shredded JSONO whose shred path equals this scalar field's path,
+	// the field reads residual-first and falls back to this shred child (shred_primitive gives
+	// the shred's lossless kind for synthesizing the stripped value). INVALID = not shred-backed.
+	idx_t shred_child_index = DConstants::INVALID_INDEX;
+	TransformPrimitive shred_primitive = TransformPrimitive::Varchar;
 };
 
 struct TrieEdge {
@@ -76,9 +77,9 @@ struct TransformBindData : public FunctionData {
 	vector<TransformField> fields;
 	vector<TransformTrieNode> trie;
 	LogicalType return_type;
-	// Scalar fields backed by a shredded lane (field.lane_child_index set); handled directly
-	// from the lane/residual rather than the trie. Empty for a plain JSONO input.
-	vector<idx_t> lane_fields;
+	// Scalar fields backed by a shredded shred (field.shred_child_index set); handled directly
+	// from the shred/residual rather than the trie. Empty for a plain JSONO input.
+	vector<idx_t> shred_fields;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<TransformBindData>(*this);
@@ -147,10 +148,10 @@ TransformPrimitive ParsePrimitiveType(const string &type) {
 	throw BinderException("jsono_transform: unsupported scalar type '%s'", type);
 }
 
-// Map a shredded lane's column type to the transform primitive that names its lossless
-// kind. A JSON-aliased VARCHAR is not a lane (it holds a document, not a scalar), so it
-// is rejected — matching the shred writer, which never lifts JSON fields into lanes.
-bool LaneTypeToPrimitive(const LogicalType &type, TransformPrimitive &out) {
+// Map a shredded shred's column type to the transform primitive that names its lossless
+// kind. A JSON-aliased VARCHAR is not a shred (it holds a document, not a scalar), so it
+// is rejected — matching the shred writer, which never lifts JSON fields into shreds.
+bool ShredTypeToPrimitive(const LogicalType &type, TransformPrimitive &out) {
 	switch (type.id()) {
 	case LogicalTypeId::VARCHAR:
 		if (type.HasAlias() && type.GetAlias() == LogicalType::JSON_TYPE_NAME) {
@@ -340,8 +341,8 @@ idx_t GetOrAddWildcardChild(TransformBindData &bind_data, idx_t node_index) {
 void InsertFieldIntoTrie(TransformBindData &bind_data, idx_t field_index) {
 	idx_t node_index = 0;
 	auto &field = bind_data.fields[field_index];
-	if (field.lane_child_index != DConstants::INVALID_INDEX) {
-		// Lane-backed scalar: read directly from the lane/residual, never via the trie.
+	if (field.shred_child_index != DConstants::INVALID_INDEX) {
+		// Shred-backed scalar: read directly from the shred/residual, never via the trie.
 		return;
 	}
 	for (auto &step : field.path) {
@@ -443,35 +444,34 @@ bool PathStepsEqual(const vector<PathStep> &left, const vector<PathStep> &right)
 	return true;
 }
 
-// Bind a shredded input's lane columns to the scalar fields they back: a scalar field whose
-// path equals a lane's path reads that lane (residual-first, lane-fallback) instead of
+// Bind a shredded input's shred columns to the scalar fields they back: a scalar field whose
+// path equals a shred's path reads that shred (residual-first, shred-fallback) instead of
 // navigating the residual tape. The trie is rebuilt to exclude the bound fields.
-void AssignShreddedLanes(TransformBindData &bind_data, const LogicalType &input_type) {
-	auto &children = StructType::GetChildTypes(input_type);
-	auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
-	auto suffix = JsonoLaneSuffix(input_type);
-	for (idx_t i = prefix; i < children.size(); i++) {
-		TransformPrimitive lane_primitive;
-		if (!LaneTypeToPrimitive(children[i].second, lane_primitive)) {
-			// A non-lane-typed trailing child is not a lane; any field on its path reads the
+void AssignShreddedShreds(TransformBindData &bind_data, const LogicalType &input_type) {
+	JsonoLayoutType layout;
+	TryParseJsonoLayoutType(input_type, layout);
+	for (idx_t i = 0; i < layout.shreds.size(); i++) {
+		TransformPrimitive shred_primitive;
+		if (!ShredTypeToPrimitive(layout.shreds[i].second, shred_primitive)) {
+			// A non-shred-typed shred is not a shred; any field on its path reads the
 			// residual, where the value remains.
 			continue;
 		}
-		auto name = JsonoStripLaneSuffix(children[i].first, suffix);
+		auto &name = layout.shreds[i].first;
 		auto steps = !name.empty() && name[0] == '$' ? ParseJsonoPath(name, "jsono_transform") : LiteralKeyPath(name);
 		for (idx_t field_index = 0; field_index < bind_data.fields.size(); field_index++) {
 			auto &field = bind_data.fields[field_index];
-			if (field.mode != TransformMode::Scalar || field.lane_child_index != DConstants::INVALID_INDEX) {
+			if (field.mode != TransformMode::Scalar || field.shred_child_index != DConstants::INVALID_INDEX) {
 				continue;
 			}
 			if (PathStepsEqual(field.path, steps)) {
-				field.lane_child_index = i;
-				field.lane_primitive = lane_primitive;
-				bind_data.lane_fields.push_back(field_index);
+				field.shred_child_index = i;
+				field.shred_primitive = shred_primitive;
+				bind_data.shred_fields.push_back(field_index);
 			}
 		}
 	}
-	if (!bind_data.lane_fields.empty()) {
+	if (!bind_data.shred_fields.empty()) {
 		BuildTransformTrie(bind_data);
 	}
 }
@@ -491,10 +491,9 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 	// from its name.
 	bind_data->spec = spec_value.ToString();
 	auto &input_type = arguments[0]->return_type;
+	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_transform", false);
 	if (IsShreddedJsonoType(input_type)) {
-		AssignShreddedLanes(*bind_data, input_type);
-	} else if (input_type.id() != LogicalTypeId::SQLNULL && !IsJsonoType(input_type)) {
-		throw BinderException("jsono_transform: argument must be JSONO");
+		AssignShreddedShreds(*bind_data, input_type);
 	}
 	bound_function.return_type = bind_data->return_type;
 	return std::move(bind_data);
@@ -657,9 +656,9 @@ bool FindObjectKeyRank(const JsonoView &view, const ObjectLayout &layout, const 
 	return true;
 }
 
-// Walk Key/Index steps to a leaf in the residual tape. Used for lane-backed scalar fields:
+// Walk Key/Index steps to a leaf in the residual tape. Used for shred-backed scalar fields:
 // the residual is authoritative, so a found leaf wins; only when the residual lacks the path
-// does the caller fall back to the lane. Mirrors the shred writer's path locator.
+// does the caller fall back to the shred. Mirrors the shred writer's path locator.
 Location LocatePath(const JsonoView &view, const vector<PathStep> &steps) {
 	size_t pos = 0;
 	size_t string_cursor = 0;
@@ -705,12 +704,12 @@ Location LocatePath(const JsonoView &view, const vector<PathStep> &steps) {
 	return Location {pos, string_cursor, true};
 }
 
-// Build the lossless scalar a lane stands for. The lane is read only when the residual lacks
+// Build the lossless scalar a shred stands for. The shred is read only when the residual lacks
 // the path, which (by the shred contract) means the value was stripped, so its original kind
-// is the lane's lossless kind: a VARCHAR lane held a JSON string, a typed lane its exact kind.
-JsonoScalar SynthLaneScalar(TransformPrimitive lane_primitive, const UnifiedVectorFormat &fmt, idx_t idx) {
+// is the shred's lossless kind: a VARCHAR shred held a JSON string, a typed shred its exact kind.
+JsonoScalar SynthShredScalar(TransformPrimitive shred_primitive, const UnifiedVectorFormat &fmt, idx_t idx) {
 	JsonoScalar scalar;
-	switch (lane_primitive) {
+	switch (shred_primitive) {
 	case TransformPrimitive::Varchar: {
 		// Reference the string_t in vector storage, not a stack copy: an inline (short) string_t
 		// stores its bytes inside itself, so a copy would leave scalar.text dangling after return.
@@ -1235,22 +1234,32 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 		}
 	}
 
-	// Read each lane child once; lane-backed scalar fields resolve residual-first and fall back
+	// Read each shred child once; shred-backed scalar fields resolve residual-first and fall back
 	// to these columns when the residual dropped the value.
-	vector<UnifiedVectorFormat> lane_fmt(bind_data.lane_fields.size());
-	if (!bind_data.lane_fields.empty()) {
-		auto &struct_children = StructVector::GetEntries(args.data[0]);
-		for (idx_t k = 0; k < bind_data.lane_fields.size(); k++) {
-			auto lane_child = bind_data.fields[bind_data.lane_fields[k]].lane_child_index;
-			struct_children[lane_child]->ToUnifiedFormat(count, lane_fmt[k]);
+	vector<UnifiedVectorFormat> shred_fmt(bind_data.shred_fields.size());
+	if (!bind_data.shred_fields.empty()) {
+		for (idx_t k = 0; k < bind_data.shred_fields.size(); k++) {
+			auto shred_child = bind_data.fields[bind_data.shred_fields[k]].shred_child_index;
+			JsonoShredVector(args.data[0], shred_child).ToUnifiedFormat(count, shred_fmt[k]);
 		}
 	}
+
+	// The shreds this input type carries, verified against each row's shred manifest so a row
+	// narrowed by a raw struct cast fails loud instead of transforming an incomplete residual.
+	JsonoLayoutType input_layout;
+	TryParseJsonoLayoutType(args.data[0].GetType(), input_layout);
+	vector<std::pair<std::string, std::string>> shred_signatures;
+	shred_signatures.reserve(input_layout.shreds.size());
+	for (auto &shred : input_layout.shreds) {
+		shred_signatures.emplace_back(shred.first, shred.second.ToString());
+	}
+	std::vector<jsono::ShredManifestEntry> manifest;
 
 	vector<string> join_buffers(bind_data.fields.size());
 	vector<idx_t> join_counts(bind_data.fields.size(), 0);
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
+		if (!ReadJsonoRowStrict(input, row, blob)) {
 			SetTransformRowNull(bind_data.fields, result, children, row);
 			continue;
 		}
@@ -1259,6 +1268,7 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 			SetTransformRowNull(bind_data.fields, result, children, row);
 			continue;
 		}
+		jsono::VerifyShredManifest(view, shred_signatures, manifest);
 		FlatVector::Validity(result).SetValid(row);
 		for (idx_t field_index = 0; field_index < bind_data.fields.size(); field_index++) {
 			auto &field = bind_data.fields[field_index];
@@ -1272,19 +1282,19 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 			}
 		}
 		ApplyTrieNode(lstate, bind_data, 0, view, 0, 0, children, row, join_buffers, join_counts);
-		for (idx_t k = 0; k < bind_data.lane_fields.size(); k++) {
-			auto field_index = bind_data.lane_fields[k];
+		for (idx_t k = 0; k < bind_data.shred_fields.size(); k++) {
+			auto field_index = bind_data.shred_fields[k];
 			auto &field = bind_data.fields[field_index];
 			auto location = LocatePath(view, field.path);
 			if (location.found) {
-				// The residual is authoritative: a value the shred writer kept wins over the lane.
+				// The residual is authoritative: a value the shred writer kept wins over the shred.
 				WriteScalarField(field, view, location, *children[field_index], row);
 				continue;
 			}
-			auto &fmt = lane_fmt[k];
+			auto &fmt = shred_fmt[k];
 			auto idx = RowIndex(fmt, row);
 			if (fmt.validity.RowIsValid(idx)) {
-				auto scalar = SynthLaneScalar(field.lane_primitive, fmt, idx);
+				auto scalar = SynthShredScalar(field.shred_primitive, fmt, idx);
 				WriteScalarValue(field, scalar, *children[field_index], row);
 			} else {
 				FlatVector::SetNull(*children[field_index], row, true);
@@ -1313,8 +1323,8 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 } // namespace
 
 void RegisterJsonoTransform(ExtensionLoader &loader) {
-	// ANY input so a shredded JSONO struct (four BLOB prefix + lane columns) also binds; the
-	// bind validates it is a plain or shredded JSONO and maps lane columns to scalar fields.
+	// ANY input so a shredded JSONO struct (four BLOB prefix + shred columns) also binds; the
+	// bind validates it is a plain or shredded JSONO and maps shred columns to scalar fields.
 	ScalarFunction fun("jsono_transform", {LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, JsonoTransformExecute,
 	                   JsonoTransformBind, nullptr, nullptr, TransformLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);

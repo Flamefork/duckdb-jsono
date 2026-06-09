@@ -1,15 +1,15 @@
 # name: test/sql/jsono_shredded_stripped.test
-# description: Stripped shredded JSONO — residual omits the top-level hot paths; reads reconstruct
+# description: Stripped shredded JSONO — body omits the top-level hot paths; reads reconstruct
 # group: [sql]
 
 require jsono
 
 require json
 
-# A stripped shredded value drops the top-level hot paths from the four-blob
-# residual (here: kind, did) and keeps them only in the lanes; nested hot paths
-# (commit.operation/collection) stay in the residual as well as in lanes. The
-# residual is built by deleting the top-level paths with a null merge_patch.
+# A stripped shredded value drops the top-level hot paths from the body
+# (here: kind, did) and keeps them only in the shreds; nested hot paths
+# (commit.operation/collection) stay in the body as well as in shreds. The
+# body is built by deleting the top-level paths with a null merge_patch.
 statement ok
 CREATE TABLE stripped AS
 WITH src AS (
@@ -17,40 +17,34 @@ WITH src AS (
 ),
 res AS (
     SELECT orig,
-           jsono_merge_patch(orig, jsono('{"did":null,"kind":null}'))
-               ::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS r
+           jsono_merge_patch(orig, jsono('{"did":null,"kind":null}'))."jsono".body AS body
     FROM src
 )
 SELECT struct_pack(
-    jsono_slots          := r.jsono_slots,
-    jsono_key_heap       := r.jsono_key_heap,
-    jsono_string_heap    := r.jsono_string_heap,
-    jsono_skips          := r.jsono_skips,
-    "$.kind"             := orig ->> '$.kind',
-    "$.did"              := orig ->> '$.did',
-    "$.commit.operation" := orig ->> '$.commit.operation',
-    "$.commit.collection":= orig ->> '$.commit.collection'
+    "jsono" := struct_pack(
+        body := res.body,
+        "$.commit.collection" := orig ->> '$.commit.collection',
+            "$.commit.operation"  := orig ->> '$.commit.operation',
+            "$.did"               := orig ->> '$.did',
+            "$.kind"              := orig ->> '$.kind')
 ) AS j
 FROM res;
 
-# Control: reading the residual alone (the raw four blobs repacked, bypassing the lossless
-# reconstruct) shows the top-level hot paths really are gone from the four blobs.
+# Control: reading the body alone (wrapped as a plain jsono, bypassing the lossless
+# reconstruct) shows the top-level hot paths really are gone from the body.
 query I
-SELECT to_json(struct_pack(
-    jsono_slots := struct_extract(j, 'jsono_slots'),
-    jsono_key_heap := struct_extract(j, 'jsono_key_heap'),
-    jsono_string_heap := struct_extract(j, 'jsono_string_heap'),
-    jsono_skips := struct_extract(j, 'jsono_skips'))) FROM stripped;
+SELECT to_json(struct_pack("jsono" := struct_pack(
+    body := j."jsono".body))) FROM stripped;
 ----
 {"commit":{"collection":"c1","operation":"create"},"extra":"e1"}
 
-# to_json reconstructs the full value by merging the lanes back into the residual.
+# to_json reconstructs the full value by merging the shreds back into the body.
 query I
 SELECT to_json(j) FROM stripped;
 ----
 {"commit":{"collection":"c1","operation":"create"},"did":"d1","extra":"e1","kind":"commit"}
 
-# a stripped top-level path resolves from its lane
+# a stripped top-level path resolves from its shred
 query I
 SELECT j ->> '$.kind' FROM stripped;
 ----
@@ -61,42 +55,36 @@ SELECT j ->> '$.did' FROM stripped;
 ----
 d1
 
-# a nested hot path resolves from its lane (and is also still in the residual)
+# a nested hot path resolves from its shred (and is also still in the body)
 query I
 SELECT j ->> '$.commit.operation' FROM stripped;
 ----
 create
 
-# a non-hot path resolves from the residual
+# a non-hot path resolves from the body
 query I
 SELECT j ->> '$.extra' FROM stripped;
 ----
 e1
 
-# extracting an ancestor of a nested lane reads the residual subtree directly
+# extracting an ancestor of a nested shred reads the body subtree directly
 # (nested hot paths were not stripped), so it stays complete
 query I
 SELECT j ->> '$.commit' FROM stripped;
 ----
 {"collection":"c1","operation":"create"}
 
-# Reconstruction is an overlay: the residual is authoritative, lanes only fill the
-# paths the residual dropped. Here $.k is kept in the residual with a real value and
-# the lane is (artificially) desynced — to_json must reflect the residual, while the
-# ->> read still hits the lane. In a real shred the two never disagree.
+# Reconstruction is an overlay: the body is authoritative, shreds only fill the
+# paths the body dropped. Here $.k is kept in the body with a real value and
+# the shred is (artificially) desynced — to_json must reflect the body, while the
+# ->> read still hits the shred. In a real shred the two never disagree.
 statement ok
 CREATE TABLE ov_conflict AS
 SELECT struct_pack(
-    jsono_slots       := r.jsono_slots,
-    jsono_key_heap    := r.jsono_key_heap,
-    jsono_string_heap := r.jsono_string_heap,
-    jsono_skips       := r.jsono_skips,
-    "$.k"             := 'LANE'
-) AS j
-FROM (
-    SELECT jsono('{"k":"RESIDUAL","c":"z"}')
-           ::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS r
-) src;
+    "jsono" := struct_pack(
+        body := jsono('{"k":"RESIDUAL","c":"z"}')."jsono".body,
+        "$.k" := 'SHRED')
+) AS j;
 
 query I
 SELECT to_json(j) FROM ov_conflict;
@@ -106,26 +94,20 @@ SELECT to_json(j) FROM ov_conflict;
 query I
 SELECT j ->> '$.k' FROM ov_conflict;
 ----
-LANE
+SHRED
 
 # A kept explicit JSON null survives reconstruction: $.a was stripped (absent from
-# the residual, lives in its lane), $.b was kept as null in the residual, $.c is
-# non-hot. Overlay fills a from its lane and keeps b's null — a B-side null must not
-# delete the residual's key.
+# the body, lives in its shred), $.b was kept as null in the body, $.c is
+# non-hot. Overlay fills a from its shred and keeps b's null — a B-side null must not
+# delete the body's key.
 statement ok
 CREATE TABLE ov_null AS
 SELECT struct_pack(
-    jsono_slots       := r.jsono_slots,
-    jsono_key_heap    := r.jsono_key_heap,
-    jsono_string_heap := r.jsono_string_heap,
-    jsono_skips       := r.jsono_skips,
-    "$.a"             := 'x',
-    "$.b"             := NULL::VARCHAR
-) AS j
-FROM (
-    SELECT jsono('{"b":null,"c":"z"}')
-           ::STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB) AS r
-) src;
+    "jsono" := struct_pack(
+        body := jsono('{"b":null,"c":"z"}')."jsono".body,
+        "$.a" := 'x',
+            "$.b" := NULL::VARCHAR)
+) AS j;
 
 query I
 SELECT to_json(j) FROM ov_null;

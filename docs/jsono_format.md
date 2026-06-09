@@ -1,82 +1,124 @@
 # JSONO — binary format specification
 
 JSONO stores JSON as a sequence of 64-bit slots plus two byte heaps and a
-navigation block. The logical type is `JSONO`; physically it is a DuckDB STRUCT
-of four BLOBs:
+navigation block. There is no logical type alias; physically a JSONO value is a
+nested DuckDB STRUCT with exactly one layout field, `jsono`, wrapping the
+four-BLOB `body`:
 
 ```
 STRUCT(
-  jsono_slots       BLOB,   -- [Header 8 bytes][Slots n × 8 bytes]
-  jsono_key_heap    BLOB,   -- key bytes, addressed by KEY slots
-  jsono_string_heap BLOB,   -- string bytes, consumed by a cursor in walk order
-  jsono_skips       BLOB    -- navigation metadata (see below)
+  jsono STRUCT(
+    body STRUCT(
+      slots       BLOB,   -- [Header 8 bytes][Slots n × 8 bytes]
+      key_heap    BLOB,   -- key bytes, addressed by KEY slots
+      string_heap BLOB,   -- string bytes, consumed by a cursor in walk order
+      skips       BLOB    -- navigation metadata + shred manifest (see below)
+    )
+  )
 )
 ```
 
-The `JSONO` alias survives round-trips through DuckDB-native storage (catalog
-metadata) but is lost through `read_parquet`, which delivers the structurally
-compatible STRUCT with the same four `jsono_*` BLOB fields.
+There is no user-defined type alias (it could not survive `read_parquet` or
+DuckLake); a stored value is just this nested STRUCT, recognised structurally.
+The four body BLOBs round-trip through every storage layer unchanged.
 
 ## Shredded layout
 
-For fast columnar reads of hot paths, a `JSONO` value can be stored *shredded*:
-the four blobs followed by one typed *lane* column per chosen path (produced by
+For fast columnar reads of hot paths, a JSONO value can be stored *shredded*:
+the `jsono` layout field carries the `body` plus one typed *shred* per
+chosen path, as the `body`'s sibling fields (produced by
 `jsono(value, shredding := spec)`).
 
 ```
 STRUCT(
-  jsono_slots#<fp>       BLOB,    -- the residual JSONO value (this spec, unchanged)
-  jsono_key_heap#<fp>    BLOB,
-  jsono_string_heap#<fp> BLOB,
-  jsono_skips#<fp>       BLOB,
-  "<path1>#<fp>"         <type1>, -- lane: value at <path1>, typed, named by the path
-  "<path2>#<fp>"         <type2>,
-  …
+  jsono STRUCT(
+    body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB),
+    "<path1>" <type1>, -- shred: value at <path1>, typed, named by the path
+    "<path2>" <type2>,
+    …
+  )
 )
 ```
 
-Shredding does **not** change the binary blob format. The four blobs are an
-ordinary JSONO value — the *residual* — so everything else in this spec applies
-to them unchanged, including `version`. Each appended column is a *lane*: the
-value at its canonical path (`$.kind`, `$.commit.operation`, …) materialized as a
-plain typed DuckDB column (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`),
-with the path as the field name. Nested lane paths are allowed.
+Shredding does **not** change the binary slot format. The four `body` blobs are
+an ordinary JSONO value — the *residual* — so everything else in this spec
+applies to them unchanged, including `version`. Each *shred* is the
+value at its canonical path (`$.kind`, `$.commit.operation`, …) materialized as
+a plain typed DuckDB column (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`,
+`BOOLEAN`), with the path as the field name. Nested shred paths are allowed. No
+JSON key is reserved: a JSON key named `body` can still be shredded through its
+`$.`-prefixed path form (`$.body`), which is a different field name.
 
-Every field name — the four blobs included — carries a common `#<fp>` suffix: a
-fingerprint of the whole lane set (each lane's path and type, order-independent).
-A plain (unshredded) value has no suffix. The suffix makes two shredded types
-with different lanes share **no** field name, so DuckDB's by-name struct cast
-rejects coercing one into the other (it requires at least one matching member)
-instead of silently dropping or `NULL`-filling lanes on an INSERT or CAST — the
-residual is stripped in lockstep, so a lane mismatch would otherwise lose data.
-The fingerprint lives in the field names, which survive a `read_parquet` round-trip
-(the alias is dropped, the field names are not), so the shape — and this
-protection — travel with the data. Lane fields are emitted in canonical order
-(sorted by name), so the type is a pure function of the lane *set*:
-`jsono_storage_type(<lane DDL>)` and the constructor produce the identical type for
-the same lanes regardless of the order they are listed in, so a column declared
-from one accepts a value built from the other.
+The single layout name (`jsono` for both plain and shredded) and the shreds
+sitting beside `body` are both deliberate. DuckDB reconciles struct types by
+field name, so a set operation, CASE or COALESCE over differently-shredded
+values merges them into one ordinary shredded type carrying the union of the
+shred sets — the struct cast `NULL`-fills a branch's missing shreds, which is
+exactly the writer's own "value stayed in the residual" encoding, so the merged
+value reads losslessly by construction. And because `body` is a field every two
+JSONO types share, DuckDB's by-name struct cast *binds* between any two of them
+— fully disjoint shred sets included — so the extension optimizer can rewrite
+every such cast into a lossless reconstruct + reshred. The remaining flip side —
+a raw by-name cast silently *dropping* a shred when the optimizer is not running
+— is caught at read time by the shred manifest (below), not by the type system.
 
-**Lossless invariant: the residual holds everything a lane cannot reproduce
-exactly.** A value is removed from the residual and kept only in its lane when it
-round-trips losslessly through the lane type (a JSON string in a `VARCHAR` lane,
-an integer in a `BIGINT` lane). A value that does not fit — a string in a `BIGINT`
-lane, an explicit JSON `null`, a missing key, or a number whose lane type would
-re-encode it differently — stays in the residual, and its lane is a redundant
-read copy. Only top-level (depth-1) paths are ever removed from the residual; a
-nested shredded path is read-accelerated but kept in the residual.
+Shreds are emitted in canonical order (sorted by name), so a constructed
+type is a pure function of the shred *set*: `jsono_storage_type(<shred DDL>)` and
+the constructor produce the identical type for the same shreds regardless of the
+order they are listed in, so a column declared from one accepts a value built
+from the other. (A type DuckDB merges out of differently-shredded branches lists
+the left branch's shreds first — same shred set, branch-dependent field order.)
+Shreds stay scalar columns, so Parquet/DuckLake projection and filter
+pushdown act on them directly.
 
-The original value is recovered by overlaying the lanes onto the residual,
+**Lossless invariant: the residual holds everything a shred cannot reproduce
+exactly.** A value is removed from the residual and kept only in its shred when it
+round-trips losslessly through the shred type (a JSON string in a `VARCHAR` shred,
+an integer in a `BIGINT` shred). A value that does not fit — a string in a `BIGINT`
+shred, an explicit JSON `null`, a missing key, or a number whose shred type would
+re-encode it differently — stays in the residual, and its shred is a redundant
+read copy. Pure object-key paths that round-trip through their shred type are
+removed from the residual; array-index paths and non-lossless shred values stay in
+the residual.
+
+The original value is recovered by overlaying the shreds onto the residual,
 **residual-authoritative**: a path absent from the residual is filled from its
-lane, and a path present in the residual wins (its lane is the redundant copy).
-Since the removed values are exactly those their lane reproduces byte-for-byte,
+shred, and a path present in the residual wins (its shred is the redundant copy).
+Since the removed values are exactly those their shred reproduces byte-for-byte,
 the overlay reconstructs the value losslessly.
+
+### Shred manifest
+
+The `skips` blob of a shredded residual ends with a *shred manifest*: the
+write-time record of which paths were stripped out of *this row's* residual,
+with the shred type each was written as. After the checkpoint sections (see
+[Navigation](#navigation-skips)) the tail is:
+
+```
+u32 entry_count
+per entry: u16 path_len, path bytes, u16 type_len, type bytes
+```
+
+Entries are sorted by path (the shred writer emits fields in canonical order)
+and list only the paths actually stripped from this row (a value kept in the
+residual by the lossless gate is not listed). A plain value writes no manifest —
+its `skips` blob ends at the checkpoints, which reads as zero entries.
+
+The manifest is what makes a raw by-name struct cast safe to detect: if a cast
+drops a shred (the target type carries fewer shreds) or converts one to a
+different type, the residual cannot reproduce the value — and the manifest
+proves it. Every reader of a shredded residual verifies the row's manifest
+against the shreds actually available and fails loud on a mismatch instead of
+silently returning partial data. Extra shreds beyond the manifest are legal (a
+widening cast `NULL`-fills them; readers fall back to the residual).
 
 ## Compatibility policy
 
-The on-disk binary format is versioned by the `version` byte in `jsono_slots`.
-Current `JSONO` files use `version = 2` (version 2 added the per-object
-`shape_hash` field to `ContainerSpan`; see [Navigation](#navigation-jsono_skips)).
+The on-disk binary format is versioned by the `version` byte in `slots`.
+Current `JSONO` files use `version = 3` (version 2 added the per-object
+`shape_hash` field to `ContainerSpan`, see [Navigation](#navigation-skips);
+version 3 added the shred manifest tail to `skips`, see
+[Shred manifest](#shred-manifest)).
 
 This extension is still experimental, so compatibility is intentionally strict:
 an incompatible change to slot tags, payload semantics, heap layout, navigation
@@ -119,7 +161,7 @@ strings and keys. That is delegated to Parquet column-dictionary encoding — se
 
 ## Header
 
-8 bytes at the start of `jsono_slots`, little-endian:
+8 bytes at the start of `slots`, little-endian:
 
 | field | type | value |
 |---|---|---|
@@ -174,9 +216,9 @@ payload bits.
 ### Tag groups
 
 **Structure (0x0–0x4).** Containers (`OBJ_*`, `ARR_*`) and keys (`KEY`).
-`container_id` indexes the `ContainerSpan` table in `jsono_skips` (see
-[Navigation](#navigation-jsono_skips)). An object's `child_count` is the number
-of key/value pairs; arrays write 0. KEY references `jsono_key_heap` via explicit
+`container_id` indexes the `ContainerSpan` table in `skips` (see
+[Navigation](#navigation-skips)). An object's `child_count` is the number
+of key/value pairs; arrays write 0. KEY references `key_heap` via explicit
 offset+len.
 
 **Literals (0x5–0x7).** `VAL_NULL`, `VAL_TRUE`, `VAL_FALSE` — no payload, one
@@ -185,7 +227,7 @@ slot.
 **Hot values (0x8, 0xA, 0xB).** Encodings for values that occur en masse on the
 main (text) parse path:
 
-- **VAL_STR_HEAP** (0x8) — a string whose bytes live in `jsono_string_heap`. The
+- **VAL_STR_HEAP** (0x8) — a string whose bytes live in `string_heap`. The
   payload carries only the length; the byte offset is **implicit** (see
   [Read model](#read-model-string-cursor)).
 - **VAL_INT60** (0xA) — primary for integers. A signed integer inline in the
@@ -210,7 +252,7 @@ tags.
 
 The number of trailing slots is stored in the `EXT_SUBTYPE_TRAILING_SLOTS` table
 so the reader counts slots from data rather than by branching. NUMBER puts its
-text in `jsono_string_heap` (payload = `text_len ‹‹ 8 | subtype`) and is consumed
+text in `string_heap` (payload = `text_len ‹‹ 8 | subtype`) and is consumed
 by the same cursor as VAL_STR_HEAP — hence no trailing slot.
 
 ## Container layout
@@ -241,7 +283,7 @@ block, (c) the basis for object checkpoints (see below).
 
 ## Read model: string cursor
 
-A string's byte offset into `jsono_string_heap` is **not stored in the slot** —
+A string's byte offset into `string_heap` is **not stored in the slot** —
 it is implicit. The reader keeps a single cursor and, during the walk, advances
 it by the length of each consumed string value:
 
@@ -254,9 +296,9 @@ after its key block). This removes the 36-bit offset from every string slot, at
 the cost that random access to the k-th value needs the accumulated cursor. The
 navigation block removes that cost.
 
-## Navigation (`jsono_skips`)
+## Navigation (`skips`)
 
-`jsono_skips` is a separate BLOB that lets a reader skip subtrees and jump to the
+`skips` is a separate BLOB that lets a reader skip subtrees and jump to the
 k-th child of an object without replaying the whole string cursor. Layout (all
 sections little-endian, fixed-size records):
 
@@ -282,7 +324,7 @@ ContainerSpan { u32 slot_span; u32 string_byte_span; u64 shape_hash; }
 
 - `slot_span` — how many slots the whole container occupies, including `*_START`
   and `*_END`. Jump past the entire subtree: `pos += slot_span`.
-- `string_byte_span` — how many `jsono_string_heap` bytes this subtree consumes.
+- `string_byte_span` — how many `string_heap` bytes this subtree consumes.
   Jump the string cursor: `string_cursor += string_byte_span`.
 - `shape_hash` — for objects, a 64-bit fingerprint of the object's sorted,
   length-prefixed key sequence (`HashObjectKeySlots`); arrays store 0. Two
@@ -335,9 +377,9 @@ checkpoint density on large objects.
 
 ## Why two heaps (split-heap)
 
-Keys (byte-identical across rows that share a schema) live in `jsono_key_heap`,
-while per-row string values live in `jsono_string_heap`. For shape-stable data,
-Parquet column-dictionary encoding collapses `jsono_key_heap` to a single entry
+Keys (byte-identical across rows that share a schema) live in `key_heap`,
+while per-row string values live in `string_heap`. For shape-stable data,
+Parquet column-dictionary encoding collapses `key_heap` to a single entry
 per column chunk, and the byte patterns of `KEY` slots become identical across
 rows (the offset of key `"browser"` is always the same byte position while the
 key set is the same). That is why `KEY` carries offset+len explicitly (cheap

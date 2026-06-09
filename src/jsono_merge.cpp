@@ -31,7 +31,7 @@ using namespace jsono;
 // Patch: RFC 7396 merge_patch (B wins, B-null deletes). IgnoreNulls: jsono_group_merge
 // (B wins, null members dropped). Overlay: A (the first argument) is authoritative —
 // B only fills keys absent from A, B-null is a no-op, A's own nulls are kept. Overlay
-// powers shredded reconstruction: the residual (A) wins, lanes (B) fill stripped paths.
+// powers shredded reconstruction: the residual (A) wins, shreds (B) fill stripped paths.
 enum class MergeMode : uint8_t { Patch, IgnoreNulls, Overlay };
 
 // One object child captured in a single pass: its key, the value's slot/string
@@ -509,7 +509,7 @@ void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, 
 			size_t sc = csrc[rank].string_cursor;
 			// A-side under Patch/Overlay is the verbatim target (A authoritative, keep
 			// its nested nulls); the B-side under any mode strips null members so an
-			// Overlay lane refill never re-introduces a null the residual dropped.
+			// Overlay shred refill never re-introduces a null the residual dropped.
 			if (src == MergeSrc::A && (merge_mode == MergeMode::Overlay || merge_mode == MergeMode::Patch)) {
 				EmitValueVerbatim(vsrc, p, sc, builder, depth + 1);
 			} else {
@@ -665,29 +665,29 @@ bool MergeFoldStep(MergeMode mode, bool acc_is_sqlnull, const JsonoView &acc_vie
 	return false;
 }
 
-// A lane carried through a lane-aware merge: its name, the result struct child index it
+// A shred carried through a shred-aware merge: its name, the result struct child index it
 // lands in, and its type. The merge folds the four-BLOB residuals (existing logic) and
-// copies each union lane from the last input that declares it. Lane keys are assumed
-// disjoint from residual keys (true when lanes are computed fields lifted into columns).
-struct MergeLane {
+// copies each union shred from the last input that declares it. Shred keys are assumed
+// disjoint from residual keys (true when shreds are computed fields lifted into columns).
+struct MergeShred {
 	string name;
 	idx_t result_child_index;
 	LogicalType type;
 };
 
 struct JsonoMergeBindData : public FunctionData {
-	vector<MergeLane> lanes;
+	vector<MergeShred> shreds;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<JsonoMergeBindData>(*this);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<JsonoMergeBindData>();
-		if (lanes.size() != other.lanes.size()) {
+		if (shreds.size() != other.shreds.size()) {
 			return false;
 		}
-		for (idx_t i = 0; i < lanes.size(); i++) {
-			if (lanes[i].name != other.lanes[i].name || lanes[i].type != other.lanes[i].type) {
+		for (idx_t i = 0; i < shreds.size(); i++) {
+			if (shreds[i].name != other.shreds[i].name || shreds[i].type != other.shreds[i].type) {
 				return false;
 			}
 		}
@@ -697,42 +697,40 @@ struct JsonoMergeBindData : public FunctionData {
 
 unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunction &bound_function,
                                              vector<unique_ptr<Expression>> &arguments) {
-	(void)context;
 	if (arguments.empty()) {
 		throw BinderException("jsono_merge_patch() requires at least one argument");
 	}
-	// Union the lanes of any shredded inputs (later inputs win a name conflict, matching
+	// Union the shreds of any shredded inputs (later inputs win a name conflict, matching
 	// the patch-wins fold). A shredded input keeps its type so the executor can read its
-	// lane columns; a plain input is bound as JSONO and contributes only its residual.
+	// shred columns; a plain input is bound as JSONO and contributes only its residual.
 	auto bind_data = make_uniq<JsonoMergeBindData>();
-	auto &lanes = bind_data->lanes;
-	auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
+	auto &shreds = bind_data->shreds;
 	for (auto &argument : arguments) {
 		if (argument->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
 		auto &type = argument->return_type;
+		JsonoRequireExtensionOptimizerForShredded(context, type, "jsono_merge_patch");
 		if (type.id() == LogicalTypeId::SQLNULL) {
 			bound_function.arguments.push_back(JsonoType());
 			continue;
 		}
 		if (IsShreddedJsonoType(type)) {
-			auto &children = StructType::GetChildTypes(type);
-			auto suffix = JsonoLaneSuffix(type);
-			for (idx_t i = prefix; i < children.size(); i++) {
-				// Union by the clean base path; JsonoShreddedStructType re-applies the merged
-				// fingerprint suffix to the result type (the inputs may carry different ones).
-				auto lane_name = JsonoStripLaneSuffix(children[i].first, suffix);
+			JsonoLayoutType layout;
+			TryParseJsonoLayoutType(type, layout);
+			for (auto &layout_shred : layout.shreds) {
+				// Union by the shred path (the inputs may carry different shred sets).
+				auto &shred_name = layout_shred.first;
 				bool found = false;
-				for (auto &lane : lanes) {
-					if (lane.name == lane_name) {
-						lane.type = children[i].second;
+				for (auto &merge_shred : shreds) {
+					if (merge_shred.name == shred_name) {
+						merge_shred.type = layout_shred.second;
 						found = true;
 						break;
 					}
 				}
 				if (!found) {
-					lanes.push_back(MergeLane {lane_name, 0, children[i].second});
+					shreds.push_back(MergeShred {shred_name, 0, layout_shred.second});
 				}
 			}
 			bound_function.arguments.push_back(type);
@@ -744,32 +742,32 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 		}
 		throw BinderException("jsono_merge_patch() arguments must be JSONO");
 	}
-	if (lanes.empty()) {
+	if (shreds.empty()) {
 		bound_function.return_type = JsonoType();
 		return std::move(bind_data);
 	}
-	// Canonical lane order (sorted by name) so the merged type is a pure function of the lane set,
-	// not of argument order: the executor writes lanes by result_child_index, so the index order and
-	// the type's lane order must agree. The fingerprint suffix is already order-independent.
-	std::sort(lanes.begin(), lanes.end(), [](const MergeLane &a, const MergeLane &b) { return a.name < b.name; });
-	child_list_t<LogicalType> lane_types;
-	idx_t next = StructType::GetChildTypes(JsonoRawStructType()).size();
-	for (auto &lane : lanes) {
-		lane.result_child_index = next++;
-		lane_types.emplace_back(lane.name, lane.type);
+	// Canonical shred order (sorted by name) so the merged type is a pure function of the shred set,
+	// not of argument order: the executor writes shreds by result_child_index, so the index order and
+	// the type's shred order must agree.
+	std::sort(shreds.begin(), shreds.end(), [](const MergeShred &a, const MergeShred &b) { return a.name < b.name; });
+	child_list_t<LogicalType> shred_types;
+	idx_t next = 0; // shred-relative index inside the result's `.shreds` struct
+	for (auto &shred : shreds) {
+		shred.result_child_index = next++;
+		shred_types.emplace_back(shred.name, shred.type);
 	}
-	bound_function.return_type = JsonoShreddedStructType(lane_types);
+	bound_function.return_type = JsonoShreddedStructType(shred_types);
 	return std::move(bind_data);
 }
 
-struct ReconLane {
+struct ReconShred {
 	idx_t child;
 	LogicalType type;
 	vector<PathStep> steps; // object-key path; size 1 is a top-level key
 };
 
-void EmitReconLaneScalar(JsonoBuilder &builder, const ReconLane &lane, const UnifiedVectorFormat &fmt, idx_t idx) {
-	switch (lane.type.id()) {
+void EmitReconShredScalar(JsonoBuilder &builder, const ReconShred &shred, const UnifiedVectorFormat &fmt, idx_t idx) {
+	switch (shred.type.id()) {
 	case LogicalTypeId::VARCHAR: {
 		auto value = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
 		builder.EmitString(nonstd::string_view(value.GetData(), value.GetSize()));
@@ -788,24 +786,32 @@ void EmitReconLaneScalar(JsonoBuilder &builder, const ReconLane &lane, const Uni
 		builder.EmitBool(UnifiedVectorFormat::GetData<bool>(fmt)[idx]);
 		return;
 	default:
-		throw InternalException("jsono reconstruct: unexpected lane type '%s'", lane.type.ToString());
+		throw InternalException("jsono reconstruct: unexpected shred type '%s'", shred.type.ToString());
 	}
 }
 
-// Reconstruct a shredded JSONO `input` (four-BLOB residual + lane columns) into the plain
-// JSONO `result` by overlaying each row's lane values back onto its residual object. Lanes
+// Reconstruct a shredded JSONO `input` (four-BLOB residual + shred columns) into the plain
+// JSONO `result` by overlaying each row's shred values back onto its residual object. Shreds
 // are disjoint from residual keys (the shred invariant), so the overlay re-inserts them.
-// Top-level lanes are emitted as one flat patch (the common jsono({...}) case); nested-path
-// lanes (`$.a.b`) accumulate a one-path chain overlay each so any depth round-trips.
-void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result) {
-	auto &input_types = StructType::GetChildTypes(input.GetType());
-	auto prefix = StructType::GetChildTypes(JsonoRawStructType()).size();
-	auto suffix = JsonoLaneSuffix(input.GetType());
-	vector<ReconLane> lanes;
+// Top-level shreds are emitted as one flat patch (the common jsono({...}) case); nested-path
+// shreds (`$.a.b`) accumulate a one-path chain overlay each so any depth round-trips.
+// A valid row with a NULL residual blob never comes from the writer (a NULL value nulls the
+// whole struct): it throws — the row is the trace of a struct cast NULL-filling the body.
+// `shred_filter` (shred indices over the shred set) restricts the overlay to those shreds — the
+// single-pass narrowing reshred folds only the shreds the target drops back into the residual;
+// the manifest is still verified against ALL of the type's shreds.
+void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
+                                    const vector<idx_t> *shred_filter = nullptr) {
+	JsonoLayoutType layout;
+	TryParseJsonoLayoutType(input.GetType(), layout);
+	vector<ReconShred> shreds;
 	bool all_top_level = true;
-	for (idx_t i = prefix; i < input_types.size(); i++) {
-		// Lane field names carry the shared "#<fp>" lane-set suffix; strip it to recover the path.
-		auto name = JsonoStripLaneSuffix(input_types[i].first, suffix);
+	for (idx_t i = 0; i < layout.shreds.size(); i++) {
+		if (shred_filter && std::find(shred_filter->begin(), shred_filter->end(), i) == shred_filter->end()) {
+			continue;
+		}
+		// Shred field names ARE the clean path (no fingerprint suffix in the nested layout).
+		auto &name = layout.shreds[i].first;
 		vector<PathStep> steps;
 		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
 			steps = ParseJsonoPath(name, "jsono reconstruct");
@@ -814,15 +820,15 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result) 
 		}
 		for (auto &step : steps) {
 			if (step.kind != PathStepKind::Key) {
-				throw InvalidInputException("jsono reconstruct: lane path '%s' is not an object-key path", name);
+				throw InvalidInputException("jsono reconstruct: shred path '%s' is not an object-key path", name);
 			}
 		}
 		if (steps.size() != 1) {
 			all_top_level = false;
 		}
-		lanes.push_back(ReconLane {i, input_types[i].second, std::move(steps)});
+		shreds.push_back(ReconShred {i, layout.shreds[i].second, std::move(steps)});
 	}
-	std::sort(lanes.begin(), lanes.end(), [](const ReconLane &a, const ReconLane &b) {
+	std::sort(shreds.begin(), shreds.end(), [](const ReconShred &a, const ReconShred &b) {
 		auto n = std::min(a.steps.size(), b.steps.size());
 		for (size_t i = 0; i < n; i++) {
 			if (a.steps[i].key != b.steps[i].key) {
@@ -834,18 +840,26 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result) 
 
 	JsonoVectorData residual;
 	InitJsonoVectorData(input, count, residual);
-	vector<UnifiedVectorFormat> lane_fmt(lanes.size());
-	auto &struct_children = StructVector::GetEntries(input);
-	for (idx_t k = 0; k < lanes.size(); k++) {
-		struct_children[lanes[k].child]->ToUnifiedFormat(count, lane_fmt[k]);
+	vector<UnifiedVectorFormat> shred_fmt(shreds.size());
+	for (idx_t k = 0; k < shreds.size(); k++) {
+		JsonoShredVector(input, shreds[k].child).ToUnifiedFormat(count, shred_fmt[k]);
 	}
 
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &out_children = StructVector::GetEntries(result);
-	auto &slots_vec = *out_children[0];
-	auto &key_heap_vec = *out_children[1];
-	auto &string_heap_vec = *out_children[2];
-	auto &skips_vec = *out_children[3];
+	// The shreds this type carries, as (path, type string) — the reference the per-row shred
+	// manifest is verified against (see VerifyShredManifest).
+	vector<std::pair<string, string>> shred_signatures;
+	shred_signatures.reserve(layout.shreds.size());
+	for (auto &shred : layout.shreds) {
+		shred_signatures.emplace_back(shred.first, shred.second.ToString());
+	}
+	std::vector<jsono::ShredManifestEntry> manifest;
+
+	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
+	InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
+	auto &slots_vec = *slots_p;
+	auto &key_heap_vec = *key_heap_p;
+	auto &string_heap_vec = *string_heap_p;
+	auto &skips_vec = *skips_p;
 	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
 	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
 	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
@@ -858,6 +872,11 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result) 
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob {};
 		if (!ReadJsonoRow(residual, row, blob)) {
+			if (RowIsValid(residual.struct_fmt, row)) {
+				throw InvalidInputException(
+				    "JSONO: shredded row carries a NULL residual blob; the writer never produces this — it is "
+				    "the trace of a struct cast NULL-filling the row's body");
+			}
 			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
 			continue;
 		}
@@ -866,25 +885,38 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result) 
 			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
 			continue;
 		}
+		jsono::VerifyShredManifest(residual_view, shred_signatures, manifest);
+		if (SlotTag(residual_view.SlotAt(0)) != tag::OBJ_START) {
+			// A non-object residual (scalar/array) is the whole value: shreds are object-key paths,
+			// so a well-formed shredded value cannot have any present here. Emit it verbatim rather
+			// than overlaying onto a non-object (which the object merge cannot handle).
+			out_builder.Reset();
+			size_t pos = 0;
+			size_t string_cursor = 0;
+			EmitValueVerbatim(residual_view, pos, string_cursor, out_builder, 0);
+			WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out,
+			                 string_heap_out, skips_out, row, out_builder);
+			continue;
+		}
 		if (all_top_level) {
-			// One flat patch object of the present lanes, overlaid in a single pass.
+			// One flat patch object of the present shreds, overlaid in a single pass.
 			patch_builder.Reset();
 			idx_t present = 0;
-			for (idx_t k = 0; k < lanes.size(); k++) {
-				present += RowIsValid(lane_fmt[k], row) ? 1 : 0;
+			for (idx_t k = 0; k < shreds.size(); k++) {
+				present += RowIsValid(shred_fmt[k], row) ? 1 : 0;
 			}
 			patch_builder.EmitObjectStart(present);
-			for (idx_t k = 0; k < lanes.size(); k++) {
-				if (RowIsValid(lane_fmt[k], row)) {
-					patch_builder.EmitKeySlot(lanes[k].steps[0].key);
+			for (idx_t k = 0; k < shreds.size(); k++) {
+				if (RowIsValid(shred_fmt[k], row)) {
+					patch_builder.EmitKeySlot(shreds[k].steps[0].key);
 				}
 			}
-			for (idx_t k = 0; k < lanes.size(); k++) {
-				if (!RowIsValid(lane_fmt[k], row)) {
+			for (idx_t k = 0; k < shreds.size(); k++) {
+				if (!RowIsValid(shred_fmt[k], row)) {
 					continue;
 				}
 				patch_builder.EmitObjectChildStart();
-				EmitReconLaneScalar(patch_builder, lanes[k], lane_fmt[k], RowIndex(lane_fmt[k], row));
+				EmitReconShredScalar(patch_builder, shreds[k], shred_fmt[k], RowIndex(shred_fmt[k], row));
 			}
 			patch_builder.EmitObjectEnd();
 			SerializeBuilderToBlob(patch_builder, patch_storage);
@@ -896,23 +928,23 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result) 
 			                 string_heap_out, skips_out, row, out_builder);
 			continue;
 		}
-		// Nested lanes: overlay one single-path chain at a time onto the accumulator. The
-		// residual is authoritative; each disjoint lane path fills in where it was stripped.
+		// Nested shreds: overlay one single-path chain at a time onto the accumulator. The
+		// residual is authoritative; each disjoint shred path fills in where it was stripped.
 		const JsonoView *acc = &residual_view;
 		JsonoView acc_view = residual_view;
 		bool any = false;
-		for (idx_t k = 0; k < lanes.size(); k++) {
-			if (!RowIsValid(lane_fmt[k], row)) {
+		for (idx_t k = 0; k < shreds.size(); k++) {
+			if (!RowIsValid(shred_fmt[k], row)) {
 				continue;
 			}
 			patch_builder.Reset();
-			for (auto &step : lanes[k].steps) {
+			for (auto &step : shreds[k].steps) {
 				patch_builder.EmitObjectStart(1);
 				patch_builder.EmitKeySlot(step.key);
 				patch_builder.EmitObjectChildStart();
 			}
-			EmitReconLaneScalar(patch_builder, lanes[k], lane_fmt[k], RowIndex(lane_fmt[k], row));
-			for (idx_t s = 0; s < lanes[k].steps.size(); s++) {
+			EmitReconShredScalar(patch_builder, shreds[k], shred_fmt[k], RowIndex(shred_fmt[k], row));
+			for (idx_t s = 0; s < shreds[k].steps.size(); s++) {
 				patch_builder.EmitObjectEnd();
 			}
 			SerializeBuilderToBlob(patch_builder, patch_storage);
@@ -942,16 +974,16 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result) 
 }
 
 // Fold the residual views in `inputs` left-to-right under `mode` and write the merged plain
-// JSONO into `out` (the four-BLOB residual). Shared by the lane-aware fast path (raw residuals)
+// JSONO into `out` (the four-BLOB residual). Shared by the shred-aware fast path (raw residuals)
 // and the reshred fallback (reconstructed values).
 void RunResidualFold(MergeMode mode, vector<JsonoVectorData> &inputs, idx_t ncols, idx_t count, Vector &out,
                      JsonoOpsLocalState &lstate) {
-	out.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &children = StructVector::GetEntries(out);
-	auto &slots_vec = *children[0];
-	auto &key_heap_vec = *children[1];
-	auto &string_heap_vec = *children[2];
-	auto &skips_vec = *children[3];
+	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
+	InitJsonoBodyWrite(out, slots_p, key_heap_p, string_heap_p, skips_p);
+	auto &slots_vec = *slots_p;
+	auto &key_heap_vec = *key_heap_p;
+	auto &string_heap_vec = *string_heap_p;
+	auto &skips_vec = *skips_p;
 	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
 	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
 	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
@@ -961,7 +993,7 @@ void RunResidualFold(MergeMode mode, vector<JsonoVectorData> &inputs, idx_t ncol
 	static thread_local OwnedJsonoBlob acc_storage;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow target_blob {};
-		bool acc_is_sqlnull = !ReadJsonoRow(inputs[0], row, target_blob);
+		bool acc_is_sqlnull = !ReadJsonoRowStrict(inputs[0], row, target_blob);
 		JsonoView acc_view = MakeJsonoView(target_blob);
 		if (!acc_is_sqlnull && (!acc_view.ParseHeader() || acc_view.Slots() == 0)) {
 			acc_is_sqlnull = true;
@@ -982,7 +1014,7 @@ void RunResidualFold(MergeMode mode, vector<JsonoVectorData> &inputs, idx_t ncol
 		}
 		for (idx_t i = 1; i < ncols; i++) {
 			JsonoBlobRow patch_blob {};
-			bool patch_present = ReadJsonoRow(inputs[i], row, patch_blob);
+			bool patch_present = ReadJsonoRowStrict(inputs[i], row, patch_blob);
 			JsonoView patch_view = MakeJsonoView(patch_blob);
 			if (patch_present && (!patch_view.ParseHeader() || patch_view.Slots() == 0)) {
 				patch_present = false;
@@ -1038,23 +1070,22 @@ bool ResidualHasTopLevelKey(const JsonoView &view, const string &key) {
 	return SlotTag(ks) == tag::KEY && view.KeyAt(SlotPayload(ks)) == target;
 }
 
-// Copy a lane column from the winning input into the result lane, then null it where the
-// merged value is SQL NULL. Patch takes the last input that declares the lane (RFC 7396
+// Copy a shred column from the winning input into the result shred, then null it where the
+// merged value is SQL NULL. Patch takes the last input that declares the shred (RFC 7396
 // last-wins); Overlay takes the first (base-authoritative).
-void FastCopyLane(DataChunk &args, idx_t ncols, idx_t count, MergeMode mode, const MergeLane &lane, Vector &dst,
-                  const ValidityMask &result_validity) {
+void FastCopyShred(DataChunk &args, idx_t ncols, idx_t count, MergeMode mode, const MergeShred &shred, Vector &dst,
+                   const ValidityMask &result_validity) {
 	idx_t src_arg = DConstants::INVALID_INDEX;
 	idx_t src_child = 0;
 	for (idx_t i = 0; i < ncols; i++) {
 		auto &t = args.data[i].GetType();
-		if (t.id() != LogicalTypeId::STRUCT || !HasJsonoBlobPrefix(t)) {
-			continue;
+		if (!IsShreddedJsonoType(t)) {
+			continue; // only shredded inputs declare shreds to copy from
 		}
-		auto &ch = StructType::GetChildTypes(t);
-		auto suffix = JsonoLaneSuffix(t);
-		for (idx_t c = 0; c < ch.size(); c++) {
-			// Input lane fields carry their own "#<fp>" suffix; compare on the clean base path.
-			if (JsonoStripLaneSuffix(ch[c].first, suffix) == lane.name &&
+		JsonoLayoutType layout;
+		TryParseJsonoLayoutType(t, layout);
+		for (idx_t c = 0; c < layout.shreds.size(); c++) {
+			if (layout.shreds[c].first == shred.name &&
 			    (mode != MergeMode::Overlay || src_arg == DConstants::INVALID_INDEX)) {
 				src_arg = i;
 				src_child = c;
@@ -1070,7 +1101,7 @@ void FastCopyLane(DataChunk &args, idx_t ncols, idx_t count, MergeMode mode, con
 		return;
 	}
 	args.data[src_arg].Flatten(count);
-	VectorOperations::Copy(*StructVector::GetEntries(args.data[src_arg])[src_child], dst, count, 0, 0);
+	VectorOperations::Copy(JsonoShredVector(args.data[src_arg], src_child), dst, count, 0, 0);
 	if (!result_validity.AllValid()) {
 		dst.Flatten(count);
 		auto &dv = FlatVector::Validity(dst);
@@ -1087,9 +1118,9 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoMergeBindData>();
 	auto count = args.size();
 	idx_t ncols = args.ColumnCount();
-	bool has_lanes = !bind_data.lanes.empty();
+	bool has_shreds = !bind_data.shreds.empty();
 
-	if (!has_lanes) {
+	if (!has_shreds) {
 		// Plain merge: fold straight into the result.
 		vector<JsonoVectorData> inputs(ncols);
 		for (idx_t i = 0; i < ncols; i++) {
@@ -1102,9 +1133,9 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		return;
 	}
 
-	// Fast path: when every input is shredded (no plain residual can shadow a lane key) and
-	// every lane is a top-level key, fold the raw residuals and copy lanes directly — skipping
-	// the reconstruct+reshred — as long as no lane key collides into the merged residual.
+	// Fast path: when every input is shredded (no plain residual can shadow a shred key) and
+	// every shred is a top-level key, fold the raw residuals and copy shreds directly — skipping
+	// the reconstruct+reshred — as long as no shred key collides into the merged residual.
 	bool fast_viable = true;
 	for (idx_t i = 0; i < ncols; i++) {
 		auto &t = args.data[i].GetType();
@@ -1112,8 +1143,8 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			fast_viable = false;
 		}
 	}
-	for (auto &lane : bind_data.lanes) {
-		if (!lane.name.empty() && lane.name[0] == '$') {
+	for (auto &shred : bind_data.shreds) {
+		if (!shred.name.empty() && shred.name[0] == '$') {
 			fast_viable = false;
 		}
 	}
@@ -1130,47 +1161,97 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		bool conflict = false;
 		for (idx_t row = 0; row < count && !conflict; row++) {
 			JsonoBlobRow blob {};
-			if (!ReadJsonoRow(fr, row, blob)) {
+			if (!ReadJsonoRowStrict(fr, row, blob)) {
 				continue;
 			}
 			JsonoView v = MakeJsonoView(blob);
 			if (!v.ParseHeader()) {
 				continue;
 			}
-			for (auto &lane : bind_data.lanes) {
-				if (ResidualHasTopLevelKey(v, lane.name)) {
+			for (auto &shred : bind_data.shreds) {
+				if (ResidualHasTopLevelKey(v, shred.name)) {
 					conflict = true;
 					break;
 				}
 			}
 		}
 		if (!conflict) {
-			// Capture constness before FastCopyLane flattens any input (which would otherwise
+			// Capture constness before FastCopyShred flattens any input (which would otherwise
 			// make AllConstant() spuriously false and trip the constant-fold assertion).
 			bool all_constant = args.AllConstant();
-			result.SetVectorType(VectorType::FLAT_VECTOR);
 			fast_residual.Flatten(count);
-			auto &rc = StructVector::GetEntries(result);
-			auto &frc = StructVector::GetEntries(fast_residual);
+			// Copy the folded plain residual's body blobs into the shredded result's body —
+			// except `skips`, which is re-emitted per row below with the output's shred manifest.
+			Vector *r_slots, *r_key_heap, *r_string_heap, *r_skips;
+			InitJsonoBodyWrite(result, r_slots, r_key_heap, r_string_heap, r_skips);
+			Vector *body_out[3] = {r_slots, r_key_heap, r_string_heap};
+			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
 			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
-			for (idx_t b = 0; b < 4; b++) {
-				rc[b]->SetVectorType(VectorType::FLAT_VECTOR);
-				VectorOperations::Copy(*frc[b], *rc[b], count, 0, 0);
+			for (idx_t b = 0; b < 3; b++) {
+				VectorOperations::Copy(*fr_blobs[b], *body_out[b], count, 0, 0);
 			}
 			auto &result_validity = FlatVector::Validity(result);
-			for (auto &lane : bind_data.lanes) {
-				FastCopyLane(args, ncols, count, mode, lane, *rc[lane.result_child_index], result_validity);
+			for (auto &shred : bind_data.shreds) {
+				FastCopyShred(args, ncols, count, mode, shred, JsonoShredVector(result, shred.result_child_index),
+				              result_validity);
+			}
+			// The folded residual was rebuilt without the inputs' manifests, but a copied shred
+			// that carries a value has no copy in the residual (the no-conflict gate above) —
+			// exactly what the manifest must record, or a later raw narrowing cast would lose it
+			// silently. Re-emit each row's skips with the manifest of its non-NULL shreds.
+			vector<std::string> manifest_entries(bind_data.shreds.size());
+			vector<UnifiedVectorFormat> shred_fmt(bind_data.shreds.size());
+			for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
+				auto &shred = bind_data.shreds[k];
+				auto &entry = manifest_entries[k];
+				auto append_lv = [&](const string &text) {
+					if (text.size() > std::numeric_limits<uint16_t>::max()) {
+						throw InvalidInputException("jsono merge: path or type name exceeds manifest limits");
+					}
+					uint16_t len = uint16_t(text.size());
+					entry.append(reinterpret_cast<const char *>(&len), sizeof(len));
+					entry.append(text);
+				};
+				append_lv(shred.name);
+				append_lv(shred.type.ToString());
+				JsonoShredVector(result, shred.result_child_index).ToUnifiedFormat(count, shred_fmt[k]);
+			}
+			auto fr_skips = FlatVector::GetData<string_t>(*fr_blobs[3]);
+			auto &fr_skips_validity = FlatVector::Validity(*fr_blobs[3]);
+			r_skips->SetVectorType(VectorType::FLAT_VECTOR);
+			auto skips_out = FlatVector::GetData<string_t>(*r_skips);
+			std::string skips_buf;
+			for (idx_t row = 0; row < count; row++) {
+				if (!result_validity.RowIsValid(row) || !fr_skips_validity.RowIsValid(row)) {
+					FlatVector::SetNull(*r_skips, row, true);
+					continue;
+				}
+				skips_buf.clear();
+				skips_buf.append(fr_skips[row].GetData(), fr_skips[row].GetSize());
+				uint32_t stripped = 0;
+				for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
+					stripped += RowIsValid(shred_fmt[k], row) ? 1 : 0;
+				}
+				if (stripped > 0) {
+					skips_buf.append(reinterpret_cast<const char *>(&stripped), sizeof(stripped));
+					for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
+						if (RowIsValid(shred_fmt[k], row)) {
+							skips_buf.append(manifest_entries[k]);
+						}
+					}
+				}
+				skips_out[row] = WriteBlobInto(*r_skips, skips_buf.data(), skips_buf.size());
 			}
 			if (all_constant) {
 				result.SetVectorType(VectorType::CONSTANT_VECTOR);
 			}
 			return;
 		}
-		// A lane key landed in the residual (conflict) — fall through to the correct reshred path.
+		// A shred key landed in the residual (conflict) — fall through to the correct reshred path.
 	}
 
 	// Reshred fallback: reconstruct shredded inputs to plain, fold, reshred. Correct for any
-	// lane/residual key overlap and for plain inputs that can shadow a lane.
+	// shred/residual key overlap and for plain inputs that can shadow a shred.
 	vector<unique_ptr<Vector>> reconstructed;
 	vector<JsonoVectorData> inputs(ncols);
 	for (idx_t i = 0; i < ncols; i++) {
@@ -1185,12 +1266,12 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	}
 	Vector fold_out(JsonoType(), count);
 	RunResidualFold(mode, inputs, ncols, count, fold_out, lstate);
-	vector<std::pair<string, LogicalType>> lane_specs;
-	lane_specs.reserve(bind_data.lanes.size());
-	for (auto &lane : bind_data.lanes) {
-		lane_specs.emplace_back(lane.name, lane.type);
+	vector<std::pair<string, LogicalType>> shred_specs;
+	shred_specs.reserve(bind_data.shreds.size());
+	for (auto &shred : bind_data.shreds) {
+		shred_specs.emplace_back(shred.name, shred.type);
 	}
-	JsonoShredFromSpec(fold_out, count, lane_specs, result);
+	JsonoShredFromSpec(fold_out, count, shred_specs, result);
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
@@ -1206,17 +1287,23 @@ void JsonoOverlayExecute(DataChunk &args, ExpressionState &state, Vector &result
 
 struct GroupMergeBindData : public FunctionData {
 	MergeMode merge_mode;
+	// Empty for a plain input (Finalize writes the plain accumulator verbatim). For a shredded
+	// input the captured shreds (clean names, canonical order) reshred the merged accumulator back
+	// to the input's shredded type so the shreds "stick" across the aggregation.
+	vector<std::pair<string, LogicalType>> shreds;
 
 	explicit GroupMergeBindData(MergeMode merge_mode) : merge_mode(merge_mode) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<GroupMergeBindData>(merge_mode);
+		auto result = make_uniq<GroupMergeBindData>(merge_mode);
+		result->shreds = shreds;
+		return std::move(result);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<GroupMergeBindData>();
-		return merge_mode == other.merge_mode;
+		return merge_mode == other.merge_mode && shreds == other.shreds;
 	}
 };
 
@@ -1241,15 +1328,39 @@ struct GroupMergeFunction {
 
 unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFunction &function,
                                              vector<unique_ptr<Expression>> &arguments) {
-	(void)context;
-	(void)function;
 	if (arguments.size() != 1) {
 		throw BinderException("jsono_group_merge() requires a single JSONO argument");
 	}
-	if (arguments[0]->return_type.id() != LogicalTypeId::SQLNULL && !IsJsonoType(arguments[0]->return_type)) {
+	auto &arg = *arguments[0];
+	if (arg.HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
+	auto &type = arg.return_type;
+	JsonoRequireExtensionOptimizerForShredded(context, type, "jsono_group_merge");
+	auto bind_data = make_uniq<GroupMergeBindData>(MergeMode::IgnoreNulls);
+	if (IsShreddedJsonoType(type)) {
+		// Capture the shreds (clean names, the type's canonical order) so Finalize reshreds the
+		// merged accumulator back to this exact shredded type — sticky shredding, like
+		// jsono_merge_patch. Redeclaring the argument as plain JSONO makes the binder insert the
+		// lossless reconstruct cast, so Update/Combine see plain JSONO and the accumulator stays plain.
+		JsonoLayoutType layout;
+		TryParseJsonoLayoutType(type, layout);
+		for (auto &shred : layout.shreds) {
+			bind_data->shreds.emplace_back(shred.first, shred.second);
+		}
+		// Keep the shredded argument type (Update reconstructs it to plain itself) rather than
+		// forcing a plain argument with a binder cast. With a plain argument the bound aggregate's
+		// argument type and its sticky shredded return type disagree, so a plan serialize→deserialize
+		// re-bind (debug verification) would re-derive a plain return and fail to reconcile it back to
+		// the shredded type. Arg type == return type makes the re-bind reproduce the same shredded type.
+		function.arguments[0] = type;
+		function.return_type = type;
+	} else if (type.id() == LogicalTypeId::SQLNULL || IsJsonoType(type)) {
+		function.arguments[0] = JsonoType();
+	} else {
 		throw BinderException("jsono_group_merge() input must be JSONO");
 	}
-	return make_uniq<GroupMergeBindData>(MergeMode::IgnoreNulls);
+	return std::move(bind_data);
 }
 
 // Fold one incoming value (a row blob, or a partial's accumulated blob) into the
@@ -1296,16 +1407,28 @@ void ApplyGroupMergeFromBlob(GroupMergeState &state, const JsonoBlobRow &blob) {
 	FoldIntoGroupState(state, view);
 }
 
+// Shredded group_merge input is kept native at bind (so the aggregate's arg and sticky
+// return types agree across a debug serialize re-bind); reconstruct it to the full plain value here,
+// because the fold reads the whole document and the residual body alone would drop the shred values.
+Vector *GroupMergeReadInput(Vector &input, idx_t count, Vector &reconstructed) {
+	if (IsShreddedJsonoType(input.GetType())) {
+		JsonoReconstructToPlain(input, count, reconstructed);
+		return &reconstructed;
+	}
+	return &input;
+}
+
 void JsonoGroupMergeSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
                                  data_ptr_t state_ptr, idx_t count) {
 	(void)aggr_input_data;
 	(void)input_count;
+	Vector reconstructed(JsonoType(), count);
 	JsonoVectorData input;
-	InitJsonoVectorData(inputs[0], count, input);
+	InitJsonoVectorData(*GroupMergeReadInput(inputs[0], count, reconstructed), count, input);
 	auto &state = *reinterpret_cast<GroupMergeState *>(state_ptr);
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
+		if (!ReadJsonoRowStrict(input, row, blob)) {
 			continue;
 		}
 		ApplyGroupMergeFromBlob(state, blob);
@@ -1316,15 +1439,16 @@ void JsonoGroupMergeUpdate(Vector inputs[], AggregateInputData &aggr_input_data,
                            idx_t count) {
 	(void)aggr_input_data;
 	(void)input_count;
+	Vector reconstructed(JsonoType(), count);
 	JsonoVectorData input;
-	InitJsonoVectorData(inputs[0], count, input);
+	InitJsonoVectorData(*GroupMergeReadInput(inputs[0], count, reconstructed), count, input);
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<GroupMergeState *>(state_fmt);
 
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
+		if (!ReadJsonoRowStrict(input, row, blob)) {
 			continue;
 		}
 		auto state_idx = RowIndex(state_fmt, row);
@@ -1352,19 +1476,27 @@ void JsonoGroupMergeCombine(Vector &source, Vector &target, AggregateInputData &
 	}
 }
 
-void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
-                             idx_t offset) {
-	(void)aggr_input_data;
-	UnifiedVectorFormat state_fmt;
-	states.ToUnifiedFormat(count, state_fmt);
-	auto state_data = UnifiedVectorFormat::GetData<GroupMergeState *>(state_fmt);
-
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &children = StructVector::GetEntries(result);
-	auto &slots_vec = *children[0];
-	auto &key_heap_vec = *children[1];
-	auto &string_heap_vec = *children[2];
-	auto &skips_vec = *children[3];
+// Write each group's accumulated plain blob (or an empty object for an empty/NULL group) into a
+// plain JSONO struct vector `out` at row base+i. Shared by the plain finalize (writes straight
+// into the result at the chunk offset) and the shredded finalize (writes a temp at base 0).
+void FinalizePlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMergeState *const *state_data, idx_t count,
+                         idx_t base) {
+	// Writes at rows [base, base+count) and produces no SQL NULLs (an empty group becomes an empty
+	// object), so navigate to the body blobs without the [0,count) validity reset InitJsonoBodyWrite
+	// applies — that would be wrong for a base offset.
+	out.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &layout = *StructVector::GetEntries(out)[0];
+	layout.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &body = *StructVector::GetEntries(layout)[0];
+	body.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &body_blobs = StructVector::GetEntries(body);
+	auto &slots_vec = *body_blobs[0];
+	auto &key_heap_vec = *body_blobs[1];
+	auto &string_heap_vec = *body_blobs[2];
+	auto &skips_vec = *body_blobs[3];
+	for (auto &blob : body_blobs) {
+		blob->SetVectorType(VectorType::FLAT_VECTOR);
+	}
 	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
 	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
 	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
@@ -1372,7 +1504,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 	JsonoBuilder empty_builder;
 
 	for (idx_t i = 0; i < count; i++) {
-		auto rid = i + offset;
+		auto rid = i + base;
 		auto &state = *state_data[RowIndex(state_fmt, i)];
 		if (!state.has_input || !state.acc) {
 			empty_builder.Reset();
@@ -1391,6 +1523,27 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 	}
 }
 
+void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
+                             idx_t offset) {
+	UnifiedVectorFormat state_fmt;
+	states.ToUnifiedFormat(count, state_fmt);
+	auto state_data = UnifiedVectorFormat::GetData<GroupMergeState *>(state_fmt);
+
+	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeBindData>();
+	if (bind_data.shreds.empty()) {
+		FinalizePlainGroups(result, state_fmt, state_data, count, offset);
+		return;
+	}
+	// Shredded return: assemble the merged plain accumulators in a temp vector, then reshred into
+	// the result's shredded type and copy into place at the chunk offset.
+	Vector plain(JsonoType(), count);
+	FinalizePlainGroups(plain, state_fmt, state_data, count, 0);
+	Vector shredded(result.GetType(), count);
+	JsonoShredFromSpec(plain, count, bind_data.shreds, shredded);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	VectorOperations::Copy(shredded, result, count, 0, offset);
+}
+
 } // namespace
 
 // Public entry (declared in jsono.hpp): forwards to the in-TU implementation, which reuses
@@ -1398,6 +1551,13 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 // losslessly without duplicating the overlay logic.
 void JsonoReconstructToPlain(Vector &input, idx_t count, Vector &result) {
 	ReconstructShreddedToPlainImpl(input, count, result);
+}
+
+// Public entry (declared in jsono.hpp): overlay only `shreds` of the shredded `input` onto its
+// residual, producing plain JSONO. The single-pass narrowing reshred uses it to fold the shreds
+// the target type drops back into the residual without materializing the full document.
+void JsonoOverlayShredsToPlain(Vector &input, idx_t count, const vector<idx_t> &shreds, Vector &result) {
+	ReconstructShreddedToPlainImpl(input, count, result, &shreds);
 }
 
 // True if some active path ends on `key` at this depth — its leaf is the value to strip.
@@ -1474,7 +1634,7 @@ static void EmitObjectStrippingPaths(const JsonoView &view, size_t obj_pos, size
 
 // Emit `view` into `builder` with the located leaf of each path removed, used by the
 // shredded writer to build the residual once it knows which paths were losslessly lifted
-// into lanes. Paths are object-key sequences: a top-level path drops a root key, a nested
+// into shreds. Paths are object-key sequences: a top-level path drops a root key, a nested
 // path drops only its leaf and keeps the surrounding object. An empty path set or a
 // non-object value is copied verbatim. Reuses the cursor-walk and EmitValueVerbatim so the
 // residual's blocks/checkpoints are rebuilt correctly.
@@ -1490,7 +1650,7 @@ void JsonoEmitObjectStrippingPaths(const JsonoView &view, const std::vector<cons
 }
 
 // The jsono_merge_patch function, exposed so the optimizer's shredded
-// reconstruction can fold the lane patch into the residual without a catalog lookup.
+// reconstruction can fold the shred patch into the residual without a catalog lookup.
 ScalarFunction JsonoMergePatchFunction() {
 	ScalarFunction fun("jsono_merge_patch", {}, JsonoType(), JsonoMergePatchExecute, JsonoMergePatchBind, nullptr,
 	                   nullptr, JsonoOpsLocalState::Init);
@@ -1502,7 +1662,7 @@ ScalarFunction JsonoMergePatchFunction() {
 
 // jsono_overlay(base, patch...): the base is authoritative, each patch fills only the
 // keys the base lacks (B-null is a no-op). This is the shredded-reconstruction primitive
-// (residual wins, lanes refill stripped paths), not a headline user operation — the
+// (residual wins, shreds refill stripped paths), not a headline user operation — the
 // optimizer binds it directly via this factory. It is registered in the catalog (see
 // RegisterJsonoMerge) only so the optimizer-injected reconstruction expression survives
 // plan (de)serialization via a name lookup; it is intentionally left out of the docs.
@@ -1515,14 +1675,69 @@ ScalarFunction JsonoOverlayFunction() {
 	return fun;
 }
 
+namespace {
+
+// __jsono_internal_checked_residual(residual, shreds): pass the plain residual through after
+// verifying its shred manifest against `shreds`, the shred signatures ("path\x01type") of the
+// shredded type the optimizer read the residual out of. The optimizer wraps every residual
+// reinterpret with this check, so a row narrowed by a raw struct cast (its manifest lists a
+// shred the type no longer carries) fails loud on every optimizer read path — extract fallback,
+// overlay reconstruction, introspection — instead of silently reading an incomplete residual.
+void JsonoCheckedResidualExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)state;
+	auto count = args.size();
+	auto &shreds_value = args.data[1];
+	if (shreds_value.GetVectorType() != VectorType::CONSTANT_VECTOR) {
+		throw InvalidInputException("__jsono_internal_checked_residual: shreds must be constant");
+	}
+	vector<std::pair<std::string, std::string>> shred_signatures;
+	auto shreds = ListValue::GetChildren(shreds_value.GetValue(0));
+	shred_signatures.reserve(shreds.size());
+	for (auto &shred : shreds) {
+		auto signature = StringValue::Get(shred);
+		auto sep = signature.find('\x01');
+		if (sep == string::npos) {
+			throw InvalidInputException("__jsono_internal_checked_residual: malformed shred signature");
+		}
+		shred_signatures.emplace_back(signature.substr(0, sep), signature.substr(sep + 1));
+	}
+
+	JsonoVectorData input;
+	InitJsonoVectorData(args.data[0], count, input);
+	std::vector<jsono::ShredManifestEntry> manifest;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob;
+		if (!ReadJsonoRow(input, row, blob)) {
+			continue;
+		}
+		JsonoView view = MakeJsonoView(blob);
+		if (!view.ParseHeader()) {
+			continue;
+		}
+		jsono::VerifyShredManifest(view, shred_signatures, manifest);
+	}
+	result.Reference(args.data[0]);
+}
+
+} // namespace
+
+ScalarFunction JsonoCheckedResidualFunction() {
+	ScalarFunction fun("__jsono_internal_checked_residual", {JsonoType(), LogicalType::LIST(LogicalType::VARCHAR)},
+	                   JsonoType(), JsonoCheckedResidualExecute);
+	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	return fun;
+}
+
 void RegisterJsonoMerge(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
 	{ loader.RegisterFunction(JsonoMergePatchFunction()); }
-	// Internal reconstruction helper, registered for serialization (see JsonoOverlayFunction).
+	// Internal reconstruction helpers, registered for serialization (see JsonoOverlayFunction).
 	{ loader.RegisterFunction(JsonoOverlayFunction()); }
+	{ loader.RegisterFunction(JsonoCheckedResidualFunction()); }
 	{
 		AggregateFunction fun(
-		    "jsono_group_merge", {jsono_type}, jsono_type, AggregateFunction::StateSize<GroupMergeState>,
+		    "jsono_group_merge", {LogicalType::ANY}, jsono_type, AggregateFunction::StateSize<GroupMergeState>,
 		    AggregateFunction::StateInitialize<GroupMergeState, GroupMergeFunction>, JsonoGroupMergeUpdate,
 		    JsonoGroupMergeCombine, JsonoGroupMergeFinalize, FunctionNullHandling::DEFAULT_NULL_HANDLING,
 		    JsonoGroupMergeSimpleUpdate, JsonoGroupMergeBind,

@@ -1,0 +1,89 @@
+# name: test/sql/jsono_shredded_funcs.test
+# description: jsono read functions (extract, extract_string, type, keys) accept shredded input
+# group: [sql]
+
+require jsono
+
+# Reconstruction rides core json's to_json(ANY) for the cross-checks below.
+require json
+
+# A shredded value with a typed shred ($.a BIGINT), a string shred (name) and a nested residual (b).
+statement ok
+CREATE TABLE t AS SELECT jsono('{"a":1,"b":{"c":2},"name":"x"}', shredding := {'$.a':'BIGINT','name':'VARCHAR'}) AS j;
+
+# jsono_extract reads both a shred path and a residual path off the reconstructed document.
+query II
+SELECT to_json(jsono_extract(j, '$.a')), to_json(jsono_extract(j, '$.b')) FROM t;
+----
+1	{"c":2}
+
+# jsono_extract_string: shred value, nested residual value, and a miss → NULL.
+query III
+SELECT jsono_extract_string(j, 'name'), jsono_extract_string(j, '$.b.c'), jsono_extract_string(j, '$.missing') FROM t;
+----
+x	2	NULL
+
+# jsono_type with and without a path; the typed shred reports its scalar type.
+query III
+SELECT jsono_type(j), jsono_type(j, '$.b'), jsono_type(j, '$.a') FROM t;
+----
+OBJECT	OBJECT	BIGINT
+
+# jsono_keys over the whole document (shreds + residual keys) and into a residual subobject.
+query II
+SELECT jsono_keys(j), jsono_keys(j, '$.b') FROM t;
+----
+[a, b, name]	[c]
+
+# Each result equals the same call over the plain (non-shredded) equivalent document.
+query IIIII
+SELECT
+  jsono_extract_string(j, 'name') = jsono_extract_string(p, 'name'),
+  to_json(jsono_extract(j, '$.b')) = to_json(jsono_extract(p, '$.b')),
+  jsono_type(j, '$.a') = jsono_type(p, '$.a'),
+  jsono_keys(j) = jsono_keys(p),
+  jsono_keys(j, '$.b') = jsono_keys(p, '$.b')
+FROM t, (SELECT jsono('{"a":1,"b":{"c":2},"name":"x"}') AS p);
+----
+true	true	true	true	true
+
+# Shredded operations require the extension optimizer: without it, core DuckDB can route
+# differently-shredded values through generic STRUCT casts.
+statement ok
+SET disabled_optimizers='extension';
+
+statement error
+SELECT jsono_extract_string(j, 'name'), to_json(jsono_extract(j, '$.b')), jsono_type(j, '$.a'), jsono_keys(j) FROM t;
+----
+requires the extension optimizer
+
+statement ok
+RESET disabled_optimizers;
+
+# A non-JSONO argument is rejected loudly at bind (ANY arg0 reaches the bind, which throws),
+# rather than silently routed through the struct constructor cast.
+statement error
+SELECT jsono_extract(42, 'a');
+----
+jsono_extract: argument must be JSONO
+
+statement error
+SELECT jsono_extract_string('foo', 'a');
+----
+jsono_extract_string: argument must be JSONO
+
+statement error
+SELECT jsono_type({'a': 1});
+----
+jsono_type: argument must be JSONO
+
+statement error
+SELECT jsono_keys('foo');
+----
+jsono_keys: argument must be JSONO
+
+# NULL input is accepted (plain path) and yields NULL.
+query IIII
+SELECT jsono_extract(NULL, '$.a'), jsono_extract_string(NULL, 'name'), jsono_type(NULL), jsono_keys(NULL);
+----
+NULL	NULL	NULL	NULL

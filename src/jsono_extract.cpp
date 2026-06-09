@@ -476,6 +476,59 @@ void EmitJsonoSubtree(const JsonoView &view, size_t &pos, size_t &string_cursor,
 	}
 }
 
+// Manifest checks for a native extract over a residual that carries a shred manifest (the
+// record of paths stripped out of this residual at write time; see jsono.hpp).
+//
+// `on_miss`: the extract path was not found in the residual. An exact manifest match (or a
+// manifest leaf inside the missing subtree) means the value was stripped into a shred this
+// reading context does not have — the row was narrowed by a raw struct cast — so fail loud
+// instead of returning a silent NULL. `on_container`: the extract found a container; a manifest
+// leaf strictly inside it means the returned subtree would be missing that leaf. An honest
+// shredded read never reaches either case (the optimizer reads shreds directly and reconstructs
+// subtree reads that overlap a shred), so a manifest hit here is always a narrowed row.
+void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathStep> &extract_steps, bool found_container,
+                               std::vector<jsono::ShredManifestEntry> &manifest_scratch,
+                               vector<PathStep> &steps_scratch) {
+	if (!view.HasShredManifest()) {
+		return;
+	}
+	view.ReadShredManifest(manifest_scratch);
+	for (auto &entry : manifest_scratch) {
+		auto path = string(entry.path);
+		steps_scratch.clear();
+		if (!path.empty() && path[0] == '$') {
+			steps_scratch = ParseJsonoPath(path, "jsono shred manifest");
+		} else {
+			steps_scratch.push_back(PathStep {PathStepKind::Key, path, 0});
+		}
+		// A manifest path is an object-key chain by the shred writer's invariant. It covers the
+		// extract when it equals the extract path (the value itself was stripped) or extends it
+		// (a stripped leaf inside the extracted subtree). For a found scalar neither can hold;
+		// for a miss both can, for a found container only the strict extension can.
+		if (steps_scratch.size() < extract_steps.size()) {
+			continue;
+		}
+		if (found_container && steps_scratch.size() == extract_steps.size()) {
+			continue;
+		}
+		bool covers = true;
+		for (idx_t i = 0; i < extract_steps.size(); i++) {
+			auto &m = steps_scratch[i];
+			auto &e = extract_steps[i];
+			if (m.kind != e.kind || m.key != e.key || m.index != e.index) {
+				covers = false;
+				break;
+			}
+		}
+		if (covers) {
+			throw InvalidInputException(
+			    "JSONO: path '%s' was shredded into a shred this value no longer carries (the row was narrowed "
+			    "by a raw struct cast) and cannot be read losslessly",
+			    path.c_str());
+		}
+	}
+}
+
 void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = expr.bind_info->Cast<ExtractPathBindData>();
@@ -485,20 +538,22 @@ void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result
 	JsonoVectorData input;
 	InitJsonoVectorData(args.data[0], count, input);
 
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &children = StructVector::GetEntries(result);
-	auto &slots_vec = *children[0];
-	auto &key_heap_vec = *children[1];
-	auto &string_heap_vec = *children[2];
-	auto &skips_vec = *children[3];
+	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
+	InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
+	auto &slots_vec = *slots_p;
+	auto &key_heap_vec = *key_heap_p;
+	auto &string_heap_vec = *string_heap_p;
+	auto &skips_vec = *skips_p;
 	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
 	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
 	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
 	auto skips_out = FlatVector::GetData<string_t>(skips_vec);
 
+	std::vector<jsono::ShredManifestEntry> manifest_scratch;
+	vector<PathStep> steps_scratch;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
+		if (!ReadJsonoRowStrict(input, row, blob)) {
 			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
 			continue;
 		}
@@ -509,11 +564,16 @@ void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result
 		}
 		Location location;
 		if (!LocatePath(lstate, bind_data.steps, view, location)) {
+			ThrowIfManifestCoversPath(view, bind_data.steps, false, manifest_scratch, steps_scratch);
 			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
 			continue;
 		}
 		size_t pos = location.pos;
 		size_t string_cursor = location.string_cursor;
+		auto found_tag = SlotTag(view.SlotAt(pos));
+		if (found_tag == tag::OBJ_START || found_tag == tag::ARR_START) {
+			ThrowIfManifestCoversPath(view, bind_data.steps, true, manifest_scratch, steps_scratch);
+		}
 		lstate.builder.Reset();
 		EmitJsonoSubtree(view, pos, string_cursor, lstate.builder, 0);
 		WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out, string_heap_out,
@@ -536,9 +596,11 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<string_t>(result);
 	std::string scratch;
+	std::vector<jsono::ShredManifestEntry> manifest_scratch;
+	vector<PathStep> steps_scratch;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
+		if (!ReadJsonoRowStrict(input, row, blob)) {
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
@@ -549,6 +611,7 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 		}
 		Location location;
 		if (!LocatePath(lstate, bind_data.steps, view, location)) {
+			ThrowIfManifestCoversPath(view, bind_data.steps, false, manifest_scratch, steps_scratch);
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
@@ -557,6 +620,7 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 		auto slot_tag = SlotTag(view.SlotAt(pos));
 		scratch.clear();
 		if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
+			ThrowIfManifestCoversPath(view, bind_data.steps, true, manifest_scratch, steps_scratch);
 			AppendJsonValueText(view, pos, string_cursor, scratch, 0);
 			result_data[row] = StringVector::AddString(result, scratch.data(), scratch.size());
 			continue;
@@ -575,17 +639,29 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 	}
 }
 
-ScalarFunction MakeExtractFunction(string name, LogicalType path_type) {
-	ScalarFunction fun(std::move(name), {JsonoType(), std::move(path_type)}, JsonoType(), JsonoExtractExecute,
-	                   JsonoExtractBind, nullptr, nullptr, ExtractLocalState::Init);
+// Bind for the public jsono_extract/jsono_extract_string sets, which accept ANY so a shredded
+// value reaches bind: redeclare arg0 to plain JSONO (the binder inserts the lossless reconstruct
+// cast) and reject non-JSONO loudly, then run the constant-path bind. The core-named "json_extract"
+// and "->>" sets stay hard-typed on plain JSONO and use JsonoExtractBind directly.
+unique_ptr<FunctionData> JsonoExtractBindAny(ClientContext &context, ScalarFunction &bound_function,
+                                             vector<unique_ptr<Expression>> &arguments) {
+	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, true);
+	return JsonoExtractBind(context, bound_function, arguments);
+}
+
+ScalarFunction MakeExtractFunction(string name, LogicalType path_type, LogicalType arg0_type = JsonoType(),
+                                   bind_scalar_function_t bind = JsonoExtractBind) {
+	ScalarFunction fun(std::move(name), {std::move(arg0_type), std::move(path_type)}, JsonoType(), JsonoExtractExecute,
+	                   bind, nullptr, nullptr, ExtractLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 	return fun;
 }
 
-ScalarFunction MakeExtractStringFunction(string name, LogicalType path_type) {
-	ScalarFunction fun(std::move(name), {JsonoType(), std::move(path_type)}, LogicalType::VARCHAR,
-	                   JsonoExtractStringExecute, JsonoExtractBind, nullptr, nullptr, ExtractLocalState::Init);
+ScalarFunction MakeExtractStringFunction(string name, LogicalType path_type, LogicalType arg0_type = JsonoType(),
+                                         bind_scalar_function_t bind = JsonoExtractBind) {
+	ScalarFunction fun(std::move(name), {std::move(arg0_type), std::move(path_type)}, LogicalType::VARCHAR,
+	                   JsonoExtractStringExecute, bind, nullptr, nullptr, ExtractLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 	return fun;
@@ -593,7 +669,7 @@ ScalarFunction MakeExtractStringFunction(string name, LogicalType path_type) {
 
 } // namespace
 
-// Native jsono extract functions, exposed so the optimizer can read a non-lane path
+// Native jsono extract functions, exposed so the optimizer can read a non-shred path
 // straight off the shredded residual (a JSONO value) instead of routing it through
 // core json's serialize-then-parse path.
 ScalarFunction JsonoExtractStringFunction(const LogicalType &path_type) {
@@ -606,18 +682,24 @@ ScalarFunction JsonoExtractFunction(const LogicalType &path_type) {
 
 void RegisterJsonoExtract(ExtensionLoader &loader) {
 	ScalarFunctionSet extract("jsono_extract");
-	extract.AddFunction(MakeExtractFunction("jsono_extract", LogicalType::VARCHAR));
-	extract.AddFunction(MakeExtractFunction("jsono_extract", LogicalType::BIGINT));
+	extract.AddFunction(
+	    MakeExtractFunction("jsono_extract", LogicalType::VARCHAR, LogicalType::ANY, JsonoExtractBindAny));
+	extract.AddFunction(
+	    MakeExtractFunction("jsono_extract", LogicalType::BIGINT, LogicalType::ANY, JsonoExtractBindAny));
 	loader.RegisterFunction(std::move(extract));
 
+	// json_extract is core-owned: keep it hard-typed on plain JSONO (an ANY overload would tie with
+	// core's on cast cost and the first-registered — core's — would win, so ANY is unreliable here).
 	ScalarFunctionSet core_extract("json_extract");
 	core_extract.AddFunction(MakeExtractFunction("json_extract", LogicalType::VARCHAR));
 	core_extract.AddFunction(MakeExtractFunction("json_extract", LogicalType::BIGINT));
 	loader.RegisterFunction(std::move(core_extract));
 
 	ScalarFunctionSet extract_string("jsono_extract_string");
-	extract_string.AddFunction(MakeExtractStringFunction("jsono_extract_string", LogicalType::VARCHAR));
-	extract_string.AddFunction(MakeExtractStringFunction("jsono_extract_string", LogicalType::BIGINT));
+	extract_string.AddFunction(
+	    MakeExtractStringFunction("jsono_extract_string", LogicalType::VARCHAR, LogicalType::ANY, JsonoExtractBindAny));
+	extract_string.AddFunction(
+	    MakeExtractStringFunction("jsono_extract_string", LogicalType::BIGINT, LogicalType::ANY, JsonoExtractBindAny));
 	loader.RegisterFunction(std::move(extract_string));
 
 	ScalarFunctionSet arrow_string("->>");

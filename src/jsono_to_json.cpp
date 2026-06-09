@@ -157,7 +157,7 @@ void WriteJsonoAsJson(Vector &input, idx_t count, Vector &result) {
 
 	for (idx_t i = 0; i < count; i++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input_data, i, blob)) {
+		if (!ReadJsonoRowStrict(input_data, i, blob)) {
 			FlatVector::SetNull(result, i, true);
 			continue;
 		}
@@ -190,6 +190,35 @@ bool JsonoCastToJson(Vector &source, Vector &result, idx_t count, CastParameters
 	return true;
 }
 
+// Cast a shredded JSONO value to its JSON text: reconstruct the plain document first, then serialize
+// (same output as the optimizer's jsono_overlay + JsonoCastToJson path). Without this, a shredded
+// struct->VARCHAR would fall to the default struct text and leak the physical "#fp" field names.
+bool JsonoShreddedToVarcharCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	(void)parameters;
+	Vector plain(JsonoType(), count);
+	JsonoReconstructToPlain(source, count, plain);
+	WriteJsonoAsJson(plain, count, result);
+	if (source.GetVectorType() == VectorType::CONSTANT_VECTOR && count > 0) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+	return true;
+}
+
+// Wildcard STRUCT(any)->VARCHAR bind: a shredded JSONO value serializes to JSON text; any other
+// struct declines (a null-function BoundCastInfo), so the cast set falls through to the default
+// struct->VARCHAR text cast — byte-identical to stock DuckDB for non-jsono structs. The exact
+// plain-JSONO->VARCHAR entry (registered below) is matched before this wildcard, so a plain value
+// is unaffected. There is no equivalent for ->JSON: core json owns STRUCT(any)->JSON and the cast
+// registry keeps the first registration, so shredded ::JSON / to_json stay the optimizer's job.
+BoundCastInfo JsonoStructToVarcharCastBind(BindCastInput &input, const LogicalType &source, const LogicalType &target) {
+	(void)input;
+	(void)target;
+	if (IsShreddedJsonoType(source)) {
+		return BoundCastInfo(JsonoShreddedToVarcharCast);
+	}
+	return BoundCastInfo(nullptr);
+}
+
 } // namespace
 
 void RegisterJsonoToJson(ExtensionLoader &loader) {
@@ -201,6 +230,10 @@ void RegisterJsonoToJson(ExtensionLoader &loader) {
 	}
 	loader.RegisterCastFunction(jsono_type, LogicalType::JSON(), BoundCastInfo(JsonoCastToJson), -1);
 	loader.RegisterCastFunction(jsono_type, LogicalType::VARCHAR, BoundCastInfo(JsonoCastToJson), -1);
+	// Bind-correct shredded->VARCHAR (declines for non-jsono structs). Explicit-only (-1): struct is
+	// not implicitly castable to VARCHAR, and this entry must not make it so.
+	loader.RegisterCastFunction(LogicalType::STRUCT({{"any", LogicalType::ANY}}), LogicalType::VARCHAR,
+	                            JsonoStructToVarcharCastBind, -1);
 }
 
 } // namespace duckdb

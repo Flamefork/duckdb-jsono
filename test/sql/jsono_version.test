@@ -9,16 +9,16 @@ require jsono
 query I
 SELECT jsono_version();
 ----
-2
+3
 
 # A blob with the right magic ('JSNO', little-endian 4A 53 4E 4F) but a newer version byte
-# (0x03) is data written by another build, not garbage. Reading it must FAIL LOUD rather than
+# (0x04) is data written by another build, not garbage. Reading it must FAIL LOUD rather than
 # silently yield SQL NULL across every stored row (which a stripped/shredded residual makes
-# undetectable downstream).
+# undetectable downstream). The hand-built value uses the nested storage layout.
 statement error
 SELECT jsono_extract_string(
-  {'jsono_slots': '\x4A\x53\x4E\x4F\x03\x00\x00\x00'::BLOB,
-   'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}, '$.a');
+  {'jsono': {'body': {'slots': '\x4A\x53\x4E\x4F\x04\x00\x00\x00'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB}}}, '$.a');
 ----
 JSONO format version mismatch
 
@@ -26,8 +26,8 @@ JSONO format version mismatch
 # reads as SQL NULL. This is the only non-throwing case: the value is absent, not corrupt.
 query I
 SELECT jsono_extract_string(
-  {'jsono_slots': '\x4A\x53\x4E\x4F\x02\x00\x00\x00'::BLOB,
-   'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}, '$.a');
+  {'jsono': {'body': {'slots': '\x4A\x53\x4E\x4F\x03\x00\x00\x00'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB}}}, '$.a');
 ----
 NULL
 
@@ -36,8 +36,8 @@ NULL
 # a version drift. (Only a slots blob too short to hold a header reads as NULL: absent value.)
 statement error
 SELECT jsono_extract_string(
-  {'jsono_slots': '\xDE\xAD\xBE\xEF\x03\x00\x00\x00'::BLOB,
-   'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}, '$.a');
+  {'jsono': {'body': {'slots': '\xDE\xAD\xBE\xEF\x03\x00\x00\x00'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB}}}, '$.a');
 ----
 not a JSONO value
 
@@ -45,8 +45,8 @@ not a JSONO value
 # rather than erroring: non-JSONO bytes -> false, not a raised error.
 query I
 SELECT jsono_validate(
-  {'jsono_slots': '\xDE\xAD\xBE\xEF\x03\x00\x00\x00'::BLOB,
-   'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB});
+  {'jsono': {'body': {'slots': '\xDE\xAD\xBE\xEF\x03\x00\x00\x00'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB}}});
 ----
 false
 
@@ -54,7 +54,7 @@ false
 # so it reads as SQL NULL (the only non-throwing path).
 query I
 SELECT jsono_extract_string(
-  {'jsono_slots': '\x4A\x53'::BLOB,
-   'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}, '$.a');
+  {'jsono': {'body': {'slots': '\x4A\x53'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB}}}, '$.a');
 ----
 NULL

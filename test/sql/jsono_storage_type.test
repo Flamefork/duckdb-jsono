@@ -13,12 +13,12 @@ require json
 query I
 SELECT jsono_storage_type();
 ----
-STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB)
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))
 
 # A column declared with that DDL is structurally a JSONO: jsono ops bind to it
 # without an explicit cast, so the round-trip from storage form works.
 statement ok
-CREATE TABLE t (props STRUCT(jsono_slots BLOB, jsono_key_heap BLOB, jsono_string_heap BLOB, jsono_skips BLOB));
+CREATE TABLE t (props STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB))));
 
 statement ok
 INSERT INTO t SELECT jsono('{"a":1}');
@@ -42,28 +42,30 @@ true
 # Boundary of the structural match: a STRUCT that is close but not the exact
 # four jsono_* BLOB layout must NOT bind to jsono ops. Guards IsJsonoType against
 # accidentally widening (it compares names AND types against JsonoRawStructType).
+# The functions accept ANY arg0 (to reach shredded values), so a near-miss struct is
+# now rejected in the bind with "argument must be JSONO" rather than at overload resolution.
 
 # Wrong field name (jsono_slot, not jsono_slots).
 statement error
 SELECT jsono_extract_string({'jsono_slot': ''::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}, '$.a');
 ----
-No function matches
+jsono_extract_string: argument must be JSONO
 
 # Wrong field type (INTEGER where BLOB is required).
 statement error
 SELECT jsono_extract_string({'jsono_slots': 0, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB, 'jsono_skips': ''::BLOB}, '$.a');
 ----
-No function matches
+jsono_extract_string: argument must be JSONO
 
 # Wrong field count (three BLOBs, not four).
 statement error
 SELECT jsono_extract_string({'jsono_slots': ''::BLOB, 'jsono_key_heap': ''::BLOB, 'jsono_string_heap': ''::BLOB}, '$.a');
 ----
-No function matches
+jsono_extract_string: argument must be JSONO
 
-# jsono_storage_type(lanes) emits the shredded storage DDL: the 4-blob residual plus one lane
-# column per spec entry. Every field name carries the lane-set fingerprint suffix, so the DDL is
-# byte-identical to the type the constructor produces from the same lanes (asserted by equality
+# jsono_storage_type(shreds) emits the shredded storage DDL: the 4-blob residual plus one shred
+# column per spec entry. Every field name carries the shred-set fingerprint suffix, so the DDL is
+# byte-identical to the type the constructor produces from the same shreds (asserted by equality
 # rather than a hardcoded fingerprint).
 query I
 SELECT jsono_storage_type('event_name VARCHAR, n BIGINT')
@@ -71,8 +73,8 @@ SELECT jsono_storage_type('event_name VARCHAR, n BIGINT')
 ----
 true
 
-# Lane order is canonicalized (sorted by name), so the shredded type is a pure function of the lane
-# set: a reversed lane order in the DDL or the spec yields the exact same type, not just a compatible
+# Shred order is canonicalized (sorted by name), so the shredded type is a pure function of the shred
+# set: a reversed shred order in the DDL or the spec yields the exact same type, not just a compatible
 # one. This keeps jsono_storage_type and CREATE TABLE AS SELECT in lockstep regardless of order.
 query I
 SELECT jsono_storage_type('n BIGINT, event_name VARCHAR')
@@ -83,7 +85,7 @@ SELECT jsono_storage_type('n BIGINT, event_name VARCHAR')
 true
 
 # A column declared from that DDL is a valid storage column for a value shredded on the same
-# lanes (CTAS infers the fingerprinted type); the lane reads back transparently through ->>.
+# shreds (CTAS infers the fingerprinted type); the shred reads back transparently through ->>.
 statement ok
 CREATE TABLE probe_shred AS
 SELECT jsono('{"event_name":"page_view","a":1}', shredding := {'event_name':'VARCHAR'}) AS e;
@@ -93,9 +95,13 @@ SELECT e ->> 'event_name' FROM probe_shred;
 ----
 page_view
 
-# A value shredded on a different lane set is rejected rather than silently coerced into the
-# column: the fingerprint suffix makes every field name differ, so the struct cast finds no match.
-statement error
+# A value shredded on a different — even fully disjoint — shred set lands losslessly: the
+# optimizer rewrites the struct cast into reconstruct + reshred against the column's shred set.
+statement ok
 INSERT INTO probe_shred SELECT jsono('{"x":"y"}', shredding := {'x':'VARCHAR'});
+
+query I
+SELECT to_json(e)::VARCHAR FROM probe_shred ORDER BY 1;
 ----
-at least one matching member
+{"a":1,"event_name":"page_view"}
+{"x":"y"}
