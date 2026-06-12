@@ -176,3 +176,108 @@ SELECT to_json(e)::VARCHAR FROM narrow_target WHERE e ->> 'a' = 'ser';
 
 statement ok
 PRAGMA disable_verification;
+
+# --- A narrowed PLAIN value: repacking the residual body alone through a raw struct_pack keeps
+# the shred manifest in skips but drops the shreds AND the shredded type. Every reader must fail
+# loud on it, and the merge family must throw BEFORE rebuilding — a rebuilt blob would drop the
+# manifest and launder the loss into permanent undetectability. ---
+
+statement ok
+CREATE TABLE plain_narrowed AS
+SELECT struct_pack("jsono" := struct_pack(body := j."jsono".body)) AS p
+FROM (SELECT jsono('{"a":"v1","b":"v2"}', shredding := {'a':'VARCHAR'}) AS j);
+
+statement error
+SELECT to_json(p) FROM plain_narrowed;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT p::JSON FROM plain_narrowed;
+----
+narrowed by a raw struct cast
+
+# The whole-keys form would silently lose the stripped key 'a'.
+statement error
+SELECT jsono_keys(p) FROM plain_narrowed;
+----
+narrowed by a raw struct cast
+
+# A path the manifest covers reads as a silent NULL without the check.
+statement error
+SELECT jsono_type(p, '$.a') FROM plain_narrowed;
+----
+narrowed by a raw struct cast
+
+# The root type is narrow-invariant (shred paths are object-key chains, so the root stays an
+# object): the answer is complete and stays readable — same per-row granularity as extract.
+query I
+SELECT jsono_type(p) FROM plain_narrowed;
+----
+OBJECT
+
+statement error
+SELECT jsono_merge_patch(p, jsono('{}')) FROM plain_narrowed;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT jsono_group_merge(p) FROM plain_narrowed;
+----
+narrowed by a raw struct cast
+
+# The all-shredded merge fast path must verify each input's manifest against that input's own
+# shreds: the narrowed row's manifest lists 'b VARCHAR' which no input carries, so the merge
+# throws instead of re-emitting a manifest without it (laundering the loss).
+statement error
+SELECT jsono_merge_patch(e, jsono('{"z":"1"}', shredding := {'z':'VARCHAR'})) FROM narrow_target;
+----
+narrowed by a raw struct cast
+
+# --- jsono_validate must report narrowed rows as invalid: the manifest lists a shred the column
+# no longer carries, the same per-row condition every reader throws on. ---
+
+# narrow_target: the narrowed row (a=v1) is false, the honest rows in the same column stay true.
+query I
+SELECT jsono_validate(e) FROM narrow_target ORDER BY e ->> 'a';
+----
+true
+true
+false
+
+# A narrowed PLAIN value (residual repacked alone): the manifest survives in skips while the type
+# carries no shreds at all.
+query I
+SELECT jsono_validate(p) FROM plain_narrowed;
+----
+false
+
+# --- The optimizer's fused matcher/projector and the writers that re-emit a residual verify the
+# manifest too: a narrowed row must fail loud wherever its stripped value would silently change
+# the result or where a rebuilt blob would drop the manifest (laundering the loss). ---
+
+# Fused filter matcher (two predicates on one column): the stripped path 'a' must not read as a
+# silent non-match.
+statement error
+SELECT count(*) FROM plain_narrowed WHERE (p ->> 'a' = 'v1') AND (p ->> 'b' = 'v2');
+----
+narrowed by a raw struct cast
+
+# Fused projector above a passing filter: the stripped path 'a' must not project a silent NULL.
+statement error
+SELECT min(p ->> 'a') FROM plain_narrowed WHERE (p ->> 'b' = 'v2') AND (p ->> 'b' IN ['v2', 'zz']);
+----
+narrowed by a raw struct cast
+
+# Shredding a narrowed plain value re-emits the residual with a fresh manifest; without the check
+# the stripped 'a' would become permanently undetectable.
+statement error
+SELECT jsono(p, shredding := {'b': 'VARCHAR'}) FROM plain_narrowed;
+----
+narrowed by a raw struct cast
+
+# Embedding a narrowed value inside a constructed document re-emits it without its manifest.
+statement error
+SELECT to_json(jsono({'wrap': p})) FROM plain_narrowed;
+----
+narrowed by a raw struct cast

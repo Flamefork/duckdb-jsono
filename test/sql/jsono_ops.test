@@ -35,18 +35,21 @@ SELECT
 ----
 [a, b, c]	true
 
-# jsono_validate fully checks the current VERSION=2 storage contract; SQL NULL stays NULL.
+# jsono_validate fully checks the current VERSION=4 storage contract; SQL NULL stays NULL.
+# The last blob is a header plus a lone OBJ_START slot: the walk never reaches an OBJ_END.
 query IIII
 SELECT
   jsono_validate(jsono('{"a":"x","b":[1,true,null]}')),
   jsono_validate(jsono(NULL)) IS NULL,
-  jsono_validate({'jsono': {'body': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB}}}),
+  jsono_validate({'jsono': {'body': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}),
   jsono_validate({
     'jsono': {'body': {
-      'slots': unhex('4A534E4F030100000000000000000000'),
+      'slots': unhex('4A534E4F040100000000000000000000'),
       'key_heap': ''::BLOB,
       'string_heap': ''::BLOB,
-      'skips': ''::BLOB
+      'skips': ''::BLOB,
+      'lengths': ''::BLOB,
+      'nums': ''::BLOB
     }}
   });
 ----
@@ -54,14 +57,17 @@ true	true	false	false
 
 # Nested arrays must have distinct closing slots. This blob is a valid `[["x"]]`
 # value with the outer ARR_END slot removed and the outer span shortened so the
-# inner ARR_END would be reused by both arrays. VERSION=2 ContainerSpans are 16 bytes
-# (u32 slot_span, u32 string_byte_span, u64 shape_hash; arrays store shape_hash 0).
+# inner ARR_END would be reused by both arrays. VERSION=4 skips carry a sorted u32 id
+# index before the 24-byte spans (u32 slot_span, u32 string_byte_span, u64 shape_hash,
+# u32 length_count, u32 num_count); the "x" length lives in the lengths stream.
 query I
 SELECT jsono_validate({'jsono': {'body': {
-  'slots': unhex('4A534E4F030100000000000000000020000000010000002001000000000000800000000000000030'),
+  'slots': unhex('4A534E4F0401000000000000000000200000000100000020000000000000008000000000000000'||'30'),
   'key_heap': ''::BLOB,
   'string_heap': unhex('78'),
-  'skips': unhex('0200000000000000000000000400000001000000000000000000000003000000010000000000000000000000')
+  'skips': unhex('020000000000000000000000'||'0000000001000000'||'040000000100000000000000000000000100000000000000'||'030000000100000000000000000000000100000000000000'),
+  'lengths': unhex('01000000'),
+  'nums': ''::BLOB
 }}});
 ----
 false
@@ -77,31 +83,36 @@ SELECT
     'slots': raw."jsono".body.slots,
     'key_heap': unhex('FF'),
     'string_heap': raw."jsono".body.string_heap,
-    'skips': raw."jsono".body.skips
+    'skips': raw."jsono".body.skips,
+    'lengths': raw."jsono".body.lengths,
+    'nums': raw."jsono".body.nums
   }}})
 FROM base;
 ----
 true	false
 
-# jsono_storage_size reports the physical footprint without validating the value: the four body
+# jsono_storage_size reports the physical footprint without validating the value: the six body
 # BLOBs, a `shreds` field (shredded shred payload bytes, 0 for a plain value) and their `total`.
-query IIIIIII
+# A 1-key object stores no container span, so skips is the bare 12-byte metadata header.
+query IIIIIIIII
 SELECT
   s.slots,
   s.key_heap,
   s.string_heap,
   s.skips,
+  s.lengths,
+  s.nums,
   s.shreds,
   s.total,
   jsono_storage_size(jsono(NULL)) IS NULL
 FROM (SELECT jsono_storage_size(jsono('{"a":"x"}')) AS s);
 ----
-40	1	1	28	0	70	true
+40	1	1	12	4	0	0	58	true
 
 # A shredded value adds shred payload bytes: a VARCHAR shred counts its string length (5), a BIGINT
 # shred counts 8; total covers the body blobs plus the shreds.
 query II
-SELECT s.shreds, s.total = s.slots + s.key_heap + s.string_heap + s.skips + s.shreds
+SELECT s.shreds, s.total = s.slots + s.key_heap + s.string_heap + s.skips + s.lengths + s.nums + s.shreds
 FROM (SELECT jsono_storage_size(jsono('{"name":"hello","n":7,"b":{"c":2}}', shredding := {'name':'VARCHAR','$.n':'BIGINT'})) AS s);
 ----
 13	true

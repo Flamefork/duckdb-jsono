@@ -2,6 +2,7 @@
 #include "jsono.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_row_read.hpp"
 #include "jsono_shred.hpp"
 #include "jsono_writer.hpp"
 
@@ -34,13 +35,12 @@ using namespace jsono;
 // powers shredded reconstruction: the residual (A) wins, shreds (B) fill stripped paths.
 enum class MergeMode : uint8_t { Patch, IgnoreNulls, Overlay };
 
-// One object child captured in a single pass: its key, the value's slot/string
-// position, and the value's slot tag. Capturing the tag here lets the merge loop
-// classify null/object children without re-reading slots.
+// One object child captured in a single pass: its key, the value's cursor (slot
+// position plus all three stream cursors), and the value's slot tag. Capturing the
+// tag here lets the merge loop classify null/object children without re-reading slots.
 struct MergeChild {
 	nonstd::string_view key;
-	size_t pos;
-	size_t string_cursor;
+	JsonoCursor cursor;
 	uint64_t tag;
 };
 
@@ -76,83 +76,79 @@ struct JsonoOpsLocalState : public FunctionLocalState {
 // own nulls stripped. IgnoreNulls implements jsono_group_merge (null members
 // dropped). Array values (and everything nested inside an array) are verbatim.
 
-// Copy a scalar value at (pos, string_cursor) byte-for-byte into the builder,
-// advancing pos/string_cursor. Equivalent to decoding the scalar and re-emitting
-// it, but without reconstructing the value: every scalar encoding round-trips to
-// the identical slot(s) (INT60/DEC60 re-encode to themselves; ext INT64/UINT64/
-// DOUBLE re-store the same raw bits; STR_HEAP/NUMBER re-append the same heap
-// bytes), so copying the source slot(s) and heap slice is the same result with
-// none of the decode/re-classify work. Caller must have excluded container slots.
-void EmitScalarVerbatim(const JsonoView &view, size_t &pos, size_t &string_cursor, JsonoBuilder &builder) {
-	auto slot = view.SlotAt(pos);
+// Copy a scalar value at `cursor` byte-for-byte into the builder, advancing the
+// cursor. Equivalent to decoding the scalar and re-emitting it, but without
+// reconstructing the value: every scalar encoding round-trips to the identical
+// slot + stream entries (INT60/DEC60 re-store the same nums word; ext INT64/
+// UINT64/DOUBLE re-store the same raw bits; STR_HEAP/NUMBER re-append the same
+// heap bytes and length entry), so copying the source slot and stream entries is
+// the same result with none of the decode/re-classify work. Caller must have
+// excluded container slots.
+void EmitScalarVerbatim(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &builder) {
+	auto slot = view.SlotAt(cursor.pos);
 	auto slot_tag = SlotTag(slot);
 	switch (slot_tag) {
 	case tag::VAL_STR_HEAP: {
-		auto len = size_t(StringLen(SlotPayload(slot)));
-		auto s = view.StringAt(string_cursor, len);
+		auto len = view.LengthAt(cursor.length_cursor);
+		auto s = view.StringAt(cursor.string_cursor, len);
 		builder.string_heap.insert(builder.string_heap.end(), s.begin(), s.end());
+		builder.lengths.push_back(len);
 		builder.slots.push_back(slot);
-		string_cursor += len;
-		pos++;
+		cursor.string_cursor += len;
+		cursor.length_cursor++;
+		cursor.pos++;
 		return;
 	}
 	case tag::VAL_EXT: {
 		auto subtype = ExtSubtype(slot);
-		auto slot_count = ExtSlotCount(subtype);
-		if (slot_count > view.Slots() - pos) {
-			throw InvalidInputException("malformed JSONO: extended scalar payload out of bounds");
-		}
 		if (subtype == ext_subtype::NUMBER) {
-			auto len = size_t(NumberExtLen(slot));
-			auto s = view.StringAt(string_cursor, len);
+			auto len = view.LengthAt(cursor.length_cursor);
+			auto s = view.StringAt(cursor.string_cursor, len);
 			builder.string_heap.insert(builder.string_heap.end(), s.begin(), s.end());
+			builder.lengths.push_back(len);
 			builder.slots.push_back(slot);
-			string_cursor += len;
-			pos++;
+			cursor.string_cursor += len;
+			cursor.length_cursor++;
+			cursor.pos++;
 			return;
 		}
+		if (subtype >= ext_subtype::COUNT) {
+			throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
+		}
 		builder.slots.push_back(slot);
-		builder.slots.push_back(view.SlotAt(pos + 1));
-		pos += slot_count;
+		builder.nums.push_back(view.NumAt(cursor.num_cursor));
+		cursor.num_cursor++;
+		cursor.pos++;
 		return;
 	}
 	case tag::VAL_INT60:
 	case tag::VAL_DEC60:
+		builder.slots.push_back(slot);
+		builder.nums.push_back(view.NumAt(cursor.num_cursor));
+		cursor.num_cursor++;
+		cursor.pos++;
+		return;
 	case tag::VAL_TRUE:
 	case tag::VAL_FALSE:
 	case tag::VAL_NULL:
 		builder.slots.push_back(slot);
-		pos++;
+		cursor.pos++;
 		return;
 	default:
 		throw InvalidInputException("malformed JSONO: non-value slot in value position");
 	}
 }
 
-// Push a scalar value's slot(s) verbatim WITHOUT copying its string bytes. Used by
-// the merge value phase to emit a run of scalars whose string bytes are copied in
-// one bulk insert (a contiguous slice of the source string_heap): per-child it
-// only touches `slots` (cheap), and the heap is filled once. Caller must have
-// excluded containers.
+// Push a scalar value's slot verbatim WITHOUT copying its stream entries. Used by
+// the merge value phase to emit a run of scalars whose string bytes and lengths/
+// nums entries are copied in bulk (contiguous slices of the source streams):
+// per-child it only touches `slots` (cheap), and the streams are filled once.
+// Caller must have excluded containers.
 void PushScalarValueSlots(const JsonoView &view, size_t pos, JsonoBuilder &builder) {
 	auto slot = view.SlotAt(pos);
-	auto slot_tag = SlotTag(slot);
-	switch (slot_tag) {
+	switch (SlotTag(slot)) {
 	case tag::VAL_STR_HEAP:
-		builder.slots.push_back(slot);
-		return;
-	case tag::VAL_EXT: {
-		auto subtype = ExtSubtype(slot);
-		auto slot_count = ExtSlotCount(subtype);
-		if (slot_count > view.Slots() - pos) {
-			throw InvalidInputException("malformed JSONO: extended scalar payload out of bounds");
-		}
-		builder.slots.push_back(slot);
-		if (subtype != ext_subtype::NUMBER) {
-			builder.slots.push_back(view.SlotAt(pos + 1));
-		}
-		return;
-	}
+	case tag::VAL_EXT:
 	case tag::VAL_INT60:
 	case tag::VAL_DEC60:
 	case tag::VAL_TRUE:
@@ -165,14 +161,14 @@ void PushScalarValueSlots(const JsonoView &view, size_t pos, JsonoBuilder &build
 	}
 }
 
-void EmitValueVerbatim(const JsonoView &view, size_t &pos, size_t &string_cursor, JsonoBuilder &builder, size_t depth) {
+void EmitValueVerbatim(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &builder, size_t depth) {
 	if (depth > JSONO_MAX_NESTING_DEPTH) {
 		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
 		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
 	}
-	auto slot_tag = SlotTag(view.SlotAt(pos));
+	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
 	if (slot_tag == tag::OBJ_START) {
-		auto layout = ReadObjectLayout(view, pos);
+		auto layout = ReadObjectLayout(view, cursor.pos);
 		builder.EmitObjectStart(layout.key_count);
 		for (size_t i = 0; i < layout.key_count; i++) {
 			auto key_slot = view.SlotAt(layout.key_start + i);
@@ -181,36 +177,41 @@ void EmitValueVerbatim(const JsonoView &view, size_t &pos, size_t &string_cursor
 			}
 			builder.EmitKeySlot(view.KeyAt(SlotPayload(key_slot)));
 		}
-		size_t val_pos = layout.value_start;
+		cursor.pos = layout.value_start;
 		for (size_t i = 0; i < layout.key_count; i++) {
 			builder.EmitObjectChildStart();
-			EmitValueVerbatim(view, val_pos, string_cursor, builder, depth + 1);
+			EmitValueVerbatim(view, cursor, builder, depth + 1);
 		}
 		builder.EmitObjectEnd();
-		pos = layout.after_pos;
+		if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
+			throw InvalidInputException("malformed JSONO: object value span mismatch");
+		}
+		cursor.pos++;
 		return;
 	}
 	if (slot_tag == tag::ARR_START) {
-		auto end_pos = ReadArrayEndPos(view, pos);
+		auto end_pos = ReadArrayEndPos(view, cursor.pos);
 		builder.EmitArrayStart();
-		pos++;
-		while (pos < end_pos) {
-			EmitValueVerbatim(view, pos, string_cursor, builder, depth + 1);
+		cursor.pos++;
+		while (cursor.pos < end_pos) {
+			EmitValueVerbatim(view, cursor, builder, depth + 1);
 		}
 		builder.EmitArrayEnd();
-		pos = end_pos + 1;
+		cursor.pos = end_pos + 1;
 		return;
 	}
-	EmitScalarVerbatim(view, pos, string_cursor, builder);
+	EmitScalarVerbatim(view, cursor, builder);
 }
 
-void EmitValueStrip(const JsonoView &view, size_t &pos, size_t &string_cursor, JsonoBuilder &builder,
-                    MergeMode merge_mode, size_t depth);
+void EmitValueStrip(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &builder, MergeMode merge_mode,
+                    size_t depth);
 
 // True if the value at `pos` keeps any content under IGNORE NULLS stripping: a non-null
 // scalar or array survives; an object survives iff some member survives (recursively).
 // Used to omit keys whose object value strips to empty — jsono_group_merge drops
-// `key:{}`, unlike jsono_merge_patch Patch mode which keeps it. Read-only navigation;
+// `key:{}`, unlike jsono_merge_patch Patch mode which keeps it. Read-only navigation
+// with a position-only cursor (the stream cursors start at zero: slot advancement does
+// not depend on stream values, and zero-based prefix sums stay within bounds);
 // early-exits on the first surviving leaf so non-empty objects cost ~one probe.
 bool ValueSurvivesIgnoreNulls(const JsonoView &view, size_t pos) {
 	auto slot_tag = SlotTag(view.SlotAt(pos));
@@ -221,13 +222,13 @@ bool ValueSurvivesIgnoreNulls(const JsonoView &view, size_t pos) {
 		return true;
 	}
 	auto layout = ReadObjectLayout(view, pos);
-	size_t vp = layout.value_start;
-	size_t sc = 0;
+	JsonoCursor probe;
+	probe.pos = layout.value_start;
 	for (size_t i = 0; i < layout.key_count; i++) {
-		if (ValueSurvivesIgnoreNulls(view, vp)) {
+		if (ValueSurvivesIgnoreNulls(view, probe.pos)) {
 			return true;
 		}
-		SkipValueFast(view, vp, sc);
+		SkipValueFast(view, probe);
 	}
 	return false;
 }
@@ -242,13 +243,15 @@ inline bool MemberSurvivesStrip(const JsonoView &view, size_t vp, MergeMode merg
 	return merge_mode == MergeMode::Patch || ValueSurvivesIgnoreNulls(view, vp);
 }
 
-void EmitObjectStrip(const JsonoView &view, size_t obj_pos, size_t obj_string_cursor, JsonoBuilder &builder,
-                     MergeMode merge_mode, size_t depth) {
+void EmitObjectStrip(const JsonoView &view, const JsonoCursor &obj_cursor, JsonoBuilder &builder, MergeMode merge_mode,
+                     size_t depth) {
 	if (depth > JSONO_MAX_NESTING_DEPTH) {
 		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
 		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
 	}
-	auto layout = ReadObjectLayout(view, obj_pos);
+	auto layout = ReadObjectLayout(view, obj_cursor.pos);
+	JsonoCursor value_start_cursor = obj_cursor;
+	value_start_cursor.pos = layout.value_start;
 	// Cache the per-member survival mask once. The IGNORE NULLS survival probe is
 	// recursive, so recomputing it across the count/key/value passes is wasteful — and
 	// with the mask the count and key passes need no slot walk at all (keys are addressed
@@ -259,15 +262,14 @@ void EmitObjectStrip(const JsonoView &view, size_t obj_pos, size_t obj_string_cu
 	bool cached = layout.key_count <= MASK_STACK;
 	size_t count = 0;
 	{
-		size_t vp = layout.value_start;
-		size_t sc = obj_string_cursor;
+		JsonoCursor vc = value_start_cursor;
 		for (size_t i = 0; i < layout.key_count; i++) {
-			bool survives = MemberSurvivesStrip(view, vp, merge_mode);
+			bool survives = MemberSurvivesStrip(view, vc.pos, merge_mode);
 			if (cached) {
 				keep[i] = survives ? 1 : 0;
 			}
 			count += survives ? 1 : 0;
-			SkipValueFast(view, vp, sc);
+			SkipValueFast(view, vc);
 		}
 	}
 	builder.EmitObjectStart(count);
@@ -283,50 +285,46 @@ void EmitObjectStrip(const JsonoView &view, size_t obj_pos, size_t obj_string_cu
 			builder.EmitKeySlot(view.KeyAt(SlotPayload(key_slot)));
 		}
 	} else {
-		size_t vp = layout.value_start;
-		size_t sc = obj_string_cursor;
+		JsonoCursor vc = value_start_cursor;
 		for (size_t i = 0; i < layout.key_count; i++) {
-			if (MemberSurvivesStrip(view, vp, merge_mode)) {
+			if (MemberSurvivesStrip(view, vc.pos, merge_mode)) {
 				auto key_slot = view.SlotAt(layout.key_start + i);
 				if (SlotTag(key_slot) != tag::KEY) {
 					throw InvalidInputException("malformed JSONO: object key slot expected");
 				}
 				builder.EmitKeySlot(view.KeyAt(SlotPayload(key_slot)));
 			}
-			SkipValueFast(view, vp, sc);
+			SkipValueFast(view, vc);
 		}
 	}
 	{
-		size_t vp = layout.value_start;
-		size_t sc = obj_string_cursor;
+		JsonoCursor vc = value_start_cursor;
 		for (size_t i = 0; i < layout.key_count; i++) {
-			bool survives = cached ? (keep[i] != 0) : MemberSurvivesStrip(view, vp, merge_mode);
+			bool survives = cached ? (keep[i] != 0) : MemberSurvivesStrip(view, vc.pos, merge_mode);
 			if (!survives) {
-				SkipValueFast(view, vp, sc);
+				SkipValueFast(view, vc);
 				continue;
 			}
 			builder.EmitObjectChildStart();
-			EmitValueStrip(view, vp, sc, builder, merge_mode, depth + 1);
+			EmitValueStrip(view, vc, builder, merge_mode, depth + 1);
 		}
 	}
 	builder.EmitObjectEnd();
 }
 
-void EmitValueStrip(const JsonoView &view, size_t &pos, size_t &string_cursor, JsonoBuilder &builder,
-                    MergeMode merge_mode, size_t depth) {
-	auto slot_tag = SlotTag(view.SlotAt(pos));
+void EmitValueStrip(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &builder, MergeMode merge_mode,
+                    size_t depth) {
+	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
 	if (slot_tag == tag::OBJ_START) {
-		EmitObjectStrip(view, pos, string_cursor, builder, merge_mode, depth);
-		auto span = CheckedContainerSpan(view, pos, tag::OBJ_START);
-		pos += size_t(span.slot_span);
-		string_cursor += size_t(span.string_byte_span);
+		EmitObjectStrip(view, cursor, builder, merge_mode, depth);
+		SkipValueFast(view, cursor);
 		return;
 	}
 	if (slot_tag == tag::ARR_START) {
-		EmitValueVerbatim(view, pos, string_cursor, builder, depth);
+		EmitValueVerbatim(view, cursor, builder, depth);
 		return;
 	}
-	EmitScalarVerbatim(view, pos, string_cursor, builder);
+	EmitScalarVerbatim(view, cursor, builder);
 }
 
 int CompareJsonoKeys(nonstd::string_view a, nonstd::string_view b) {
@@ -346,45 +344,48 @@ int CompareJsonoKeys(nonstd::string_view a, nonstd::string_view b) {
 	return 0;
 }
 
-// Captures every child and returns the string cursor just past the last child, so
-// the merge value phase can read child r's string-heap span as the gap between
-// consecutive children's cursors (out[r+1].string_cursor, or this end for the last
-// child) without re-decoding the value.
-size_t CollectObjectChildren(const JsonoView &view, const ObjectLayout &layout, size_t obj_string_cursor,
-                             std::vector<MergeChild> &out) {
+// Captures every child and returns the cursor just past the last child, so the merge
+// value phase can read child r's per-stream span as the gap between consecutive
+// children's cursors (out[r+1].cursor, or this end for the last child) without
+// re-decoding the value.
+JsonoCursor CollectObjectChildren(const JsonoView &view, const ObjectLayout &layout, const JsonoCursor &obj_cursor,
+                                  std::vector<MergeChild> &out) {
 	out.clear();
 	out.reserve(layout.key_count);
-	size_t vp = layout.value_start;
-	size_t sc = obj_string_cursor;
+	JsonoCursor vc = obj_cursor;
+	vc.pos = layout.value_start;
 	for (size_t i = 0; i < layout.key_count; i++) {
 		auto key_slot = view.SlotAt(layout.key_start + i);
 		if (SlotTag(key_slot) != tag::KEY) {
 			throw InvalidInputException("malformed JSONO: object key slot expected");
 		}
 		auto key = view.KeyAt(SlotPayload(key_slot));
-		auto value_slot = view.SlotAt(vp);
-		out.push_back(MergeChild {key, vp, sc, SlotTag(value_slot)});
-		SkipValueFastFromSlot(view, value_slot, vp, sc);
+		if (vc.pos >= view.Slots()) {
+			throw InvalidInputException("malformed JSONO: value position out of bounds");
+		}
+		auto value_slot = view.SlotAt(vc.pos);
+		out.push_back(MergeChild {key, vc, SlotTag(value_slot)});
+		SkipValueFastFromSlot(view, value_slot, vc);
 	}
-	return sc;
+	return vc;
 }
 
-void MergeTwoObjects(const JsonoView &va, size_t pos_a, size_t sc_a, const JsonoView &vb, size_t pos_b, size_t sc_b,
+void MergeTwoObjects(const JsonoView &va, const JsonoCursor &cursor_a, const JsonoView &vb, const JsonoCursor &cursor_b,
                      JsonoBuilder &builder, MergeMode merge_mode, size_t depth);
 
 // Merge two object views into the builder (B patches A), sorted-key linear merge.
-void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, const JsonoView &vb, size_t pos_b,
-                                size_t sc_b, JsonoBuilder &builder, MergeMode merge_mode, size_t depth,
+void MergeTwoObjectsWithScratch(const JsonoView &va, const JsonoCursor &cursor_a, const JsonoView &vb,
+                                const JsonoCursor &cursor_b, JsonoBuilder &builder, MergeMode merge_mode, size_t depth,
                                 std::vector<MergeChild> &children_a, std::vector<MergeChild> &children_b,
                                 std::vector<MergePlanEntry> &plan) {
 	if (depth > JSONO_MAX_NESTING_DEPTH) {
 		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
 		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
 	}
-	auto layout_a = ReadObjectLayout(va, pos_a);
-	auto layout_b = ReadObjectLayout(vb, pos_b);
-	size_t children_a_end = CollectObjectChildren(va, layout_a, sc_a, children_a);
-	size_t children_b_end = CollectObjectChildren(vb, layout_b, sc_b, children_b);
+	auto layout_a = ReadObjectLayout(va, cursor_a.pos);
+	auto layout_b = ReadObjectLayout(vb, cursor_b.pos);
+	JsonoCursor children_a_end = CollectObjectChildren(va, layout_a, cursor_a, children_a);
+	JsonoCursor children_b_end = CollectObjectChildren(vb, layout_b, cursor_b, children_b);
 
 	plan.clear();
 	plan.reserve(children_a.size() + children_b.size());
@@ -413,7 +414,7 @@ void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, 
 			// B-only key. Patch keeps every non-null member (RFC 7396 may leave `{}`);
 			// Overlay and IGNORE NULLS drop a member whose object value strips to empty.
 			if (children_b[ib].tag != tag::VAL_NULL &&
-			    (merge_mode == MergeMode::Patch || ValueSurvivesIgnoreNulls(vb, children_b[ib].pos))) {
+			    (merge_mode == MergeMode::Patch || ValueSurvivesIgnoreNulls(vb, children_b[ib].cursor.pos))) {
 				plan.push_back(MergePlanEntry {children_b[ib].key, MergeSrc::B, 0, ib});
 			}
 			ib++;
@@ -433,7 +434,7 @@ void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, 
 				if (children_a[ia].tag == tag::OBJ_START && children_b[ib].tag == tag::OBJ_START) {
 					// Recurse keeps A's surviving members, so the merged object is non-empty.
 					plan.push_back(MergePlanEntry {children_a[ia].key, MergeSrc::Recurse, ia, ib});
-				} else if (merge_mode == MergeMode::Patch || ValueSurvivesIgnoreNulls(vb, children_b[ib].pos)) {
+				} else if (merge_mode == MergeMode::Patch || ValueSurvivesIgnoreNulls(vb, children_b[ib].cursor.pos)) {
 					plan.push_back(MergePlanEntry {children_b[ib].key, MergeSrc::B, ia, ib});
 				}
 			} else if (merge_mode == MergeMode::IgnoreNulls && children_a[ia].tag != tag::VAL_NULL) {
@@ -471,13 +472,15 @@ void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, 
 		kk = key_run_end;
 	}
 	// Value block. Consecutive scalar children from one source have their string
-	// bytes in a contiguous slice of that source's string_heap (null-stripping
-	// removes keys/slots but never string bytes), so a run is copied with one bulk
-	// insert instead of one insert per value. A run stops at a source change, a
-	// container child (emitted per-leaf), or a checkpoint-stride boundary. The
-	// stride stop keeps the builder's per-child EmitObjectChildStart snapshots
-	// correct: within a run only its first index can be a stride multiple, and that
-	// snapshot reads the sizes the already-emitted prior run left behind.
+	// bytes and lengths/nums entries in contiguous slices of that source's streams
+	// (null-stripping removes keys/slots but never stream entries of kept members),
+	// so a run is copied with one bulk insert per stream instead of one insert per
+	// value. A run stops at a source change, a container child (emitted per-leaf), a
+	// stream-cursor gap (a stripped member carried stream entries), or a
+	// checkpoint-stride boundary. The stride stop keeps the builder's per-child
+	// EmitObjectChildStart snapshots correct: within a run only its first index can
+	// be a stride multiple, and that snapshot reads the sizes the already-emitted
+	// prior run left behind.
 	bool has_checkpoints;
 	size_t stride;
 	{
@@ -492,41 +495,40 @@ void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, 
 		auto src = plan[k].src;
 		if (src == MergeSrc::Recurse) {
 			builder.EmitObjectChildStart();
-			MergeTwoObjects(va, children_a[plan[k].ra].pos, children_a[plan[k].ra].string_cursor, vb,
-			                children_b[plan[k].rb].pos, children_b[plan[k].rb].string_cursor, builder, merge_mode,
+			MergeTwoObjects(va, children_a[plan[k].ra].cursor, vb, children_b[plan[k].rb].cursor, builder, merge_mode,
 			                depth + 1);
 			k++;
 			continue;
 		}
 		const JsonoView &vsrc = src == MergeSrc::A ? va : vb;
 		auto &csrc = src == MergeSrc::A ? children_a : children_b;
-		size_t csrc_end = src == MergeSrc::A ? children_a_end : children_b_end;
+		const JsonoCursor &csrc_end = src == MergeSrc::A ? children_a_end : children_b_end;
 		size_t rank = src == MergeSrc::A ? plan[k].ra : plan[k].rb;
 		auto value_tag = csrc[rank].tag;
 		if (value_tag == tag::OBJ_START || value_tag == tag::ARR_START) {
 			builder.EmitObjectChildStart();
-			size_t p = csrc[rank].pos;
-			size_t sc = csrc[rank].string_cursor;
+			JsonoCursor c = csrc[rank].cursor;
 			// A-side under Patch/Overlay is the verbatim target (A authoritative, keep
 			// its nested nulls); the B-side under any mode strips null members so an
 			// Overlay shred refill never re-introduces a null the residual dropped.
 			if (src == MergeSrc::A && (merge_mode == MergeMode::Overlay || merge_mode == MergeMode::Patch)) {
-				EmitValueVerbatim(vsrc, p, sc, builder, depth + 1);
+				EmitValueVerbatim(vsrc, c, builder, depth + 1);
 			} else {
-				EmitValueStrip(vsrc, p, sc, builder, merge_mode, depth + 1);
+				EmitValueStrip(vsrc, c, builder, merge_mode, depth + 1);
 			}
 			k++;
 			continue;
 		}
 		// Extend the scalar run: same source, scalar value, before the next stride
-		// boundary, and string-contiguous in the source heap. A child's string span
-		// is the gap between its cursor and the next child's (csrc_end for the last),
-		// so member `r` is contiguous with the run iff its cursor equals the position
-		// just past the previous member. A base member stripped for being null leaves
-		// no string bytes, so the slice spans it; a member stripped by a patch null
-		// can carry bytes (string/number/object), which break the run there.
+		// boundary, and stream-contiguous in the source. A child's per-stream span is
+		// the gap between its cursor and the next child's (csrc_end for the last), so
+		// member `r` is contiguous with the run iff its cursor equals the position
+		// just past the previous member on EVERY stream. A base member stripped for
+		// being null leaves no stream entries, so the slices span it; a member
+		// stripped by a patch null can carry entries (string/number/object), which
+		// break the run there.
 		size_t boundary = has_checkpoints ? (k / stride + 1) * stride : plan_size;
-		size_t first_string_cursor = csrc[rank].string_cursor;
+		JsonoCursor first_cursor = csrc[rank].cursor;
 		size_t last_rank = rank;
 		size_t run_end = k + 1;
 		while (run_end < boundary && run_end < plan_size && plan[run_end].src == src) {
@@ -535,8 +537,11 @@ void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, 
 			if (run_tag == tag::OBJ_START || run_tag == tag::ARR_START) {
 				break;
 			}
-			size_t after_last = last_rank + 1 < csrc.size() ? csrc[last_rank + 1].string_cursor : csrc_end;
-			if (csrc[run_rank].string_cursor != after_last) {
+			const JsonoCursor &after_last = last_rank + 1 < csrc.size() ? csrc[last_rank + 1].cursor : csrc_end;
+			auto &run_cursor = csrc[run_rank].cursor;
+			if (run_cursor.string_cursor != after_last.string_cursor ||
+			    run_cursor.length_cursor != after_last.length_cursor ||
+			    run_cursor.num_cursor != after_last.num_cursor) {
 				break;
 			}
 			last_rank = run_rank;
@@ -549,25 +554,39 @@ void MergeTwoObjectsWithScratch(const JsonoView &va, size_t pos_a, size_t sc_a, 
 		}
 		for (size_t i = k; i < run_end; i++) {
 			size_t run_rank = src == MergeSrc::A ? plan[i].ra : plan[i].rb;
-			PushScalarValueSlots(vsrc, csrc[run_rank].pos, builder);
+			PushScalarValueSlots(vsrc, csrc[run_rank].cursor.pos, builder);
 		}
-		size_t run_string_end = last_rank + 1 < csrc.size() ? csrc[last_rank + 1].string_cursor : csrc_end;
-		if (run_string_end > first_string_cursor) {
-			auto slice = vsrc.StringAt(first_string_cursor, run_string_end - first_string_cursor);
+		const JsonoCursor &run_end_cursor = last_rank + 1 < csrc.size() ? csrc[last_rank + 1].cursor : csrc_end;
+		if (run_end_cursor.string_cursor > first_cursor.string_cursor) {
+			auto slice =
+			    vsrc.StringAt(first_cursor.string_cursor, run_end_cursor.string_cursor - first_cursor.string_cursor);
 			builder.string_heap.insert(builder.string_heap.end(), slice.begin(), slice.end());
+		}
+		if (run_end_cursor.length_cursor > first_cursor.length_cursor) {
+			auto entry_count = run_end_cursor.length_cursor - first_cursor.length_cursor;
+			auto bytes = vsrc.LengthsBytes(first_cursor.length_cursor, entry_count);
+			auto old_size = builder.lengths.size();
+			builder.lengths.resize(old_size + entry_count);
+			std::memcpy(builder.lengths.data() + old_size, bytes, entry_count * sizeof(uint32_t));
+		}
+		if (run_end_cursor.num_cursor > first_cursor.num_cursor) {
+			auto entry_count = run_end_cursor.num_cursor - first_cursor.num_cursor;
+			auto bytes = vsrc.NumsBytes(first_cursor.num_cursor, entry_count);
+			auto old_size = builder.nums.size();
+			builder.nums.resize(old_size + entry_count);
+			std::memcpy(builder.nums.data() + old_size, bytes, entry_count * sizeof(uint64_t));
 		}
 		k = run_end;
 	}
 	builder.EmitObjectEnd();
 }
 
-void MergeTwoObjects(const JsonoView &va, size_t pos_a, size_t sc_a, const JsonoView &vb, size_t pos_b, size_t sc_b,
+void MergeTwoObjects(const JsonoView &va, const JsonoCursor &cursor_a, const JsonoView &vb, const JsonoCursor &cursor_b,
                      JsonoBuilder &builder, MergeMode merge_mode, size_t depth) {
 	std::vector<MergeChild> children_a;
 	std::vector<MergeChild> children_b;
 	std::vector<MergePlanEntry> plan;
-	MergeTwoObjectsWithScratch(va, pos_a, sc_a, vb, pos_b, sc_b, builder, merge_mode, depth, children_a, children_b,
-	                           plan);
+	MergeTwoObjectsWithScratch(va, cursor_a, vb, cursor_b, builder, merge_mode, depth, children_a, children_b, plan);
 }
 
 // A self-owned JSONO blob: the in-flight accumulator for the fold-based scalar
@@ -580,6 +599,8 @@ struct OwnedJsonoBlob {
 	std::string key_heap;
 	std::string string_heap;
 	std::string skips;
+	std::string lengths;
+	std::string nums;
 };
 
 void SerializeBuilderToBlob(const JsonoBuilder &builder, OwnedJsonoBlob &out) {
@@ -596,18 +617,26 @@ void SerializeBuilderToBlob(const JsonoBuilder &builder, OwnedJsonoBlob &out) {
 	}
 	out.key_heap.assign(builder.key_heap.data(), builder.key_heap.size());
 	out.string_heap.assign(builder.string_heap.data(), builder.string_heap.size());
+	out.lengths.assign(reinterpret_cast<const char *>(builder.lengths.data()),
+	                   builder.lengths.size() * sizeof(uint32_t));
+	out.nums.assign(reinterpret_cast<const char *>(builder.nums.data()), builder.nums.size() * sizeof(uint64_t));
 
+	auto span_ids_bytes = builder.span_ids.size() * sizeof(uint32_t);
 	auto spans_bytes = builder.skips.size() * sizeof(ContainerSpan);
 	auto index_bytes = builder.object_checkpoint_index.size() * sizeof(ObjectCheckpointIndex);
 	auto checkpoints_bytes = builder.object_checkpoints.size() * sizeof(ObjectCursorCheckpoint);
-	out.skips.resize(sizeof(ContainerMetadataHeader) + spans_bytes + index_bytes + checkpoints_bytes);
+	out.skips.resize(sizeof(ContainerMetadataHeader) + span_ids_bytes + spans_bytes + index_bytes + checkpoints_bytes);
 	ContainerMetadataHeader meta;
-	meta.container_count = uint32_t(builder.skips.size());
+	meta.span_count = uint32_t(builder.skips.size());
 	meta.checkpoint_index_count = uint32_t(builder.object_checkpoint_index.size());
 	meta.checkpoint_count = uint32_t(builder.object_checkpoints.size());
 	size_t off = 0;
 	std::memcpy(&out.skips[off], &meta, sizeof(meta));
 	off += sizeof(meta);
+	if (span_ids_bytes > 0) {
+		std::memcpy(&out.skips[off], builder.span_ids.data(), span_ids_bytes);
+		off += span_ids_bytes;
+	}
 	if (spans_bytes > 0) {
 		std::memcpy(&out.skips[off], builder.skips.data(), spans_bytes);
 		off += spans_bytes;
@@ -623,7 +652,8 @@ void SerializeBuilderToBlob(const JsonoBuilder &builder, OwnedJsonoBlob &out) {
 
 JsonoView ViewOfBlob(const OwnedJsonoBlob &b) {
 	return JsonoView(b.slots.data(), b.slots.size(), b.key_heap.data(), b.key_heap.size(), b.string_heap.data(),
-	                 b.string_heap.size(), b.skips.data(), b.skips.size());
+	                 b.string_heap.size(), b.skips.data(), b.skips.size(), b.lengths.data(), b.lengths.size(),
+	                 b.nums.data(), b.nums.size());
 }
 
 // One RFC 7396 fold step. Returns true when the result is SQL NULL (a SQL NULL
@@ -641,26 +671,25 @@ bool MergeFoldStep(MergeMode mode, bool acc_is_sqlnull, const JsonoView &acc_vie
 		return mode == MergeMode::Overlay ? acc_is_sqlnull : true;
 	}
 	builder.Reset();
-	size_t p = 0;
-	size_t sc = 0;
+	JsonoCursor cursor;
 	bool acc_is_object = !acc_is_sqlnull && SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START;
 	bool patch_is_object = SlotTag(patch_view.SlotAt(0)) == tag::OBJ_START;
 	if (acc_is_object && patch_is_object) {
-		MergeTwoObjectsWithScratch(acc_view, 0, 0, patch_view, 0, 0, builder, mode, 0, children_a, children_b, plan);
+		MergeTwoObjectsWithScratch(acc_view, JsonoCursor(), patch_view, JsonoCursor(), builder, mode, 0, children_a,
+		                           children_b, plan);
 		return false;
 	}
 	if (mode == MergeMode::Overlay) {
 		// A authoritative: keep the accumulator if present, otherwise fall to the patch.
 		const JsonoView &src = acc_is_sqlnull ? patch_view : acc_view;
-		size_t sp = 0;
-		size_t ssc = 0;
-		EmitValueVerbatim(src, sp, ssc, builder, 0);
+		JsonoCursor src_cursor;
+		EmitValueVerbatim(src, src_cursor, builder, 0);
 		return false;
 	}
 	if (!patch_is_object) {
-		EmitValueVerbatim(patch_view, p, sc, builder, 0);
+		EmitValueVerbatim(patch_view, cursor, builder, 0);
 	} else {
-		EmitValueStrip(patch_view, p, sc, builder, MergeMode::Patch, 0);
+		EmitValueStrip(patch_view, cursor, builder, MergeMode::Patch, 0);
 	}
 	return false;
 }
@@ -838,64 +867,37 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		return a.steps.size() < b.steps.size();
 	});
 
-	JsonoVectorData residual;
-	InitJsonoVectorData(input, count, residual);
+	// The row reader verifies each row's shred manifest against the shreds this type carries
+	// (the manifest is checked against ALL of them even under a shred_filter).
+	JsonoRowReader residual_reader;
+	residual_reader.Init(input, count);
 	vector<UnifiedVectorFormat> shred_fmt(shreds.size());
 	for (idx_t k = 0; k < shreds.size(); k++) {
 		JsonoShredVector(input, shreds[k].child).ToUnifiedFormat(count, shred_fmt[k]);
 	}
 
-	// The shreds this type carries, as (path, type string) — the reference the per-row shred
-	// manifest is verified against (see VerifyShredManifest).
-	vector<std::pair<string, string>> shred_signatures;
-	shred_signatures.reserve(layout.shreds.size());
-	for (auto &shred : layout.shreds) {
-		shred_signatures.emplace_back(shred.first, shred.second.ToString());
-	}
-	std::vector<jsono::ShredManifestEntry> manifest;
-
-	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
-	InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
-	auto &slots_vec = *slots_p;
-	auto &key_heap_vec = *key_heap_p;
-	auto &string_heap_vec = *string_heap_p;
-	auto &skips_vec = *skips_p;
-	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
-	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
-	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
-	auto skips_out = FlatVector::GetData<string_t>(skips_vec);
+	JsonoBodyWriter writer;
+	writer.Init(result);
 
 	JsonoBuilder patch_builder;
 	JsonoBuilder out_builder;
 	OwnedJsonoBlob patch_storage;
 	OwnedJsonoBlob acc_storage;
+	JsonoView residual_view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob {};
-		if (!ReadJsonoRow(residual, row, blob)) {
-			if (RowIsValid(residual.struct_fmt, row)) {
-				throw InvalidInputException(
-				    "JSONO: shredded row carries a NULL residual blob; the writer never produces this — it is "
-				    "the trace of a struct cast NULL-filling the row's body");
-			}
-			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+		if (residual_reader.Read(row, blob, residual_view) != JsonoRowState::Value) {
+			writer.SetRowNull(row);
 			continue;
 		}
-		JsonoView residual_view = MakeJsonoView(blob);
-		if (!residual_view.ParseHeader() || residual_view.Slots() == 0) {
-			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
-			continue;
-		}
-		jsono::VerifyShredManifest(residual_view, shred_signatures, manifest);
 		if (SlotTag(residual_view.SlotAt(0)) != tag::OBJ_START) {
 			// A non-object residual (scalar/array) is the whole value: shreds are object-key paths,
 			// so a well-formed shredded value cannot have any present here. Emit it verbatim rather
 			// than overlaying onto a non-object (which the object merge cannot handle).
 			out_builder.Reset();
-			size_t pos = 0;
-			size_t string_cursor = 0;
-			EmitValueVerbatim(residual_view, pos, string_cursor, out_builder, 0);
-			WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out,
-			                 string_heap_out, skips_out, row, out_builder);
+			JsonoCursor cursor;
+			EmitValueVerbatim(residual_view, cursor, out_builder, 0);
+			writer.WriteRow(row, out_builder);
 			continue;
 		}
 		if (all_top_level) {
@@ -923,9 +925,9 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			JsonoView patch_view = ViewOfBlob(patch_storage);
 			patch_view.ParseHeader();
 			out_builder.Reset();
-			MergeTwoObjects(residual_view, 0, 0, patch_view, 0, 0, out_builder, MergeMode::Overlay, 0);
-			WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out,
-			                 string_heap_out, skips_out, row, out_builder);
+			MergeTwoObjects(residual_view, JsonoCursor(), patch_view, JsonoCursor(), out_builder, MergeMode::Overlay,
+			                0);
+			writer.WriteRow(row, out_builder);
 			continue;
 		}
 		// Nested shreds: overlay one single-path chain at a time onto the accumulator. The
@@ -951,7 +953,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			JsonoView patch_view = ViewOfBlob(patch_storage);
 			patch_view.ParseHeader();
 			out_builder.Reset();
-			MergeTwoObjects(*acc, 0, 0, patch_view, 0, 0, out_builder, MergeMode::Overlay, 0);
+			MergeTwoObjects(*acc, JsonoCursor(), patch_view, JsonoCursor(), out_builder, MergeMode::Overlay, 0);
 			SerializeBuilderToBlob(out_builder, acc_storage);
 			acc_view = ViewOfBlob(acc_storage);
 			acc_view.ParseHeader();
@@ -959,76 +961,54 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			any = true;
 		}
 		out_builder.Reset();
-		if (any) {
-			size_t p = 0;
-			size_t sc = 0;
-			EmitValueVerbatim(*acc, p, sc, out_builder, 0);
-		} else {
-			size_t p = 0;
-			size_t sc = 0;
-			EmitValueVerbatim(residual_view, p, sc, out_builder, 0);
-		}
-		WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out, string_heap_out,
-		                 skips_out, row, out_builder);
+		JsonoCursor cursor;
+		EmitValueVerbatim(any ? *acc : residual_view, cursor, out_builder, 0);
+		writer.WriteRow(row, out_builder);
 	}
 }
 
 // Fold the residual views in `inputs` left-to-right under `mode` and write the merged plain
 // JSONO into `out` (the four-BLOB residual). Shared by the shred-aware fast path (raw residuals)
-// and the reshred fallback (reconstructed values).
-void RunResidualFold(MergeMode mode, vector<JsonoVectorData> &inputs, idx_t ncols, idx_t count, Vector &out,
+// and the reshred fallback (reconstructed values). Each input reader carries its own manifest
+// policy: the fold rebuilds the residual without the inputs' manifests, so an unverified
+// narrowed input would launder the loss into a permanently undetectable one — the readers throw
+// before rebuilding (except jsono_overlay's trusted residual, see JsonoFoldExecute).
+void RunResidualFold(MergeMode mode, vector<JsonoRowReader> &inputs, idx_t ncols, idx_t count, Vector &out,
                      JsonoOpsLocalState &lstate) {
-	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
-	InitJsonoBodyWrite(out, slots_p, key_heap_p, string_heap_p, skips_p);
-	auto &slots_vec = *slots_p;
-	auto &key_heap_vec = *key_heap_p;
-	auto &string_heap_vec = *string_heap_p;
-	auto &skips_vec = *skips_p;
-	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
-	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
-	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
-	auto skips_out = FlatVector::GetData<string_t>(skips_vec);
+	JsonoBodyWriter writer;
+	writer.Init(out);
 	// jsono_merge_patch folds left to right (RFC 7396): the first argument is the
 	// target document (kept verbatim — its nulls are values), the rest are patches.
 	static thread_local OwnedJsonoBlob acc_storage;
+	JsonoView acc_view;
+	JsonoView patch_view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow target_blob {};
-		bool acc_is_sqlnull = !ReadJsonoRowStrict(inputs[0], row, target_blob);
-		JsonoView acc_view = MakeJsonoView(target_blob);
-		if (!acc_is_sqlnull && (!acc_view.ParseHeader() || acc_view.Slots() == 0)) {
-			acc_is_sqlnull = true;
-		}
+		bool acc_is_sqlnull = inputs[0].Read(row, target_blob, acc_view) != JsonoRowState::Value;
 		if (ncols == 1) {
 			// A lone target is returned verbatim (its nulls survive).
 			if (acc_is_sqlnull) {
-				SetJsonoStructNull(out, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+				writer.SetRowNull(row);
 			} else {
 				lstate.builder.Reset();
-				size_t p = 0;
-				size_t sc = 0;
-				EmitValueVerbatim(acc_view, p, sc, lstate.builder, 0);
-				WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out,
-				                 string_heap_out, skips_out, row, lstate.builder);
+				JsonoCursor cursor;
+				EmitValueVerbatim(acc_view, cursor, lstate.builder, 0);
+				writer.WriteRow(row, lstate.builder);
 			}
 			continue;
 		}
 		for (idx_t i = 1; i < ncols; i++) {
 			JsonoBlobRow patch_blob {};
-			bool patch_present = ReadJsonoRowStrict(inputs[i], row, patch_blob);
-			JsonoView patch_view = MakeJsonoView(patch_blob);
-			if (patch_present && (!patch_view.ParseHeader() || patch_view.Slots() == 0)) {
-				patch_present = false;
-			}
+			bool patch_present = inputs[i].Read(row, patch_blob, patch_view) == JsonoRowState::Value;
 			bool result_sqlnull =
 			    MergeFoldStep(mode, acc_is_sqlnull, acc_view, patch_present, patch_view, lstate.builder,
 			                  lstate.merge_children_a, lstate.merge_children_b, lstate.merge_plan);
 			if (i + 1 == ncols) {
 				// Last step writes straight to the output builder — no serialize round-trip.
 				if (result_sqlnull) {
-					SetJsonoStructNull(out, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+					writer.SetRowNull(row);
 				} else {
-					WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out,
-					                 string_heap_out, skips_out, row, lstate.builder);
+					writer.WriteRow(row, lstate.builder);
 				}
 			} else if (result_sqlnull) {
 				acc_is_sqlnull = true;
@@ -1120,11 +1100,23 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	idx_t ncols = args.ColumnCount();
 	bool has_shreds = !bind_data.shreds.empty();
 
+	// Each input reader verifies its rows' manifests against that input's own shreds (a plain
+	// input carries none, so any manifest entry on it fails loud). jsono_overlay is exempt: it
+	// is the optimizer's reconstruction primitive and its residual argument legitimately
+	// carries a manifest already verified by __jsono_internal_checked_residual.
+	auto init_input = [&](JsonoRowReader &reader, Vector &input) {
+		if (mode == MergeMode::Overlay) {
+			reader.InitTrusted(input, count);
+		} else {
+			reader.Init(input, count);
+		}
+	};
+
 	if (!has_shreds) {
 		// Plain merge: fold straight into the result.
-		vector<JsonoVectorData> inputs(ncols);
+		vector<JsonoRowReader> inputs(ncols);
 		for (idx_t i = 0; i < ncols; i++) {
-			InitJsonoVectorData(args.data[i], count, inputs[i]);
+			init_input(inputs[i], args.data[i]);
 		}
 		RunResidualFold(mode, inputs, ncols, count, result, lstate);
 		if (args.AllConstant()) {
@@ -1150,9 +1142,9 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	}
 
 	if (fast_viable) {
-		vector<JsonoVectorData> raw(ncols);
+		vector<JsonoRowReader> raw(ncols);
 		for (idx_t i = 0; i < ncols; i++) {
-			InitJsonoVectorData(args.data[i], count, raw[i]);
+			init_input(raw[i], args.data[i]);
 		}
 		Vector fast_residual(JsonoType(), count);
 		RunResidualFold(mode, raw, ncols, count, fast_residual, lstate);
@@ -1182,13 +1174,15 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			fast_residual.Flatten(count);
 			// Copy the folded plain residual's body blobs into the shredded result's body —
 			// except `skips`, which is re-emitted per row below with the output's shred manifest.
-			Vector *r_slots, *r_key_heap, *r_string_heap, *r_skips;
-			InitJsonoBodyWrite(result, r_slots, r_key_heap, r_string_heap, r_skips);
-			Vector *body_out[3] = {r_slots, r_key_heap, r_string_heap};
+			JsonoBodyWriter writer;
+			writer.Init(result);
 			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
 			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
-			for (idx_t b = 0; b < 3; b++) {
-				VectorOperations::Copy(*fr_blobs[b], *body_out[b], count, 0, 0);
+			for (idx_t b = 0; b < BODY_BLOB_COUNT; b++) {
+				if (b == BODY_SKIPS) {
+					continue;
+				}
+				VectorOperations::Copy(*fr_blobs[b], *writer.vec[b], count, 0, 0);
 			}
 			auto &result_validity = FlatVector::Validity(result);
 			for (auto &shred : bind_data.shreds) {
@@ -1216,14 +1210,14 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				append_lv(shred.type.ToString());
 				JsonoShredVector(result, shred.result_child_index).ToUnifiedFormat(count, shred_fmt[k]);
 			}
-			auto fr_skips = FlatVector::GetData<string_t>(*fr_blobs[3]);
-			auto &fr_skips_validity = FlatVector::Validity(*fr_blobs[3]);
-			r_skips->SetVectorType(VectorType::FLAT_VECTOR);
-			auto skips_out = FlatVector::GetData<string_t>(*r_skips);
+			auto fr_skips = FlatVector::GetData<string_t>(*fr_blobs[BODY_SKIPS]);
+			auto &fr_skips_validity = FlatVector::Validity(*fr_blobs[BODY_SKIPS]);
+			auto &r_skips = writer.Skips();
+			auto skips_out = writer.data[BODY_SKIPS];
 			std::string skips_buf;
 			for (idx_t row = 0; row < count; row++) {
 				if (!result_validity.RowIsValid(row) || !fr_skips_validity.RowIsValid(row)) {
-					FlatVector::SetNull(*r_skips, row, true);
+					FlatVector::SetNull(r_skips, row, true);
 					continue;
 				}
 				skips_buf.clear();
@@ -1240,7 +1234,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 						}
 					}
 				}
-				skips_out[row] = WriteBlobInto(*r_skips, skips_buf.data(), skips_buf.size());
+				skips_out[row] = WriteBlobInto(r_skips, skips_buf.data(), skips_buf.size());
 			}
 			if (all_constant) {
 				result.SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -1253,15 +1247,17 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	// Reshred fallback: reconstruct shredded inputs to plain, fold, reshred. Correct for any
 	// shred/residual key overlap and for plain inputs that can shadow a shred.
 	vector<unique_ptr<Vector>> reconstructed;
-	vector<JsonoVectorData> inputs(ncols);
+	vector<JsonoRowReader> inputs(ncols);
 	for (idx_t i = 0; i < ncols; i++) {
 		if (IsShreddedJsonoType(args.data[i].GetType())) {
+			// The reconstruction verifies the shredded input's manifest itself; its plain
+			// output never carries one.
 			auto plain = make_uniq<Vector>(JsonoType(), count);
 			ReconstructShreddedToPlainImpl(args.data[i], count, *plain);
-			InitJsonoVectorData(*plain, count, inputs[i]);
+			init_input(inputs[i], *plain);
 			reconstructed.push_back(std::move(plain));
 		} else {
-			InitJsonoVectorData(args.data[i], count, inputs[i]);
+			init_input(inputs[i], args.data[i]);
 		}
 	}
 	Vector fold_out(JsonoType(), count);
@@ -1374,22 +1370,21 @@ unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFu
 void FoldIntoGroupState(GroupMergeState &state, const JsonoView &incoming) {
 	static thread_local JsonoBuilder scratch;
 	scratch.Reset();
-	size_t pos = 0;
-	size_t sc = 0;
+	JsonoCursor cursor;
 	bool incoming_is_object = SlotTag(incoming.SlotAt(0)) == tag::OBJ_START;
 	bool merged_objects = false;
 	if (incoming_is_object && state.acc) {
 		JsonoView acc_view = ViewOfBlob(*state.acc);
 		if (acc_view.ParseHeader() && acc_view.Slots() > 0 && SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START) {
-			MergeTwoObjects(acc_view, 0, 0, incoming, 0, 0, scratch, MergeMode::IgnoreNulls, 0);
+			MergeTwoObjects(acc_view, JsonoCursor(), incoming, JsonoCursor(), scratch, MergeMode::IgnoreNulls, 0);
 			merged_objects = true;
 		}
 	}
 	if (!merged_objects) {
 		if (incoming_is_object) {
-			EmitValueStrip(incoming, pos, sc, scratch, MergeMode::IgnoreNulls, 0);
+			EmitValueStrip(incoming, cursor, scratch, MergeMode::IgnoreNulls, 0);
 		} else {
-			EmitValueVerbatim(incoming, pos, sc, scratch, 0);
+			EmitValueVerbatim(incoming, cursor, scratch, 0);
 		}
 	}
 	if (!state.acc) {
@@ -1397,14 +1392,6 @@ void FoldIntoGroupState(GroupMergeState &state, const JsonoView &incoming) {
 	}
 	SerializeBuilderToBlob(scratch, *state.acc);
 	state.has_input = true;
-}
-
-void ApplyGroupMergeFromBlob(GroupMergeState &state, const JsonoBlobRow &blob) {
-	JsonoView view = MakeJsonoView(blob);
-	if (!view.ParseHeader() || view.Slots() == 0) {
-		return;
-	}
-	FoldIntoGroupState(state, view);
 }
 
 // Shredded group_merge input is kept native at bind (so the aggregate's arg and sticky
@@ -1422,16 +1409,20 @@ void JsonoGroupMergeSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input
                                  data_ptr_t state_ptr, idx_t count) {
 	(void)aggr_input_data;
 	(void)input_count;
+	// Update inputs are plain (a shredded argument was reconstructed — and verified — by
+	// GroupMergeReadInput), so any manifest entry is a narrowed row: the reader fails loud
+	// before the fold rebuilds the accumulator without it.
 	Vector reconstructed(JsonoType(), count);
-	JsonoVectorData input;
-	InitJsonoVectorData(*GroupMergeReadInput(inputs[0], count, reconstructed), count, input);
+	JsonoRowReader reader;
+	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
 	auto &state = *reinterpret_cast<GroupMergeState *>(state_ptr);
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			continue;
 		}
-		ApplyGroupMergeFromBlob(state, blob);
+		FoldIntoGroupState(state, view);
 	}
 }
 
@@ -1439,20 +1430,22 @@ void JsonoGroupMergeUpdate(Vector inputs[], AggregateInputData &aggr_input_data,
                            idx_t count) {
 	(void)aggr_input_data;
 	(void)input_count;
+	// Same per-row policy as the simple update: plain inputs, any manifest entry fails loud.
 	Vector reconstructed(JsonoType(), count);
-	JsonoVectorData input;
-	InitJsonoVectorData(*GroupMergeReadInput(inputs[0], count, reconstructed), count, input);
+	JsonoRowReader reader;
+	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<GroupMergeState *>(state_fmt);
 
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			continue;
 		}
 		auto state_idx = RowIndex(state_fmt, row);
-		ApplyGroupMergeFromBlob(*state_data[state_idx], blob);
+		FoldIntoGroupState(*state_data[state_idx], view);
 	}
 }
 
@@ -1481,26 +1474,11 @@ void JsonoGroupMergeCombine(Vector &source, Vector &target, AggregateInputData &
 // into the result at the chunk offset) and the shredded finalize (writes a temp at base 0).
 void FinalizePlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMergeState *const *state_data, idx_t count,
                          idx_t base) {
-	// Writes at rows [base, base+count) and produces no SQL NULLs (an empty group becomes an empty
-	// object), so navigate to the body blobs without the [0,count) validity reset InitJsonoBodyWrite
-	// applies — that would be wrong for a base offset.
-	out.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &layout = *StructVector::GetEntries(out)[0];
-	layout.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &body = *StructVector::GetEntries(layout)[0];
-	body.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &body_blobs = StructVector::GetEntries(body);
-	auto &slots_vec = *body_blobs[0];
-	auto &key_heap_vec = *body_blobs[1];
-	auto &string_heap_vec = *body_blobs[2];
-	auto &skips_vec = *body_blobs[3];
-	for (auto &blob : body_blobs) {
-		blob->SetVectorType(VectorType::FLAT_VECTOR);
-	}
-	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
-	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
-	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
-	auto skips_out = FlatVector::GetData<string_t>(skips_vec);
+	// Writes at rows [base, base+count) and produces no SQL NULLs (an empty group becomes an
+	// empty object). JsonoBodyWriter only flattens and resolves data pointers — it touches no
+	// validity — so writing at a base offset is safe.
+	JsonoBodyWriter writer;
+	writer.Init(out);
 	JsonoBuilder empty_builder;
 
 	for (idx_t i = 0; i < count; i++) {
@@ -1510,16 +1488,19 @@ void FinalizePlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMerge
 			empty_builder.Reset();
 			empty_builder.EmitObjectStart(0);
 			empty_builder.EmitObjectEnd();
-			WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out,
-			                 string_heap_out, skips_out, rid, empty_builder);
+			writer.WriteRow(rid, empty_builder);
 			continue;
 		}
 		// The accumulator is already a serialized blob; copy each component verbatim.
-		slots_out[rid] = WriteBlobInto(slots_vec, state.acc->slots.data(), state.acc->slots.size());
-		key_heap_out[rid] = WriteBlobInto(key_heap_vec, state.acc->key_heap.data(), state.acc->key_heap.size());
-		string_heap_out[rid] =
-		    WriteBlobInto(string_heap_vec, state.acc->string_heap.data(), state.acc->string_heap.size());
-		skips_out[rid] = WriteBlobInto(skips_vec, state.acc->skips.data(), state.acc->skips.size());
+		writer.data[BODY_SLOTS][rid] = WriteBlobInto(writer.Slots(), state.acc->slots.data(), state.acc->slots.size());
+		writer.data[BODY_KEY_HEAP][rid] =
+		    WriteBlobInto(writer.KeyHeap(), state.acc->key_heap.data(), state.acc->key_heap.size());
+		writer.data[BODY_STRING_HEAP][rid] =
+		    WriteBlobInto(writer.StringHeap(), state.acc->string_heap.data(), state.acc->string_heap.size());
+		writer.data[BODY_SKIPS][rid] = WriteBlobInto(writer.Skips(), state.acc->skips.data(), state.acc->skips.size());
+		writer.data[BODY_LENGTHS][rid] =
+		    WriteBlobInto(writer.Lengths(), state.acc->lengths.data(), state.acc->lengths.size());
+		writer.data[BODY_NUMS][rid] = WriteBlobInto(writer.Nums(), state.acc->nums.data(), state.acc->nums.size());
 	}
 }
 
@@ -1577,10 +1558,9 @@ static bool PathTerminatesOnKey(const std::vector<const std::vector<PathStep> *>
 // this object's keys at `depth`: a path that terminates here strips that key's value, a
 // longer path recurses into the child object so only its leaf is removed. Surrounding
 // keys are emitted verbatim. Every active path has length > depth by construction.
-static void EmitObjectStrippingPaths(const JsonoView &view, size_t obj_pos, size_t obj_string_cursor,
-                                     JsonoBuilder &builder, const std::vector<const std::vector<PathStep> *> &active,
-                                     size_t depth) {
-	auto layout = ReadObjectLayout(view, obj_pos);
+static void EmitObjectStrippingPaths(const JsonoView &view, const JsonoCursor &obj_cursor, JsonoBuilder &builder,
+                                     const std::vector<const std::vector<PathStep> *> &active, size_t depth) {
+	auto layout = ReadObjectLayout(view, obj_cursor.pos);
 	auto key_at = [&](size_t i) {
 		auto key_slot = view.SlotAt(layout.key_start + i);
 		if (SlotTag(key_slot) != tag::KEY) {
@@ -1601,12 +1581,12 @@ static void EmitObjectStrippingPaths(const JsonoView &view, size_t obj_pos, size
 			builder.EmitKeySlot(key);
 		}
 	}
-	size_t value_pos = layout.value_start;
-	size_t value_string_cursor = obj_string_cursor;
+	JsonoCursor value_cursor = obj_cursor;
+	value_cursor.pos = layout.value_start;
 	for (size_t i = 0; i < layout.key_count; i++) {
 		auto key = key_at(i);
 		if (PathTerminatesOnKey(active, depth, key)) {
-			SkipValueFast(view, value_pos, value_string_cursor);
+			SkipValueFast(view, value_cursor);
 			continue;
 		}
 		builder.EmitObjectChildStart();
@@ -1620,13 +1600,11 @@ static void EmitObjectStrippingPaths(const JsonoView &view, size_t obj_pos, size
 				deeper.push_back(path);
 			}
 		}
-		if (!deeper.empty() && SlotTag(view.SlotAt(value_pos)) == tag::OBJ_START) {
-			EmitObjectStrippingPaths(view, value_pos, value_string_cursor, builder, deeper, depth + 1);
-			auto span = CheckedContainerSpan(view, value_pos, tag::OBJ_START);
-			value_pos += size_t(span.slot_span);
-			value_string_cursor += size_t(span.string_byte_span);
+		if (!deeper.empty() && SlotTag(view.SlotAt(value_cursor.pos)) == tag::OBJ_START) {
+			EmitObjectStrippingPaths(view, value_cursor, builder, deeper, depth + 1);
+			SkipValueFast(view, value_cursor);
 		} else {
-			EmitValueVerbatim(view, value_pos, value_string_cursor, builder, depth + 1);
+			EmitValueVerbatim(view, value_cursor, builder, depth + 1);
 		}
 	}
 	builder.EmitObjectEnd();
@@ -1641,12 +1619,11 @@ static void EmitObjectStrippingPaths(const JsonoView &view, size_t obj_pos, size
 void JsonoEmitObjectStrippingPaths(const JsonoView &view, const std::vector<const std::vector<PathStep> *> &paths,
                                    JsonoBuilder &builder) {
 	if (paths.empty() || view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
-		size_t pos = 0;
-		size_t string_cursor = 0;
-		EmitValueVerbatim(view, pos, string_cursor, builder, 0);
+		jsono::JsonoCursor cursor;
+		EmitValueVerbatim(view, cursor, builder, 0);
 		return;
 	}
-	EmitObjectStrippingPaths(view, 0, 0, builder, paths, 0);
+	EmitObjectStrippingPaths(view, jsono::JsonoCursor(), builder, paths, 0);
 }
 
 // The jsono_merge_patch function, exposed so the optimizer's shredded
@@ -1702,19 +1679,12 @@ void JsonoCheckedResidualExecute(DataChunk &args, ExpressionState &state, Vector
 		shred_signatures.emplace_back(signature.substr(0, sep), signature.substr(sep + 1));
 	}
 
-	JsonoVectorData input;
-	InitJsonoVectorData(args.data[0], count, input);
-	std::vector<jsono::ShredManifestEntry> manifest;
+	JsonoRowReader reader;
+	reader.Init(args.data[0], count, std::move(shred_signatures));
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRow(input, row, blob)) {
-			continue;
-		}
-		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader()) {
-			continue;
-		}
-		jsono::VerifyShredManifest(view, shred_signatures, manifest);
+		reader.ReadPermissive(row, blob, view);
 	}
 	result.Reference(args.data[0]);
 }

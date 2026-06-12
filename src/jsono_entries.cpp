@@ -1,6 +1,8 @@
 #include "jsono.hpp"
 #include "jsono_number.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_render.hpp"
+#include "jsono_row_read.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -173,43 +175,14 @@ void AppendKeySegment(std::string &path, nonstd::string_view key, JsonoEntriesKe
 void AppendIndexSegment(std::string &path, idx_t index, JsonoEntriesKeyStyle style) {
 	if (style == JsonoEntriesKeyStyle::JsonPath) {
 		path.push_back('[');
-		path.append(std::to_string(index));
+		AppendUnsignedText(index, path);
 		path.push_back(']');
 		return;
 	}
 	if (!path.empty()) {
 		path.push_back('.');
 	}
-	path.append(std::to_string(index));
-}
-
-// Render a leaf scalar as bare VARCHAR (no JSON quoting). Returns true for JSON
-// null, where the caller emits a SQL NULL value rather than the text "null".
-bool JsonoScalarToText(const JsonoScalar &scalar, std::string &out) {
-	switch (scalar.kind) {
-	case JsonoScalarKind::Null:
-		return true;
-	case JsonoScalarKind::String:
-	case JsonoScalarKind::NumberText:
-		out.assign(scalar.text.data(), scalar.text.size());
-		return false;
-	case JsonoScalarKind::Int64:
-		out = std::to_string(scalar.int_value);
-		return false;
-	case JsonoScalarKind::UInt64:
-		out = std::to_string(scalar.uint_value);
-		return false;
-	case JsonoScalarKind::Double:
-		EmitDouble(scalar.double_value, out);
-		return false;
-	case JsonoScalarKind::Dec60:
-		AppendDec60Text(out, scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
-		return false;
-	case JsonoScalarKind::Bool:
-		out = scalar.bool_value ? "true" : "false";
-		return false;
-	}
-	return true;
+	AppendUnsignedText(index, path);
 }
 
 // Output sink for jsono_entries. Resolves the LIST child (key/value) vectors once
@@ -257,7 +230,7 @@ struct EntriesSink {
 			break;
 		default:
 			scratch.clear();
-			JsonoScalarToText(scalar, scratch);
+			RenderExtractText(scalar, scratch);
 			value_data[child_row] = StringVector::AddString(*value_vec, scratch.data(), scratch.size());
 			break;
 		}
@@ -283,58 +256,46 @@ struct EntriesSink {
 	}
 };
 
-// Depth-first walk that materializes one (path, value) struct per leaf. Object
-// values advance a value cursor while the shared string cursor consumes heap bytes
-// in walk order.
-void WalkEntries(const JsonoView &view, size_t &pos, size_t &string_cursor, std::string &path,
-                 JsonoEntriesKeyStyle style, EntriesSink &sink, size_t depth) {
-	if (depth > JSONO_MAX_NESTING_DEPTH) {
-		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
-		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+// Walk sink that materializes one (path, value) struct per leaf, growing and
+// shrinking the dotted/JSONPath segments of `path` via the walk's member/element
+// tokens (the saved path length lives in the recursion frame).
+struct EntriesWalkSink {
+	EntriesWalkSink(std::string &path_p, JsonoEntriesKeyStyle style_p, EntriesSink &sink_p)
+	    : path(path_p), style(style_p), sink(sink_p) {
 	}
-	auto slot_tag = SlotTag(view.SlotAt(pos));
-	switch (slot_tag) {
-	case tag::OBJ_START: {
-		auto layout = ReadObjectLayout(view, pos);
-		auto val_cursor = layout.value_start;
-		for (size_t i = 0; i < layout.key_count; i++) {
-			auto key_slot = view.SlotAt(layout.key_start + i);
-			if (SlotTag(key_slot) != tag::KEY) {
-				throw InvalidInputException("malformed JSONO: object key slot expected");
-			}
-			auto key = view.KeyAt(SlotPayload(key_slot));
-			auto saved = path.size();
-			AppendKeySegment(path, key, style);
-			WalkEntries(view, val_cursor, string_cursor, path, style, sink, depth + 1);
-			path.resize(saved);
-		}
-		if (val_cursor != layout.after_pos - 1) {
-			throw InvalidInputException("malformed JSONO: object value span mismatch");
-		}
-		pos = layout.after_pos;
-		return;
+
+	std::string &path;
+	JsonoEntriesKeyStyle style;
+	EntriesSink &sink;
+
+	void BeginObject() {
 	}
-	case tag::ARR_START: {
-		auto end_pos = ReadArrayEndPos(view, pos);
-		pos++;
-		idx_t index = 0;
-		while (pos < end_pos) {
-			auto saved = path.size();
-			AppendIndexSegment(path, index, style);
-			WalkEntries(view, pos, string_cursor, path, style, sink, depth + 1);
-			path.resize(saved);
-			index++;
-		}
-		pos = end_pos + 1;
-		return;
+	void EndObject() {
 	}
-	default: {
-		auto scalar = DecodeScalarAt(view, pos, string_cursor);
+	void BeginArray() {
+	}
+	void EndArray() {
+	}
+	size_t BeginMember(nonstd::string_view key, size_t) {
+		auto saved = path.size();
+		AppendKeySegment(path, key, style);
+		return saved;
+	}
+	void EndMember(size_t saved) {
+		path.resize(saved);
+	}
+	size_t BeginElement(idx_t index) {
+		auto saved = path.size();
+		AppendIndexSegment(path, index, style);
+		return saved;
+	}
+	void EndElement(size_t saved) {
+		path.resize(saved);
+	}
+	void Scalar(const JsonoScalar &scalar) {
 		sink.Append(path, scalar);
-		return;
 	}
-	}
-}
+};
 
 // Render a shredded shred's typed value as the text an entry carries. Shreds are limited
 // to the shred-primitive types, so a small switch covers them; VARCHAR returns the heap
@@ -347,27 +308,32 @@ nonstd::string_view FormatShredValue(const UnifiedVectorFormat &fmt, idx_t idx, 
 		return nonstd::string_view(s.GetData(), s.GetSize());
 	}
 	case LogicalTypeId::BIGINT:
-		scratch = std::to_string(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx]);
+		scratch.clear();
+		AppendSignedText(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx], scratch);
 		return scratch;
 	case LogicalTypeId::UBIGINT:
-		scratch = std::to_string(UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx]);
+		scratch.clear();
+		AppendUnsignedText(UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx], scratch);
 		return scratch;
 	case LogicalTypeId::DOUBLE:
-		scratch = std::to_string(UnifiedVectorFormat::GetData<double>(fmt)[idx]);
+		scratch.clear();
+		EmitDouble(UnifiedVectorFormat::GetData<double>(fmt)[idx], scratch);
 		return scratch;
 	case LogicalTypeId::BOOLEAN:
 		scratch = UnifiedVectorFormat::GetData<bool>(fmt)[idx] ? "true" : "false";
 		return scratch;
 	default:
-		scratch.clear();
-		return scratch;
+		throw InternalException("jsono_entries: unhandled shred type %s", type.ToString());
 	}
 }
 
 void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
-	JsonoVectorData input;
-	InitJsonoVectorData(args.data[0], count, input);
+	// The row reader verifies each row's shred manifest against the shreds this input type
+	// carries, so a row narrowed by a raw struct cast fails loud instead of emitting
+	// incomplete entries.
+	JsonoRowReader reader;
+	reader.Init(args.data[0], count);
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = func_expr.bind_info->Cast<JsonoEntriesBindData>();
 	auto style = bind_data.style;
@@ -387,34 +353,23 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 	std::string shred_scratch;
 	EntriesSink sink(result);
 
-	// The shreds this input type carries, verified against each row's shred manifest so a row
-	// narrowed by a raw struct cast fails loud instead of emitting incomplete entries.
-	JsonoLayoutType layout;
-	TryParseJsonoLayoutType(args.data[0].GetType(), layout);
-	vector<std::pair<std::string, std::string>> shred_signatures;
-	shred_signatures.reserve(layout.shreds.size());
-	for (auto &shred : layout.shreds) {
-		shred_signatures.emplace_back(shred.first, shred.second.ToString());
-	}
-	std::vector<jsono::ShredManifestEntry> manifest;
-
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
+		auto row_state = reader.Read(row, blob, view);
+		if (row_state == JsonoRowState::Null) {
 			SetListRowNull(result, row);
 			continue;
 		}
 		auto start = sink.next_child;
-		JsonoView view = MakeJsonoView(blob);
-		if (view.ParseHeader() && view.Slots() > 0) {
-			jsono::VerifyShredManifest(view, shred_signatures, manifest);
+		if (row_state == JsonoRowState::Value) {
 			path.clear();
 			if (style == JsonoEntriesKeyStyle::JsonPath) {
 				path.push_back('$');
 			}
-			size_t pos = 0;
-			size_t string_cursor = 0;
-			WalkEntries(view, pos, string_cursor, path, style, sink, 0);
+			JsonoCursor cursor;
+			EntriesWalkSink walk(path, style, sink);
+			WalkJsonoValue(view, cursor, walk, 0);
 		} else if (shreds.empty()) {
 			SetListRowNull(result, row);
 			continue;

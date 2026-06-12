@@ -40,7 +40,7 @@ SELECT to_json(jsono({'b': NULL, 'a': 1, 'nested': {'x': NULL, 'y': 2}}));
 query II
 SELECT typeof(jsono({'a': 1})), to_json(jsono({'b': 2, 'a': 'x'}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))	{"a":"x","b":2}
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))	{"a":"x","b":2}
 
 # Top-level NULL STRUCT becomes SQL NULL, matching jsono(NULL).
 query I
@@ -139,3 +139,65 @@ query I
 SELECT to_json(jsono({'h': 340282366920938463463374607431768211455::UHUGEINT}));
 ----
 {"h":340282366920938463463374607431768211455}
+
+# The format requires unique sorted object keys (readers binary-search, rank-cache and
+# shape_hash on that invariant). An unnamed STRUCT (row(...)) would emit every field under
+# the duplicate key "", so it is rejected at bind time. This deliberately diverges from the
+# text-parse DOM path, which dedupes duplicate keys last-wins: a parser must accept whatever
+# JSON arrives, while struct construction can demand named fields instead of silently
+# dropping data. Duplicate *named* fields cannot be built from SQL at all (DuckDB's binder
+# rejects them in struct literals, struct_pack, STRUCT type syntax and row references), so
+# the unnamed form is the whole reachable surface.
+statement error
+SELECT jsono(row(1, 2));
+----
+unnamed
+
+statement error
+SELECT jsono(row(42));
+----
+unnamed
+
+# Nested unnamed structs are rejected through the same recursive plan.
+statement error
+SELECT jsono({'a': 1, 'b': row(1, 2)});
+----
+unnamed
+
+# The bare STRUCT -> jsono cast shares the constructor plan and the same guard.
+statement error
+SELECT row(1, 2)::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
+----
+unnamed
+
+# PIN: TRY_CAST between identical JSONO types is elided by the cast registry (equal types bind
+# DuckDB's no-op cast before the extension bind is consulted), so it offers no row-level
+# corruption recovery: a valid row whose body is NULL (the trace of an unsafe raw struct cast)
+# passes through and still fails loud at the first reader. Corrupt storage is never laundered
+# into SQL NULL, TRY_CAST or not.
+statement error
+SELECT jsono_extract_string(TRY_CAST(struct_pack(jsono := struct_pack(body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))) AS STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))), '$.a');
+----
+corrupt JSONO storage
+
+# One-pass shredded write: a NULL shred field stays in the residual as an explicit null
+# (NULL shred = "value lives in the residual"), non-NULL shred fields are stripped and
+# manifest-covered. Mixed NULL masks per row exercise the partial-strip emit.
+query III
+SELECT j.jsono."a", j.jsono."k", to_json(j)::VARCHAR
+FROM (
+    SELECT jsono(struct_pack(a := a, k := k)) AS j
+    FROM (VALUES ('x', 1::BIGINT), (NULL, 2::BIGINT), ('z', NULL::BIGINT)) v(a, k)
+) ORDER BY ALL;
+----
+x	1	{"a":"x","k":1}
+z	NULL	{"a":"z","k":null}
+NULL	2	{"a":null,"k":2}
+
+# A field literally named like a JSONPath keeps the locate-and-strip semantics: the shred
+# name parses as the path $.x, which does not exist, so the shred is NULL and the value
+# stays in the residual under its literal key.
+query II
+SELECT j.jsono."$.x" IS NULL, to_json(j)::VARCHAR FROM (SELECT jsono({'$.x': 'v', 'y': 1}) AS j);
+----
+true	{"$.x":"v","y":1}

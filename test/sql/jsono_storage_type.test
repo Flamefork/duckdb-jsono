@@ -13,12 +13,12 @@ require json
 query I
 SELECT jsono_storage_type();
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 # A column declared with that DDL is structurally a JSONO: jsono ops bind to it
 # without an explicit cast, so the round-trip from storage form works.
 statement ok
-CREATE TABLE t (props STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB))));
+CREATE TABLE t (props STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 
 statement ok
 INSERT INTO t SELECT jsono('{"a":1}');

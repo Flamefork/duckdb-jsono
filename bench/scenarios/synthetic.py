@@ -9,6 +9,7 @@ from config import (
     PLUCK_CORE_SPEC,
     TRANSFORM_CORE_SPEC,
     TRANSFORM_ECOMMERCE_JOIN_SPEC,
+    WIDE_FLAT_SIZES,
 )
 
 SCENARIOS = [
@@ -230,6 +231,40 @@ SCENARIOS = [
         "base_path": "$.ec_items",
         "path": 0,
         "targets": ["jsono", "json"],
+    },
+    # Wide-flat page_view-class merge shape (~100 schema-stable scalar keys):
+    # merge-family performance is shape-dependent, the nested merge scenarios
+    # above do not represent it. Generate the dataset with:
+    # uv run python bench/generate_data.py --kind wide_flat
+    {
+        "operation": "merge_patch",
+        "scenario": "wide_flat_small_patch",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "patch_object": {"event_name": "page_view_merged"},
+        "targets": ["jsono", "json"],
+    },
+    {
+        "operation": "group_merge_jsono",
+        "scenario": "wide_flat_few_groups",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "group_col": "g1e1",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "group_merge_jsono",
+        "scenario": "wide_flat_many_groups",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "group_col": "g1e4",
+        "targets": ["jsono"],
     },
     {
         "operation": "parse",

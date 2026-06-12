@@ -182,6 +182,79 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
             query.timed_sql,
         )
 
+    def test_jsono_parse_shred_query_shreds_in_timed_section(self) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "parse_shred",
+                "scenario": "field_sample_nested",
+                "json_column": "event_properties",
+                "shredding": {"clientID": "VARCHAR"},
+                "targets": ["jsono"],
+            },
+            Path("events.parquet"),
+        )
+
+        self.assertEqual(query.prepare_sql, ())
+        self.assertIn(
+            "jsono(event_properties::VARCHAR, shredding := {'clientID': 'VARCHAR'})",
+            query.timed_sql,
+        )
+
+    def test_jsono_extract_string_query_materializes_shredded_input(self) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "extract_string",
+                "scenario": "field_sample_shred_hit",
+                "json_column": "event_properties",
+                "shredding": {"clientID": "VARCHAR"},
+                "path": "$.clientID",
+                "targets": ["jsono"],
+            },
+            Path("events.parquet"),
+        )
+
+        self.assertIn(
+            "jsono(event_properties::VARCHAR, shredding := {'clientID': 'VARCHAR'})",
+            query.prepare_sql[0],
+        )
+        self.assertIn(
+            "SELECT jsono_extract_string(t, '$.clientID') AS r", query.timed_sql
+        )
+        self.assertNotIn("shredding", query.timed_sql)
+
+    def test_jsono_project_paths_query_is_filterless_multi_extract(self) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "project_paths",
+                "scenario": "field_sample_plain",
+                "json_column": "event_properties",
+                "paths": ["$.clientID", "$.browser"],
+                "targets": ["jsono", "json"],
+            },
+            Path("events.parquet"),
+        )
+
+        self.assertIn("jsono(event_properties::VARCHAR)", query.prepare_sql[0])
+        self.assertIn("t->>'$.clientID' AS p0", query.timed_sql)
+        self.assertIn("t->>'$.browser' AS p1", query.timed_sql)
+        self.assertNotIn("WHERE", query.timed_sql)
+
+    def test_core_project_paths_query_reads_text_directly(self) -> None:
+        query = run_benchmarks.build_json_query(
+            {
+                "operation": "project_paths",
+                "scenario": "field_sample_plain",
+                "json_column": "event_properties",
+                "paths": ["$.clientID", "$.browser"],
+                "targets": ["jsono", "json"],
+            },
+            Path("events.parquet"),
+        )
+
+        self.assertEqual(query.prepare_sql, ())
+        self.assertIn("event_properties->>'$.clientID' AS p0", query.timed_sql)
+        self.assertIn("event_properties->>'$.browser' AS p1", query.timed_sql)
+
     def test_jsono_optimizer_project_query_exercises_repeated_extracts(self) -> None:
         query = run_benchmarks.build_jsono_query(
             {

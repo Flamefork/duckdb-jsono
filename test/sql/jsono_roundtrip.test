@@ -161,7 +161,7 @@ SELECT
   typeof(jsono('{"a":1}')),
   try_jsono('{bad') IS NULL;
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))	true
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))	true
 
 statement error
 SELECT jsono('{bad');
@@ -179,17 +179,20 @@ SELECT
 # absent value: it must fail loud, not silently read as NULL (same class as the bad metadata
 # case below). Only a slots blob too short to hold a header reads as NULL.
 statement error
-SELECT to_json({'jsono': {'body': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB}}});
+SELECT to_json({'jsono': {'body': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}});
 ----
 not a JSONO value
 
-# to_json on a structurally valid header with missing container span should fail, not crash.
+# to_json on a structurally valid header with a missing container span (arrays always store
+# one) should fail, not crash.
 statement error
 SELECT to_json({'jsono': {'body': {
-  'slots': unhex('4A534E4F030100000000000000000000'),
+  'slots': unhex('4A534E4F040100000000000000000020'),
   'key_heap': ''::BLOB,
   'string_heap': ''::BLOB,
-  'skips': ''::BLOB
+  'skips': ''::BLOB,
+  'lengths': ''::BLOB,
+  'nums': ''::BLOB
 }}});
 ----
 container span
@@ -197,10 +200,12 @@ container span
 # to_json on a structurally valid header with truncated slot data should fail, not crash.
 statement error
 SELECT to_json({'jsono': {'body': {
-  'slots': unhex('4A534E4F030100000000000000000020'),
+  'slots': unhex('4A534E4F040100000000000000000020'),
   'key_heap': ''::BLOB,
   'string_heap': ''::BLOB,
-  'skips': unhex('01000000000000000000000001000000000000000000000000000000')
+  'skips': unhex('01000000000000000000000000000000010000000000000000000000000000000000000000000000'),
+  'lengths': ''::BLOB,
+  'nums': ''::BLOB
 }}});
 ----
 malformed JSONO
@@ -216,23 +221,26 @@ SELECT
 ----
 true	true	true	true
 
-# The writer emits a metadata header (12 B) plus one 16-byte span per object/array container.
+# The writer emits a metadata header (12 B) plus a sparse id (4 B) and a 24-byte span ONLY
+# for spanned containers: here the array stores one and the root object stores one too —
+# its immediate children include a container, so its skip must jump, not walk.
 query I
 SELECT octet_length(jsono('{"a":"x","b":["yy"]}')."jsono".body.skips);
 ----
-44
+68
 
-# One cursor checkpoint is added for an object with 17 keys.
+# A 17-key object is spanned (id 4 B + span 24 B) and gets a checkpoint index entry (12 B)
+# with one 16-byte cursor checkpoint.
 query I
 SELECT octet_length(jsono('{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":"x"}')."jsono".body.skips);
 ----
-48
+68
 
 # jsono() yields the documented nested STRUCT shape directly (no type alias).
 query I
 SELECT typeof(jsono('{"a":1}'));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 # jsono() is exactly this STRUCT, so a bare STRUCT (e.g. read from Parquet, which carries no
 # alias) flows into to_json/transform unchanged.

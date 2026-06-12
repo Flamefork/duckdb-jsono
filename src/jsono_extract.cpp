@@ -1,11 +1,13 @@
 #include "jsono_extract.hpp"
 #include "jsono.hpp"
+#include "jsono_locate.hpp"
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_render.hpp"
+#include "jsono_row_read.hpp"
 #include "jsono_writer.hpp"
 
-#include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
@@ -20,7 +22,6 @@
 
 #include "string_view.hpp"
 
-#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -55,22 +56,8 @@ struct ExtractPathBindData : public FunctionData {
 	}
 };
 
-struct ExtractRankCacheEntry {
-	bool valid = false;
-	idx_t step_index = DConstants::INVALID_INDEX;
-	size_t key_count = 0;
-	string key;
-	size_t rank = 0;
-	bool found = false;
-};
-
-constexpr idx_t RANK_CACHE_SIZE = 4096;
-
 struct ExtractLocalState : public FunctionLocalState {
-	ExtractLocalState() : rank_cache(RANK_CACHE_SIZE) {
-	}
-
-	vector<ExtractRankCacheEntry> rank_cache;
+	RankCache rank_cache;
 	JsonoBuilder builder;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
@@ -83,8 +70,7 @@ struct ExtractLocalState : public FunctionLocalState {
 };
 
 struct Location {
-	size_t pos = 0;
-	size_t string_cursor = 0;
+	JsonoCursor cursor;
 };
 
 vector<PathStep> LiteralKeyPath(nonstd::string_view name) {
@@ -143,389 +129,327 @@ unique_ptr<FunctionData> JsonoExtractBind(ClientContext &context, ScalarFunction
 	return make_uniq<ExtractPathBindData>(std::move(path), std::move(steps));
 }
 
-nonstd::string_view ObjectKeyAtRank(const JsonoView &view, const ObjectLayout &layout, size_t rank) {
-	if (rank >= layout.key_count) {
-		throw InternalException("JSONO object key rank out of bounds");
-	}
-	auto key_slot = view.SlotAt(layout.key_start + rank);
-	if (SlotTag(key_slot) != tag::KEY) {
-		throw InvalidInputException("malformed JSONO: expected KEY slot");
-	}
-	return view.KeyAt(SlotPayload(key_slot));
-}
-
-bool FindObjectKeyRank(const JsonoView &view, const ObjectLayout &layout, const string &key, size_t &rank) {
-	size_t lo = 0;
-	size_t hi = layout.key_count;
-	while (lo < hi) {
-		auto mid = lo + (hi - lo) / 2;
-		auto key_slot = view.SlotAt(layout.key_start + mid);
-		if (SlotTag(key_slot) != tag::KEY) {
-			throw InvalidInputException("malformed JSONO: expected KEY slot");
-		}
-		if (view.KeyAt(SlotPayload(key_slot)) < key) {
-			lo = mid + 1;
-		} else {
-			hi = mid;
-		}
-	}
-	rank = lo;
-	if (lo >= layout.key_count) {
-		return false;
-	}
-	auto key_slot = view.SlotAt(layout.key_start + lo);
-	if (SlotTag(key_slot) != tag::KEY) {
-		throw InvalidInputException("malformed JSONO: expected KEY slot");
-	}
-	if (view.KeyAt(SlotPayload(key_slot)) != key) {
-		return false;
-	}
-	return true;
-}
-
-bool ValidateCachedObjectRank(const JsonoView &view, const ObjectLayout &layout, const string &key, size_t rank,
-                              bool found) {
-	if (rank > layout.key_count) {
-		return false;
-	}
-	if (found) {
-		return rank < layout.key_count && ObjectKeyAtRank(view, layout, rank) == key;
-	}
-	if (rank > 0 && ObjectKeyAtRank(view, layout, rank - 1) >= key) {
-		return false;
-	}
-	if (rank < layout.key_count && ObjectKeyAtRank(view, layout, rank) <= key) {
-		return false;
-	}
-	return true;
-}
-
-ExtractRankCacheEntry &GetRankCacheEntry(vector<ExtractRankCacheEntry> &rank_cache, idx_t step_index,
-                                         size_t key_count) {
-	auto cache_index = idx_t(((uint64_t(step_index) * 0x9E3779B97F4A7C15ULL) ^ key_count) & (RANK_CACHE_SIZE - 1));
-	return rank_cache[cache_index];
-}
-
-bool FindPathObjectRank(ExtractLocalState &lstate, idx_t step_index, const JsonoView &view, const ObjectLayout &layout,
-                        const string &key, size_t &rank) {
-	auto &entry = GetRankCacheEntry(lstate.rank_cache, step_index, layout.key_count);
-	auto cache_valid = entry.valid && entry.step_index == step_index && entry.key_count == layout.key_count &&
-	                   entry.key == key && ValidateCachedObjectRank(view, layout, key, entry.rank, entry.found);
-	if (!cache_valid) {
-		bool found = FindObjectKeyRank(view, layout, key, rank);
-		entry.valid = true;
-		entry.step_index = step_index;
-		entry.key_count = layout.key_count;
-		entry.key = key;
-		entry.rank = rank;
-		entry.found = found;
-		return found;
-	}
-	rank = entry.rank;
-	return entry.found;
-}
-
 bool LocatePath(ExtractLocalState &lstate, const vector<PathStep> &steps, const JsonoView &view, Location &location) {
-	size_t pos = 0;
-	size_t string_cursor = 0;
-	for (idx_t step_index = 0; step_index < steps.size(); step_index++) {
-		if (pos >= view.Slots()) {
-			return false;
-		}
-		auto slot_tag = SlotTag(view.SlotAt(pos));
-		auto &step = steps[step_index];
-		switch (step.kind) {
-		case PathStepKind::Key: {
-			if (slot_tag != tag::OBJ_START) {
-				return false;
-			}
-			auto layout = ReadObjectLayout(view, pos);
-			size_t rank = 0;
-			if (!FindPathObjectRank(lstate, step_index, view, layout, step.key, rank)) {
-				return false;
-			}
-			size_t value_rank = 0;
-			size_t value_pos = layout.value_start;
-			size_t value_string_cursor = string_cursor;
-			MoveObjectValueCursorToRank(view, layout, string_cursor, rank, value_rank, value_pos, value_string_cursor);
-			pos = value_pos;
-			string_cursor = value_string_cursor;
-			break;
-		}
-		case PathStepKind::Index: {
-			if (slot_tag != tag::ARR_START) {
-				return false;
-			}
-			auto end_pos = ReadArrayEndPos(view, pos);
-			size_t elem_pos = pos + 1;
-			idx_t current = 0;
-			while (elem_pos < end_pos && current < step.index) {
-				SkipValueFast(view, elem_pos, string_cursor);
-				current++;
-			}
-			if (elem_pos >= end_pos || current < step.index) {
-				return false;
-			}
-			pos = elem_pos;
-			break;
-		}
-		case PathStepKind::Wildcard:
-			return false;
-		}
+	JsonoCursor cursor;
+	if (!LocatePathSteps(&lstate.rank_cache, 0, steps, view, cursor)) {
+		return false;
 	}
-	location.pos = pos;
-	location.string_cursor = string_cursor;
+	location.cursor = cursor;
 	return true;
 }
 
-void AppendJsonString(nonstd::string_view value, std::string &out) {
-	out.push_back('"');
-	for (char c : value) {
-		switch (c) {
-		case '"':
-			out.append("\\\"");
+// Copy the container subtree at `start` into `builder` as a standalone value. The subtree
+// is one contiguous range of every stream (slots, string_heap, lengths, nums), so the
+// streams are bulk-copied; slots are rewritten only where they reference row-global state:
+// KEY heap offsets are rebased (contiguous source key-byte runs are copied once, not per
+// key) and container ids are renumbered to start at 0. The writer's counter assigns ids in
+// walk order, so the subtree's containers occupy the contiguous id range
+// [root_id, root_id + container_count) — its sparse span index, checkpoint index and
+// checkpoint records are contiguous record runs in `skips`, copied with the same id/offset
+// rebase (span contents and checkpoint deltas are subtree-local already). The result is
+// byte-identical to a per-value re-emit of the same subtree.
+void BulkEmitSubtree(const JsonoView &view, const JsonoCursor &start, JsonoBuilder &builder) {
+	auto root_slot = view.SlotAt(start.pos);
+	auto root_tag = SlotTag(root_slot);
+	uint64_t root_id = ContainerId(SlotPayload(root_slot));
+	ContainerSpan root_span;
+	bool root_has_span = view.TryContainerSpan(root_id, root_span);
+	size_t slot_span;
+	size_t string_bytes;
+	size_t length_count;
+	size_t num_count;
+	if (root_has_span) {
+		if (root_span.slot_span < 2 || size_t(root_span.slot_span) > view.Slots() - start.pos) {
+			throw InvalidInputException("malformed JSONO: container slot span out of bounds");
+		}
+		auto end_tag = SlotTag(view.SlotAt(start.pos + root_span.slot_span - 1));
+		if (end_tag != (root_tag == tag::OBJ_START ? tag::OBJ_END : tag::ARR_END)) {
+			throw InvalidInputException("malformed JSONO: container span end tag mismatch");
+		}
+		slot_span = root_span.slot_span;
+		string_bytes = root_span.string_byte_span;
+		length_count = root_span.length_count;
+		num_count = root_span.num_count;
+	} else {
+		// Spanless root: a small flat object (an array or an object with a container child
+		// always stores a span). One iterative pass below discovers its end and stream spans.
+		if (root_tag != tag::OBJ_START) {
+			throw InvalidInputException("malformed JSONO: container span missing");
+		}
+		slot_span = 0;
+		string_bytes = 0;
+		length_count = 0;
+		num_count = 0;
+	}
+
+	if (root_has_span) {
+		builder.slots.reserve(slot_span);
+	}
+	uint64_t container_count = 0;
+	// Pending run of contiguous source key bytes; every key belongs to exactly one run and
+	// the flush bounds-checks the union of its keys' ranges before any bytes are copied.
+	uint64_t run_src_start = 0;
+	uint64_t run_src_len = 0;
+	size_t run_dest_base = 0;
+	// With a root span the slot range and stream spans are known up front, so the pass only
+	// copies and rewrites slots. Without one it also walks the stream cursors (LengthAt per
+	// string value) and stops when the container depth returns to zero.
+	size_t pos = start.pos;
+	size_t depth = 0;
+	auto length_cursor = start.length_cursor;
+	do {
+		auto slot = view.SlotAt(pos);
+		auto slot_tag = SlotTag(slot);
+		switch (slot_tag) {
+		case tag::KEY: {
+			auto payload = SlotPayload(slot);
+			auto offset = KeyOffset(payload);
+			auto len = KeyLen(payload);
+			if (run_src_len > 0 && offset != run_src_start + run_src_len) {
+				auto run = view.KeyHeapSlice(run_src_start, run_src_len);
+				builder.key_heap.insert(builder.key_heap.end(), run.begin(), run.end());
+				run_src_len = 0;
+			}
+			if (run_src_len == 0) {
+				run_src_start = offset;
+				run_dest_base = builder.key_heap.size();
+			}
+			builder.PushKeySlot(run_dest_base + run_src_len, len);
+			run_src_len += len;
 			break;
-		case '\\':
-			out.append("\\\\");
+		}
+		case tag::OBJ_START:
+		case tag::ARR_START: {
+			auto payload = SlotPayload(slot);
+			if (container_count > 0 && ContainerId(payload) != root_id + container_count) {
+				throw InvalidInputException("malformed JSONO: container ids are not sequential in walk order");
+			}
+			builder.slots.push_back(
+			    MakeSlot(slot_tag, MakeContainerPayload(container_count, ContainerChildCount(payload))));
+			container_count++;
+			depth++;
 			break;
-		case '\b':
-			out.append("\\b");
-			break;
-		case '\f':
-			out.append("\\f");
-			break;
-		case '\n':
-			out.append("\\n");
-			break;
-		case '\r':
-			out.append("\\r");
-			break;
-		case '\t':
-			out.append("\\t");
+		}
+		case tag::OBJ_END:
+		case tag::ARR_END:
+			builder.slots.push_back(slot);
+			depth--;
 			break;
 		default:
-			if (static_cast<unsigned char>(c) < 0x20) {
-				char buf[8];
-				std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
-				out.append(buf);
+			if (!root_has_span) {
+				switch (slot_tag) {
+				case tag::VAL_STR_HEAP:
+					string_bytes += view.LengthAt(length_cursor + length_count);
+					length_count++;
+					break;
+				case tag::VAL_INT60:
+				case tag::VAL_DEC60:
+					num_count++;
+					break;
+				case tag::VAL_EXT: {
+					auto subtype = ExtSubtype(slot);
+					if (subtype == ext_subtype::NUMBER) {
+						string_bytes += view.LengthAt(length_cursor + length_count);
+						length_count++;
+					} else if (subtype < ext_subtype::COUNT) {
+						num_count++;
+					} else {
+						throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
+					}
+					break;
+				}
+				case tag::VAL_NULL:
+				case tag::VAL_TRUE:
+				case tag::VAL_FALSE:
+					break;
+				default:
+					throw InvalidInputException("malformed JSONO: unknown slot tag");
+				}
+			}
+			builder.slots.push_back(slot);
+			break;
+		}
+		pos++;
+	} while (root_has_span ? pos < start.pos + slot_span : depth > 0);
+	if (run_src_len > 0) {
+		auto run = view.KeyHeapSlice(run_src_start, run_src_len);
+		builder.key_heap.insert(builder.key_heap.end(), run.begin(), run.end());
+	}
+	builder.container_count = container_count;
+
+	auto strings = view.StringAt(start.string_cursor, string_bytes);
+	builder.string_heap.insert(builder.string_heap.end(), strings.begin(), strings.end());
+	if (length_count > 0) {
+		auto bytes = view.LengthsBytes(start.length_cursor, length_count);
+		builder.lengths.resize(length_count);
+		std::memcpy(builder.lengths.data(), bytes, length_count * sizeof(uint32_t));
+	}
+	if (num_count > 0) {
+		auto bytes = view.NumsBytes(start.num_cursor, num_count);
+		builder.nums.resize(num_count);
+		std::memcpy(builder.nums.data(), bytes, num_count * sizeof(uint64_t));
+	}
+
+	// A spanless root cannot have spanned descendants or checkpoints (it is a flat object),
+	// so its metadata sections are empty and the searches below are skipped entirely.
+	if (!root_has_span && container_count == 1) {
+		return;
+	}
+
+	auto &metadata = view.MetadataHeader();
+	size_t span_lo = 0;
+	{
+		size_t lo = 0;
+		size_t hi = metadata.span_count;
+		while (lo < hi) {
+			auto mid = lo + (hi - lo) / 2;
+			if (view.SpanIdAt(mid) < root_id) {
+				lo = mid + 1;
 			} else {
-				out.push_back(c);
+				hi = mid;
 			}
 		}
+		span_lo = lo;
 	}
-	out.push_back('"');
+	size_t span_hi = span_lo;
+	while (span_hi < metadata.span_count) {
+		auto span_id = view.SpanIdAt(span_hi);
+		if (span_id >= root_id + container_count) {
+			break;
+		}
+		builder.span_ids.push_back(uint32_t(span_id - root_id));
+		span_hi++;
+	}
+	if (span_hi > span_lo) {
+		auto count = span_hi - span_lo;
+		builder.skips.resize(count);
+		std::memcpy(builder.skips.data(), view.SpanRecordsBytes(span_lo, count), count * sizeof(ContainerSpan));
+	}
+
+	size_t index_lo = 0;
+	{
+		size_t lo = 0;
+		size_t hi = metadata.checkpoint_index_count;
+		while (lo < hi) {
+			auto mid = lo + (hi - lo) / 2;
+			if (view.ObjectCheckpointIndexAt(uint32_t(mid)).container_id < root_id) {
+				lo = mid + 1;
+			} else {
+				hi = mid;
+			}
+		}
+		index_lo = lo;
+	}
+	size_t index_hi = index_lo;
+	uint32_t checkpoint_base = 0;
+	while (index_hi < metadata.checkpoint_index_count) {
+		auto entry = view.ObjectCheckpointIndexAt(uint32_t(index_hi));
+		if (entry.container_id >= root_id + container_count) {
+			break;
+		}
+		if (index_hi == index_lo) {
+			checkpoint_base = entry.checkpoint_offset;
+		} else if (entry.checkpoint_offset < checkpoint_base) {
+			throw InvalidInputException("malformed JSONO: object checkpoint offsets are not ascending");
+		}
+		builder.object_checkpoint_index.push_back(ObjectCheckpointIndex {uint32_t(entry.container_id - root_id),
+		                                                                 entry.checkpoint_offset - checkpoint_base,
+		                                                                 entry.checkpoint_stride, 0});
+		index_hi++;
+	}
+	if (index_hi > index_lo) {
+		auto checkpoint_end = index_hi < metadata.checkpoint_index_count
+		                          ? view.ObjectCheckpointIndexAt(uint32_t(index_hi)).checkpoint_offset
+		                          : metadata.checkpoint_count;
+		if (checkpoint_end < checkpoint_base) {
+			throw InvalidInputException("malformed JSONO: object checkpoint offsets are not ascending");
+		}
+		auto count = size_t(checkpoint_end - checkpoint_base);
+		builder.object_checkpoints.resize(count);
+		std::memcpy(builder.object_checkpoints.data(), view.CheckpointRecordsBytes(checkpoint_base, count),
+		            count * sizeof(ObjectCursorCheckpoint));
+	}
 }
 
-bool AppendExtractStringScalar(const JsonoScalar &scalar, std::string &out) {
+// Write a scalar extract result directly into the row's six body blobs, skipping the
+// JsonoBuilder: slots are the header plus one tag word, skips is the constant empty
+// metadata header, and the value's single stream entry comes straight from the source
+// view. Tag selection mirrors JsonoBuilder::Emit*, so the bytes match a re-emit.
+void WriteScalarExtractRow(JsonoBodyWriter &writer, idx_t row, const JsonoView &view, JsonoCursor cursor) {
+	auto scalar = DecodeScalarAt(view, cursor);
+	uint64_t slot = 0;
+	uint64_t num_word = 0;
+	bool has_num = false;
+	nonstd::string_view text;
+	bool has_text = false;
 	switch (scalar.kind) {
-	case JsonoScalarKind::Null:
-		return true;
 	case JsonoScalarKind::String:
+		slot = MakeSlot(tag::VAL_STR_HEAP, 0);
+		text = scalar.text;
+		has_text = true;
+		break;
 	case JsonoScalarKind::NumberText:
-		out.append(scalar.text.data(), scalar.text.size());
-		return false;
+		slot = MakeExtSlot(ext_subtype::NUMBER);
+		text = scalar.text;
+		has_text = true;
+		break;
 	case JsonoScalarKind::Int64:
-		out.append(std::to_string(scalar.int_value));
-		return false;
+		slot = FitsInt60(scalar.int_value) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64);
+		num_word = uint64_t(scalar.int_value);
+		has_num = true;
+		break;
 	case JsonoScalarKind::UInt64:
-		out.append(std::to_string(scalar.uint_value));
-		return false;
+		slot =
+		    scalar.uint_value <= uint64_t(INT60_MAX) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::UINT64);
+		num_word = scalar.uint_value;
+		has_num = true;
+		break;
 	case JsonoScalarKind::Double:
-		EmitDouble(scalar.double_value, out);
-		return false;
+		if (!std::isfinite(scalar.double_value)) {
+			throw InvalidInputException("jsono: cannot store non-finite double value (NaN/Infinity)");
+		}
+		slot = MakeExtSlot(ext_subtype::DOUBLE);
+		std::memcpy(&num_word, &scalar.double_value, sizeof(num_word));
+		has_num = true;
+		break;
 	case JsonoScalarKind::Dec60:
-		AppendDec60Text(out, scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
-		return false;
+		slot = MakeSlot(tag::VAL_DEC60, 0);
+		num_word = MakeDec60Payload(scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
+		has_num = true;
+		break;
 	case JsonoScalarKind::Bool:
-		out.append(scalar.bool_value ? "true" : "false");
-		return false;
+		slot = MakeSlot(scalar.bool_value ? tag::VAL_TRUE : tag::VAL_FALSE, 0);
+		break;
+	case JsonoScalarKind::Null:
+		slot = MakeSlot(tag::VAL_NULL, 0);
+		break;
 	}
-	return true;
-}
-
-void AppendJsonValueText(const JsonoView &view, size_t &pos, size_t &string_cursor, std::string &out, size_t depth) {
-	if (depth > JSONO_MAX_NESTING_DEPTH) {
-		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
-		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+	char slots_buf[JSONO_HEADER_SIZE + sizeof(uint64_t)];
+	JsonoHeader header;
+	header.magic = MAGIC;
+	header.version = VERSION;
+	header.flags = flags::SORTED_KEYS;
+	header.reserved = 0;
+	std::memcpy(slots_buf, &header, JSONO_HEADER_SIZE);
+	std::memcpy(slots_buf + JSONO_HEADER_SIZE, &slot, sizeof(slot));
+	static constexpr ContainerMetadataHeader EMPTY_METADATA {0, 0, 0};
+	writer.data[BODY_SLOTS][row] = WriteBlobInto(writer.Slots(), slots_buf, sizeof(slots_buf));
+	writer.data[BODY_KEY_HEAP][row] = WriteBlobInto(writer.KeyHeap(), nullptr, 0);
+	writer.data[BODY_STRING_HEAP][row] = WriteBlobInto(writer.StringHeap(), text.data(), text.size());
+	writer.data[BODY_SKIPS][row] =
+	    WriteBlobInto(writer.Skips(), reinterpret_cast<const char *>(&EMPTY_METADATA), sizeof(EMPTY_METADATA));
+	if (has_text) {
+		auto len = uint32_t(text.size());
+		writer.data[BODY_LENGTHS][row] =
+		    WriteBlobInto(writer.Lengths(), reinterpret_cast<const char *>(&len), sizeof(len));
+	} else {
+		writer.data[BODY_LENGTHS][row] = WriteBlobInto(writer.Lengths(), nullptr, 0);
 	}
-	auto slot_tag = SlotTag(view.SlotAt(pos));
-	switch (slot_tag) {
-	case tag::OBJ_START: {
-		auto layout = ReadObjectLayout(view, pos);
-		auto val_cursor = layout.value_start;
-		out.push_back('{');
-		for (size_t i = 0; i < layout.key_count; i++) {
-			if (i) {
-				out.push_back(',');
-			}
-			auto key_slot = view.SlotAt(layout.key_start + i);
-			if (SlotTag(key_slot) != tag::KEY) {
-				throw InvalidInputException("malformed JSONO: expected KEY slot");
-			}
-			AppendJsonString(view.KeyAt(SlotPayload(key_slot)), out);
-			out.push_back(':');
-			AppendJsonValueText(view, val_cursor, string_cursor, out, depth + 1);
-		}
-		if (val_cursor != layout.after_pos - 1) {
-			throw InvalidInputException("malformed JSONO: object value span mismatch");
-		}
-		pos = layout.after_pos;
-		out.push_back('}');
-		return;
-	}
-	case tag::ARR_START: {
-		auto end_pos = ReadArrayEndPos(view, pos);
-		pos++;
-		out.push_back('[');
-		bool first = true;
-		while (pos < end_pos) {
-			if (!first) {
-				out.push_back(',');
-			}
-			first = false;
-			AppendJsonValueText(view, pos, string_cursor, out, depth + 1);
-		}
-		pos = end_pos + 1;
-		out.push_back(']');
-		return;
-	}
-	default: {
-		auto scalar = DecodeScalarAt(view, pos, string_cursor);
-		if (scalar.kind == JsonoScalarKind::String) {
-			AppendJsonString(scalar.text, out);
-			return;
-		}
-		if (AppendExtractStringScalar(scalar, out)) {
-			out.append("null");
-		}
-		return;
-	}
-	}
-}
-
-void EmitJsonoSubtree(const JsonoView &view, size_t &pos, size_t &string_cursor, JsonoBuilder &builder, size_t depth) {
-	if (depth > JSONO_MAX_NESTING_DEPTH) {
-		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
-		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
-	}
-	auto slot_tag = SlotTag(view.SlotAt(pos));
-	switch (slot_tag) {
-	case tag::OBJ_START: {
-		auto layout = ReadObjectLayout(view, pos);
-		auto val_cursor = layout.value_start;
-		builder.EmitObjectStart(layout.key_count);
-		for (size_t i = 0; i < layout.key_count; i++) {
-			auto key_slot = view.SlotAt(layout.key_start + i);
-			if (SlotTag(key_slot) != tag::KEY) {
-				throw InvalidInputException("malformed JSONO: expected KEY slot");
-			}
-			builder.EmitKeySlot(view.KeyAt(SlotPayload(key_slot)));
-		}
-		for (size_t i = 0; i < layout.key_count; i++) {
-			builder.EmitObjectChildStart();
-			EmitJsonoSubtree(view, val_cursor, string_cursor, builder, depth + 1);
-		}
-		if (val_cursor != layout.after_pos - 1) {
-			throw InvalidInputException("malformed JSONO: object value span mismatch");
-		}
-		pos = layout.after_pos;
-		builder.EmitObjectEnd();
-		return;
-	}
-	case tag::ARR_START: {
-		auto end_pos = ReadArrayEndPos(view, pos);
-		builder.EmitArrayStart();
-		pos++;
-		while (pos < end_pos) {
-			EmitJsonoSubtree(view, pos, string_cursor, builder, depth + 1);
-		}
-		pos = end_pos + 1;
-		builder.EmitArrayEnd();
-		return;
-	}
-	default: {
-		auto scalar = DecodeScalarAt(view, pos, string_cursor);
-		switch (scalar.kind) {
-		case JsonoScalarKind::String:
-			builder.EmitString(scalar.text);
-			return;
-		case JsonoScalarKind::Int64:
-			builder.EmitInt(scalar.int_value);
-			return;
-		case JsonoScalarKind::UInt64:
-			builder.EmitUInt(scalar.uint_value);
-			return;
-		case JsonoScalarKind::Double:
-			builder.EmitDouble(scalar.double_value);
-			return;
-		case JsonoScalarKind::Dec60:
-			builder.EmitDec60(scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
-			return;
-		case JsonoScalarKind::NumberText:
-			builder.EmitNumberText(scalar.text);
-			return;
-		case JsonoScalarKind::Bool:
-			builder.EmitBool(scalar.bool_value);
-			return;
-		case JsonoScalarKind::Null:
-			builder.EmitNull();
-			return;
-		}
-		return;
-	}
-	}
-}
-
-// Manifest checks for a native extract over a residual that carries a shred manifest (the
-// record of paths stripped out of this residual at write time; see jsono.hpp).
-//
-// `on_miss`: the extract path was not found in the residual. An exact manifest match (or a
-// manifest leaf inside the missing subtree) means the value was stripped into a shred this
-// reading context does not have — the row was narrowed by a raw struct cast — so fail loud
-// instead of returning a silent NULL. `on_container`: the extract found a container; a manifest
-// leaf strictly inside it means the returned subtree would be missing that leaf. An honest
-// shredded read never reaches either case (the optimizer reads shreds directly and reconstructs
-// subtree reads that overlap a shred), so a manifest hit here is always a narrowed row.
-void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathStep> &extract_steps, bool found_container,
-                               std::vector<jsono::ShredManifestEntry> &manifest_scratch,
-                               vector<PathStep> &steps_scratch) {
-	if (!view.HasShredManifest()) {
-		return;
-	}
-	view.ReadShredManifest(manifest_scratch);
-	for (auto &entry : manifest_scratch) {
-		auto path = string(entry.path);
-		steps_scratch.clear();
-		if (!path.empty() && path[0] == '$') {
-			steps_scratch = ParseJsonoPath(path, "jsono shred manifest");
-		} else {
-			steps_scratch.push_back(PathStep {PathStepKind::Key, path, 0});
-		}
-		// A manifest path is an object-key chain by the shred writer's invariant. It covers the
-		// extract when it equals the extract path (the value itself was stripped) or extends it
-		// (a stripped leaf inside the extracted subtree). For a found scalar neither can hold;
-		// for a miss both can, for a found container only the strict extension can.
-		if (steps_scratch.size() < extract_steps.size()) {
-			continue;
-		}
-		if (found_container && steps_scratch.size() == extract_steps.size()) {
-			continue;
-		}
-		bool covers = true;
-		for (idx_t i = 0; i < extract_steps.size(); i++) {
-			auto &m = steps_scratch[i];
-			auto &e = extract_steps[i];
-			if (m.kind != e.kind || m.key != e.key || m.index != e.index) {
-				covers = false;
-				break;
-			}
-		}
-		if (covers) {
-			throw InvalidInputException(
-			    "JSONO: path '%s' was shredded into a shred this value no longer carries (the row was narrowed "
-			    "by a raw struct cast) and cannot be read losslessly",
-			    path.c_str());
-		}
+	if (has_num) {
+		writer.data[BODY_NUMS][row] =
+		    WriteBlobInto(writer.Nums(), reinterpret_cast<const char *>(&num_word), sizeof(num_word));
+	} else {
+		writer.data[BODY_NUMS][row] = WriteBlobInto(writer.Nums(), nullptr, 0);
 	}
 }
 
@@ -535,49 +459,35 @@ void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ExtractLocalState>();
 	auto count = args.size();
 
-	JsonoVectorData input;
-	InitJsonoVectorData(args.data[0], count, input);
+	JsonoRowReader reader;
+	reader.InitPointRead(args.data[0], count);
 
-	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
-	InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
-	auto &slots_vec = *slots_p;
-	auto &key_heap_vec = *key_heap_p;
-	auto &string_heap_vec = *string_heap_p;
-	auto &skips_vec = *skips_p;
-	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
-	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
-	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
-	auto skips_out = FlatVector::GetData<string_t>(skips_vec);
+	JsonoBodyWriter writer;
+	writer.Init(result);
 
-	std::vector<jsono::ShredManifestEntry> manifest_scratch;
-	vector<PathStep> steps_scratch;
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
-			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
-			continue;
-		}
-		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader() || view.Slots() == 0) {
-			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			writer.SetRowNull(row);
 			continue;
 		}
 		Location location;
 		if (!LocatePath(lstate, bind_data.steps, view, location)) {
-			ThrowIfManifestCoversPath(view, bind_data.steps, false, manifest_scratch, steps_scratch);
-			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+			reader.CheckPathMiss(view, bind_data.steps);
+			writer.SetRowNull(row);
 			continue;
 		}
-		size_t pos = location.pos;
-		size_t string_cursor = location.string_cursor;
-		auto found_tag = SlotTag(view.SlotAt(pos));
+		auto cursor = location.cursor;
+		auto found_tag = SlotTag(view.SlotAt(cursor.pos));
 		if (found_tag == tag::OBJ_START || found_tag == tag::ARR_START) {
-			ThrowIfManifestCoversPath(view, bind_data.steps, true, manifest_scratch, steps_scratch);
+			reader.CheckContainerRead(view, bind_data.steps);
+			lstate.builder.Reset();
+			BulkEmitSubtree(view, cursor, lstate.builder);
+			writer.WriteRow(row, lstate.builder);
+		} else {
+			WriteScalarExtractRow(writer, row, view, cursor);
 		}
-		lstate.builder.Reset();
-		EmitJsonoSubtree(view, pos, string_cursor, lstate.builder, 0);
-		WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out, string_heap_out,
-		                 skips_out, row, lstate.builder);
 	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -590,45 +500,38 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ExtractLocalState>();
 	auto count = args.size();
 
-	JsonoVectorData input;
-	InitJsonoVectorData(args.data[0], count, input);
+	JsonoRowReader reader;
+	reader.InitPointRead(args.data[0], count);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<string_t>(result);
 	std::string scratch;
-	std::vector<jsono::ShredManifestEntry> manifest_scratch;
-	vector<PathStep> steps_scratch;
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader() || view.Slots() == 0) {
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
 		Location location;
 		if (!LocatePath(lstate, bind_data.steps, view, location)) {
-			ThrowIfManifestCoversPath(view, bind_data.steps, false, manifest_scratch, steps_scratch);
+			reader.CheckPathMiss(view, bind_data.steps);
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
-		size_t pos = location.pos;
-		size_t string_cursor = location.string_cursor;
-		auto slot_tag = SlotTag(view.SlotAt(pos));
+		auto cursor = location.cursor;
+		auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
 		scratch.clear();
 		if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
-			ThrowIfManifestCoversPath(view, bind_data.steps, true, manifest_scratch, steps_scratch);
-			AppendJsonValueText(view, pos, string_cursor, scratch, 0);
+			reader.CheckContainerRead(view, bind_data.steps);
+			AppendJsonValueText(view, cursor, scratch, 0);
 			result_data[row] = StringVector::AddString(result, scratch.data(), scratch.size());
 			continue;
 		}
-		auto scalar = DecodeScalarAt(view, pos, string_cursor);
+		auto scalar = DecodeScalarAt(view, cursor);
 		if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
 			result_data[row] = StringVector::AddString(result, scalar.text.data(), scalar.text.size());
-		} else if (AppendExtractStringScalar(scalar, scratch)) {
+		} else if (RenderExtractText(scalar, scratch)) {
 			FlatVector::SetNull(result, row, true);
 		} else {
 			result_data[row] = StringVector::AddString(result, scratch.data(), scratch.size());

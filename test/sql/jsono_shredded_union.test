@@ -228,10 +228,10 @@ SELECT to_json(e)::VARCHAR FROM ins_target ORDER BY 1;
 statement error
 SELECT struct_pack(
         "jsono" := struct_pack(
-            body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB),
-            a := 'v'))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)));
+            body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
+            a := 'v'))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
 ----
-NULL residual
+body is NULL
 
 # --- CASE/COALESCE also reconcile two differently shredded values: DuckDB merges their shred
 # sets into one shredded type and the optimizer reshredds each arm — values correct, type

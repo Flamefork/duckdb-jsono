@@ -1,8 +1,12 @@
 #include "jsono_shred.hpp"
 #include "jsono.hpp"
+#include "jsono_dom.hpp"
+#include "jsono_locate.hpp"
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_render.hpp"
+#include "jsono_row_read.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -54,6 +58,15 @@ struct ShredBindData : public FunctionData {
 	bool reshred_active = false;
 	vector<idx_t> keep_src;
 	vector<idx_t> return_src;
+	// One-pass text write (JsonoShredFromTextExecute): a trie over the object-key shred paths
+	// lets pass 1 of the direct DOM writer capture and strip the leaves while sizing — the
+	// throwaway plain materialization and the per-row locate/strip/re-emit disappear. Fields
+	// whose path is not a pure key sequence never strip; they are filled from the written
+	// residual per row (residual_fill_fields). Duplicate paths in the spec (e.g. '$.a' and
+	// 'a') fall back to the two-pass path.
+	bool one_pass_text = false;
+	std::vector<jsono_dom::DomShredTrieNode> trie;
+	vector<idx_t> residual_fill_fields;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<ShredBindData>(*this);
@@ -237,6 +250,39 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec) {
 	// JsonoShreddedStructType names every field (blobs included) with the shred-set fingerprint, so a
 	// column declared from the same shreds is byte-identical and a mismatched cast fails loud.
 	bind_data->return_type = JsonoShreddedStructType(shreds);
+
+	bind_data->one_pass_text = true;
+	bind_data->trie.emplace_back();
+	for (idx_t f = 0; f < bind_data->fields.size(); f++) {
+		auto &field = bind_data->fields[f];
+		if (!IsObjectKeyPath(field.steps)) {
+			bind_data->residual_fill_fields.push_back(f);
+			continue;
+		}
+		uint32_t node = 0;
+		for (auto &step : field.steps) {
+			uint32_t next = std::numeric_limits<uint32_t>::max();
+			for (auto &edge : bind_data->trie[node].children) {
+				if (edge.first == step.key) {
+					next = edge.second;
+					break;
+				}
+			}
+			if (next == std::numeric_limits<uint32_t>::max()) {
+				bind_data->trie.emplace_back();
+				next = uint32_t(bind_data->trie.size() - 1);
+				bind_data->trie[node].children.emplace_back(step.key, next);
+			}
+			node = next;
+		}
+		if (bind_data->trie[node].field >= 0) {
+			// Two spec entries name the same key path (e.g. '$.a' and 'a'); the per-row
+			// locate-and-strip path handles them with the documented semantics.
+			bind_data->one_pass_text = false;
+			break;
+		}
+		bind_data->trie[node].field = int64_t(f);
+	}
 	return bind_data;
 }
 
@@ -294,112 +340,21 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 	return std::move(bind_data);
 }
 
-bool FindObjectKeyRank(const JsonoView &view, const ObjectLayout &layout, const string &key, size_t &rank) {
-	size_t lo = 0;
-	size_t hi = layout.key_count;
-	while (lo < hi) {
-		auto mid = lo + (hi - lo) / 2;
-		auto key_slot = view.SlotAt(layout.key_start + mid);
-		if (SlotTag(key_slot) != tag::KEY) {
-			throw InvalidInputException("malformed JSONO: expected KEY slot");
-		}
-		if (view.KeyAt(SlotPayload(key_slot)) < key) {
-			lo = mid + 1;
-		} else {
-			hi = mid;
-		}
-	}
-	rank = lo;
-	if (lo >= layout.key_count) {
-		return false;
-	}
-	auto key_slot = view.SlotAt(layout.key_start + lo);
-	return SlotTag(key_slot) == tag::KEY && view.KeyAt(SlotPayload(key_slot)) == key;
-}
-
 struct Location {
 	Location() = default;
-	Location(size_t pos_p, size_t string_cursor_p, bool found_p)
-	    : pos(pos_p), string_cursor(string_cursor_p), found(found_p) {
+	Location(const JsonoCursor &cursor_p, bool found_p) : cursor(cursor_p), found(found_p) {
 	}
 
-	size_t pos = 0;
-	size_t string_cursor = 0;
+	JsonoCursor cursor;
 	bool found = false;
 };
 
 Location LocatePath(const JsonoView &view, const vector<PathStep> &steps) {
-	size_t pos = 0;
-	size_t string_cursor = 0;
-	for (auto &step : steps) {
-		if (pos >= view.Slots()) {
-			return {};
-		}
-		auto slot_tag = SlotTag(view.SlotAt(pos));
-		if (step.kind == PathStepKind::Key) {
-			if (slot_tag != tag::OBJ_START) {
-				return {};
-			}
-			auto layout = ReadObjectLayout(view, pos);
-			size_t rank = 0;
-			if (!FindObjectKeyRank(view, layout, step.key, rank)) {
-				return {};
-			}
-			size_t value_rank = 0;
-			size_t value_pos = layout.value_start;
-			size_t value_string_cursor = string_cursor;
-			MoveObjectValueCursorToRank(view, layout, string_cursor, rank, value_rank, value_pos, value_string_cursor);
-			pos = value_pos;
-			string_cursor = value_string_cursor;
-		} else if (step.kind == PathStepKind::Index) {
-			if (slot_tag != tag::ARR_START) {
-				return {};
-			}
-			auto end_pos = ReadArrayEndPos(view, pos);
-			size_t element_pos = pos + 1;
-			idx_t current = 0;
-			while (element_pos < end_pos && current < step.index) {
-				SkipValueFast(view, element_pos, string_cursor);
-				current++;
-			}
-			if (element_pos >= end_pos || current < step.index) {
-				return {};
-			}
-			pos = element_pos;
-		} else {
-			return {};
-		}
+	JsonoCursor cursor;
+	if (!LocatePathSteps(nullptr, 0, steps, view, cursor)) {
+		return {};
 	}
-	return Location {pos, string_cursor, true};
-}
-
-// Render a scalar as the text `->>` would produce. Returns true for JSON null (the
-// extract yields SQL NULL), false otherwise (text appended to `out`).
-bool RenderExtractText(const JsonoScalar &scalar, std::string &out) {
-	switch (scalar.kind) {
-	case JsonoScalarKind::Null:
-		return true;
-	case JsonoScalarKind::String:
-	case JsonoScalarKind::NumberText:
-		out.append(scalar.text.data(), scalar.text.size());
-		return false;
-	case JsonoScalarKind::Int64:
-		out.append(std::to_string(scalar.int_value));
-		return false;
-	case JsonoScalarKind::UInt64:
-		out.append(std::to_string(scalar.uint_value));
-		return false;
-	case JsonoScalarKind::Double:
-		EmitDouble(scalar.double_value, out);
-		return false;
-	case JsonoScalarKind::Dec60:
-		AppendDec60Text(out, scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
-		return false;
-	case JsonoScalarKind::Bool:
-		out.append(scalar.bool_value ? "true" : "false");
-		return false;
-	}
-	return true;
+	return Location {cursor, true};
 }
 
 // Write the shred value for a field and return whether the original value is losslessly
@@ -412,14 +367,13 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const Location &
 		FlatVector::SetNull(shred, row, true);
 		return false;
 	}
-	auto value_tag = SlotTag(view.SlotAt(location.pos));
+	auto value_tag = SlotTag(view.SlotAt(location.cursor.pos));
 	if (value_tag == tag::OBJ_START || value_tag == tag::ARR_START) {
 		FlatVector::SetNull(shred, row, true);
 		return false;
 	}
-	size_t pos = location.pos;
-	size_t string_cursor = location.string_cursor;
-	auto scalar = DecodeScalarAt(view, pos, string_cursor);
+	auto cursor = location.cursor;
+	auto scalar = DecodeScalarAt(view, cursor);
 	switch (field.primitive) {
 	case ShredPrimitive::Varchar: {
 		scratch.clear();
@@ -471,61 +425,42 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const Location &
 
 void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &fields, Vector &result,
                       ShredLocalState &lstate) {
-	JsonoVectorData input;
-	InitJsonoVectorData(input_vec, count, input);
+	// The input is plain JSONO, which never carries a manifest of its own: the reader fails
+	// loud on a narrowed row, whose re-emit below would otherwise replace the old manifest
+	// with a fresh one and launder the loss into permanent undetectability.
+	JsonoRowReader reader;
+	reader.Init(input_vec, count);
 
-	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
-	InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
-	auto &slots_vec = *slots_p;
-	auto &key_heap_vec = *key_heap_p;
-	auto &string_heap_vec = *string_heap_p;
-	auto &skips_vec = *skips_p;
+	JsonoBodyWriter writer;
+	writer.Init(result);
 	vector<Vector *> shred_children;
 	shred_children.reserve(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		shred_children.push_back(&JsonoShredVector(result, f));
 		shred_children.back()->SetVectorType(VectorType::FLAT_VECTOR);
 	}
-	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
-	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
-	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
-	auto skips_out = FlatVector::GetData<string_t>(skips_vec);
 
 	auto null_shred_row = [&](idx_t row) {
-		SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+		writer.SetRowNull(row);
 		for (auto &shred : shred_children) {
 			FlatVector::SetNull(*shred, row, true);
 		}
 	};
 
-	// Per-field manifest entry bytes (u16 path_len, path, u16 type_len, type), built once: the
-	// per-row manifest concatenates the entries of the paths actually stripped from that row's
-	// residual (fields are already in canonical sorted order, so the manifest is too).
+	// Per-field manifest entry bytes, built once: the per-row manifest concatenates the entries
+	// of the paths actually stripped from that row's residual (fields are already in canonical
+	// sorted order, so the manifest is too).
 	vector<std::string> manifest_entries(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
-		auto &entry = manifest_entries[f];
-		auto append_lv = [&](const string &text) {
-			if (text.size() > std::numeric_limits<uint16_t>::max()) {
-				throw InvalidInputException("jsono shred: path or type name exceeds manifest limits");
-			}
-			uint16_t len = uint16_t(text.size());
-			entry.append(reinterpret_cast<const char *>(&len), sizeof(len));
-			entry.append(text);
-		};
-		append_lv(fields[f].path_name);
-		append_lv(fields[f].logical_type.ToString());
+		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
 	}
 	std::string manifest;
 	vector<idx_t> stripped_fields;
 
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
-			null_shred_row(row);
-			continue;
-		}
-		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader() || view.Slots() == 0) {
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			null_shred_row(row);
 			continue;
 		}
@@ -555,8 +490,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 			}
 			manifest_ptr = &manifest;
 		}
-		WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out, string_heap_out,
-		                 skips_out, row, lstate.builder, manifest_ptr);
+		writer.WriteRow(row, lstate.builder, manifest_ptr);
 	}
 }
 
@@ -568,40 +502,32 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &bind_data, Vector &result,
                           ShredLocalState &lstate) {
 	auto &fields = bind_data.fields;
-	JsonoLayoutType src_layout;
-	TryParseJsonoLayoutType(input_vec.GetType(), src_layout);
 
 	input_vec.Flatten(count);
-	JsonoVectorData input;
-	InitJsonoVectorData(input_vec, count, input);
 
 	// Shreds the target drops (or retypes) fold back into the residual first, as one vectorized
 	// partial overlay; the per-row pass then locates/strips against that merged residual, while
 	// the manifest still reads from the ORIGINAL residual (the overlay output carries none).
+	// Reading the original residual, the reader verifies each row's manifest against the
+	// source's shreds — a narrowed input row fails loud here too; the merged residual is plain
+	// and unmanifested by construction (the overlay verified the source itself).
 	Vector returned(JsonoType(), count);
-	JsonoVectorData merged;
-	JsonoVectorData *residual_data = &input;
-	if (!bind_data.return_src.empty()) {
+	JsonoRowReader reader;
+	bool reads_merged = !bind_data.return_src.empty();
+	if (reads_merged) {
 		JsonoOverlayShredsToPlain(input_vec, count, bind_data.return_src, returned);
-		InitJsonoVectorData(returned, count, merged);
-		residual_data = &merged;
+		reader.Init(returned, count);
+	} else {
+		reader.Init(input_vec, count);
 	}
 
-	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
-	InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
-	auto &slots_vec = *slots_p;
-	auto &key_heap_vec = *key_heap_p;
-	auto &string_heap_vec = *string_heap_p;
-	auto &skips_vec = *skips_p;
+	JsonoBodyWriter writer;
+	writer.Init(result);
 	vector<Vector *> shred_out(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		shred_out[f] = &JsonoShredVector(result, f);
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
 	}
-	auto slots_out = FlatVector::GetData<string_t>(slots_vec);
-	auto key_heap_out = FlatVector::GetData<string_t>(key_heap_vec);
-	auto string_heap_out = FlatVector::GetData<string_t>(string_heap_vec);
-	auto skips_out = FlatVector::GetData<string_t>(skips_vec);
 
 	for (idx_t f = 0; f < fields.size(); f++) {
 		if (bind_data.keep_src[f] != DConstants::INVALID_INDEX) {
@@ -611,29 +537,13 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 
 	vector<std::string> manifest_entries(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
-		auto &entry = manifest_entries[f];
-		auto append_lv = [&](const string &text) {
-			if (text.size() > std::numeric_limits<uint16_t>::max()) {
-				throw InvalidInputException("jsono shred: path or type name exceeds manifest limits");
-			}
-			uint16_t len = uint16_t(text.size());
-			entry.append(reinterpret_cast<const char *>(&len), sizeof(len));
-			entry.append(text);
-		};
-		append_lv(fields[f].path_name);
-		append_lv(fields[f].logical_type.ToString());
+		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
 	}
 
-	// The source's shreds, verified against each row's manifest before reading the residual: a
-	// narrowed input row (its manifest lists a shred the source type lost) must fail loud here too.
-	vector<std::pair<std::string, std::string>> shred_signatures;
-	shred_signatures.reserve(src_layout.shreds.size());
-	for (auto &shred : src_layout.shreds) {
-		shred_signatures.emplace_back(shred.first, shred.second.ToString());
-	}
-	std::vector<ShredManifestEntry> old_manifest;
+	const std::vector<ShredManifestEntry> *old_manifest = nullptr;
+	std::vector<ShredManifestEntry> src_manifest;
 	auto manifest_has_path = [&](const string &path) {
-		for (auto &entry : old_manifest) {
+		for (auto &entry : *old_manifest) {
 			if (entry.path == nonstd::string_view(path.data(), path.size())) {
 				return true;
 			}
@@ -642,38 +552,37 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 	};
 
 	auto null_row = [&](idx_t row) {
-		SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+		writer.SetRowNull(row);
 		for (auto *shred : shred_out) {
 			FlatVector::SetNull(*shred, row, true);
 		}
 	};
 
+	JsonoVectorData input;
+	InitJsonoVectorData(input_vec, count, input);
 	std::string manifest;
 	vector<idx_t> stripped_fields;
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(*residual_data, row, blob)) {
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			null_row(row);
 			continue;
 		}
-		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader() || view.Slots() == 0) {
-			null_row(row);
-			continue;
-		}
-		if (residual_data == &input) {
-			VerifyShredManifest(view, shred_signatures, old_manifest);
+		if (!reads_merged) {
+			old_manifest = &reader.RowManifest(view);
 		} else {
 			// The merged residual carries no manifest; the kept shreds' stripped state lives in
 			// the original row's manifest. The partial overlay already verified it.
 			JsonoBlobRow src_blob;
-			old_manifest.clear();
+			src_manifest.clear();
 			if (ReadJsonoRowStrict(input, row, src_blob)) {
 				JsonoView src_view = MakeJsonoView(src_blob);
 				if (src_view.ParseHeader()) {
-					src_view.ReadShredManifest(old_manifest);
+					src_view.ReadShredManifest(src_manifest);
 				}
 			}
+			old_manifest = &src_manifest;
 		}
 
 		FlatVector::Validity(result).SetValid(row);
@@ -701,11 +610,15 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			// verbatim instead of re-emitting through the builder. The original residual already
 			// carries the right manifest (the kept entries are exactly the input row's manifest);
 			// a merged residual carries none, so the kept entries are appended to its skips.
-			slots_out[row] = WriteBlobInto(slots_vec, blob.slots.GetData(), blob.slots.GetSize());
-			key_heap_out[row] = WriteBlobInto(key_heap_vec, blob.key_heap.GetData(), blob.key_heap.GetSize());
-			string_heap_out[row] =
-			    WriteBlobInto(string_heap_vec, blob.string_heap.GetData(), blob.string_heap.GetSize());
-			if (residual_data != &input && !stripped_fields.empty()) {
+			writer.data[BODY_SLOTS][row] = WriteBlobInto(writer.Slots(), blob.slots.GetData(), blob.slots.GetSize());
+			writer.data[BODY_KEY_HEAP][row] =
+			    WriteBlobInto(writer.KeyHeap(), blob.key_heap.GetData(), blob.key_heap.GetSize());
+			writer.data[BODY_STRING_HEAP][row] =
+			    WriteBlobInto(writer.StringHeap(), blob.string_heap.GetData(), blob.string_heap.GetSize());
+			writer.data[BODY_LENGTHS][row] =
+			    WriteBlobInto(writer.Lengths(), blob.lengths.GetData(), blob.lengths.GetSize());
+			writer.data[BODY_NUMS][row] = WriteBlobInto(writer.Nums(), blob.nums.GetData(), blob.nums.GetSize());
+			if (reads_merged && !stripped_fields.empty()) {
 				manifest.clear();
 				manifest.append(blob.skips.GetData(), blob.skips.GetSize());
 				uint32_t entry_count = uint32_t(stripped_fields.size());
@@ -713,9 +626,10 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 				for (auto f : stripped_fields) {
 					manifest.append(manifest_entries[f]);
 				}
-				skips_out[row] = WriteBlobInto(skips_vec, manifest.data(), manifest.size());
+				writer.data[BODY_SKIPS][row] = WriteBlobInto(writer.Skips(), manifest.data(), manifest.size());
 			} else {
-				skips_out[row] = WriteBlobInto(skips_vec, blob.skips.GetData(), blob.skips.GetSize());
+				writer.data[BODY_SKIPS][row] =
+				    WriteBlobInto(writer.Skips(), blob.skips.GetData(), blob.skips.GetSize());
 			}
 			continue;
 		}
@@ -732,8 +646,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			}
 			manifest_ptr = &manifest;
 		}
-		WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_out, key_heap_out, string_heap_out,
-		                 skips_out, row, lstate.builder, manifest_ptr);
+		writer.WriteRow(row, lstate.builder, manifest_ptr);
 	}
 }
 
@@ -752,18 +665,144 @@ void JsonoShredExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 }
 
-// jsono(text, shredding := spec): parse the JSON text into a plain jsono value, then shred it
-// against the spec in the same call. The parse output is a throwaway plain vector; only the
-// shredded result is materialized.
+// jsono(text, shredding := spec): parse the JSON text and shred it in one pass — the direct
+// DOM writer's sizing pass captures the shred leaves and strips the lossless ones from the
+// emit plan, so the full plain value is never materialized and no path is located twice.
+// The rare present-but-lossy VARCHAR shred (`->>` text of a number/bool) is filled from the
+// written residual with the exact two-pass semantics, as are non-object-key paths.
 void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = expr.bind_info->Cast<ShredBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ShredLocalState>();
 	auto count = args.size();
 	bool input_constant = args.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR || expr.children[0]->IsFoldable();
-	Vector plain(JsonoType(), count);
-	JsonoParseTextVector(args.data[0], count, plain);
-	ApplyShredFields(plain, count, bind_data.fields, result, lstate);
+	if (!bind_data.one_pass_text) {
+		Vector plain(JsonoType(), count);
+		JsonoParseTextVector(args.data[0], count, plain);
+		ApplyShredFields(plain, count, bind_data.fields, result, lstate);
+		if (input_constant) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		}
+		return;
+	}
+
+	auto &fields = bind_data.fields;
+	UnifiedVectorFormat input_fmt;
+	args.data[0].ToUnifiedFormat(count, input_fmt);
+	auto inputs = UnifiedVectorFormat::GetData<string_t>(input_fmt);
+
+	JsonoBodyWriter writer;
+	writer.Init(result);
+	vector<Vector *> shred_out(fields.size());
+	for (idx_t f = 0; f < fields.size(); f++) {
+		shred_out[f] = &JsonoShredVector(result, f);
+		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
+	}
+
+	vector<std::string> manifest_entries(fields.size());
+	jsono_dom::DomShredContext ctx;
+	ctx.nodes = &bind_data.trie;
+	ctx.manifest_entries = &manifest_entries;
+	ctx.kinds.resize(fields.size());
+	for (idx_t f = 0; f < fields.size(); f++) {
+		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
+		switch (fields[f].primitive) {
+		case ShredPrimitive::Varchar:
+			ctx.kinds[f] = jsono_dom::DomShredKind::Varchar;
+			break;
+		case ShredPrimitive::Bigint:
+			ctx.kinds[f] = jsono_dom::DomShredKind::Int64;
+			break;
+		case ShredPrimitive::Ubigint:
+			ctx.kinds[f] = jsono_dom::DomShredKind::Uint64;
+			break;
+		case ShredPrimitive::Double:
+			ctx.kinds[f] = jsono_dom::DomShredKind::Double;
+			break;
+		case ShredPrimitive::Boolean:
+			ctx.kinds[f] = jsono_dom::DomShredKind::Boolean;
+			break;
+		}
+	}
+
+	jsono_dom::YyjsonAllocator parser;
+	jsono_dom::DomDirectState dom;
+
+	// Fill a shred from the row's written residual: the value was kept there, so the
+	// two-pass locate + render path applies verbatim.
+	auto fill_from_residual = [&](const JsonoView &view, idx_t f, idx_t row) {
+		auto location = LocatePath(view, fields[f].steps);
+		WriteShred(fields[f], view, location, *shred_out[f], row, lstate.text);
+	};
+
+	for (idx_t row = 0; row < count; row++) {
+		auto idx = input_fmt.sel->get_index(row);
+		if (!input_fmt.validity.RowIsValid(idx)) {
+			writer.SetRowNull(row);
+			for (idx_t f = 0; f < fields.size(); f++) {
+				FlatVector::SetNull(*shred_out[f], row, true);
+			}
+			continue;
+		}
+		auto input = inputs[idx];
+		if (input.GetSize() == 0) {
+			throw InvalidInputException("jsono: input is empty");
+		}
+		yyjson_read_err err;
+		auto doc = jsono_dom::ReadJsonoDoc(input, parser.alc, err);
+		if (!doc) {
+			throw InvalidInputException("jsono: invalid JSON - %s", err.msg);
+		}
+		bool needs_residual_fill = !bind_data.residual_fill_fields.empty();
+		try {
+			jsono_dom::EmitDomRowDirect(yyjson_doc_get_root(doc), dom, writer, row, &ctx);
+			FlatVector::Validity(result).SetValid(row);
+			for (idx_t f = 0; f < fields.size(); f++) {
+				auto &cap = ctx.captures[f];
+				switch (cap.state) {
+				case jsono_dom::DomShredCapture::State::Missing:
+					FlatVector::SetNull(*shred_out[f], row, true);
+					break;
+				case jsono_dom::DomShredCapture::State::String:
+					FlatVector::GetData<string_t>(*shred_out[f])[row] =
+					    StringVector::AddString(*shred_out[f], cap.text.data(), cap.text.size());
+					break;
+				case jsono_dom::DomShredCapture::State::Int:
+					FlatVector::GetData<int64_t>(*shred_out[f])[row] = cap.int_value;
+					break;
+				case jsono_dom::DomShredCapture::State::Uint:
+					FlatVector::GetData<uint64_t>(*shred_out[f])[row] = cap.uint_value;
+					break;
+				case jsono_dom::DomShredCapture::State::Bool:
+					FlatVector::GetData<bool>(*shred_out[f])[row] = cap.bool_value;
+					break;
+				case jsono_dom::DomShredCapture::State::ResidualFill:
+					needs_residual_fill = true;
+					break;
+				}
+			}
+		} catch (...) {
+			yyjson_doc_free(doc);
+			throw;
+		}
+		yyjson_doc_free(doc);
+		if (needs_residual_fill) {
+			JsonoBlobRow blob {writer.data[BODY_SLOTS][row],       writer.data[BODY_KEY_HEAP][row],
+			                   writer.data[BODY_STRING_HEAP][row], writer.data[BODY_SKIPS][row],
+			                   writer.data[BODY_LENGTHS][row],     writer.data[BODY_NUMS][row]};
+			JsonoView view = MakeJsonoView(blob);
+			if (view.ParseHeader()) {
+				for (auto f : bind_data.residual_fill_fields) {
+					fill_from_residual(view, f, row);
+				}
+				for (idx_t f = 0; f < fields.size(); f++) {
+					if (ctx.captures[f].state == jsono_dom::DomShredCapture::State::ResidualFill) {
+						fill_from_residual(view, f, row);
+					}
+				}
+			}
+		}
+	}
 	if (input_constant) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
@@ -774,6 +813,21 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 bool IsShredValueType(const LogicalType &type) {
 	ShredPrimitive primitive;
 	return TypeToShredPrimitive(type, primitive);
+}
+
+std::string JsonoShredManifestEntry(const string &path, const LogicalType &type) {
+	std::string entry;
+	auto append_lv = [&](const string &text) {
+		if (text.size() > std::numeric_limits<uint16_t>::max()) {
+			throw InvalidInputException("jsono shred: path or type name exceeds manifest limits");
+		}
+		uint16_t len = uint16_t(text.size());
+		entry.append(reinterpret_cast<const char *>(&len), sizeof(len));
+		entry.append(text);
+	};
+	append_lv(path);
+	append_lv(type.ToString());
+	return entry;
 }
 
 void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<string, LogicalType>> &shreds,

@@ -22,6 +22,11 @@ ScalarFunction JsonoShredFromJsonoFunction();
 // every other field (other scalars, nested objects/arrays) stays in the residual tape.
 bool IsShredValueType(const LogicalType &type);
 
+// Serialized shred-manifest entry bytes for one shred (u16 path_len, path, u16 type_len,
+// type name); a row's manifest is a u32 entry count followed by the entries of the paths
+// stripped from that row's residual.
+std::string JsonoShredManifestEntry(const string &path, const LogicalType &type);
+
 // Shred a plain JSONO `input` vector into the shredded `result` STRUCT (the four-BLOB
 // residual prefix followed by one shred column per `shreds` entry, in order). Each shred is
 // a top-level key named by `shreds[i].first` with type `shreds[i].second`; its value is

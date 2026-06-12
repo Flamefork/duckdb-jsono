@@ -13,10 +13,14 @@
 // Force inlining where a small decode is called once per scalar from the hot
 // readers: left as a plain call the compiler keeps it out-of-line and pays a
 // per-scalar 72-byte struct return; inlined, the struct is scalarized away.
+// JSONO_COLD marks the throw-only slow paths out-of-line so the inlined hot
+// path stays a compare-and-load.
 #if defined(__GNUC__) || defined(__clang__)
 #define JSONO_ALWAYS_INLINE inline __attribute__((always_inline))
+#define JSONO_COLD          __attribute__((noinline, cold))
 #else
 #define JSONO_ALWAYS_INLINE inline
+#define JSONO_COLD
 #endif
 
 namespace duckdb {
@@ -25,7 +29,7 @@ class ExtensionLoader;
 class ClientContext;
 
 // A jsono value is physically a nested STRUCT with exactly one layout field, named "jsono" for
-// both plain and shredded values. Inside the layout field live a `body` STRUCT of four BLOBs (the
+// both plain and shredded values. Inside the layout field live a `body` STRUCT of six BLOBs (the
 // binary JSONO body, see JsonoBodyStructType) and, for shredded values, a `shreds` STRUCT of typed
 // shred columns. The single layout name is deliberate: DuckDB reconciles set-operation branch
 // types by field name (CombineStructTypes), so differently-shredded branches merge into one
@@ -58,7 +62,7 @@ LogicalType JsonoType();
 // string so writers can declare storage columns without hardcoding the fields.
 LogicalType JsonoRawStructType();
 
-// The four-BLOB body STRUCT shared by every layout: STRUCT(slots BLOB, key_heap BLOB,
+// The six-BLOB body STRUCT shared by every layout: STRUCT(slots BLOB, key_heap BLOB,
 // string_heap BLOB, skips BLOB). The binary JSONO body lives here, identical for plain and shredded.
 LogicalType JsonoBodyStructType();
 
@@ -117,7 +121,7 @@ LogicalType JsonoResolveJsonoArgument(ClientContext &context, const Expression &
 
 class Vector;
 
-// Reconstruct a shredded JSONO `input` (four-BLOB residual + shred columns) into the
+// Reconstruct a shredded JSONO `input` (six-BLOB residual + shred columns) into the
 // lossless plain JSONO `result` by overlaying each row's shred values onto its residual.
 // This is how a shredded value becomes usable where a plain JSONO is required (an implicit
 // cast, an INSERT into a plain JSONO column) without dropping the shred data. Top-level shreds
@@ -137,12 +141,17 @@ void JsonoParseTextVector(Vector &source, idx_t count, Vector &result);
 //===--------------------------------------------------------------------===//
 // JSONO binary format
 //
-// A JSONO value is physically split into four BLOB children:
+// A JSONO value is physically split into six BLOB children:
 //   slots        — [Header (8 bytes)] [Slots (n × 8 bytes)]
 //   key_heap     — key bytes referenced by KEY slots
-//   string_heap  — string bytes consumed by STRING slots in walk order
-//   skips        — [ContainerMetadataHeader] [ContainerSpan...]
-//                  [ObjectCheckpointIndex...] [ObjectCursorCheckpoint...]
+//   string_heap  — string bytes consumed by STRING/NUMBER slots in walk order
+//   skips        — [ContainerMetadataHeader] [sorted u32 container ids]
+//                  [ContainerSpan...] [ObjectCheckpointIndex...]
+//                  [ObjectCursorCheckpoint...] [shred manifest]
+//   lengths      — u32 LE byte lengths of VAL_STR_HEAP / VAL_EXT-NUMBER values,
+//                  walk order
+//   nums         — u64 LE numeric payloads of VAL_INT60 / VAL_DEC60 /
+//                  VAL_EXT-INT64/UINT64/DOUBLE values, walk order
 //
 // Header (little-endian throughout):
 //   u32 magic        = 'JSNO' (0x4F4E534A)
@@ -170,7 +179,15 @@ constexpr uint32_t MAGIC = 0x4F4E534A; // 'JSNO' little-endian
 // entries this row's shred writer stripped out of the residual. Readers verify the
 // manifest against the shreds actually present, turning a shred silently dropped or
 // retyped by a raw struct cast into a loud read error. See docs/jsono_format.md.
-constexpr uint8_t VERSION = 0x03;
+// version 4: variable payloads leave the slots. String/number-text lengths move to
+// the `lengths` stream (u32 LE, walk order) and numeric payloads (INT60/DEC60 and
+// the former VAL_EXT trailing data slots) to the `nums` stream (u64 LE, walk
+// order), making slot words shape-constant across rows. ContainerSpan gains
+// length_count/num_count, ObjectCursorCheckpoint gains length_delta/num_delta, and
+// spans are stored only where a skip needs them — arrays, objects with child_count >
+// OBJECT_CHECKPOINT_STRIDE, and objects whose immediate children include a
+// container — addressed through a sorted sparse container-id index.
+constexpr uint8_t VERSION = 0x04;
 
 namespace flags {
 constexpr uint8_t SORTED_KEYS = 0x01;
@@ -196,24 +213,16 @@ constexpr uint64_t VAL_EXT = 0xF;
 } // namespace tag
 
 // VAL_EXT subtype byte (low 8 bits of the VAL_EXT slot payload). Selects the
-// concrete extended encoding; the value bytes live in the following slot(s).
+// concrete extended encoding. Every VAL_EXT value is a single slot: INT64/
+// UINT64/DOUBLE store their 64 raw bits as one `nums` entry, NUMBER stores its
+// byte-exact text in string_heap with its length as one `lengths` entry.
 namespace ext_subtype {
-constexpr uint64_t INT64 = 0;  // signed 2^59..2^63, one trailing slot
-constexpr uint64_t UINT64 = 1; // unsigned 2^63..2^64-1, one trailing slot
-constexpr uint64_t DOUBLE = 2; // IEEE double bits (jsono(STRUCT) path), one trailing slot
-constexpr uint64_t NUMBER = 3; // raw bignum/high-precision text in string_heap
+constexpr uint64_t INT64 = 0;  // signed 2^59..2^63, one nums entry
+constexpr uint64_t UINT64 = 1; // unsigned 2^63..2^64-1, one nums entry
+constexpr uint64_t DOUBLE = 2; // IEEE double bits (jsono(STRUCT) path), one nums entry
+constexpr uint64_t NUMBER = 3; // raw bignum/high-precision text in string_heap, one lengths entry
 constexpr uint64_t COUNT = 4;
 } // namespace ext_subtype
-
-// Number of trailing value slots per subtype, kept as data so readers count
-// slots through one table instead of branching on each subtype. NUMBER stores
-// its value in the heap, so it carries no trailing slot.
-constexpr uint8_t EXT_SUBTYPE_TRAILING_SLOTS[ext_subtype::COUNT] = {
-    1, // INT64
-    1, // UINT64
-    1, // DOUBLE
-    0, // NUMBER (text in string_heap, no trailing slot)
-};
 
 constexpr uint64_t TAG_SHIFT = 60;
 constexpr uint64_t PAYLOAD_MASK = (uint64_t(1) << 60) - 1;
@@ -238,38 +247,15 @@ inline uint64_t ExtSubtype(uint64_t slot) {
 	return SlotPayload(slot) & 0xFF;
 }
 
-// VAL_EXT/NUMBER payload: subtype byte (low 8 bits) plus the raw-text byte
-// length in the remaining payload bits. The text itself lives in string_heap
-// and is consumed in walk order exactly like VAL_STR_HEAP, so NUMBER carries
-// no trailing slot.
-constexpr uint64_t EXT_NUMBER_LEN_SHIFT = 8;
-
-inline uint64_t MakeNumberExtSlot(uint64_t text_len) {
-	return MakeSlot(tag::VAL_EXT, (text_len << EXT_NUMBER_LEN_SHIFT) | ext_subtype::NUMBER);
-}
-
-inline uint64_t NumberExtLen(uint64_t slot) {
-	return SlotPayload(slot) >> EXT_NUMBER_LEN_SHIFT;
-}
-
-// Total slots a VAL_EXT value occupies: the VAL_EXT slot plus its trailing
-// value slots.
-inline size_t ExtSlotCount(uint64_t subtype) {
-	if (subtype >= ext_subtype::COUNT) {
-		throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
-	}
-	return 1 + size_t(EXT_SUBTYPE_TRAILING_SLOTS[subtype]);
-}
-
 // KEY payload layout: heap_offset (36 bits high) << 24 | heap_len (24 bits low).
 // KEYs still carry their heap offset because key_heap is dict-encoded by
 // Parquet (every row has the same key set in the same sorted order, so the
 // dictionary collapses to a single entry per column chunk and the offsets
 // are byte-identical across rows already).
 //
-// STRING payload layout: the full 60-bit payload holds heap_len. The byte
-// offset into string_heap is implicit — the reader maintains a cursor as it
-// walks the JSONO and advances by heap_len on each STRING slot.
+// VAL_STR_HEAP carries no payload: the byte length lives in the `lengths`
+// stream and the byte offset into string_heap is implicit — the reader
+// maintains a cursor pair (heap bytes + lengths index) in walk order.
 constexpr uint64_t HEAP_LEN_BITS = 24;
 constexpr uint64_t HEAP_LEN_MASK = (uint64_t(1) << HEAP_LEN_BITS) - 1;
 
@@ -285,14 +271,6 @@ inline uint64_t KeyLen(uint64_t payload) {
 	return payload & HEAP_LEN_MASK;
 }
 
-inline uint64_t MakeStringPayload(uint64_t heap_len) {
-	return heap_len & PAYLOAD_MASK;
-}
-
-inline uint64_t StringLen(uint64_t payload) {
-	return payload;
-}
-
 // OBJ_START/ARR_START payload: container id into skips plus inline
 // child count. Only OBJ_START uses child_count; arrays store 0.
 constexpr uint64_t CONTAINER_CHILD_COUNT_BITS = 24;
@@ -300,6 +278,10 @@ constexpr uint64_t CONTAINER_CHILD_COUNT_MASK = (uint64_t(1) << CONTAINER_CHILD_
 constexpr uint64_t CONTAINER_ID_MAX = PAYLOAD_MASK >> CONTAINER_CHILD_COUNT_BITS;
 
 constexpr uint32_t NO_OBJECT_CHECKPOINTS = std::numeric_limits<uint32_t>::max();
+// Container ids below this resolve through the downward hint scan in TryContainerSpan
+// (<= SPAN_HINT_LIMIT probes, usually 1-2) instead of the binary search; the bound also
+// caps the scan length.
+constexpr uint64_t SPAN_HINT_LIMIT = 4;
 constexpr uint32_t OBJECT_CHECKPOINT_STRIDE = 16;
 constexpr uint16_t LARGE_OBJECT_CHECKPOINT_STRIDE = 16;
 constexpr uint32_t LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT = 64;
@@ -372,18 +354,24 @@ inline uint64_t HashKey(uint64_t state, nonstd::string_view key) {
 }
 
 struct ContainerMetadataHeader {
-	uint32_t container_count;
+	uint32_t span_count;
 	uint32_t checkpoint_index_count;
 	uint32_t checkpoint_count;
 };
 
-// ContainerSpan carries the subtree slot span, string_heap byte span, and (for
-// objects) a shape_hash: the fingerprint of the object's sorted key sequence.
-// Arrays store shape_hash = 0 (never read — the rank cache only runs on objects).
+// ContainerSpan carries the subtree's slot span, string_heap byte span, lengths/
+// nums entry counts, and (for objects) a shape_hash: the fingerprint of the
+// object's sorted key sequence. Spans are stored only for arrays, objects with
+// child_count > OBJECT_CHECKPOINT_STRIDE, and objects whose immediate children
+// include a container; a sorted sparse container-id index precedes the span
+// records (see docs/jsono_format.md). Arrays store shape_hash = 0 (never read —
+// the rank cache only runs on objects).
 struct ContainerSpan {
 	uint32_t slot_span;
 	uint32_t string_byte_span;
 	uint64_t shape_hash;
+	uint32_t length_count;
+	uint32_t num_count;
 };
 
 struct ObjectCheckpointIndex {
@@ -396,12 +384,27 @@ struct ObjectCheckpointIndex {
 struct ObjectCursorCheckpoint {
 	uint32_t slot_delta;
 	uint32_t string_delta;
+	uint32_t length_delta;
+	uint32_t num_delta;
 };
 
 static_assert(sizeof(ContainerMetadataHeader) == 12, "ContainerMetadataHeader must be exactly 12 bytes");
-static_assert(sizeof(ContainerSpan) == 16, "ContainerSpan must be exactly 16 bytes");
+static_assert(sizeof(ContainerSpan) == 24, "ContainerSpan must be exactly 24 bytes");
 static_assert(sizeof(ObjectCheckpointIndex) == 12, "ObjectCheckpointIndex must be exactly 12 bytes");
-static_assert(sizeof(ObjectCursorCheckpoint) == 8, "ObjectCursorCheckpoint must be exactly 8 bytes");
+static_assert(sizeof(ObjectCursorCheckpoint) == 16, "ObjectCursorCheckpoint must be exactly 16 bytes");
+
+// The reader's walk state over one JSONO value: the slot position plus the three
+// implicit-offset stream cursors. string_cursor counts string_heap BYTES;
+// length_cursor / num_cursor count `lengths` (u32) / `nums` (u64) ENTRIES. All
+// four advance together in tree-walk order; ContainerSpan / ObjectCursorCheckpoint
+// carry per-stream deltas so a subtree skip or checkpoint jump moves the whole
+// cursor in O(1).
+struct JsonoCursor {
+	size_t pos = 0;
+	size_t string_cursor = 0;
+	size_t length_cursor = 0;
+	size_t num_cursor = 0;
+};
 
 // One shred-manifest entry: a path the shred writer stripped out of this row's residual (its value
 // lives only in the shred) and the shred type it was written as. The views point into the skips blob.
@@ -417,6 +420,48 @@ struct ShredManifestEntry {
 // The manifest is the write-time record of which paths are NOT in the residual: a reader holding
 // fewer (or differently typed) shreds than the manifest lists cannot reproduce the value — that row
 // was narrowed by a raw struct cast — and must fail loud instead of silently dropping the value.
+
+// Parse a shred manifest from its raw tail bytes into `entries` (string_views into `data`).
+// Returns the entry count; an empty tail is a value without a manifest. Throws on framing
+// corruption (declared entries longer than the tail, or trailing bytes).
+inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector<ShredManifestEntry> &entries) {
+	entries.clear();
+	if (size == 0) {
+		return 0;
+	}
+	size_t cursor = 0;
+	auto read_bytes = [&](void *dst, size_t bytes) {
+		if (bytes > size - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		std::memcpy(dst, data + cursor, bytes);
+		cursor += bytes;
+	};
+	uint32_t entry_count;
+	read_bytes(&entry_count, sizeof(entry_count));
+	entries.reserve(entry_count);
+	for (uint32_t i = 0; i < entry_count; i++) {
+		uint16_t path_len;
+		read_bytes(&path_len, sizeof(path_len));
+		if (path_len > size - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		auto path = nonstd::string_view(data + cursor, path_len);
+		cursor += path_len;
+		uint16_t type_len;
+		read_bytes(&type_len, sizeof(type_len));
+		if (type_len > size - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		auto type = nonstd::string_view(data + cursor, type_len);
+		cursor += type_len;
+		entries.push_back(ShredManifestEntry {path, type});
+	}
+	if (cursor != size) {
+		throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
+	}
+	return entries.size();
+}
 
 // Fingerprint an object's stored KEY slots (sorted order, length-prefixed) into a
 // shape_hash. Path-agnostic: every object-emitting writer routes through this on
@@ -443,26 +488,19 @@ inline uint64_t ContainerChildCount(uint64_t payload) {
 	return payload & CONTAINER_CHILD_COUNT_MASK;
 }
 
-// i60 signed. Sign-extends from bit 59.
+// i60 signed: the VAL_INT60 eligibility range. The value itself is stored as a
+// full 64-bit two's-complement word in the `nums` stream (the slot is a pure
+// tag), so the bound only decides the tag, not the stored width.
 constexpr int64_t INT60_MIN = -(int64_t(1) << 59);
 constexpr int64_t INT60_MAX = (int64_t(1) << 59) - 1;
-
-inline uint64_t EncodeInt60(int64_t value) {
-	return uint64_t(value) & PAYLOAD_MASK;
-}
-
-inline int64_t DecodeInt60(uint64_t payload) {
-	if (payload & (uint64_t(1) << 59)) {
-		return int64_t(payload | (uint64_t(0xF) << 60));
-	}
-	return int64_t(payload);
-}
 
 inline bool FitsInt60(int64_t value) {
 	return value >= INT60_MIN && value <= INT60_MAX;
 }
 
-// VAL_DEC60: value = mantissa / 10^scale, packed sign + scale + mantissa.
+// VAL_DEC60: value = mantissa / 10^scale, packed sign + scale + mantissa. The
+// packed word is stored as this value's `nums` entry (top four bits zero); the
+// slot is a pure tag.
 //   bit 59      : sign (1 = negative mantissa)
 //   bits 54..58 : scale  (0..22, 5 bits)
 //   bits 0..53  : |mantissa| (< 2^53, 54-bit field)
@@ -526,18 +564,26 @@ struct JsonoHeader {
 
 static_assert(sizeof(JsonoHeader) == JSONO_HEADER_SIZE, "JsonoHeader must be exactly 8 bytes");
 
-// View over a single JSONO row. The four borrowed blobs (key_heap,
-// string_heap, slots, skips) must stay alive for the view's lifetime. No
+// View over a single JSONO row. The six borrowed blobs (slots, key_heap,
+// string_heap, skips, lengths, nums) must stay alive for the view's lifetime. No
 // allocations, no copies — slot access reads via aligned memcpy from the
 // slots buffer; heap lookups return string_views into the appropriate heap.
 class JsonoView {
 public:
+	// An empty view (no header, zero slots): the state a row reader leaves its out-param in
+	// for an absent value. Every accessor on it fails the same bounds checks as a zero-length
+	// blob, so it can never read.
+	JsonoView() = default;
+
 	JsonoView(const char *slots, size_t slots_size, const char *key_heap, size_t key_heap_size, const char *string_heap,
-	          size_t string_heap_size, const char *skips, size_t skips_size)
+	          size_t string_heap_size, const char *skips, size_t skips_size, const char *lengths, size_t lengths_size,
+	          const char *nums, size_t nums_size)
 	    : slots_(reinterpret_cast<const uint8_t *>(slots)), slots_size_(slots_size),
 	      key_heap_(reinterpret_cast<const uint8_t *>(key_heap)), key_heap_size_(key_heap_size),
 	      string_heap_(reinterpret_cast<const uint8_t *>(string_heap)), string_heap_size_(string_heap_size),
-	      skips_(reinterpret_cast<const uint8_t *>(skips)), skips_size_(skips_size) {
+	      skips_(reinterpret_cast<const uint8_t *>(skips)), skips_size_(skips_size),
+	      lengths_(reinterpret_cast<const uint8_t *>(lengths)), lengths_size_(lengths_size),
+	      nums_(reinterpret_cast<const uint8_t *>(nums)), nums_size_(nums_size) {
 	}
 
 	// Returns false only for an *absent* value: the slots blob is too short to even hold a
@@ -564,17 +610,28 @@ public:
 		if (slots_bytes % sizeof(uint64_t) != 0) {
 			throw InvalidInputException("malformed JSONO: slots blob is not a whole number of 8-byte slots");
 		}
+		if (lengths_size_ % sizeof(uint32_t) != 0) {
+			throw InvalidInputException("malformed JSONO: lengths blob is not a whole number of 4-byte entries");
+		}
+		if (nums_size_ % sizeof(uint64_t) != 0) {
+			throw InvalidInputException("malformed JSONO: nums blob is not a whole number of 8-byte entries");
+		}
 		if (skips_size_ >= sizeof(ContainerMetadataHeader)) {
 			std::memcpy(&metadata_header_, skips_, sizeof(metadata_header_));
-			auto spans_bytes = uint64_t(metadata_header_.container_count) * sizeof(ContainerSpan);
+			auto span_ids_bytes = uint64_t(metadata_header_.span_count) * sizeof(uint32_t);
+			auto spans_bytes = uint64_t(metadata_header_.span_count) * sizeof(ContainerSpan);
 			auto index_bytes = uint64_t(metadata_header_.checkpoint_index_count) * sizeof(ObjectCheckpointIndex);
 			auto checkpoints_bytes = uint64_t(metadata_header_.checkpoint_count) * sizeof(ObjectCursorCheckpoint);
-			auto required_bytes =
-			    uint64_t(sizeof(ContainerMetadataHeader)) + spans_bytes + index_bytes + checkpoints_bytes;
+			auto required_bytes = uint64_t(sizeof(ContainerMetadataHeader)) + span_ids_bytes + spans_bytes +
+			                      index_bytes + checkpoints_bytes;
 			if (required_bytes > skips_size_) {
 				throw InvalidInputException("malformed JSONO: metadata blob is shorter than its declared spans");
 			}
 			manifest_offset_ = size_t(required_bytes);
+		} else if (skips_size_ > 0) {
+			// The writer always emits the fixed metadata header, so a shorter non-empty blob is
+			// corruption, not a value without spans.
+			throw InvalidInputException("malformed JSONO: metadata blob is shorter than its header");
 		} else {
 			metadata_header_ = {};
 			manifest_offset_ = skips_size_;
@@ -586,42 +643,16 @@ public:
 	// Parse the shred manifest from the skips tail into `entries`. Returns the entry count
 	// (zero for a plain value, whose skips blob ends at the checkpoints).
 	size_t ReadShredManifest(std::vector<ShredManifestEntry> &entries) const {
-		entries.clear();
-		if (manifest_offset_ >= skips_size_) {
-			return 0;
-		}
-		auto cursor = manifest_offset_;
-		auto read_bytes = [&](void *dst, size_t bytes) {
-			if (bytes > skips_size_ - cursor) {
-				throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
-			}
-			std::memcpy(dst, skips_ + cursor, bytes);
-			cursor += bytes;
-		};
-		uint32_t entry_count;
-		read_bytes(&entry_count, sizeof(entry_count));
-		entries.reserve(entry_count);
-		for (uint32_t i = 0; i < entry_count; i++) {
-			uint16_t path_len;
-			read_bytes(&path_len, sizeof(path_len));
-			if (path_len > skips_size_ - cursor) {
-				throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
-			}
-			auto path = nonstd::string_view(reinterpret_cast<const char *>(skips_) + cursor, path_len);
-			cursor += path_len;
-			uint16_t type_len;
-			read_bytes(&type_len, sizeof(type_len));
-			if (type_len > skips_size_ - cursor) {
-				throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
-			}
-			auto type = nonstd::string_view(reinterpret_cast<const char *>(skips_) + cursor, type_len);
-			cursor += type_len;
-			entries.push_back(ShredManifestEntry {path, type});
-		}
-		if (cursor != skips_size_) {
-			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
-		}
-		return entries.size();
+		auto tail = ManifestTail();
+		return ParseShredManifestBytes(tail.data(), tail.size(), entries);
+	}
+
+	// Raw bytes of the shred-manifest tail (empty for a value without one). The verification
+	// layer (jsono_row_read.hpp) memoizes verdicts by these bytes: equal tails are the same
+	// manifest, so a vector of same-spec rows verifies with one byte-compare per row.
+	nonstd::string_view ManifestTail() const {
+		return nonstd::string_view(reinterpret_cast<const char *>(skips_) + manifest_offset_,
+		                           skips_size_ - manifest_offset_);
 	}
 
 	// True when this row's writer stripped at least one path out of the residual (cheap: a
@@ -642,9 +673,9 @@ public:
 		return metadata_header_;
 	}
 
-	uint64_t SlotAt(size_t i) const {
+	JSONO_ALWAYS_INLINE uint64_t SlotAt(size_t i) const {
 		if (i >= slot_count_) {
-			throw InvalidInputException("malformed JSONO: slot index out of bounds");
+			ThrowMalformed("malformed JSONO: slot index out of bounds");
 		}
 		uint64_t v;
 		std::memcpy(&v, slots_ + JSONO_HEADER_SIZE + i * sizeof(uint64_t), sizeof(v));
@@ -652,43 +683,166 @@ public:
 	}
 
 	// Lookup for a KEY slot's payload — reads into key_heap.
-	nonstd::string_view KeyAt(uint64_t payload) const {
-		auto off = KeyOffset(payload);
-		auto len = KeyLen(payload);
-		if (off > key_heap_size_ || len > key_heap_size_ - off) {
-			throw InvalidInputException("malformed JSONO: key heap reference out of bounds");
+	JSONO_ALWAYS_INLINE nonstd::string_view KeyAt(uint64_t payload) const {
+		return KeyHeapSlice(KeyOffset(payload), KeyLen(payload));
+	}
+
+	// Slice key_heap directly, for bulk copies of contiguous key-byte runs.
+	JSONO_ALWAYS_INLINE nonstd::string_view KeyHeapSlice(uint64_t offset, uint64_t len) const {
+		if (offset > key_heap_size_ || len > key_heap_size_ - offset) {
+			ThrowMalformed("malformed JSONO: key heap reference out of bounds");
 		}
-		return nonstd::string_view(reinterpret_cast<const char *>(key_heap_) + off, len);
+		return nonstd::string_view(reinterpret_cast<const char *>(key_heap_) + offset, len);
 	}
 
 	// Slice the next `len` bytes of string_heap starting at `string_cursor`.
 	// Caller is responsible for advancing the cursor; the view itself is
 	// stateless w.r.t. position.
-	nonstd::string_view StringAt(size_t string_cursor, size_t len) const {
+	JSONO_ALWAYS_INLINE nonstd::string_view StringAt(size_t string_cursor, size_t len) const {
 		if (string_cursor > string_heap_size_ || len > string_heap_size_ - string_cursor) {
-			throw InvalidInputException("malformed JSONO: string heap reference out of bounds");
+			ThrowMalformed("malformed JSONO: string heap reference out of bounds");
 		}
 		return nonstd::string_view(reinterpret_cast<const char *>(string_heap_) + string_cursor, len);
 	}
 
-	ContainerSpan ContainerSpanAt(uint64_t container_id) const {
-		if (container_id >= metadata_header_.container_count) {
-			throw InvalidInputException("malformed JSONO: container span index out of bounds");
+	// Sparse span lookup over the sorted container-id index. False when the container
+	// stores no span (a small flat object — skipped by a linear walk instead).
+	// The ids are strictly ascending, so ids[i] >= i: the entry for `container_id`, if
+	// stored, sits at index <= container_id. Near-root containers (the ids key lookups
+	// hit hottest — the row root is always id 0) are therefore found by a short downward
+	// scan from min(container_id, count-1), bounded by SPAN_HINT_LIMIT steps; larger ids
+	// fall back to the binary search.
+	JSONO_ALWAYS_INLINE bool TryContainerSpan(uint64_t container_id, ContainerSpan &span) const {
+		size_t count = metadata_header_.span_count;
+		if (count == 0) {
+			return false;
 		}
-		auto offset = sizeof(ContainerMetadataHeader) + size_t(container_id) * sizeof(ContainerSpan);
-		ContainerSpan span;
+		auto ids_start = skips_ + sizeof(ContainerMetadataHeader);
+		size_t lo;
+		if (container_id < SPAN_HINT_LIMIT) {
+			lo = container_id < count ? size_t(container_id) : count - 1;
+			uint32_t id;
+			std::memcpy(&id, ids_start + lo * sizeof(uint32_t), sizeof(id));
+			while (id > container_id) {
+				if (lo == 0) {
+					return false;
+				}
+				lo--;
+				std::memcpy(&id, ids_start + lo * sizeof(uint32_t), sizeof(id));
+			}
+			if (id != container_id) {
+				return false;
+			}
+		} else {
+			lo = 0;
+			size_t hi = count;
+			while (lo < hi) {
+				auto mid = lo + (hi - lo) / 2;
+				uint32_t id;
+				std::memcpy(&id, ids_start + mid * sizeof(uint32_t), sizeof(id));
+				if (id < container_id) {
+					lo = mid + 1;
+				} else {
+					hi = mid;
+				}
+			}
+			if (lo >= count) {
+				return false;
+			}
+			uint32_t id;
+			std::memcpy(&id, ids_start + lo * sizeof(uint32_t), sizeof(id));
+			if (id != container_id) {
+				return false;
+			}
+		}
+		auto offset = SpansOffset() + lo * sizeof(ContainerSpan);
 		std::memcpy(&span, skips_ + offset, sizeof(span));
+		return true;
+	}
+
+	// Span lookup for containers the writer always spans (arrays, objects with
+	// child_count > OBJECT_CHECKPOINT_STRIDE): a missing span is corruption.
+	JSONO_ALWAYS_INLINE ContainerSpan ContainerSpanAt(uint64_t container_id) const {
+		ContainerSpan span;
+		if (!TryContainerSpan(container_id, span)) {
+			ThrowMalformed("malformed JSONO: container span missing");
+		}
 		return span;
 	}
 
-	ObjectCursorCheckpoint ObjectCheckpointAt(uint32_t checkpoint_index) const {
-		if (checkpoint_index >= metadata_header_.checkpoint_count) {
-			throw InvalidInputException("malformed JSONO: object cursor checkpoint index out of bounds");
+	uint32_t SpanIdAt(size_t index) const {
+		if (index >= metadata_header_.span_count) {
+			throw InvalidInputException("malformed JSONO: span id index out of bounds");
 		}
-		auto spans_bytes = size_t(metadata_header_.container_count) * sizeof(ContainerSpan);
-		auto index_bytes = size_t(metadata_header_.checkpoint_index_count) * sizeof(ObjectCheckpointIndex);
-		auto offset = sizeof(ContainerMetadataHeader) + spans_bytes + index_bytes +
-		              size_t(checkpoint_index) * sizeof(ObjectCursorCheckpoint);
+		uint32_t id;
+		std::memcpy(&id, skips_ + sizeof(ContainerMetadataHeader) + index * sizeof(uint32_t), sizeof(id));
+		return id;
+	}
+
+	JSONO_ALWAYS_INLINE uint32_t LengthAt(size_t length_index) const {
+		if (length_index >= LengthCount()) {
+			ThrowMalformed("malformed JSONO: lengths stream index out of bounds");
+		}
+		uint32_t length;
+		std::memcpy(&length, lengths_ + length_index * sizeof(uint32_t), sizeof(length));
+		return length;
+	}
+
+	JSONO_ALWAYS_INLINE uint64_t NumAt(size_t num_index) const {
+		if (num_index >= NumCount()) {
+			ThrowMalformed("malformed JSONO: nums stream index out of bounds");
+		}
+		uint64_t value;
+		std::memcpy(&value, nums_ + num_index * sizeof(uint64_t), sizeof(value));
+		return value;
+	}
+
+	size_t LengthCount() const {
+		return lengths_size_ / sizeof(uint32_t);
+	}
+
+	size_t NumCount() const {
+		return nums_size_ / sizeof(uint64_t);
+	}
+
+	// Raw byte slices over the streams, for bulk copies of contiguous walk-order runs.
+	const uint8_t *LengthsBytes(size_t length_index, size_t count) const {
+		if (length_index > LengthCount() || count > LengthCount() - length_index) {
+			throw InvalidInputException("malformed JSONO: lengths stream slice out of bounds");
+		}
+		return lengths_ + length_index * sizeof(uint32_t);
+	}
+
+	const uint8_t *NumsBytes(size_t num_index, size_t count) const {
+		if (num_index > NumCount() || count > NumCount() - num_index) {
+			throw InvalidInputException("malformed JSONO: nums stream slice out of bounds");
+		}
+		return nums_ + num_index * sizeof(uint64_t);
+	}
+
+	// Raw byte slices over the span / checkpoint record sections, for bulk copies of a
+	// subtree's contiguous metadata ranges (a subtree's containers occupy a contiguous id
+	// range, so its spans and checkpoints are contiguous record runs).
+	const uint8_t *SpanRecordsBytes(size_t index, size_t count) const {
+		if (index > size_t(metadata_header_.span_count) || count > size_t(metadata_header_.span_count) - index) {
+			throw InvalidInputException("malformed JSONO: span record slice out of bounds");
+		}
+		return skips_ + SpansOffset() + index * sizeof(ContainerSpan);
+	}
+
+	const uint8_t *CheckpointRecordsBytes(size_t index, size_t count) const {
+		if (index > size_t(metadata_header_.checkpoint_count) ||
+		    count > size_t(metadata_header_.checkpoint_count) - index) {
+			throw InvalidInputException("malformed JSONO: checkpoint record slice out of bounds");
+		}
+		return skips_ + CheckpointsOffset() + index * sizeof(ObjectCursorCheckpoint);
+	}
+
+	JSONO_ALWAYS_INLINE ObjectCursorCheckpoint ObjectCheckpointAt(uint32_t checkpoint_index) const {
+		if (checkpoint_index >= metadata_header_.checkpoint_count) {
+			ThrowMalformed("malformed JSONO: object cursor checkpoint index out of bounds");
+		}
+		auto offset = CheckpointsOffset() + size_t(checkpoint_index) * sizeof(ObjectCursorCheckpoint);
 		ObjectCursorCheckpoint checkpoint;
 		std::memcpy(&checkpoint, skips_ + offset, sizeof(checkpoint));
 		return checkpoint;
@@ -698,9 +852,7 @@ public:
 		if (checkpoint_index >= metadata_header_.checkpoint_index_count) {
 			throw InvalidInputException("malformed JSONO: object checkpoint index out of bounds");
 		}
-		auto offset = sizeof(ContainerMetadataHeader) +
-		              size_t(metadata_header_.container_count) * sizeof(ContainerSpan) +
-		              size_t(checkpoint_index) * sizeof(ObjectCheckpointIndex);
+		auto offset = CheckpointIndexOffset() + size_t(checkpoint_index) * sizeof(ObjectCheckpointIndex);
 		ObjectCheckpointIndex index;
 		std::memcpy(&index, skips_ + offset, sizeof(index));
 		return index;
@@ -709,8 +861,7 @@ public:
 	ObjectCheckpointIndex ObjectCheckpointIndexForContainer(uint32_t container_id) const {
 		size_t lo = 0;
 		size_t hi = metadata_header_.checkpoint_index_count;
-		auto index_start =
-		    skips_ + sizeof(ContainerMetadataHeader) + size_t(metadata_header_.container_count) * sizeof(ContainerSpan);
+		auto index_start = skips_ + CheckpointIndexOffset();
 		while (lo < hi) {
 			auto mid = lo + (hi - lo) / 2;
 			ObjectCheckpointIndex index;
@@ -745,38 +896,53 @@ public:
 	}
 
 private:
-	const uint8_t *slots_;
-	size_t slots_size_;
-	const uint8_t *key_heap_;
-	size_t key_heap_size_;
-	const uint8_t *string_heap_;
-	size_t string_heap_size_;
-	const uint8_t *skips_;
-	size_t skips_size_;
+	// Out-of-line throw for the always-inlined accessors: the hot path stays a
+	// compare-and-load, the exception machinery lives here.
+	[[noreturn]] JSONO_COLD static void ThrowMalformed(const char *message) {
+		throw InvalidInputException("%s", message);
+	}
+
+	size_t SpansOffset() const {
+		return sizeof(ContainerMetadataHeader) + size_t(metadata_header_.span_count) * sizeof(uint32_t);
+	}
+
+	size_t CheckpointIndexOffset() const {
+		return SpansOffset() + size_t(metadata_header_.span_count) * sizeof(ContainerSpan);
+	}
+
+	size_t CheckpointsOffset() const {
+		return CheckpointIndexOffset() +
+		       size_t(metadata_header_.checkpoint_index_count) * sizeof(ObjectCheckpointIndex);
+	}
+
+	const uint8_t *slots_ = nullptr;
+	size_t slots_size_ = 0;
+	const uint8_t *key_heap_ = nullptr;
+	size_t key_heap_size_ = 0;
+	const uint8_t *string_heap_ = nullptr;
+	size_t string_heap_size_ = 0;
+	const uint8_t *skips_ = nullptr;
+	size_t skips_size_ = 0;
+	const uint8_t *lengths_ = nullptr;
+	size_t lengths_size_ = 0;
+	const uint8_t *nums_ = nullptr;
+	size_t nums_size_ = 0;
 	JsonoHeader header_ {};
 	ContainerMetadataHeader metadata_header_ {};
 	size_t slot_count_ = 0;
 	size_t manifest_offset_ = 0;
 };
 
-// Verify a row's shred manifest against the shreds the reading type actually carries, given as
-// (path, type-string) pairs. Every manifest entry must have a shred of the same path and type:
-// the manifest lists the paths stripped out of this residual at write time, so a missing shred
-// means the value was narrowed by a raw struct cast (the shred was dropped) and a retyped shred
-// means its value was silently converted — either way the original value cannot be reproduced
-// and the read must fail loud. Extra shreds are fine (a widening cast NULL-fills them; readers
-// fall back to the residual). `manifest` is caller-provided scratch to keep the per-row parse
-// allocation-free.
-inline void VerifyShredManifest(const JsonoView &view,
-                                const std::vector<std::pair<std::string, std::string>> &shred_signatures,
-                                std::vector<ShredManifestEntry> &manifest) {
-	// Always reset the caller's scratch: a row without a manifest must not inherit the previous
-	// row's entries (callers also read `manifest` after this to learn the row's stripped paths).
-	manifest.clear();
-	if (!view.HasShredManifest()) {
-		return;
-	}
-	view.ReadShredManifest(manifest);
+// Verify a row's parsed shred-manifest entries against the shreds the reading type actually
+// carries, given as (path, type-string) pairs. Every manifest entry must have a shred of the same
+// path and type: the manifest lists the paths stripped out of this residual at write time, so a
+// missing shred means the value was narrowed by a raw struct cast (the shred was dropped) and a
+// retyped shred means its value was silently converted — either way the original value cannot be
+// reproduced and the read must fail loud. Extra shreds are fine (a widening cast NULL-fills them;
+// readers fall back to the residual). Callers go through the row-read layer
+// (jsono_row_read.hpp), which parses and memoizes the entries.
+inline void VerifyShredManifestEntries(const std::vector<ShredManifestEntry> &manifest,
+                                       const std::vector<std::pair<std::string, std::string>> &shred_signatures) {
 	for (auto &entry : manifest) {
 		bool found = false;
 		for (auto &shred : shred_signatures) {

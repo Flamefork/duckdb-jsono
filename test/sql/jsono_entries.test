@@ -168,3 +168,25 @@ SELECT jsono_entries(
 );
 ----
 [{'key': a, 'value': 1}]
+
+# --- DOUBLE shred leaf renders shortest round-trip text, identical to the residual path ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono(jsono({a: 1.5::DOUBLE}), shredding := {'a':'DOUBLE'}))) u);
+----
+$.a	1.5
+
+# same stored double in the residual (array element, not shreddable)
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono({a: [1.5::DOUBLE]}))) u);
+----
+$.a[0]	1.5
+
+# the shred leaf text matches to_json of the same document
+require json
+
+query I
+SELECT to_json(jsono(jsono({a: 1.5::DOUBLE}), shredding := {'a':'DOUBLE'}));
+----
+{"a":1.5}

@@ -96,6 +96,25 @@ SELECT j ->> '$.k' FROM ov_conflict;
 ----
 SHRED
 
+# A string extract of an ancestor of a stripped shred serializes the container, so it
+# must reconstruct rather than read the residual alone — the shred leaf is stripped
+# there and the manifest makes a residual-only read fail loudly. Built via
+# jsono(..., shredding :=) so the residual carries a real shred manifest.
+statement ok
+CREATE TABLE manifest_stripped AS
+SELECT jsono('{"commit":{"operation":"create"},"x":1}',
+             shredding := {'$.commit.operation': 'VARCHAR'}) AS j;
+
+query I
+SELECT j ->> '$.commit' FROM manifest_stripped;
+----
+{"operation":"create"}
+
+query I
+SELECT j ->> '$' FROM manifest_stripped;
+----
+{"commit":{"operation":"create"},"x":1}
+
 # A kept explicit JSON null survives reconstruction: $.a was stripped (absent from
 # the body, lives in its shred), $.b was kept as null in the body, $.c is
 # non-hot. Overlay fills a from its shred and keeps b's null — a B-side null must not

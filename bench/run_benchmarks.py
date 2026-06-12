@@ -229,11 +229,18 @@ def create_connection(target: Target) -> duckdb.DuckDBPyConnection:
     return conn
 
 
-def jsono_prepare_jsono(scenario_config: dict, data_path: Path) -> str:
+def jsono_value_sql(scenario_config: dict) -> str:
     json_column = scenario_config["json_column"]
+    if "shredding" in scenario_config:
+        shredding = sql_typed_literal(scenario_config["shredding"])
+        return f"jsono({json_column}::VARCHAR, shredding := {shredding})"
+    return f"jsono({json_column}::VARCHAR)"
+
+
+def jsono_prepare_jsono(scenario_config: dict, data_path: Path) -> str:
     return f"""
         CREATE OR REPLACE TEMP TABLE _bench_in AS
-        SELECT jsono({json_column}::VARCHAR) AS t
+        SELECT {jsono_value_sql(scenario_config)} AS t
         FROM {table_sql(data_path)}
     """
 
@@ -316,6 +323,21 @@ def build_jsono_parse_query(scenario_config: dict, data_path: Path) -> Benchmark
         timed_sql=f"""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
             SELECT jsono({json_column}::VARCHAR) AS r
+            FROM {table_sql(data_path)}
+        """,
+    )
+
+
+def build_jsono_parse_shred_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    # End-to-end shred-from-text ingest: parse + shred in one timed call, the
+    # production write path of a shredded column (W-1/W-3 frame).
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {jsono_value_sql(scenario_config)} AS r
             FROM {table_sql(data_path)}
         """,
     )
@@ -543,6 +565,62 @@ def build_jsono_optimizer_project_query(
     )
 
 
+def project_paths_columns_sql(value_sql: str, paths: list[str]) -> str:
+    return ",\n                ".join(
+        f"{value_sql}->>{sql_string(path)} AS p{index}"
+        for index, path in enumerate(paths)
+    )
+
+
+def build_jsono_project_paths_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    # Filterless multi-extract projection: no WHERE, so the matcher-gated
+    # projector fuse does not fire today (O-1); over shredded input each path is
+    # rewritten independently (O-2).
+    columns = project_paths_columns_sql("t", scenario_config["paths"])
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {columns}
+            FROM _bench_in
+        """,
+    )
+
+
+def filter_paths_predicates_sql(value_sql: str, predicates: list[dict]) -> str:
+    clauses = []
+    for predicate in predicates:
+        path = sql_string(predicate["path"])
+        values = predicate["values"]
+        if len(values) == 1:
+            clauses.append(f"({value_sql}->>{path} = {sql_string(values[0])})")
+        else:
+            value_list = ", ".join(sql_string(value) for value in values)
+            clauses.append(f"({value_sql}->>{path} IN [{value_list}])")
+    return "\n              AND ".join(clauses)
+
+
+def build_jsono_filter_paths_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    # Filtered multi-extract read: a WHERE with >=2 constant `->>` equality/IN predicates over
+    # one column. The matcher fuses them into a single __jsono_internal_match (one residual read
+    # + one manifest check over a shredded column; O-2). The aggregate count keeps the result
+    # tiny so timing reflects the filter, not the sink.
+    predicates_sql = filter_paths_predicates_sql("t", scenario_config["predicates"])
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT count(*) AS matched
+            FROM _bench_in
+            WHERE {predicates_sql}
+        """,
+    )
+
+
 def build_jsono_merge_patch_query(
     scenario_config: dict, data_path: Path
 ) -> BenchmarkQuery:
@@ -658,6 +736,8 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     match operation:
         case "parse":
             return build_jsono_parse_query(scenario_config, data_path)
+        case "parse_shred":
+            return build_jsono_parse_shred_query(scenario_config, data_path)
         case "parse_struct":
             return build_jsono_parse_struct_query(scenario_config, data_path)
         case "parse_struct_roundtrip":
@@ -686,6 +766,10 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_group_merge_jsono_query(scenario_config, data_path)
         case "optimizer_project":
             return build_jsono_optimizer_project_query(scenario_config, data_path)
+        case "project_paths":
+            return build_jsono_project_paths_query(scenario_config, data_path)
+        case "filter_paths":
+            return build_jsono_filter_paths_query(scenario_config, data_path)
         case "merge_patch":
             return build_jsono_merge_patch_query(scenario_config, data_path)
         case "reshred":
@@ -785,12 +869,49 @@ def build_core_extract_string_query(
     )
 
 
+def build_core_project_paths_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    columns = project_paths_columns_sql(
+        scenario_config["json_column"], scenario_config["paths"]
+    )
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {columns}
+            FROM {table_sql(data_path)}
+        """,
+    )
+
+
+def build_core_filter_paths_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    predicates_sql = filter_paths_predicates_sql(
+        scenario_config["json_column"], scenario_config["predicates"]
+    )
+    return BenchmarkQuery(
+        prepare_sql=(),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT count(*) AS matched
+            FROM {table_sql(data_path)}
+            WHERE {predicates_sql}
+        """,
+    )
+
+
 def build_json_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     operation = scenario_config["operation"]
 
     match operation:
         case "merge_patch":
             return build_core_merge_patch_query(scenario_config, data_path)
+        case "project_paths":
+            return build_core_project_paths_query(scenario_config, data_path)
+        case "filter_paths":
+            return build_core_filter_paths_query(scenario_config, data_path)
         case "entries":
             return build_core_entries_query(scenario_config, data_path)
         case "extract":

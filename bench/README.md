@@ -64,6 +64,7 @@ case registry; see `bench/PROFILING.md`.
 JSONO-only operations:
 
 - `parse`: `jsono(json_text)`;
+- `parse_shred`: `jsono(json_text, shredding := spec)` — end-to-end shred-from-text ingest;
 - `parse_copy`: `parse` + writing the result to Parquet (end-to-end path with storage size);
 - `scan_text`: diagnostic lower bound on scan/output cost; compare against `parse` when optimizing JSONO creation;
 - `parse_struct`: `jsono(STRUCT)` on a pre-materialized typed STRUCT input;
@@ -76,6 +77,9 @@ JSONO-only operations:
 - `transform`: `jsono_transform`;
 - `group_merge`: `to_json(jsono_group_merge(...))`;
 - `group_merge_jsono`: `jsono_group_merge`, the JSONO-native path.
+
+Scenarios may set a `shredding` spec: the materialized `jsono` input (and the `parse_shred`
+timed call) is then shredded with it. Scenario names carry `shred` so they are easy to filter.
 
 Operations paired with a core DuckDB `json` baseline (target `json`):
 
@@ -96,6 +100,9 @@ Operations paired with a core DuckDB `json` baseline (target `json`):
 - `extract_string`: `jsono_extract_string(jsono(obj), path)` vs `json_extract_string(obj, path)` for
   one constant path. This covers the VARCHAR-returning executor used by `jsono_extract_string` and
   `->>`; aliases are not benchmarked separately.
+- `project_paths`: filterless multi-extract projection `SELECT j->>'p1', ..., j->>'pN'` (no WHERE)
+  vs the same `->>` list over core JSON text. The `jsono` input is materialized before the timed
+  section; the shredded variant is JSONO-only.
 
 ## Correctness gate
 
@@ -162,6 +169,7 @@ uv run --frozen python bench/profile_driver.py build/release/extension/jsono/jso
 ```bash
 uv run --frozen python bench/run_benchmarks.py --list
 uv run --frozen python bench/generate_data.py --kind events --size 10k
+uv run --frozen python bench/generate_data.py --kind wide_flat
 uv run --frozen python bench/compare_results.py --save-baseline
 uv run --frozen python bench/compare_results.py
 uv run --frozen python bench/run_benchmarks.py --profile --filter current/transform/1k/flat_core

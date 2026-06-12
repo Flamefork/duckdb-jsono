@@ -147,7 +147,10 @@ def run_correctness_gate(args: list[str]) -> list[str]:
 
         for scenario_config in scenarios:
             size = scenario_config["size"]
-            data_path = DATA_DIR / f"events_{size}.parquet"
+            if "data_file" in scenario_config:
+                data_path = scenario_config["data_file"]
+            else:
+                data_path = DATA_DIR / f"events_{size}.parquet"
             if not data_path.exists():
                 continue
 

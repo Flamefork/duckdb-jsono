@@ -1,12 +1,14 @@
 #pragma once
 
 #include "jsono.hpp"
+#include "jsono_number.hpp"
 
 #include "duckdb/common/types/vector.hpp"
 
 #include "string_view.hpp"
 
 #include <cstring>
+#include <string>
 
 namespace duckdb {
 namespace jsono {
@@ -16,6 +18,8 @@ struct JsonoBlobRow {
 	string_t key_heap;
 	string_t string_heap;
 	string_t skips;
+	string_t lengths;
+	string_t nums;
 };
 
 struct JsonoVectorData {
@@ -26,17 +30,31 @@ struct JsonoVectorData {
 	UnifiedVectorFormat key_heap_fmt;
 	UnifiedVectorFormat string_heap_fmt;
 	UnifiedVectorFormat skips_fmt;
+	UnifiedVectorFormat lengths_fmt;
+	UnifiedVectorFormat nums_fmt;
 	const string_t *slots_data = nullptr;
 	const string_t *key_heap_data = nullptr;
 	const string_t *string_heap_data = nullptr;
 	const string_t *skips_data = nullptr;
+	const string_t *lengths_data = nullptr;
+	const string_t *nums_data = nullptr;
+	// All nine levels report AllValid(): per-row reads skip every validity check (the
+	// dominant storage-scan case — six blob children make per-row checks measurable).
+	bool all_valid = false;
 };
 
+// Layout of one object read off its OBJ_START slot. `after_pos`, `shape_hash` and the
+// checkpoint fields are meaningful only when `has_span`: the layout consults the
+// ContainerSpan table for objects with child_count > OBJECT_CHECKPOINT_STRIDE (the
+// checkpointed ones). Smaller objects are laid out without it — their end position is
+// discovered by the walk itself — even though those with a container child do store a
+// span (it serves subtree skips, not key lookup).
 struct ObjectLayout {
 	size_t key_start;
 	size_t key_count;
 	size_t value_start;
 	size_t after_pos;
+	bool has_span;
 	uint32_t checkpoint_offset;
 	uint16_t checkpoint_stride;
 	uint64_t shape_hash;
@@ -51,9 +69,10 @@ inline bool RowIsValid(const UnifiedVectorFormat &fmt, idx_t row) {
 	return fmt.validity.RowIsValid(idx);
 }
 
-// Navigate a jsono value vector (plain or shredded) to its four body blob child vectors:
-// top-level layout field [0] -> body [0] -> {slots, key_heap, string_heap, skips}. The body is
-// identical for plain and shredded, so the rest of the reader never needs to know which it is.
+// Navigate a jsono value vector (plain or shredded) to its six body blob child vectors:
+// top-level layout field [0] -> body [0] -> {slots, key_heap, string_heap, skips, lengths, nums}.
+// The body is identical for plain and shredded, so the rest of the reader never needs to know
+// which it is.
 inline void InitJsonoVectorData(Vector &input, idx_t count, JsonoVectorData &data) {
 	input.ToUnifiedFormat(count, data.struct_fmt);
 	auto &layout = *StructVector::GetEntries(input)[0];
@@ -65,15 +84,54 @@ inline void InitJsonoVectorData(Vector &input, idx_t count, JsonoVectorData &dat
 	blobs[1]->ToUnifiedFormat(count, data.key_heap_fmt);
 	blobs[2]->ToUnifiedFormat(count, data.string_heap_fmt);
 	blobs[3]->ToUnifiedFormat(count, data.skips_fmt);
+	blobs[4]->ToUnifiedFormat(count, data.lengths_fmt);
+	blobs[5]->ToUnifiedFormat(count, data.nums_fmt);
 	data.slots_data = UnifiedVectorFormat::GetData<string_t>(data.slots_fmt);
 	data.key_heap_data = UnifiedVectorFormat::GetData<string_t>(data.key_heap_fmt);
 	data.string_heap_data = UnifiedVectorFormat::GetData<string_t>(data.string_heap_fmt);
 	data.skips_data = UnifiedVectorFormat::GetData<string_t>(data.skips_fmt);
+	data.lengths_data = UnifiedVectorFormat::GetData<string_t>(data.lengths_fmt);
+	data.nums_data = UnifiedVectorFormat::GetData<string_t>(data.nums_fmt);
+	data.all_valid = data.struct_fmt.validity.AllValid() && data.layout_fmt.validity.AllValid() &&
+	                 data.body_fmt.validity.AllValid() && data.slots_fmt.validity.AllValid() &&
+	                 data.key_heap_fmt.validity.AllValid() && data.string_heap_fmt.validity.AllValid() &&
+	                 data.skips_fmt.validity.AllValid() && data.lengths_fmt.validity.AllValid() &&
+	                 data.nums_fmt.validity.AllValid();
+}
+
+// The unchecked blob copy shared by both row readers once validity is settled.
+inline void ReadJsonoRowBlobs(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
+	out.slots = data.slots_data[RowIndex(data.slots_fmt, row)];
+	out.key_heap = data.key_heap_data[RowIndex(data.key_heap_fmt, row)];
+	out.string_heap = data.string_heap_data[RowIndex(data.string_heap_fmt, row)];
+	out.skips = data.skips_data[RowIndex(data.skips_fmt, row)];
+	out.lengths = data.lengths_data[RowIndex(data.lengths_fmt, row)];
+	out.nums = data.nums_data[RowIndex(data.nums_fmt, row)];
+}
+
+// Issue prefetches for the first cache line of every stream a point read is about to walk.
+// A row's blobs are cold (the working set is the whole column), and the read path touches
+// them serially — slots in ParseHeader, then skips, key_heap, lengths, string_heap during
+// the locate — so each first touch stalls in turn. Prefetching them together at row start
+// overlaps those misses. Only the per-row point readers (extract / match / project) call
+// this; bulk walkers touch the streams densely anyway.
+inline void PrefetchJsonoRowStreams(const JsonoBlobRow &blob) {
+#if defined(__GNUC__) || defined(__clang__)
+	__builtin_prefetch(blob.slots.GetData());
+	__builtin_prefetch(blob.key_heap.GetData());
+	__builtin_prefetch(blob.string_heap.GetData());
+	__builtin_prefetch(blob.skips.GetData());
+	__builtin_prefetch(blob.lengths.GetData());
+#endif
 }
 
 // Permissive row read for union-merged reconstruction: a dead layout group is expected to be NULL,
 // so any missing nested field is treated as an absent row.
 inline bool ReadJsonoRow(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
+	if (data.all_valid) {
+		ReadJsonoRowBlobs(data, row, out);
+		return true;
+	}
 	if (!RowIsValid(data.struct_fmt, row) || !RowIsValid(data.layout_fmt, row) || !RowIsValid(data.body_fmt, row)) {
 		return false;
 	}
@@ -81,14 +139,19 @@ inline bool ReadJsonoRow(const JsonoVectorData &data, idx_t row, JsonoBlobRow &o
 	auto key_heap_idx = RowIndex(data.key_heap_fmt, row);
 	auto string_heap_idx = RowIndex(data.string_heap_fmt, row);
 	auto skips_idx = RowIndex(data.skips_fmt, row);
+	auto lengths_idx = RowIndex(data.lengths_fmt, row);
+	auto nums_idx = RowIndex(data.nums_fmt, row);
 	if (!data.slots_fmt.validity.RowIsValid(slots_idx) || !data.key_heap_fmt.validity.RowIsValid(key_heap_idx) ||
-	    !data.string_heap_fmt.validity.RowIsValid(string_heap_idx) || !data.skips_fmt.validity.RowIsValid(skips_idx)) {
+	    !data.string_heap_fmt.validity.RowIsValid(string_heap_idx) || !data.skips_fmt.validity.RowIsValid(skips_idx) ||
+	    !data.lengths_fmt.validity.RowIsValid(lengths_idx) || !data.nums_fmt.validity.RowIsValid(nums_idx)) {
 		return false;
 	}
 	out.slots = data.slots_data[slots_idx];
 	out.key_heap = data.key_heap_data[key_heap_idx];
 	out.string_heap = data.string_heap_data[string_heap_idx];
 	out.skips = data.skips_data[skips_idx];
+	out.lengths = data.lengths_data[lengths_idx];
+	out.nums = data.nums_data[nums_idx];
 	return true;
 }
 
@@ -100,6 +163,10 @@ inline void ThrowCorruptJsonoRow(const char *field) {
 }
 
 inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
+	if (data.all_valid) {
+		ReadJsonoRowBlobs(data, row, out);
+		return true;
+	}
 	if (!RowIsValid(data.struct_fmt, row)) {
 		return false;
 	}
@@ -113,6 +180,8 @@ inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlob
 	auto key_heap_idx = RowIndex(data.key_heap_fmt, row);
 	auto string_heap_idx = RowIndex(data.string_heap_fmt, row);
 	auto skips_idx = RowIndex(data.skips_fmt, row);
+	auto lengths_idx = RowIndex(data.lengths_fmt, row);
+	auto nums_idx = RowIndex(data.nums_fmt, row);
 	if (!data.slots_fmt.validity.RowIsValid(slots_idx)) {
 		ThrowCorruptJsonoRow("slots blob");
 	}
@@ -125,17 +194,25 @@ inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlob
 	if (!data.skips_fmt.validity.RowIsValid(skips_idx)) {
 		ThrowCorruptJsonoRow("skips blob");
 	}
+	if (!data.lengths_fmt.validity.RowIsValid(lengths_idx)) {
+		ThrowCorruptJsonoRow("lengths blob");
+	}
+	if (!data.nums_fmt.validity.RowIsValid(nums_idx)) {
+		ThrowCorruptJsonoRow("nums blob");
+	}
 	out.slots = data.slots_data[slots_idx];
 	out.key_heap = data.key_heap_data[key_heap_idx];
 	out.string_heap = data.string_heap_data[string_heap_idx];
 	out.skips = data.skips_data[skips_idx];
+	out.lengths = data.lengths_data[lengths_idx];
+	out.nums = data.nums_data[nums_idx];
 	return true;
 }
 
 inline JsonoView MakeJsonoView(const JsonoBlobRow &blob) {
 	return JsonoView(blob.slots.GetData(), blob.slots.GetSize(), blob.key_heap.GetData(), blob.key_heap.GetSize(),
-	                 blob.string_heap.GetData(), blob.string_heap.GetSize(), blob.skips.GetData(),
-	                 blob.skips.GetSize());
+	                 blob.string_heap.GetData(), blob.string_heap.GetSize(), blob.skips.GetData(), blob.skips.GetSize(),
+	                 blob.lengths.GetData(), blob.lengths.GetSize(), blob.nums.GetData(), blob.nums.GetSize());
 }
 
 inline ContainerSpan CheckedContainerSpan(const JsonoView &view, size_t pos, uint64_t expected_tag) {
@@ -156,28 +233,75 @@ inline ContainerSpan CheckedContainerSpan(const JsonoView &view, size_t pos, uin
 	return span;
 }
 
-inline ObjectLayout ReadObjectLayout(const JsonoView &view, size_t pos) {
+// Advance `cursor` past a spanned container in O(1): all four stream cursors jump by the
+// span's per-stream counts, bounds-checked against the row's blobs.
+inline void AdvanceCursorBySpan(const JsonoView &view, const ContainerSpan &span, JsonoCursor &cursor) {
+	if (cursor.string_cursor > view.StringHeapSize() ||
+	    size_t(span.string_byte_span) > view.StringHeapSize() - cursor.string_cursor) {
+		throw InvalidInputException("malformed JSONO: container string span out of bounds");
+	}
+	if (cursor.length_cursor > view.LengthCount() ||
+	    size_t(span.length_count) > view.LengthCount() - cursor.length_cursor) {
+		throw InvalidInputException("malformed JSONO: container lengths span out of bounds");
+	}
+	if (cursor.num_cursor > view.NumCount() || size_t(span.num_count) > view.NumCount() - cursor.num_cursor) {
+		throw InvalidInputException("malformed JSONO: container nums span out of bounds");
+	}
+	cursor.pos += size_t(span.slot_span);
+	cursor.string_cursor += size_t(span.string_byte_span);
+	cursor.length_cursor += size_t(span.length_count);
+	cursor.num_cursor += size_t(span.num_count);
+}
+
+// `probe_small_object_span`: key-lookup callers (extract / optimizer match+project) pass true so a
+// small object that does store a span (one with a container child) yields its shape_hash — that is
+// what lets their per-object rank cache trust a cached key rank by an int compare instead of
+// re-reading the key heap. Walk-everything callers (serializers, merge, transform) keep the default:
+// they never consult shape_hash, so the sparse-index binary search would be pure waste.
+inline ObjectLayout ReadObjectLayout(const JsonoView &view, size_t pos, bool probe_small_object_span = false) {
 	auto slot = view.SlotAt(pos);
 	auto payload = SlotPayload(slot);
+	if (SlotTag(slot) != tag::OBJ_START) {
+		throw InvalidInputException("malformed JSONO: unexpected container tag");
+	}
 	auto key_count = size_t(ContainerChildCount(payload));
+	auto key_start = pos + 1;
+	if (key_count >= view.Slots() || key_start > view.Slots() - key_count) {
+		throw InvalidInputException("malformed JSONO: object child count out of bounds");
+	}
+	if (key_count <= OBJECT_CHECKPOINT_STRIDE) {
+		ContainerSpan span;
+		if (probe_small_object_span && view.TryContainerSpan(ContainerId(payload), span)) {
+			if (span.slot_span < 2 || size_t(span.slot_span) > view.Slots() - pos) {
+				throw InvalidInputException("malformed JSONO: container slot span out of bounds");
+			}
+			return ObjectLayout {key_start,
+			                     key_count,
+			                     key_start + key_count,
+			                     pos + size_t(span.slot_span),
+			                     true,
+			                     NO_OBJECT_CHECKPOINTS,
+			                     0,
+			                     span.shape_hash};
+		}
+		// Small objects need no span for layout: the walk discovers OBJ_END itself.
+		return ObjectLayout {key_start, key_count, key_start + key_count, 0, false, NO_OBJECT_CHECKPOINTS, 0, 0};
+	}
 	auto span = CheckedContainerSpan(view, pos, tag::OBJ_START);
 	auto after_pos = pos + size_t(span.slot_span);
 	auto end_pos = after_pos - 1;
 	if (SlotTag(view.SlotAt(end_pos)) != tag::OBJ_END) {
 		throw InvalidInputException("malformed JSONO: object span does not end with OBJ_END");
 	}
-	auto key_start = pos + 1;
 	if (key_count > end_pos - key_start) {
 		throw InvalidInputException("malformed JSONO: object child count out of bounds");
 	}
-	ObjectCheckpointIndex checkpoint_index {uint32_t(ContainerId(payload)), NO_OBJECT_CHECKPOINTS, 0, 0};
-	if (key_count > OBJECT_CHECKPOINT_STRIDE) {
-		checkpoint_index = view.ObjectCheckpointIndexForContainer(uint32_t(ContainerId(payload)));
-	}
+	auto checkpoint_index = view.ObjectCheckpointIndexForContainer(uint32_t(ContainerId(payload)));
 	return ObjectLayout {key_start,
 	                     key_count,
 	                     key_start + key_count,
 	                     after_pos,
+	                     true,
 	                     checkpoint_index.checkpoint_offset,
 	                     checkpoint_index.checkpoint_stride,
 	                     span.shape_hash};
@@ -192,67 +316,123 @@ inline size_t ReadArrayEndPos(const JsonoView &view, size_t pos) {
 	return end_pos;
 }
 
-// Skip the value whose first slot is `slot`, already read at `pos` (a valid slot
+void SkipValueFast(const JsonoView &view, JsonoCursor &cursor, size_t depth);
+void SkipContainerFromSlot(const JsonoView &view, uint64_t slot, JsonoCursor &cursor, size_t depth);
+
+// Skip a scalar value whose slot is already read at `cursor.pos`. Returns false for
+// containers and non-value slots (the caller dispatches those to the out-of-line
+// container path). Always-inline: per-value walk loops pay no call for the dominant
+// scalar case.
+JSONO_ALWAYS_INLINE bool TrySkipScalarFromSlot(const JsonoView &view, uint64_t slot, JsonoCursor &cursor) {
+	switch (SlotTag(slot)) {
+	case tag::VAL_STR_HEAP: {
+		auto len = size_t(view.LengthAt(cursor.length_cursor));
+		(void)view.StringAt(cursor.string_cursor, len);
+		cursor.string_cursor += len;
+		cursor.length_cursor++;
+		cursor.pos++;
+		return true;
+	}
+	case tag::VAL_EXT: {
+		auto subtype = ExtSubtype(slot);
+		if (subtype == ext_subtype::NUMBER) {
+			auto len = size_t(view.LengthAt(cursor.length_cursor));
+			(void)view.StringAt(cursor.string_cursor, len);
+			cursor.string_cursor += len;
+			cursor.length_cursor++;
+		} else if (subtype < ext_subtype::COUNT) {
+			(void)view.NumAt(cursor.num_cursor);
+			cursor.num_cursor++;
+		} else {
+			throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
+		}
+		cursor.pos++;
+		return true;
+	}
+	case tag::VAL_INT60:
+	case tag::VAL_DEC60:
+		(void)view.NumAt(cursor.num_cursor);
+		cursor.num_cursor++;
+		cursor.pos++;
+		return true;
+	case tag::VAL_TRUE:
+	case tag::VAL_FALSE:
+	case tag::VAL_NULL:
+		cursor.pos++;
+		return true;
+	default:
+		return false;
+	}
+}
+
+// Skip the value whose first slot is `slot`, already read at `cursor.pos` (a valid slot
 // index). Lets callers that have just read the slot — e.g. to inspect its tag —
-// skip without paying a second SlotAt for the common scalar cases.
-inline void SkipValueFastFromSlot(const JsonoView &view, uint64_t slot, size_t &pos, size_t &string_cursor) {
+// skip without paying a second SlotAt for the common scalar cases. Spanned containers
+// (arrays, large objects, objects with a container child) jump via their ContainerSpan;
+// a small flat object (no span) is walked linearly — its children are all scalars, so
+// the recursion only fires on crafted blobs, guarded by `depth`.
+JSONO_ALWAYS_INLINE void SkipValueFastFromSlot(const JsonoView &view, uint64_t slot, JsonoCursor &cursor,
+                                               size_t depth = 0) {
+	if (TrySkipScalarFromSlot(view, slot, cursor)) {
+		return;
+	}
+	SkipContainerFromSlot(view, slot, cursor, depth);
+}
+
+JSONO_ALWAYS_INLINE void SkipValueFast(const JsonoView &view, JsonoCursor &cursor, size_t depth = 0) {
+	if (cursor.pos >= view.Slots()) {
+		throw InvalidInputException("malformed JSONO: value position out of bounds");
+	}
+	SkipValueFastFromSlot(view, view.SlotAt(cursor.pos), cursor, depth);
+}
+
+// The container (and malformed-slot) tail of SkipValueFastFromSlot, deliberately
+// out-of-line: it recurses through SkipValueFast for small-object walks.
+inline void SkipContainerFromSlot(const JsonoView &view, uint64_t slot, JsonoCursor &cursor, size_t depth) {
 	auto slot_tag = SlotTag(slot);
 	auto payload = SlotPayload(slot);
 	switch (slot_tag) {
 	case tag::OBJ_START: {
-		auto span = CheckedContainerSpan(view, pos, tag::OBJ_START);
-		if (SlotTag(view.SlotAt(pos + size_t(span.slot_span) - 1)) != tag::OBJ_END) {
-			throw InvalidInputException("malformed JSONO: object span does not end with OBJ_END");
+		ContainerSpan span;
+		if (view.TryContainerSpan(ContainerId(payload), span)) {
+			if (span.slot_span < 2 || size_t(span.slot_span) > view.Slots() - cursor.pos) {
+				throw InvalidInputException("malformed JSONO: container slot span out of bounds");
+			}
+			if (SlotTag(view.SlotAt(cursor.pos + size_t(span.slot_span) - 1)) != tag::OBJ_END) {
+				throw InvalidInputException("malformed JSONO: object span does not end with OBJ_END");
+			}
+			AdvanceCursorBySpan(view, span, cursor);
+			return;
 		}
-		if (string_cursor > view.StringHeapSize() ||
-		    size_t(span.string_byte_span) > view.StringHeapSize() - string_cursor) {
-			throw InvalidInputException("malformed JSONO: container string span out of bounds");
+		if (depth > JSONO_MAX_NESTING_DEPTH) {
+			throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
+			                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
 		}
-		pos += size_t(span.slot_span);
-		string_cursor += size_t(span.string_byte_span);
+		auto key_count = size_t(ContainerChildCount(payload));
+		if (key_count > OBJECT_CHECKPOINT_STRIDE) {
+			throw InvalidInputException("malformed JSONO: container span missing");
+		}
+		if (key_count + 1 > view.Slots() - cursor.pos) {
+			throw InvalidInputException("malformed JSONO: object child count out of bounds");
+		}
+		cursor.pos += 1 + key_count;
+		for (size_t i = 0; i < key_count; i++) {
+			SkipValueFast(view, cursor, depth + 1);
+		}
+		if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
+			throw InvalidInputException("malformed JSONO: object walk does not end with OBJ_END");
+		}
+		cursor.pos++;
 		return;
 	}
 	case tag::ARR_START: {
-		auto span = CheckedContainerSpan(view, pos, tag::ARR_START);
-		if (SlotTag(view.SlotAt(pos + size_t(span.slot_span) - 1)) != tag::ARR_END) {
+		auto span = CheckedContainerSpan(view, cursor.pos, tag::ARR_START);
+		if (SlotTag(view.SlotAt(cursor.pos + size_t(span.slot_span) - 1)) != tag::ARR_END) {
 			throw InvalidInputException("malformed JSONO: array span does not end with ARR_END");
 		}
-		if (string_cursor > view.StringHeapSize() ||
-		    size_t(span.string_byte_span) > view.StringHeapSize() - string_cursor) {
-			throw InvalidInputException("malformed JSONO: container string span out of bounds");
-		}
-		pos += size_t(span.slot_span);
-		string_cursor += size_t(span.string_byte_span);
+		AdvanceCursorBySpan(view, span, cursor);
 		return;
 	}
-	case tag::VAL_STR_HEAP: {
-		auto len = size_t(StringLen(payload));
-		(void)view.StringAt(string_cursor, len);
-		string_cursor += len;
-		pos++;
-		return;
-	}
-	case tag::VAL_EXT: {
-		auto subtype = ExtSubtype(slot);
-		auto slot_count = ExtSlotCount(subtype);
-		if (slot_count > view.Slots() - pos) {
-			throw InvalidInputException("malformed JSONO: extended scalar payload out of bounds");
-		}
-		if (subtype == ext_subtype::NUMBER) {
-			auto len = size_t(NumberExtLen(slot));
-			(void)view.StringAt(string_cursor, len);
-			string_cursor += len;
-		}
-		pos += slot_count;
-		return;
-	}
-	case tag::VAL_INT60:
-	case tag::VAL_DEC60:
-	case tag::VAL_TRUE:
-	case tag::VAL_FALSE:
-	case tag::VAL_NULL:
-		pos++;
-		return;
 	case tag::KEY:
 	case tag::OBJ_END:
 	case tag::ARR_END:
@@ -260,13 +440,6 @@ inline void SkipValueFastFromSlot(const JsonoView &view, uint64_t slot, size_t &
 	default:
 		throw InvalidInputException("malformed JSONO: unknown slot tag");
 	}
-}
-
-inline void SkipValueFast(const JsonoView &view, size_t &pos, size_t &string_cursor) {
-	if (pos >= view.Slots()) {
-		throw InvalidInputException("malformed JSONO: value position out of bounds");
-	}
-	SkipValueFastFromSlot(view, view.SlotAt(pos), pos, string_cursor);
 }
 
 // Semantic kind of a decoded scalar slot, decoupled from the storage tag/subtype.
@@ -287,55 +460,57 @@ struct JsonoScalar {
 	nonstd::string_view text;
 };
 
-// Decode the scalar value at `pos`, advancing pos and string_cursor past it. This
-// is the single owner of the scalar tag/ext-subtype ladder and the trailing-slot /
-// string-heap accounting; every reader projects the returned scalar to its sink.
-// Throws on container or non-value slots (callers handle OBJ_START/ARR_START first).
-JSONO_ALWAYS_INLINE JsonoScalar DecodeScalarAt(const JsonoView &view, size_t &pos, size_t &string_cursor) {
-	if (pos >= view.Slots()) {
+// Decode the scalar value at `cursor`, advancing it past the value. This is the single
+// owner of the scalar tag/ext-subtype ladder and the stream-cursor accounting; every
+// reader projects the returned scalar to its sink. Throws on container or non-value
+// slots (callers handle OBJ_START/ARR_START first).
+JSONO_ALWAYS_INLINE JsonoScalar DecodeScalarAt(const JsonoView &view, JsonoCursor &cursor) {
+	if (cursor.pos >= view.Slots()) {
 		throw InvalidInputException("malformed JSONO: value position out of bounds");
 	}
-	auto slot = view.SlotAt(pos);
+	auto slot = view.SlotAt(cursor.pos);
 	auto slot_tag = SlotTag(slot);
-	auto payload = SlotPayload(slot);
 	JsonoScalar scalar;
 	switch (slot_tag) {
 	case tag::VAL_STR_HEAP: {
-		auto len = size_t(StringLen(payload));
+		auto len = size_t(view.LengthAt(cursor.length_cursor));
 		scalar.kind = JsonoScalarKind::String;
-		scalar.text = view.StringAt(string_cursor, len);
-		string_cursor += len;
-		pos++;
+		scalar.text = view.StringAt(cursor.string_cursor, len);
+		cursor.string_cursor += len;
+		cursor.length_cursor++;
+		cursor.pos++;
 		return scalar;
 	}
 	case tag::VAL_INT60:
 		scalar.kind = JsonoScalarKind::Int64;
-		scalar.int_value = DecodeInt60(payload);
-		pos++;
+		scalar.int_value = int64_t(view.NumAt(cursor.num_cursor));
+		cursor.num_cursor++;
+		cursor.pos++;
 		return scalar;
-	case tag::VAL_DEC60:
+	case tag::VAL_DEC60: {
+		auto packed = view.NumAt(cursor.num_cursor);
+		cursor.num_cursor++;
 		scalar.kind = JsonoScalarKind::Dec60;
-		scalar.dec_negative = Dec60Negative(payload);
-		scalar.dec_mantissa = Dec60Mantissa(payload);
-		scalar.dec_scale = Dec60Scale(payload);
-		pos++;
+		scalar.dec_negative = Dec60Negative(packed);
+		scalar.dec_mantissa = Dec60Mantissa(packed);
+		scalar.dec_scale = Dec60Scale(packed);
+		cursor.pos++;
 		return scalar;
+	}
 	case tag::VAL_EXT: {
 		auto subtype = ExtSubtype(slot);
-		auto slot_count = ExtSlotCount(subtype);
-		if (slot_count > view.Slots() - pos) {
-			throw InvalidInputException("malformed JSONO: extended scalar payload out of bounds");
-		}
 		if (subtype == ext_subtype::NUMBER) {
-			auto len = size_t(NumberExtLen(slot));
+			auto len = size_t(view.LengthAt(cursor.length_cursor));
 			scalar.kind = JsonoScalarKind::NumberText;
-			scalar.text = view.StringAt(string_cursor, len);
-			string_cursor += len;
-			pos += slot_count;
+			scalar.text = view.StringAt(cursor.string_cursor, len);
+			cursor.string_cursor += len;
+			cursor.length_cursor++;
+			cursor.pos++;
 			return scalar;
 		}
-		auto raw = view.SlotAt(pos + 1);
-		pos += slot_count;
+		auto raw = view.NumAt(cursor.num_cursor);
+		cursor.num_cursor++;
+		cursor.pos++;
 		switch (subtype) {
 		case ext_subtype::INT64:
 			scalar.kind = JsonoScalarKind::Int64;
@@ -356,16 +531,16 @@ JSONO_ALWAYS_INLINE JsonoScalar DecodeScalarAt(const JsonoView &view, size_t &po
 	case tag::VAL_TRUE:
 		scalar.kind = JsonoScalarKind::Bool;
 		scalar.bool_value = true;
-		pos++;
+		cursor.pos++;
 		return scalar;
 	case tag::VAL_FALSE:
 		scalar.kind = JsonoScalarKind::Bool;
 		scalar.bool_value = false;
-		pos++;
+		cursor.pos++;
 		return scalar;
 	case tag::VAL_NULL:
 		scalar.kind = JsonoScalarKind::Null;
-		pos++;
+		cursor.pos++;
 		return scalar;
 	case tag::KEY:
 	case tag::OBJ_END:
@@ -398,9 +573,13 @@ inline const char *JsonoScalarTypeName(JsonoScalarKind kind) {
 	return nullptr;
 }
 
-inline void MoveObjectValueCursorToRank(const JsonoView &view, const ObjectLayout &layout, size_t object_string_cursor,
-                                        size_t target_rank, size_t &cursor_rank, size_t &value_pos,
-                                        size_t &value_string_cursor) {
+// Move `value_cursor` (positioned somewhere at or before `target_rank` inside the
+// object's value block) forward to the value at `target_rank`. `value_block_base` is
+// the cursor at the start of the value block (rank 0) — checkpoint deltas are relative
+// to it. The object cursor only moves forward.
+inline void MoveObjectValueCursorToRank(const JsonoView &view, const ObjectLayout &layout,
+                                        const JsonoCursor &value_block_base, size_t target_rank, size_t &cursor_rank,
+                                        JsonoCursor &value_cursor) {
 	if (target_rank < cursor_rank) {
 		throw InternalException("JSONO object cursor cannot move backwards");
 	}
@@ -412,17 +591,27 @@ inline void MoveObjectValueCursorToRank(const JsonoView &view, const ObjectLayou
 			if (size_t(checkpoint.slot_delta) > layout.after_pos - 1 - layout.value_start) {
 				throw InvalidInputException("malformed JSONO: object cursor checkpoint slot out of bounds");
 			}
-			if (object_string_cursor > view.StringHeapSize() ||
-			    size_t(checkpoint.string_delta) > view.StringHeapSize() - object_string_cursor) {
+			if (value_block_base.string_cursor > view.StringHeapSize() ||
+			    size_t(checkpoint.string_delta) > view.StringHeapSize() - value_block_base.string_cursor) {
 				throw InvalidInputException("malformed JSONO: object cursor checkpoint heap out of bounds");
 			}
+			if (value_block_base.length_cursor > view.LengthCount() ||
+			    size_t(checkpoint.length_delta) > view.LengthCount() - value_block_base.length_cursor) {
+				throw InvalidInputException("malformed JSONO: object cursor checkpoint lengths out of bounds");
+			}
+			if (value_block_base.num_cursor > view.NumCount() ||
+			    size_t(checkpoint.num_delta) > view.NumCount() - value_block_base.num_cursor) {
+				throw InvalidInputException("malformed JSONO: object cursor checkpoint nums out of bounds");
+			}
 			cursor_rank = checkpoint_rank;
-			value_pos = layout.value_start + size_t(checkpoint.slot_delta);
-			value_string_cursor = object_string_cursor + size_t(checkpoint.string_delta);
+			value_cursor.pos = layout.value_start + size_t(checkpoint.slot_delta);
+			value_cursor.string_cursor = value_block_base.string_cursor + size_t(checkpoint.string_delta);
+			value_cursor.length_cursor = value_block_base.length_cursor + size_t(checkpoint.length_delta);
+			value_cursor.num_cursor = value_block_base.num_cursor + size_t(checkpoint.num_delta);
 		}
 	}
 	while (cursor_rank < target_rank) {
-		SkipValueFast(view, value_pos, value_string_cursor);
+		SkipValueFast(view, value_cursor);
 		cursor_rank++;
 	}
 }

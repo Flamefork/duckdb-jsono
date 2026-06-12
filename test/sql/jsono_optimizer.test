@@ -254,7 +254,12 @@ FROM (
     ('null_missing', '{}'),
     ('null_missing', '{"x":7}'),
     ('object_array', '{"x":{"a":1}}'),
-    ('object_array', '{"x":[2]}')
+    ('object_array', '{"x":[2]}'),
+    ('wide_numeric_to_string', '{"x":"9999999999999"}'),
+    ('wide_numeric_to_string', '{"x":"abc"}'),
+    ('wide_numeric_to_string', '{"x":null}'),
+    ('wide_width_mismatch', '{"x":9999999999999}'),
+    ('wide_width_mismatch', '{"x":123456789012345}')
 ) AS rows(group_id, payload);
 
 statement ok
@@ -330,6 +335,8 @@ negative	-1	2
 null_missing	7	7
 object_array	[2]	{"a":1}
 same_width	100	200
+wide_numeric_to_string	9999999999999	abc
+wide_width_mismatch	123456789012345	9999999999999
 
 # __jsono_internal_match
 query T
@@ -370,6 +377,80 @@ u1	app.bsky.feed.post
 u1	app.bsky.feed.post
 u2	app.bsky.feed.like
 u5	NULL
+
+# --- Filterless projector fuse: >=2 distinct constant ->> paths off one JSONO column fuse
+#     into a single __jsono_internal_project pass even without a matcher-carrying filter
+#     (bare multi-extract projection, GROUP BY over extracts). ---
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT j->>'$.did' AS did,
+               j->>'$.commit.collection' AS event,
+               j->>'$.missing' AS missing
+FROM jsono_optimizer_probe;
+----
+physical_plan	<REGEX>:.*__jsono_internal_project.*
+
+query II
+EXPLAIN SELECT j->>'$.kind' AS kind,
+               count(j->>'$.commit.collection') AS with_collection
+FROM jsono_optimizer_probe
+GROUP BY kind;
+----
+physical_plan	<REGEX>:.*__jsono_internal_project.*
+
+# A single extracted path (even repeated) has nothing to share: no fused pass.
+query II
+EXPLAIN SELECT j->>'$.did' AS did, j->>'$.did' AS did_again FROM jsono_optimizer_probe;
+----
+physical_plan	<!REGEX>:.*__jsono_internal_project.*
+
+statement ok
+PRAGMA explain_output='all';
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE jsono_filterless_project_expected AS
+SELECT j->>'$.did' AS did,
+       j->>'$.commit.collection' AS event,
+       j->>'$.missing' AS missing
+FROM jsono_optimizer_probe;
+
+statement ok
+RESET disabled_optimizers;
+
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_filterless_project_expected EXCEPT ALL
+   SELECT j->>'$.did' AS did,
+          j->>'$.commit.collection' AS event,
+          j->>'$.missing' AS missing
+   FROM jsono_optimizer_probe)
+  UNION ALL
+  (SELECT j->>'$.did' AS did,
+          j->>'$.commit.collection' AS event,
+          j->>'$.missing' AS missing
+   FROM jsono_optimizer_probe
+   EXCEPT ALL SELECT * FROM jsono_filterless_project_expected)
+);
+----
+0
+
+query TI
+SELECT j->>'$.kind' AS kind,
+       count(j->>'$.commit.collection') AS with_collection
+FROM jsono_optimizer_probe
+GROUP BY kind
+ORDER BY kind;
+----
+commit	4
+identity	1
+NULL	1
 
 statement ok
 PRAGMA disable_verify_serializer;
@@ -467,3 +548,89 @@ SELECT
 FROM jsono_introspect_shredded;
 ----
 true	true	true	true	true
+
+# --- O-2: matcher fuse over a shredded column. The shredded rewrite turns each non-shred extract
+#     predicate into jsono_extract_string over a residual reinterpret (a CASE wrapping
+#     __jsono_internal_checked_residual). The matcher groups predicates by that residual source
+#     (Expression::Equals) so >=2 residual predicates over one shredded column fuse into a single
+#     __jsono_internal_match reading the residual once with one manifest check, instead of K
+#     independent residual reads. (Uses the jsono-named extract so the bind does not depend on core
+#     json's STRUCT->JSON ->>, which the unittest binary does not autoload.) ---
+
+statement ok
+CREATE TABLE jsono_matcher_shredded AS
+SELECT jsono(payload, shredding := {'$.kind':'VARCHAR'}) AS j
+FROM (
+  VALUES
+    ('{"kind":"commit","city":"sea","os":"mac","browser":"ff"}'),
+    ('{"kind":"identity","city":"nyc","os":"win","browser":"chrome"}'),
+    ('{"kind":"commit","city":"sea","os":"mac","browser":"chrome"}')
+) t(payload);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# Three residual (non-shred) equality predicates over one shredded column fuse into a single
+# __jsono_internal_match: the residual is read once with one manifest check, so the plan carries
+# exactly one checked_residual and no standalone jsono_extract_string.
+query II
+EXPLAIN SELECT count(*) FROM jsono_matcher_shredded
+WHERE (jsono_extract_string(j, '$.city') = 'sea')
+  AND (jsono_extract_string(j, '$.os') = 'mac')
+  AND (jsono_extract_string(j, '$.browser') = 'chrome');
+----
+physical_plan	<REGEX>:.*__jsono_internal_match.*
+
+query II
+EXPLAIN SELECT count(*) FROM jsono_matcher_shredded
+WHERE (jsono_extract_string(j, '$.city') = 'sea')
+  AND (jsono_extract_string(j, '$.os') = 'mac')
+  AND (jsono_extract_string(j, '$.browser') = 'chrome');
+----
+physical_plan	<!REGEX>:.*jsono_extract_string.*
+
+# An IN predicate group fuses too.
+query II
+EXPLAIN SELECT count(*) FROM jsono_matcher_shredded
+WHERE (jsono_extract_string(j, '$.city') IN ['sea', 'nyc'])
+  AND (jsono_extract_string(j, '$.os') IN ['mac', 'win']);
+----
+physical_plan	<REGEX>:.*__jsono_internal_match.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Correctness: the fused matcher returns the same rows as the plain-equivalent documents.
+query III
+SELECT
+  jsono_extract_string(j, '$.city') AS city,
+  jsono_extract_string(j, '$.browser') AS browser,
+  jsono_extract_string(j, '$.kind') AS kind
+FROM jsono_matcher_shredded
+WHERE (jsono_extract_string(j, '$.city') = 'sea')
+  AND (jsono_extract_string(j, '$.os') = 'mac')
+  AND (jsono_extract_string(j, '$.browser') = 'chrome')
+ORDER BY ALL;
+----
+sea	chrome	commit
+
+# The fused matcher honours the shred manifest: a row narrowed by a raw struct cast (the dropped
+# shred's value is gone from the residual) fails loud on the fused residual read, not a silent
+# non-match. Build the narrowed row the same way the cast-guard test does.
+statement ok
+CREATE TABLE jsono_matcher_narrow AS SELECT jsono('{}', shredding := {'$.a':'VARCHAR'}) AS j WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO jsono_matcher_narrow SELECT jsono('{"a":"v1","b":"v2","c":"v3"}', shredding := {'$.a':'VARCHAR','$.b':'VARCHAR','$.c':'VARCHAR'});
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT count(*) FROM jsono_matcher_narrow
+WHERE (jsono_extract_string(j, '$.b') = 'v2') AND (jsono_extract_string(j, '$.c') = 'v3');
+----
+narrowed by a raw struct cast

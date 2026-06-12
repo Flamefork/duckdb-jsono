@@ -60,6 +60,8 @@ struct StorageSizeResult {
 	uint64_t *key_heap;
 	uint64_t *string_heap;
 	uint64_t *skips;
+	uint64_t *lengths;
+	uint64_t *nums;
 	uint64_t *shreds;
 	uint64_t *total;
 };
@@ -72,7 +74,8 @@ StorageSizeResult InitStorageSizeResult(Vector &result) {
 	}
 	return StorageSizeResult {FlatVector::GetData<uint64_t>(*children[0]), FlatVector::GetData<uint64_t>(*children[1]),
 	                          FlatVector::GetData<uint64_t>(*children[2]), FlatVector::GetData<uint64_t>(*children[3]),
-	                          FlatVector::GetData<uint64_t>(*children[4]), FlatVector::GetData<uint64_t>(*children[5])};
+	                          FlatVector::GetData<uint64_t>(*children[4]), FlatVector::GetData<uint64_t>(*children[5]),
+	                          FlatVector::GetData<uint64_t>(*children[6]), FlatVector::GetData<uint64_t>(*children[7])};
 }
 
 void SetStorageSizeRowNull(Vector &result, idx_t row) {
@@ -97,9 +100,11 @@ void WriteStorageSizeRow(const StorageSizeSource &source, const JsonoBlobRow &bl
 	output.key_heap[row] = blob.key_heap.GetSize();
 	output.string_heap[row] = blob.string_heap.GetSize();
 	output.skips[row] = blob.skips.GetSize();
+	output.lengths[row] = blob.lengths.GetSize();
+	output.nums[row] = blob.nums.GetSize();
 	output.shreds[row] = shred_bytes;
-	output.total[row] =
-	    output.slots[row] + output.key_heap[row] + output.string_heap[row] + output.skips[row] + shred_bytes;
+	output.total[row] = output.slots[row] + output.key_heap[row] + output.string_heap[row] + output.skips[row] +
+	                    output.lengths[row] + output.nums[row] + shred_bytes;
 }
 
 void JsonoStorageSizeExecuteSingle(Vector &input_vec, idx_t count, Vector &result) {
@@ -154,7 +159,7 @@ void RegisterJsonoStorageSize(ExtensionLoader &loader) {
 	// Per-BLOB byte counts share the body struct's field names, so derive them from
 	// JsonoBodyStructType() instead of re-listing, then append `shreds` (shredded shred payload bytes,
 	// 0 for a plain value) and `total`. The field order must stay slots/key_heap/string_heap/skips/
-	// shreds/total — Execute writes the child vectors by that positional order.
+	// lengths/nums/shreds/total — Execute writes the child vectors by that positional order.
 	auto body_struct = JsonoBodyStructType();
 	child_list_t<LogicalType> size_children;
 	for (auto &field : StructType::GetChildTypes(body_struct)) {

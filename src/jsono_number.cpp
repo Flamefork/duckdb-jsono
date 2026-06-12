@@ -2,6 +2,8 @@
 
 #include "jsono.hpp"
 
+#include "duckdb/common/types/cast_helpers.hpp"
+
 #include "yyjson.hpp"
 #include "string_view.hpp"
 
@@ -107,27 +109,32 @@ size_t BuildDec60Canonical(char *out, bool negative, uint64_t abs_mantissa, uint
 	return pos;
 }
 
-void EmitIntegerFromDigits(bool negative, nonstd::string_view digits, nonstd::string_view text, JsonoBuilder &builder) {
+ClassifiedNumber ClassifiedNumberText() {
+	return ClassifiedNumber {MakeExtSlot(ext_subtype::NUMBER), 0, false};
+}
+
+ClassifiedNumber ClassifiedInt(int64_t v) {
+	return ClassifiedNumber {FitsInt60(v) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64), uint64_t(v),
+	                         true};
+}
+
+ClassifiedNumber ClassifyIntegerFromDigits(bool negative, nonstd::string_view digits) {
 	uint64_t magnitude;
 	if (!AccumulateUInt(digits, magnitude)) {
-		builder.EmitNumberText(text); // beyond uint64 → bignum NUMBER
-		return;
+		return ClassifiedNumberText(); // beyond uint64 → bignum NUMBER
 	}
 	if (negative) {
 		// |v| <= 2^63 fits int64 (INT64_MIN = -2^63); anything larger is bignum.
 		if (magnitude <= uint64_t(1) << 63) {
-			builder.EmitInt(magnitude == (uint64_t(1) << 63) ? std::numeric_limits<int64_t>::min()
-			                                                 : -int64_t(magnitude));
-		} else {
-			builder.EmitNumberText(text);
+			return ClassifiedInt(magnitude == (uint64_t(1) << 63) ? std::numeric_limits<int64_t>::min()
+			                                                      : -int64_t(magnitude));
 		}
-		return;
+		return ClassifiedNumberText();
 	}
 	if (magnitude <= uint64_t(std::numeric_limits<int64_t>::max())) {
-		builder.EmitInt(int64_t(magnitude)); // INT60 or VAL_EXT/INT64
-	} else {
-		builder.EmitUInt(magnitude); // VAL_EXT/UINT64
+		return ClassifiedInt(int64_t(magnitude)); // INT60 or VAL_EXT/INT64
 	}
+	return ClassifiedNumber {MakeExtSlot(ext_subtype::UINT64), magnitude, true}; // VAL_EXT/UINT64
 }
 
 } // namespace
@@ -159,17 +166,23 @@ void AppendDec60Text(std::string &out, bool negative, uint64_t abs_mantissa, uin
 	// Zero-pad the mantissa digits so there is at least one digit before the
 	// decimal point (total length >= scale + 1), then split off the last `scale`
 	// digits as the fraction.
-	std::string digits = std::to_string(abs_mantissa);
-	if (digits.size() < scale + 1) {
-		digits.insert(digits.begin(), scale + 1 - digits.size(), '0');
+	char buf[20];
+	auto end = buf + sizeof(buf);
+	auto begin = NumericHelper::FormatUnsigned(abs_mantissa, end);
+	auto digit_count = size_t(end - begin);
+	if (digit_count > scale) {
+		auto split = digit_count - scale;
+		out.append(begin, split);
+		out.push_back('.');
+		out.append(begin + split, scale);
+	} else {
+		out.append("0.");
+		out.append(scale - digit_count, '0');
+		out.append(begin, digit_count);
 	}
-	auto split = digits.size() - scale;
-	out.append(digits, 0, split);
-	out.push_back('.');
-	out.append(digits, split, scale);
 }
 
-void EmitNumberFromText(nonstd::string_view text, JsonoBuilder &builder) {
+ClassifiedNumber ClassifyNumberFromText(nonstd::string_view text) {
 	bool negative = !text.empty() && text.front() == '-';
 	size_t i = negative ? 1 : 0;
 
@@ -181,15 +194,13 @@ void EmitNumberFromText(nonstd::string_view text, JsonoBuilder &builder) {
 	nonstd::string_view int_digits = text.substr(int_start, i - int_start);
 
 	if (i == text.size()) {
-		EmitIntegerFromDigits(negative, int_digits, text, builder);
-		return;
+		return ClassifyIntegerFromDigits(negative, int_digits);
 	}
 
 	// A fraction or exponent follows. Exponent forms are not reconstructible
 	// from mantissa/scale, so they go straight to NUMBER.
 	if (text[i] != '.') {
-		builder.EmitNumberText(text); // 'e'/'E' exponent → NUMBER
-		return;
+		return ClassifiedNumberText(); // 'e'/'E' exponent → NUMBER
 	}
 
 	size_t frac_start = i + 1;
@@ -198,8 +209,7 @@ void EmitNumberFromText(nonstd::string_view text, JsonoBuilder &builder) {
 		j++;
 	}
 	if (j != text.size()) {
-		builder.EmitNumberText(text); // exponent after fraction (e.g. 1.5e-3) → NUMBER
-		return;
+		return ClassifiedNumberText(); // exponent after fraction (e.g. 1.5e-3) → NUMBER
 	}
 	nonstd::string_view frac_digits = text.substr(frac_start, j - frac_start);
 	uint64_t scale = frac_digits.size();
@@ -208,8 +218,7 @@ void EmitNumberFromText(nonstd::string_view text, JsonoBuilder &builder) {
 	// uint64; the tighter |mantissa|<2^53 bound is checked below. No concat alloc.
 	uint64_t mantissa;
 	if (!AccumulateUIntPair(int_digits, frac_digits, mantissa) || !FitsDec60(mantissa, scale)) {
-		builder.EmitNumberText(text);
-		return;
+		return ClassifiedNumberText();
 	}
 
 	// DEC60 is valid only when its canonical reconstruction is byte-identical to
@@ -219,10 +228,19 @@ void EmitNumberFromText(nonstd::string_view text, JsonoBuilder &builder) {
 	char canonical[40];
 	size_t canonical_len = BuildDec60Canonical(canonical, negative, mantissa, scale);
 	if (nonstd::string_view(canonical, canonical_len) == text) {
-		builder.EmitDec60(negative, mantissa, scale);
-	} else {
-		builder.EmitNumberText(text);
+		return ClassifiedNumber {MakeSlot(tag::VAL_DEC60, 0), MakeDec60Payload(negative, mantissa, scale), true};
 	}
+	return ClassifiedNumberText();
+}
+
+void EmitNumberFromText(nonstd::string_view text, JsonoBuilder &builder) {
+	auto classified = ClassifyNumberFromText(text);
+	if (!classified.consumes_num) {
+		builder.EmitNumberText(text);
+		return;
+	}
+	builder.slots.push_back(classified.slot);
+	builder.nums.push_back(classified.num);
 }
 
 } // namespace jsono

@@ -6,11 +6,13 @@ require jsono
 
 require json
 
-# Peek the raw residual tape: the four blobs read as a plain jsono with the shreds ignored.
+# Peek the raw residual tape: the body blobs repacked as a plain jsono with the shreds dropped.
 # This is the white-box view of what shredding stripped — distinct from casting a shredded
 # value to the plain jsono STRUCT, which losslessly reconstructs by overlaying the shreds.
-# Extract the four residual blobs by position (their field names carry the shred-set fingerprint
-# suffix) and repack them under the clean names so the result is a plain JSONO value.
+# The residual alone is an internal fragment: its shred manifest lists the stripped paths and the
+# plain repack carries no shreds to cover them, so whole-value readers (to_json) fail loud on a
+# stripped row, and only path reads away from the stripped paths still answer. Both behaviors are
+# asserted below as the white-box evidence of what was stripped vs kept.
 statement ok
 CREATE MACRO jsono_residual(j) AS struct_pack(
     "jsono" := struct_pack(
@@ -27,10 +29,10 @@ SELECT to_json(jsono('{"did":"d1","kind":"commit"}', shredding := {'$.kind':'VAR
 ----
 {"did":"d1","kind":"commit"}
 
-query I
+statement error
 SELECT to_json(jsono_residual(jsono('{"did":"d1","kind":"commit"}', shredding := {'$.kind':'VARCHAR','$.did':'VARCHAR'})));
 ----
-{}
+row was shredded with shred '$.did VARCHAR'
 
 # Typed shred: a BIGINT path strips and reconstructs as a JSON number; the residual
 # keeps only the non-hot key.
@@ -39,10 +41,17 @@ SELECT to_json(jsono('{"extra":"e1","kind":"commit","time_us":1700}', shredding 
 ----
 {"extra":"e1","kind":"commit","time_us":1700}
 
-query I
+statement error
 SELECT to_json(jsono_residual(jsono('{"extra":"e1","kind":"commit","time_us":1700}', shredding := {'$.kind':'VARCHAR','$.time_us':'BIGINT'})));
 ----
-{"extra":"e1"}
+row was shredded with shred '$.kind VARCHAR'
+
+# The non-hot key stays in the residual and still reads there (the extract manifest check is
+# path-granular: only the stripped paths are barred).
+query I
+SELECT jsono_residual(jsono('{"extra":"e1","kind":"commit","time_us":1700}', shredding := {'$.kind':'VARCHAR','$.time_us':'BIGINT'})) ->> '$.extra';
+----
+e1
 
 query I
 SELECT CAST(jsono('{"time_us":1700}', shredding := {'$.time_us':'BIGINT'}) ->> '$.time_us' AS BIGINT);
@@ -87,11 +96,17 @@ SELECT to_json(jsono('{"commit":{"collection":"c1","operation":"create"},"kind":
 ----
 {"commit":{"collection":"c1","operation":"create"},"kind":"commit"}
 
-# The residual keeps the surrounding object but drops the stripped nested leaf.
+# The residual keeps the surrounding object but drops the stripped nested leaf: the kept sibling
+# still reads, the whole value does not.
 query I
+SELECT jsono_residual(jsono('{"commit":{"collection":"c1","operation":"create"},"kind":"commit"}', shredding := {'$.kind':'VARCHAR','$.commit.operation':'VARCHAR'})) ->> '$.commit.collection';
+----
+c1
+
+statement error
 SELECT to_json(jsono_residual(jsono('{"commit":{"collection":"c1","operation":"create"},"kind":"commit"}', shredding := {'$.kind':'VARCHAR','$.commit.operation':'VARCHAR'})));
 ----
-{"commit":{"collection":"c1"}}
+row was shredded with shred '$.commit.operation VARCHAR'
 
 query I
 SELECT jsono('{"commit":{"operation":"create"},"kind":"commit"}', shredding := {'$.kind':'VARCHAR','$.commit.operation':'VARCHAR'}) ->> '$.commit.operation';
@@ -104,17 +119,28 @@ SELECT to_json(jsono('{"commit":{"record":{"text":"hi","langs":["en"]},"rev":"r1
 ----
 {"commit":{"record":{"langs":["en"],"text":"hi"},"rev":"r1"}}
 
-query I
+statement error
 SELECT to_json(jsono_residual(jsono('{"commit":{"record":{"text":"hi","langs":["en"]},"rev":"r1"}}', shredding := {'$.commit.record.text':'VARCHAR','$.commit.rev':'VARCHAR'})));
 ----
-{"commit":{"record":{"langs":["en"]}}}
+row was shredded with shred '$.commit.record.text VARCHAR'
+
+query I
+SELECT jsono_residual(jsono('{"commit":{"record":{"text":"hi","langs":["en"]},"rev":"r1"}}', shredding := {'$.commit.record.text':'VARCHAR','$.commit.rev':'VARCHAR'})) ->> '$.commit.record.langs';
+----
+["en"]
 
 # Stripping the only key of a nested object leaves it empty in the residual; the shred
-# refills it on reconstruction.
-query I
+# refills it on reconstruction (asserted by the round-trip below), and the residual alone
+# fails loud on its stripped leaf.
+statement error
 SELECT to_json(jsono_residual(jsono('{"commit":{"record":{"text":"only"}}}', shredding := {'$.commit.record.text':'VARCHAR'})));
 ----
-{"commit":{"record":{}}}
+row was shredded with shred '$.commit.record.text VARCHAR'
+
+query I
+SELECT to_json(jsono('{"commit":{"record":{"text":"only"}}}', shredding := {'$.commit.record.text':'VARCHAR'}));
+----
+{"commit":{"record":{"text":"only"}}}
 
 # A nested non-string value is not lossless through a VARCHAR shred, so it stays in the
 # residual (read-accelerated, not stripped).
@@ -249,29 +275,29 @@ SELECT to_json(jsono({'name': 'x', 'k': 'y'}));
 ----
 {"k":"y","name":"x"}
 
-query I
+statement error
 SELECT to_json(jsono_residual(jsono({'name': 'x', 'k': 'y'})));
 ----
-{}
+row was shredded with shred 'k VARCHAR'
 
 # Casting a shredded value to the plain jsono STRUCT is LOSSLESS: it reconstructs the full
 # document (overlay the shreds back onto the residual), it does not expose the stripped
-# residual (which jsono_residual above shows is {}).
+# residual (which jsono_residual above shows holds neither key).
 query I
-SELECT to_json(jsono({'name': 'x', 'k': 'y'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB))));
+SELECT to_json(jsono({'name': 'x', 'k': 'y'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 {"k":"y","name":"x"}
 
 # A nested-path shred round-trips through the reconstruct cast too.
 query I
-SELECT to_json(jsono('{"commit":{"operation":"create"},"kind":"k"}', shredding := {'$.commit.operation':'VARCHAR','$.kind':'VARCHAR'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB))));
+SELECT to_json(jsono('{"commit":{"operation":"create"},"kind":"k"}', shredding := {'$.commit.operation':'VARCHAR','$.kind':'VARCHAR'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 {"commit":{"operation":"create"},"kind":"k"}
 
 # Storing a shredded value into a plain jsono STRUCT column preserves the shred data (the
 # implicit cast reconstructs); the shreds must not be silently dropped.
 statement ok
-CREATE TABLE plain_store (params STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB))));
+CREATE TABLE plain_store (params STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 
 statement ok
 INSERT INTO plain_store SELECT jsono({'a': 'x', 'b': 5::BIGINT, 'c': 'y'});
@@ -331,3 +357,18 @@ SELECT to_json(jsono(jsono('{"p":{"q":"deep"},"r":"top"}', shredding := {'$.p.q'
                      shredding := {'r':'VARCHAR'}));
 ----
 {"p":{"q":"deep"},"r":"top"}
+
+# Two spec entries naming the same key path ('a' and '$.a'): both shreds fill and the key
+# strips once (the duplicate-path fallback keeps the per-row locate-and-strip semantics).
+query III
+SELECT to_json(j), j."jsono"."a", j."jsono"."$.a"
+FROM (SELECT jsono('{"a":"v","z":1}', shredding := {'a':'VARCHAR', '$.a':'VARCHAR'}) AS j);
+----
+{"a":"v","z":1}	v	v
+
+# A UBIGINT shred strips values past int64 range and plain non-negative integers alike.
+query III
+SELECT to_json(j), j."jsono"."big", j."jsono"."small"
+FROM (SELECT jsono('{"big":18446744073709551615,"small":7}', shredding := {'big':'UBIGINT','small':'UBIGINT'}) AS j);
+----
+{"big":18446744073709551615,"small":7}	18446744073709551615	7

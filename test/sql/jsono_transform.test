@@ -185,11 +185,11 @@ SELECT jsono_transform(jsono('{"a":1}'), '{"a":"BIGINT"}');
 ----
 must be a non-NULL STRUCT
 
-# Wildcard list preserves positional NULLs.
+# Wildcard list preserves positional NULLs; a non-string scalar leaf carries its ->> text.
 query I
 SELECT jsono_transform(jsono('{"purchase":{"products":[{"category":"books"},{"x":1},{"category":null},{"category":2},{"category":"games"}]}}'), {'categories':{'type':['VARCHAR'],'path':'$.purchase.products[*].category'}});
 ----
-{'categories': [books, NULL, NULL, NULL, games]}
+{'categories': [books, NULL, NULL, 2, games]}
 
 # Wildcard item objects also use storage-level rank to value cursor checkpoints.
 query I
@@ -209,11 +209,11 @@ SELECT jsono_transform(jsono('{"purchase":{"products":[]}}'), {'categories':{'ty
 ----
 {'categories': []}
 
-# Join mode skips NULL, missing, non-string, and container leaves.
+# Join mode skips NULL, missing, and container leaves; non-string scalars join as ->> text.
 query I
 SELECT jsono_transform(jsono('{"purchase":{"products":[{"category":"books"},{"x":1},{"category":null},{"category":2},{"category":["bad"]},{"category":"games"}]}}'), {'categories':{'type':'VARCHAR','path':'$.purchase.products[*].category','join_separator':'|'}});
 ----
-{'categories': books|games}
+{'categories': books|2|games}
 
 # Join mode keeps empty strings as present values.
 query II
@@ -226,6 +226,16 @@ SELECT joined.names = '|x', single_empty.names = ''
 FROM extracted;
 ----
 true	true
+
+# Wildcard leaves render every scalar kind as its ->> text in both list and join modes
+# (integers, fractions, booleans, bignums); JSON null stays a positional NULL in list mode
+# and is skipped by join mode — both modes carry the same set of textualized leaves.
+query I
+SELECT jsono_transform(jsono('{"items":[{"v":"s"},{"v":2},{"v":1.5},{"v":true},{"v":null},{"v":1e999}]}'),
+  {'lst': {'type': ['VARCHAR'], 'path': '$.items[*].v'},
+   'joined': {'type': 'VARCHAR', 'path': '$.items[*].v', 'join_separator': '|'}});
+----
+{'lst': [s, 2, 1.5, true, NULL, 1e999], 'joined': s|2|1.5|true|1e999}
 
 # Wildcard traversal keeps positional NULLs when one node has object-key and array-index paths.
 query I

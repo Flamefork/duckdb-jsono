@@ -31,6 +31,11 @@ struct ShapeCacheEntry {
 	// Reserved on JsonoBuilder construction so steady-state operation
 	// doesn't churn the allocator across LRU evictions.
 	std::vector<uint32_t> perm;
+	// Fingerprint of the post-dedup sorted key sequence — what
+	// HashObjectKeySlots computes from the emitted KEY slots. Cached by the
+	// direct write path so spanned objects skip per-row rehashing on a hit;
+	// the builder path leaves it 0 (its FinishContainer hashes the slots).
+	uint64_t sorted_hash = 0;
 };
 
 // Direct-mapped shape cache. Slot = hash & (SIZE-1); collisions evict.
@@ -110,22 +115,6 @@ struct DomJsonoBuilder : public JsonoBuilder {
 		// shape_cache deliberately NOT reset — that's the whole point.
 	}
 
-	// Sizing heuristic for event-tracking JSON (~5% keys, ~50% string values,
-	// ~1 slot per ~24 input bytes). Called once per chunk with the chunk's
-	// total input bytes; vector::reserve is a no-op if capacity already covers.
-	void ReserveForChunk(size_t total_input_bytes) {
-		auto need_slots = total_input_bytes / 24 + 64;
-		auto need_keys = total_input_bytes / 20 + 64;
-		auto need_values = total_input_bytes / 2 + 64;
-		Reserve(need_slots, need_keys, need_values);
-		if (kvs.capacity() < 256) {
-			kvs.reserve(256);
-		}
-		if (indices.capacity() < 256) {
-			indices.reserve(256);
-		}
-	}
-
 	// Direct-mapped lookup. One memory access; check hash + n_keys to guard
 	// against collisions (different schemas mapping to same slot).
 	const ShapeCacheEntry *ShapeCacheFind(uint64_t hash, uint32_t n_keys) const {
@@ -171,6 +160,132 @@ struct YyjsonAllocator {
 };
 
 bool EmitDomElement(yyjson_val *element, DomJsonoBuilder &b);
+
+// Two-pass direct DOM writer (text parse path). Pass 1 walks the DOM once to
+// compute the exact byte size of all six body streams (collecting per-object
+// sort permutations and classifying numbers along the way); the row then
+// allocates six exact-size result strings and pass 2 writes every stream
+// in place — no intermediate builder vectors, no growth reallocation, and no
+// final per-stream memcpy.
+struct DomSizing {
+	size_t slot_count = 0;
+	size_t key_bytes = 0;
+	size_t string_bytes = 0;
+	size_t length_count = 0;
+	size_t num_count = 0;
+	size_t span_count = 0;
+	size_t checkpoint_index_count = 0;
+	size_t checkpoint_count = 0;
+	uint64_t container_count = 0;
+};
+
+// Per-object emit plan recorded by pass 1 in DFS pre-order; pass 2 replays
+// plans with a cursor. kv/idx offsets point into the row-retained kvs/indices
+// buffers (append-only during a row, so absolute offsets stay valid).
+struct DomObjectPlan {
+	uint64_t sorted_hash;
+	size_t kv_offset;
+	size_t idx_offset;
+	uint32_t emit_count;
+};
+
+struct DomDirectState {
+	using KVPair = DomJsonoBuilder::KVPair;
+	// kvs/indices are retained for the whole row (unlike the builder's
+	// per-object truncation): pass 2 reads keys and value handles through the
+	// recorded plans instead of re-iterating yyjson objects.
+	std::vector<KVPair> kvs;
+	std::vector<uint32_t> indices;
+	std::vector<DomObjectPlan> plans;
+	// Numbers classified by pass 1, replayed by pass 2 in walk order: the slot
+	// word, followed by the nums-stream word when the slot consumes one.
+	// VAL_EXT/NUMBER raw text is not staged — pass 2 re-reads it from the DOM.
+	std::vector<uint64_t> staged_numbers;
+	DomSizing sz;
+
+	// Direct-mapped shape cache, same policy as DomJsonoBuilder's — separate
+	// instance because entries here also carry the sorted-key hash.
+	std::vector<ShapeCacheEntry> shape_cache;
+	uint64_t shape_cache_mask = 0;
+
+	DomDirectState() {
+		size_t cache_size = ShapeCacheSize();
+		shape_cache.resize(cache_size);
+		shape_cache_mask = uint64_t(cache_size - 1);
+		for (auto &entry : shape_cache) {
+			entry.perm.reserve(64); // typical N for analytics JSON
+		}
+	}
+
+	void ResetRow() {
+		kvs.clear();
+		indices.clear();
+		plans.clear();
+		staged_numbers.clear();
+		sz = DomSizing();
+	}
+
+	const ShapeCacheEntry *ShapeCacheFind(uint64_t hash, uint32_t n_keys) const {
+		const auto &slot = shape_cache[hash & shape_cache_mask];
+		if (slot.hash == hash && slot.n_keys == n_keys) {
+			return &slot;
+		}
+		return nullptr;
+	}
+
+	void ShapeCacheInsert(uint64_t hash, uint32_t n_keys, const uint32_t *perm_src, uint32_t perm_n,
+	                      uint64_t sorted_hash) {
+		auto &slot = shape_cache[hash & shape_cache_mask];
+		slot.hash = hash;
+		slot.n_keys = n_keys;
+		slot.perm.assign(perm_src, perm_src + perm_n);
+		slot.sorted_hash = sorted_hash;
+	}
+};
+
+// One-pass shredded text write (jsono(text, shredding := ...)): pass 1 matches the spec's
+// object-key paths against each object's deduped sorted keys while sizing. A lossless leaf
+// (value kind matches the shred type exactly) is stripped from the emit plan — pass 2 then
+// never visits it — and captured below; a present-but-lossy leaf of a VARCHAR shred stays in
+// the residual and is marked ResidualFill, so the caller fills the shred from the written row
+// with the exact locate-and-render semantics of the two-pass path.
+enum class DomShredKind : uint8_t { Varchar, Int64, Uint64, Double, Boolean };
+
+struct DomShredCapture {
+	enum class State : uint8_t { Missing, String, Int, Uint, Bool, ResidualFill };
+	State state = State::Missing;
+	bool stripped = false;
+	nonstd::string_view text;
+	int64_t int_value = 0;
+	uint64_t uint_value = 0;
+	bool bool_value = false;
+};
+
+// One node per distinct object-key path prefix; node 0 is the root. `field` is the shred
+// terminating at this node (-1 if none — a node can both terminate a path and carry deeper
+// edges, e.g. '$.a' next to '$.a.b').
+struct DomShredTrieNode {
+	int64_t field = -1;
+	std::vector<std::pair<std::string, uint32_t>> children;
+};
+
+struct DomShredContext {
+	const std::vector<DomShredTrieNode> *nodes = nullptr;
+	std::vector<DomShredKind> kinds;                            // per shred field
+	const std::vector<std::string> *manifest_entries = nullptr; // per shred field, serialized
+	// Per-row outputs: captures parallel to the shred fields, manifest = the row's serialized
+	// shred-manifest tail (empty when nothing was stripped).
+	std::vector<DomShredCapture> captures;
+	std::string manifest;
+};
+
+// Size (pass 1) and write (pass 2) one parsed DOM row straight into the
+// writer's six exact-size blobs. Throws InvalidInputException on writer limits
+// (nesting depth, key/string/container bounds) — all from pass 1, before any
+// result allocation. With `shred` set, pass 1 also captures/strips shred leaves
+// and the row's skips blob carries the shred manifest.
+void EmitDomRowDirect(yyjson_val *root, DomDirectState &state, JsonoBodyWriter &writer, idx_t row,
+                      DomShredContext *shred = nullptr);
 
 } // namespace jsono_dom
 } // namespace duckdb

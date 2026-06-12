@@ -1,0 +1,144 @@
+# name: test/sql/jsono_v4_streams.test
+# description: v4 format: lengths/nums payload streams and threshold container spans
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+# Every scalar payload class round-trips through its stream: strings and NUMBER text via
+# lengths + string_heap, INT60/DEC60/INT64/UINT64/DOUBLE via nums. Byte-exact text forms
+# (bignum, exponent) are preserved.
+query I
+SELECT to_json(jsono('{"s":"hello","empty":"","i":7,"neg":-42,"big":576460752303423488,"u":18446744073709551615,"d":2.5,"bn":123456789012345678901234567890,"e":1.5e-3,"t":true,"n":null}'));
+----
+{"big":576460752303423488,"bn":123456789012345678901234567890,"d":2.5,"e":1.5e-3,"empty":"","i":7,"n":null,"neg":-42,"s":"hello","t":true,"u":18446744073709551615}
+
+# The lengths and nums blobs hold the payloads (u32/u64 entries in walk order); the slots
+# blob stays shape-constant. 3 string-ish values (s, empty, bn... bn is NUMBER text) -> the
+# value above has 5 lengths entries (hello, "", bignum text, exponent text) — count them
+# directly: 4 entries x 4 bytes, and 5 nums entries x 8 bytes (i, neg, big, u, d).
+query II
+SELECT
+  octet_length(j."jsono".body.lengths) / 4,
+  octet_length(j."jsono".body.nums) / 8
+FROM (SELECT jsono('{"s":"hi","empty":"","i":7,"neg":-42,"big":576460752303423488,"u":18446744073709551615,"d":2.5,"bn":123456789012345678901234567890,"e":1.5e-3,"t":true,"n":null}') AS j);
+----
+4	5
+
+# A small flat object (<= 16 keys, scalar children only) stores no ContainerSpan: its skips
+# blob is the bare 12-byte metadata header. An array always stores one (12 + 4 id + 24 span).
+query II
+SELECT
+  octet_length(jsono('{"a":1,"b":"x"}')."jsono".body.skips),
+  octet_length(jsono('[1,2]')."jsono".body.skips);
+----
+12	40
+
+# A small object whose immediate children include a container stores a span — skipping it
+# stays an O(1) jump instead of a subtree walk. The nested flat object itself stays
+# span-less (one span: 12 + 4 + 24); a nested array adds its own (two spans: 12 + 2x28).
+query II
+SELECT
+  octet_length(jsono('{"a":1,"o":{"x":1}}')."jsono".body.skips),
+  octet_length(jsono('{"a":1,"l":[1,2]}')."jsono".body.skips);
+----
+40	68
+
+# The struct constructor's one_list fast path agrees with the criterion, validated against
+# a full walk. The NULL-typed scalar field is not shreddable, so the first two values stay
+# plain and validate the direct-path blob itself: list present -> root spanned, NULL list
+# (scalar null child) -> root flat. The third auto-shreds and validates the rebuilt residual.
+query III
+SELECT
+  jsono_validate(jsono({a: NULL, ps: [{q: 1, r: 'y'}, {q: 2, r: 'z'}]})),
+  jsono_validate(jsono({a: NULL, ps: NULL::STRUCT(q INTEGER, r VARCHAR)[]})),
+  jsono_validate(jsono({a: 1, ps: [{q: 1, r: 'y'}]}));
+----
+true	true	true
+
+# Extracting a late key of a small object walks (not jumps) over mixed earlier values —
+# strings, numbers, nested small objects and arrays — keeping all stream cursors in sync.
+query III
+SELECT
+  j ->> '$.z',
+  j ->> '$.m.q',
+  to_json(jsono_extract(j, '$.m'))
+FROM (SELECT jsono('{"a":"text","b":12345678901234567890,"c":[1,"two",3.5],"m":{"p":1.25,"q":"deep"},"z":"last"}') AS j);
+----
+last	deep	{"p":1.25,"q":"deep"}
+
+# An object with > 16 keys is spanned and checkpointed; reaching a high-rank key uses the
+# checkpoint jump with the v4 per-stream deltas. Values before the jump consume all three
+# streams so a wrong delta would misread.
+query III
+SELECT
+  j ->> '$.k17',
+  j ->> '$.k18',
+  jsono_type(j, '$.k16')
+FROM (SELECT jsono('{"k00":"v0","k01":1.5,"k02":123456789012345678901,"k03":"v3","k04":4,"k05":"v5","k06":6.25,"k07":"v7","k08":8,"k09":"v9","k10":10,"k11":"v11","k12":12.5,"k13":"v13","k14":14,"k15":"v15","k16":16,"k17":"v17","k18":1.75}') AS j);
+----
+v17	1.75	BIGINT
+
+# Same via a large (>= 64 keys) object: build it from a struct, then extract across the
+# checkpoint stride boundaries.
+query II
+WITH big AS (
+  SELECT jsono(('{' || string_agg('"k' || lpad(i::VARCHAR, 3, '0') || '":' ||
+         CASE WHEN i % 3 = 0 THEN '"s' || i || '"' WHEN i % 3 = 1 THEN i::VARCHAR ELSE (i + 0.5)::VARCHAR END, ',')
+         || '}')) AS j
+  FROM range(0, 80) t(i)
+)
+SELECT j ->> '$.k063', j ->> '$.k079' FROM big;
+----
+s63	79
+
+# Merge copies scalar runs (slots + bulk stream slices) and recurses into objects; the
+# patched value round-trips with payloads intact.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":"keep","b":1.5,"c":{"x":1,"y":"two"},"d":18446744073709551615}'),
+  jsono('{"b":null,"c":{"y":"TWO"},"e":"new"}')));
+----
+{"a":"keep","c":{"x":1,"y":"TWO"},"d":18446744073709551615,"e":"new"}
+
+# Group merge accumulates through the serialize/view cycle (lengths/nums survive the
+# accumulator blob round-trip).
+query I
+SELECT to_json(jsono_group_merge(j ORDER BY n))
+FROM (VALUES (1, jsono('{"a":1.5,"s":"x"}')), (2, jsono('{"b":123456789012345678901234567890}'))) t(n, j);
+----
+{"a":1.5,"b":123456789012345678901234567890,"s":"x"}
+
+# Shredded residual: the stripped path's payload leaves the residual streams; the value
+# reconstructs from the shred, including through a Parquet round-trip of all six blobs.
+statement ok
+CREATE TABLE v4_shredded AS
+SELECT jsono('{"name":"hello","n":7,"d":2.5,"rest":{"deep":"value"}}',
+             shredding := {'name': 'VARCHAR', '$.n': 'BIGINT'}) AS e;
+
+query III
+SELECT to_json(e), e ->> '$.name', e ->> '$.rest.deep' FROM v4_shredded;
+----
+{"d":2.5,"n":7,"name":"hello","rest":{"deep":"value"}}	hello	value
+
+statement ok
+COPY v4_shredded TO '__TEST_DIR__/v4_shredded.parquet' (FORMAT PARQUET);
+
+query II
+SELECT to_json(e), jsono_validate(e) FROM read_parquet('__TEST_DIR__/v4_shredded.parquet');
+----
+{"d":2.5,"n":7,"name":"hello","rest":{"deep":"value"}}	true
+
+# Plain Parquet round-trip of a value exercising every stream (strings, NUMBER text,
+# ints, decimals, doubles-from-struct excluded — text path has none).
+statement ok
+COPY (SELECT jsono('{"arr":[1,"two",3.5,{"k":"v"}],"big":99999999999999999999,"s":"tail"}') AS j)
+TO '__TEST_DIR__/v4_plain.parquet' (FORMAT PARQUET);
+
+query II
+SELECT to_json(j), jsono_validate(j) FROM read_parquet('__TEST_DIR__/v4_plain.parquet');
+----
+{"arr":[1,"two",3.5,{"k":"v"}],"big":99999999999999999999,"s":"tail"}	true

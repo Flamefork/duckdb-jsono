@@ -211,3 +211,11 @@ query I
 SELECT to_json(jsono('{"s":"3.140","d":3.140}'));
 ----
 {"d":3.140,"s":"3.140"}
+
+# The ladder is writer-independent: a (2^59, 2^63) value re-emitted from a UBIGINT shred on
+# reconstruct is VAL_EXT/INT64, byte-identical to the text-parsed value (EmitUInt must not
+# drift int64-representable values to VAL_EXT/UINT64).
+query I
+SELECT jsono('{"a":1152921504606846976}', shredding := {'$.a': 'UBIGINT'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))) = jsono('{"a":1152921504606846976}');
+----
+true

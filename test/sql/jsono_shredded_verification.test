@@ -60,6 +60,6 @@ x	1
 
 # Lossless round-trip through the shredded->plain reconstruct cast (optimizer-independent path).
 query I
-SELECT to_json(jsono({'a': 1, 'name': 'x'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB))));
+SELECT to_json(jsono({'a': 1, 'name': 'x'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 {"a":1,"name":"x"}

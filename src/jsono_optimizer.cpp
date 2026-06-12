@@ -1,8 +1,11 @@
 #include "jsono_optimizer.hpp"
 #include "jsono.hpp"
+#include "jsono_locate.hpp"
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_render.hpp"
+#include "jsono_row_read.hpp"
 #include "jsono_shred.hpp"
 
 #include "duckdb/common/constants.hpp"
@@ -38,8 +41,6 @@
 #include "string_view.hpp"
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -147,18 +148,6 @@ struct JsonoProjectBindData : public FunctionData {
 	}
 };
 
-struct JsonoPathRankCacheEntry {
-	bool valid = false;
-	idx_t step_index = DConstants::INVALID_INDEX;
-	size_t key_count = 0;
-	uint64_t shape_hash = 0;
-	string key;
-	size_t rank = 0;
-	bool found = false;
-};
-
-constexpr idx_t RANK_CACHE_SIZE = 4096;
-
 // Per-row ObjectLayout cache. A row's matcher/projector resolves several paths that
 // share a container (e.g. every root-key predicate re-reads the root object's layout;
 // every commit.* predicate re-reads commit's). ReadObjectLayout was the top JSONO
@@ -173,10 +162,10 @@ struct JsonoLayoutCacheEntry {
 constexpr idx_t LAYOUT_CACHE_SIZE = 16;
 
 struct JsonoPathLocalState : public FunctionLocalState {
-	JsonoPathLocalState() : rank_cache(RANK_CACHE_SIZE), layout_cache(LAYOUT_CACHE_SIZE) {
+	JsonoPathLocalState() : layout_cache(LAYOUT_CACHE_SIZE) {
 	}
 
-	vector<JsonoPathRankCacheEntry> rank_cache;
+	RankCache rank_cache;
 	vector<JsonoLayoutCacheEntry> layout_cache;
 	uint64_t layout_generation = 0;
 	std::string scratch;
@@ -191,22 +180,20 @@ struct JsonoPathLocalState : public FunctionLocalState {
 };
 
 struct JsonoMatchLocation {
-	size_t pos = 0;
-	size_t string_cursor = 0;
+	JsonoCursor cursor;
 };
 
 struct JsonoRewritePredicate {
-	ColumnBinding binding;
-	LogicalType column_type;
-	string column_alias;
+	// The JSONO-typed value the extract reads. A bare column for a plain JSONO column, or the
+	// residual reinterpret (a CASE over __jsono_internal_checked_residual) the shredded rewrite
+	// produces for a non-shred path. Both are read once per row by the fused matcher.
+	optional_ptr<Expression> source;
 	JsonoMatchPredicate predicate;
 	idx_t expression_index = 0;
 };
 
 struct JsonoRewriteGroup {
-	ColumnBinding binding;
-	LogicalType column_type;
-	string column_alias;
+	optional_ptr<Expression> source;
 	vector<JsonoMatchPredicate> predicates;
 	vector<idx_t> expression_indexes;
 };
@@ -380,28 +367,59 @@ bool TryReadJsonoExtract(ClientContext &context, Expression &expr, BoundColumnRe
 	return true;
 }
 
+// Like TryReadJsonoExtract, but captures the JSONO-typed value the extract reads as an
+// arbitrary expression rather than requiring a bare column ref. The matcher groups predicates by
+// this source (column-equal for plain columns, Expression::Equals for the residual reinterpret
+// the shredded rewrite emits), so K predicates over one shredded column fuse into a single
+// __jsono_internal_match over one residual read with one manifest check, mirroring the projector.
+bool TryReadJsonoExtractSource(ClientContext &context, Expression &expr, Expression *&source,
+                               JsonoMatchPredicate &predicate) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &function = expr.Cast<BoundFunctionExpression>();
+	if (function.function.name != "->>" && function.function.name != "jsono_extract_string") {
+		return false;
+	}
+	if (function.children.size() != 2 || !IsJsonoType(function.children[0]->return_type)) {
+		return false;
+	}
+	string path;
+	vector<PathStep> steps;
+	if (!TryReadExtractPath(context, *function.children[1], path, steps)) {
+		return false;
+	}
+	source = function.children[0].get();
+	predicate.path = std::move(path);
+	predicate.steps = std::move(steps);
+	predicate.compiled_path = CompileJsonoPath(predicate.steps);
+	return true;
+}
+
+void SetPredicateSource(JsonoRewritePredicate &predicate, Expression &source, JsonoMatchPredicate match_predicate) {
+	predicate.source = &source;
+	predicate.predicate = std::move(match_predicate);
+}
+
 bool TryReadEqualsPredicate(ClientContext &context, BoundComparisonExpression &comparison,
                             JsonoRewritePredicate &predicate) {
 	if (comparison.GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
 		return false;
 	}
-	BoundColumnRefExpression *column_ref = nullptr;
+	Expression *source = nullptr;
 	JsonoMatchPredicate match_predicate;
 	string value;
-	if (!TryReadJsonoExtract(context, *comparison.left, column_ref, match_predicate) ||
+	if (!TryReadJsonoExtractSource(context, *comparison.left, source, match_predicate) ||
 	    !TryReadStringValue(context, *comparison.right, value)) {
-		column_ref = nullptr;
+		source = nullptr;
 		match_predicate = JsonoMatchPredicate();
-		if (!TryReadJsonoExtract(context, *comparison.right, column_ref, match_predicate) ||
+		if (!TryReadJsonoExtractSource(context, *comparison.right, source, match_predicate) ||
 		    !TryReadStringValue(context, *comparison.left, value)) {
 			return false;
 		}
 	}
 	match_predicate.values.push_back(std::move(value));
-	predicate.binding = column_ref->binding;
-	predicate.column_type = column_ref->return_type;
-	predicate.column_alias = column_ref->GetAlias();
-	predicate.predicate = std::move(match_predicate);
+	SetPredicateSource(predicate, *source, std::move(match_predicate));
 	return true;
 }
 
@@ -409,9 +427,9 @@ bool TryReadInPredicate(ClientContext &context, BoundOperatorExpression &compari
 	if (comparison.GetExpressionType() != ExpressionType::COMPARE_IN || comparison.children.size() < 2) {
 		return false;
 	}
-	BoundColumnRefExpression *column_ref = nullptr;
+	Expression *source = nullptr;
 	JsonoMatchPredicate match_predicate;
-	if (!TryReadJsonoExtract(context, *comparison.children[0], column_ref, match_predicate)) {
+	if (!TryReadJsonoExtractSource(context, *comparison.children[0], source, match_predicate)) {
 		return false;
 	}
 	for (idx_t child_index = 1; child_index < comparison.children.size(); child_index++) {
@@ -421,10 +439,7 @@ bool TryReadInPredicate(ClientContext &context, BoundOperatorExpression &compari
 		}
 		match_predicate.values.push_back(std::move(value));
 	}
-	predicate.binding = column_ref->binding;
-	predicate.column_type = column_ref->return_type;
-	predicate.column_alias = column_ref->GetAlias();
-	predicate.predicate = std::move(match_predicate);
+	SetPredicateSource(predicate, *source, std::move(match_predicate));
 	return true;
 }
 
@@ -437,16 +452,13 @@ bool TryReadContainsPredicate(ClientContext &context, BoundFunctionExpression &f
 	if (!TryReadStringListValue(context, *function.children[0], values)) {
 		return false;
 	}
-	BoundColumnRefExpression *column_ref = nullptr;
+	Expression *source = nullptr;
 	JsonoMatchPredicate match_predicate;
-	if (!TryReadJsonoExtract(context, *function.children[1], column_ref, match_predicate)) {
+	if (!TryReadJsonoExtractSource(context, *function.children[1], source, match_predicate)) {
 		return false;
 	}
 	match_predicate.values = std::move(values);
-	predicate.binding = column_ref->binding;
-	predicate.column_type = column_ref->return_type;
-	predicate.column_alias = column_ref->GetAlias();
-	predicate.predicate = std::move(match_predicate);
+	SetPredicateSource(predicate, *source, std::move(match_predicate));
 	return true;
 }
 
@@ -463,206 +475,72 @@ bool TryReadPredicate(ClientContext &context, Expression &expr, JsonoRewritePred
 	}
 }
 
-bool FindObjectKeyRank(const JsonoView &view, const ObjectLayout &layout, const string &key, size_t &rank) {
-	size_t lo = 0;
-	size_t hi = layout.key_count;
-	while (lo < hi) {
-		auto mid = lo + (hi - lo) / 2;
-		auto key_slot = view.SlotAt(layout.key_start + mid);
-		if (SlotTag(key_slot) != tag::KEY) {
-			throw InvalidInputException("malformed JSONO: expected KEY slot");
-		}
-		if (view.KeyAt(SlotPayload(key_slot)) < key) {
-			lo = mid + 1;
-		} else {
-			hi = mid;
-		}
-	}
-	rank = lo;
-	if (lo >= layout.key_count) {
-		return false;
-	}
-	auto key_slot = view.SlotAt(layout.key_start + lo);
-	if (SlotTag(key_slot) != tag::KEY) {
-		throw InvalidInputException("malformed JSONO: expected KEY slot");
-	}
-	return view.KeyAt(SlotPayload(key_slot)) == key;
-}
-
-nonstd::string_view ObjectKeyAtRank(const JsonoView &view, const ObjectLayout &layout, size_t rank) {
-	if (rank >= layout.key_count) {
-		throw InternalException("JSONO object key rank out of bounds");
-	}
-	auto key_slot = view.SlotAt(layout.key_start + rank);
-	if (SlotTag(key_slot) != tag::KEY) {
-		throw InvalidInputException("malformed JSONO: expected KEY slot");
-	}
-	return view.KeyAt(SlotPayload(key_slot));
-}
-
-bool ValidateCachedObjectRank(const JsonoView &view, const ObjectLayout &layout, const string &key, size_t rank,
-                              bool found) {
-	if (rank > layout.key_count) {
-		return false;
-	}
-	if (found) {
-		return rank < layout.key_count && ObjectKeyAtRank(view, layout, rank) == key;
-	}
-	if (rank > 0 && ObjectKeyAtRank(view, layout, rank - 1) >= key) {
-		return false;
-	}
-	if (rank < layout.key_count && ObjectKeyAtRank(view, layout, rank) <= key) {
-		return false;
-	}
-	return true;
-}
-
-JsonoPathRankCacheEntry &GetRankCacheEntry(vector<JsonoPathRankCacheEntry> &rank_cache, idx_t step_index,
-                                           size_t key_count) {
-	auto cache_index = idx_t(((uint64_t(step_index) * 0x9E3779B97F4A7C15ULL) ^ key_count) & (RANK_CACHE_SIZE - 1));
-	return rank_cache[cache_index];
-}
-
-// Default fast path trusts the stored shape_hash; JSONO_RANK_VALIDATE=1 forces the
-// old key-heap validation, isolating the format's storage/read overhead from the
-// fast-path win in a single build (read once, not per row).
-inline bool TrustShapeHash() {
-	static const bool trust = []() {
-		const char *env = std::getenv("JSONO_RANK_VALIDATE");
-		return !(env && env[0] == '1');
-	}();
-	return trust;
-}
-
-bool FindPathObjectRank(JsonoPathLocalState &lstate, idx_t step_index, const JsonoView &view,
-                        const ObjectLayout &layout, const string &key, size_t &rank) {
-	auto &entry = GetRankCacheEntry(lstate.rank_cache, step_index, layout.key_count);
-	// The stored shape_hash uniquely identifies the object's sorted key sequence, so a
-	// matching (step_index, shape_hash, key) lets us trust the cached rank with a single
-	// int compare instead of re-reading the key heap (ValidateCachedObjectRank). This is
-	// the safe form of the H7 rank-cache fast path: the format carries shape identity, so
-	// it stays correct on non-shape-stable data where (step_index, key_count) collides.
-	bool hit;
-	if (TrustShapeHash()) {
-		hit =
-		    entry.valid && entry.step_index == step_index && entry.shape_hash == layout.shape_hash && entry.key == key;
-	} else {
-		hit = entry.valid && entry.step_index == step_index && entry.key_count == layout.key_count &&
-		      entry.key == key && ValidateCachedObjectRank(view, layout, key, entry.rank, entry.found);
-	}
-	if (hit) {
-		rank = entry.rank;
-		return entry.found;
-	}
-	bool found = FindObjectKeyRank(view, layout, key, rank);
-	entry.valid = true;
-	entry.step_index = step_index;
-	entry.key_count = layout.key_count;
-	entry.shape_hash = layout.shape_hash;
-	entry.key = key;
-	entry.rank = rank;
-	entry.found = found;
-	return found;
-}
-
 bool LocateObjectKey(JsonoPathLocalState &lstate, idx_t step_index, const JsonoView &view, const string &key,
-                     size_t &pos, size_t &string_cursor) {
-	if (pos >= view.Slots()) {
+                     JsonoCursor &cursor) {
+	if (cursor.pos >= view.Slots()) {
 		return false;
 	}
 	// On a per-row cache hit the entry was stored only after a successful OBJ_START
 	// read, so both the tag check and ReadObjectLayout are skipped.
-	auto &entry = lstate.layout_cache[pos & (LAYOUT_CACHE_SIZE - 1)];
-	if (entry.generation != lstate.layout_generation || entry.pos != pos) {
-		if (SlotTag(view.SlotAt(pos)) != tag::OBJ_START) {
+	auto &entry = lstate.layout_cache[cursor.pos & (LAYOUT_CACHE_SIZE - 1)];
+	if (entry.generation != lstate.layout_generation || entry.pos != cursor.pos) {
+		if (SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_START) {
 			return false;
 		}
 		entry.generation = lstate.layout_generation;
-		entry.pos = pos;
-		entry.layout = ReadObjectLayout(view, pos);
+		entry.pos = cursor.pos;
+		entry.layout = ReadObjectLayout(view, cursor.pos, true);
 	}
 	const auto &layout = entry.layout;
 	size_t rank = 0;
-	if (!FindPathObjectRank(lstate, step_index, view, layout, key, rank)) {
+	if (!lstate.rank_cache.Find(step_index, view, layout, key, rank)) {
 		return false;
 	}
-	size_t value_rank = 0;
-	size_t value_pos = layout.value_start;
-	size_t value_string_cursor = string_cursor;
-	MoveObjectValueCursorToRank(view, layout, string_cursor, rank, value_rank, value_pos, value_string_cursor);
-	pos = value_pos;
-	string_cursor = value_string_cursor;
+	MoveCursorToObjectValueRank(view, layout, rank, cursor);
 	return true;
 }
 
-bool LocatePathStep(JsonoPathLocalState &lstate, idx_t step_index, const JsonoView &view, const PathStep &step,
-                    size_t &pos, size_t &string_cursor) {
-	if (pos >= view.Slots()) {
-		return false;
+bool LocateOneStep(JsonoPathLocalState &lstate, idx_t step_index, const JsonoView &view, const PathStep &step,
+                   JsonoCursor &cursor) {
+	if (step.kind == PathStepKind::Key) {
+		// Not the shared LocatePathStep: the matcher/projector resolves several paths per
+		// row, so the Key step goes through the per-row ObjectLayout cache.
+		return LocateObjectKey(lstate, step_index, view, step.key, cursor);
 	}
-	auto slot_tag = SlotTag(view.SlotAt(pos));
-	switch (step.kind) {
-	case PathStepKind::Key: {
-		return LocateObjectKey(lstate, step_index, view, step.key, pos, string_cursor);
-	}
-	case PathStepKind::Index: {
-		if (slot_tag != tag::ARR_START) {
-			return false;
-		}
-		auto end_pos = ReadArrayEndPos(view, pos);
-		size_t elem_pos = pos + 1;
-		idx_t current = 0;
-		while (elem_pos < end_pos && current < step.index) {
-			SkipValueFast(view, elem_pos, string_cursor);
-			current++;
-		}
-		if (elem_pos >= end_pos || current < step.index) {
-			return false;
-		}
-		pos = elem_pos;
-		return true;
-	}
-	case PathStepKind::Wildcard:
-		return false;
-	}
-	return false;
+	return LocatePathStep(&lstate.rank_cache, step_index, view, step, cursor);
 }
 
 bool LocateCompiledPath(JsonoPathLocalState &lstate, const JsonoCompiledPath &compiled_path, idx_t step_base,
                         const JsonoView &view, JsonoMatchLocation &location) {
-	size_t pos = 0;
-	size_t string_cursor = 0;
+	JsonoCursor cursor;
 	switch (compiled_path.kind) {
 	case JsonoCompiledPathKind::RootKey:
-		if (!LocateObjectKey(lstate, step_base, view, compiled_path.first_key, pos, string_cursor)) {
+		if (!LocateObjectKey(lstate, step_base, view, compiled_path.first_key, cursor)) {
 			return false;
 		}
 		break;
 	case JsonoCompiledPathKind::RootKeyKey:
-		if (!LocateObjectKey(lstate, step_base, view, compiled_path.first_key, pos, string_cursor) ||
-		    !LocateObjectKey(lstate, step_base + 1, view, compiled_path.second_key, pos, string_cursor)) {
+		if (!LocateObjectKey(lstate, step_base, view, compiled_path.first_key, cursor) ||
+		    !LocateObjectKey(lstate, step_base + 1, view, compiled_path.second_key, cursor)) {
 			return false;
 		}
 		break;
 	case JsonoCompiledPathKind::Generic:
 		return false;
 	}
-	location.pos = pos;
-	location.string_cursor = string_cursor;
+	location.cursor = cursor;
 	return true;
 }
 
 bool LocateSteps(JsonoPathLocalState &lstate, idx_t step_base, const vector<PathStep> &steps, const JsonoView &view,
                  JsonoMatchLocation &location) {
-	size_t pos = 0;
-	size_t string_cursor = 0;
+	JsonoCursor cursor;
 	for (idx_t step_index = 0; step_index < steps.size(); step_index++) {
-		if (!LocatePathStep(lstate, step_base + step_index, view, steps[step_index], pos, string_cursor)) {
+		if (!LocateOneStep(lstate, step_base + step_index, view, steps[step_index], cursor)) {
 			return false;
 		}
 	}
-	location.pos = pos;
-	location.string_cursor = string_cursor;
+	location.cursor = cursor;
 	return true;
 }
 
@@ -691,144 +569,21 @@ bool ContainsExpectedValue(const vector<string> &values, nonstd::string_view can
 	return false;
 }
 
-void AppendJsonString(nonstd::string_view value, std::string &out) {
-	out.push_back('"');
-	for (char c : value) {
-		switch (c) {
-		case '"':
-			out.append("\\\"");
-			break;
-		case '\\':
-			out.append("\\\\");
-			break;
-		case '\b':
-			out.append("\\b");
-			break;
-		case '\f':
-			out.append("\\f");
-			break;
-		case '\n':
-			out.append("\\n");
-			break;
-		case '\r':
-			out.append("\\r");
-			break;
-		case '\t':
-			out.append("\\t");
-			break;
-		default:
-			if (static_cast<unsigned char>(c) < 0x20) {
-				char buf[8];
-				std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
-				out.append(buf);
-			} else {
-				out.push_back(c);
-			}
-		}
-	}
-	out.push_back('"');
-}
-
-bool AppendExtractStringScalar(const JsonoScalar &scalar, std::string &out) {
-	switch (scalar.kind) {
-	case JsonoScalarKind::Null:
-		return true;
-	case JsonoScalarKind::String:
-	case JsonoScalarKind::NumberText:
-		out.append(scalar.text.data(), scalar.text.size());
-		return false;
-	case JsonoScalarKind::Int64:
-		out.append(std::to_string(scalar.int_value));
-		return false;
-	case JsonoScalarKind::UInt64:
-		out.append(std::to_string(scalar.uint_value));
-		return false;
-	case JsonoScalarKind::Double:
-		EmitDouble(scalar.double_value, out);
-		return false;
-	case JsonoScalarKind::Dec60:
-		AppendDec60Text(out, scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
-		return false;
-	case JsonoScalarKind::Bool:
-		out.append(scalar.bool_value ? "true" : "false");
-		return false;
-	}
-	return true;
-}
-
-void AppendJsonValueText(const JsonoView &view, size_t &pos, size_t &string_cursor, std::string &out, size_t depth) {
-	if (depth > JSONO_MAX_NESTING_DEPTH) {
-		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
-		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
-	}
-	auto slot_tag = SlotTag(view.SlotAt(pos));
-	switch (slot_tag) {
-	case tag::OBJ_START: {
-		auto layout = ReadObjectLayout(view, pos);
-		auto val_cursor = layout.value_start;
-		out.push_back('{');
-		for (size_t i = 0; i < layout.key_count; i++) {
-			if (i) {
-				out.push_back(',');
-			}
-			auto key_slot = view.SlotAt(layout.key_start + i);
-			if (SlotTag(key_slot) != tag::KEY) {
-				throw InvalidInputException("malformed JSONO: expected KEY slot");
-			}
-			AppendJsonString(view.KeyAt(SlotPayload(key_slot)), out);
-			out.push_back(':');
-			AppendJsonValueText(view, val_cursor, string_cursor, out, depth + 1);
-		}
-		if (val_cursor != layout.after_pos - 1) {
-			throw InvalidInputException("malformed JSONO: object value span mismatch");
-		}
-		pos = layout.after_pos;
-		out.push_back('}');
-		return;
-	}
-	case tag::ARR_START: {
-		auto end_pos = ReadArrayEndPos(view, pos);
-		pos++;
-		out.push_back('[');
-		bool first = true;
-		while (pos < end_pos) {
-			if (!first) {
-				out.push_back(',');
-			}
-			first = false;
-			AppendJsonValueText(view, pos, string_cursor, out, depth + 1);
-		}
-		pos = end_pos + 1;
-		out.push_back(']');
-		return;
-	}
-	default: {
-		auto scalar = DecodeScalarAt(view, pos, string_cursor);
-		if (scalar.kind == JsonoScalarKind::String) {
-			AppendJsonString(scalar.text, out);
-			return;
-		}
-		if (AppendExtractStringScalar(scalar, out)) {
-			out.append("null");
-		}
-		return;
-	}
-	}
-}
-
-bool LocatedValueMatches(JsonoPathLocalState &lstate, const vector<string> &values, const JsonoView &view,
-                         const JsonoMatchLocation &location) {
-	auto slot_tag = SlotTag(view.SlotAt(location.pos));
+bool LocatedValueMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoMatchPredicate &predicate,
+                         const JsonoView &view, const JsonoMatchLocation &location) {
+	auto &values = predicate.values;
+	auto slot_tag = SlotTag(view.SlotAt(location.cursor.pos));
 	if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
+		// The compare serializes the whole found container; a manifest leaf inside it would
+		// silently change the text.
+		reader.CheckContainerRead(view, predicate.steps);
 		lstate.scratch.clear();
-		auto pos = location.pos;
-		auto string_cursor = location.string_cursor;
-		AppendJsonValueText(view, pos, string_cursor, lstate.scratch, 0);
+		auto cursor = location.cursor;
+		AppendJsonValueText(view, cursor, lstate.scratch, 0);
 		return ContainsExpectedValue(values, nonstd::string_view(lstate.scratch.data(), lstate.scratch.size()));
 	}
-	auto pos = location.pos;
-	auto string_cursor = location.string_cursor;
-	auto scalar = DecodeScalarAt(view, pos, string_cursor);
+	auto cursor = location.cursor;
+	auto scalar = DecodeScalarAt(view, cursor);
 	if (scalar.kind == JsonoScalarKind::Null) {
 		return false;
 	}
@@ -836,44 +591,48 @@ bool LocatedValueMatches(JsonoPathLocalState &lstate, const vector<string> &valu
 		return ContainsExpectedValue(values, scalar.text);
 	}
 	lstate.scratch.clear();
-	if (AppendExtractStringScalar(scalar, lstate.scratch)) {
+	if (RenderExtractText(scalar, lstate.scratch)) {
 		return false;
 	}
 	return ContainsExpectedValue(values, nonstd::string_view(lstate.scratch.data(), lstate.scratch.size()));
 }
 
-bool PredicateMatches(JsonoPathLocalState &lstate, const JsonoMatchPredicate &predicate, const JsonoView &view) {
+bool PredicateMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoMatchPredicate &predicate,
+                      const JsonoView &view) {
 	JsonoMatchLocation location;
 	if (!LocatePath(lstate, predicate, view, location)) {
+		// A miss covered by the row's shred manifest must not read as a silent non-match.
+		reader.CheckPathMiss(view, predicate.steps);
 		return false;
 	}
-	return LocatedValueMatches(lstate, predicate.values, view, location);
+	return LocatedValueMatches(lstate, reader, predicate, view, location);
 }
 
-void WriteLocatedExtractString(JsonoPathLocalState &lstate, Vector &result, idx_t row, const JsonoView &view,
-                               const JsonoMatchLocation &location) {
+void WriteLocatedExtractString(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoProjectField &field,
+                               Vector &result, idx_t row, const JsonoView &view, const JsonoMatchLocation &location) {
 	auto result_data = FlatVector::GetData<string_t>(result);
-	auto slot_tag = SlotTag(view.SlotAt(location.pos));
+	auto slot_tag = SlotTag(view.SlotAt(location.cursor.pos));
 	if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
+		// `->>` serializes a found container; a manifest leaf inside it would silently drop
+		// from the text.
+		reader.CheckContainerRead(view, field.steps);
 		lstate.scratch.clear();
-		auto pos = location.pos;
-		auto string_cursor = location.string_cursor;
-		AppendJsonValueText(view, pos, string_cursor, lstate.scratch, 0);
+		auto cursor = location.cursor;
+		AppendJsonValueText(view, cursor, lstate.scratch, 0);
 		FlatVector::Validity(result).SetValid(row);
 		result_data[row] = StringVector::AddString(result, lstate.scratch.data(), lstate.scratch.size());
 		return;
 	}
 
-	auto pos = location.pos;
-	auto string_cursor = location.string_cursor;
-	auto scalar = DecodeScalarAt(view, pos, string_cursor);
+	auto cursor = location.cursor;
+	auto scalar = DecodeScalarAt(view, cursor);
 	if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
 		FlatVector::Validity(result).SetValid(row);
 		result_data[row] = StringVector::AddString(result, scalar.text.data(), scalar.text.size());
 		return;
 	}
 	lstate.scratch.clear();
-	if (AppendExtractStringScalar(scalar, lstate.scratch)) {
+	if (RenderExtractText(scalar, lstate.scratch)) {
 		FlatVector::SetNull(result, row, true);
 		return;
 	}
@@ -968,15 +727,6 @@ bool TryParseCanonicalUnsignedIntegerText(nonstd::string_view text, uint64_t &va
 	return TryParseUnsignedIntegerText(text, value);
 }
 
-void EnsureExtremaStringMode(JsonoExtractExtremaState &state) {
-	if (!state.numeric_mode) {
-		return;
-	}
-	auto rendered = std::to_string(state.numeric_value);
-	state.text_value = string_t(rendered.data(), UnsafeNumericCast<uint32_t>(rendered.size()));
-	state.numeric_mode = false;
-}
-
 void AssignExtremaText(JsonoExtractExtremaState &state, nonstd::string_view candidate) {
 	JsonoExtractExtremaFunction::DestroyText(state);
 	if (candidate.size() <= string_t::INLINE_LENGTH) {
@@ -986,6 +736,18 @@ void AssignExtremaText(JsonoExtractExtremaState &state, nonstd::string_view cand
 	auto owned = new char[candidate.size()];
 	memcpy(owned, candidate.data(), candidate.size());
 	state.text_value = string_t(owned, UnsafeNumericCast<uint32_t>(candidate.size()));
+}
+
+void EnsureExtremaStringMode(JsonoExtractExtremaState &state) {
+	if (!state.numeric_mode) {
+		return;
+	}
+	auto rendered = std::to_string(state.numeric_value);
+	// Assign while still in numeric mode so DestroyText inside stays a no-op
+	// (text_value is uninitialized in numeric mode); the copy must own its buffer,
+	// a string_t over the local rendering would dangle for >inline-length values.
+	AssignExtremaText(state, nonstd::string_view(rendered.data(), rendered.size()));
+	state.numeric_mode = false;
 }
 
 void FoldStringExtrema(JsonoExtractExtremaState &state, JsonoExtremaKind kind, nonstd::string_view candidate) {
@@ -1168,8 +930,8 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoPathLocalState>();
 	auto count = args.size();
 
-	JsonoVectorData input;
-	InitJsonoVectorData(args.data[0], count, input);
+	JsonoRowReader reader;
+	reader.InitPointRead(args.data[0], count);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &children = StructVector::GetEntries(result);
@@ -1177,15 +939,11 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 		child->SetVectorType(VectorType::FLAT_VECTOR);
 	}
 
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		lstate.layout_generation++;
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
-			SetProjectRowNull(result, children, row);
-			continue;
-		}
-		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader() || view.Slots() == 0) {
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			SetProjectRowNull(result, children, row);
 			continue;
 		}
@@ -1194,10 +952,12 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 			auto &field = bind_data.fields[field_index];
 			JsonoMatchLocation location;
 			if (!LocateProjectField(lstate, field, view, location)) {
+				// A miss covered by the row's shred manifest must not project a silent NULL.
+				reader.CheckPathMiss(view, field.steps);
 				FlatVector::SetNull(*children[field_index], row, true);
 				continue;
 			}
-			WriteLocatedExtractString(lstate, *children[field_index], row, view, location);
+			WriteLocatedExtractString(lstate, reader, field, *children[field_index], row, view, location);
 		}
 	}
 	if (args.AllConstant()) {
@@ -1254,25 +1014,22 @@ void JsonoInternalMatchExecute(DataChunk &args, ExpressionState &state, Vector &
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoPathLocalState>();
 	auto count = args.size();
 
-	JsonoVectorData input;
-	InitJsonoVectorData(args.data[0], count, input);
+	JsonoRowReader reader;
+	reader.InitPointRead(args.data[0], count);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<bool>(result);
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		lstate.layout_generation++;
 		result_data[row] = false;
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
-			continue;
-		}
-		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader() || view.Slots() == 0) {
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			continue;
 		}
 		auto matches = true;
 		for (auto &predicate : bind_data.predicates) {
-			if (!PredicateMatches(lstate, predicate, view)) {
+			if (!PredicateMatches(lstate, reader, predicate, view)) {
 				matches = false;
 				break;
 			}
@@ -1305,14 +1062,14 @@ unique_ptr<Expression> MakeJsonoInternalMatchExpression(const JsonoRewriteGroup 
 		bind_data->predicates.push_back(std::move(predicate));
 	}
 	vector<unique_ptr<Expression>> children;
-	children.push_back(make_uniq<BoundColumnRefExpression>(group.column_alias, group.column_type, group.binding));
+	children.push_back(group.source->Copy());
 	return make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, MakeJsonoInternalMatchFunction(),
 	                                          std::move(children), std::move(bind_data));
 }
 
-idx_t FindRewriteGroup(vector<JsonoRewriteGroup> &groups, const ColumnBinding &binding) {
+idx_t FindRewriteGroup(vector<JsonoRewriteGroup> &groups, const Expression &source) {
 	for (idx_t group_index = 0; group_index < groups.size(); group_index++) {
-		if (groups[group_index].binding == binding) {
+		if (groups[group_index].source->Equals(source)) {
 			return group_index;
 		}
 	}
@@ -1327,12 +1084,10 @@ void RewriteFilter(ClientContext &context, LogicalFilter &filter) {
 			continue;
 		}
 		predicate.expression_index = expression_index;
-		auto group_index = FindRewriteGroup(groups, predicate.binding);
+		auto group_index = FindRewriteGroup(groups, *predicate.source);
 		if (group_index == DConstants::INVALID_INDEX) {
 			JsonoRewriteGroup group;
-			group.binding = predicate.binding;
-			group.column_type = predicate.column_type;
-			group.column_alias = predicate.column_alias;
+			group.source = predicate.source;
 			groups.push_back(std::move(group));
 			group_index = groups.size() - 1;
 		}
@@ -1367,41 +1122,6 @@ void RewriteFilter(ClientContext &context, LogicalFilter &filter) {
 	filter.expressions = std::move(expressions);
 }
 
-bool TryReadInternalMatchSource(Expression &expr, ColumnBinding &binding, LogicalType &type, string &alias,
-                                idx_t &predicate_count) {
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
-		return false;
-	}
-	auto &function = expr.Cast<BoundFunctionExpression>();
-	if (function.function.name != "__jsono_internal_match" || function.children.size() != 1 ||
-	    function.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-		return false;
-	}
-	auto &column_ref = function.children[0]->Cast<BoundColumnRefExpression>();
-	auto &bind_data = function.bind_info->Cast<JsonoMatchBindData>();
-	binding = column_ref.binding;
-	type = column_ref.return_type;
-	alias = column_ref.GetAlias();
-	predicate_count = bind_data.predicates.size();
-	return true;
-}
-
-bool TryReadProjectField(ClientContext &context, Expression &expr, const ColumnBinding &source_binding,
-                         JsonoProjectField &field) {
-	BoundColumnRefExpression *column_ref = nullptr;
-	JsonoMatchPredicate predicate;
-	if (!TryReadJsonoExtract(context, expr, column_ref, predicate)) {
-		return false;
-	}
-	if (column_ref->binding != source_binding) {
-		return false;
-	}
-	field.path = std::move(predicate.path);
-	field.steps = std::move(predicate.steps);
-	field.compiled_path = std::move(predicate.compiled_path);
-	return true;
-}
-
 bool ProjectPathEquals(const vector<PathStep> &left, const vector<PathStep> &right) {
 	return PathStepsEqual(left, right);
 }
@@ -1415,17 +1135,44 @@ idx_t FindProjectField(const vector<JsonoProjectField> &fields, const vector<Pat
 	return DConstants::INVALID_INDEX;
 }
 
-void CollectProjectFields(ClientContext &context, Expression &expr, const ColumnBinding &source_binding,
-                          vector<JsonoProjectField> &fields) {
-	JsonoProjectField field;
-	if (TryReadProjectField(context, expr, source_binding, field) &&
-	    FindProjectField(fields, field.steps) == DConstants::INVALID_INDEX) {
-		field.name = "p" + std::to_string(fields.size());
-		fields.push_back(std::move(field));
+// A JSONO column read by constant-path extracts in the parent's expression lists, with the
+// distinct paths collected in first-appearance order. The projector fuse fires when one
+// column accumulates >=2 distinct paths.
+struct JsonoProjectSource {
+	ColumnBinding binding;
+	LogicalType type;
+	string alias;
+	vector<JsonoProjectField> fields;
+};
+
+void CollectProjectSources(ClientContext &context, Expression &expr, vector<JsonoProjectSource> &sources) {
+	BoundColumnRefExpression *column_ref = nullptr;
+	JsonoMatchPredicate predicate;
+	if (TryReadJsonoExtract(context, expr, column_ref, predicate)) {
+		JsonoProjectSource *source = nullptr;
+		for (auto &candidate : sources) {
+			if (candidate.binding == column_ref->binding) {
+				source = &candidate;
+				break;
+			}
+		}
+		if (!source) {
+			sources.push_back(
+			    JsonoProjectSource {column_ref->binding, column_ref->return_type, column_ref->GetAlias(), {}});
+			source = &sources.back();
+		}
+		if (FindProjectField(source->fields, predicate.steps) == DConstants::INVALID_INDEX) {
+			JsonoProjectField field;
+			field.name = "p" + std::to_string(source->fields.size());
+			field.path = std::move(predicate.path);
+			field.steps = std::move(predicate.steps);
+			field.compiled_path = std::move(predicate.compiled_path);
+			source->fields.push_back(std::move(field));
+		}
 		return;
 	}
-	ExpressionIterator::EnumerateChildren(
-	    expr, [&](Expression &child) { CollectProjectFields(context, child, source_binding, fields); });
+	ExpressionIterator::EnumerateChildren(expr,
+	                                      [&](Expression &child) { CollectProjectSources(context, child, sources); });
 }
 
 idx_t FindBindingIndex(const vector<ColumnBinding> &bindings, const ColumnBinding &binding) {
@@ -1558,53 +1305,48 @@ unique_ptr<Expression> MakeJsonoInternalProjectExpression(JsonoProjectRewriteSta
 	                                          std::move(children), std::move(bind_data));
 }
 
-// Insert one __jsono_internal_project STRUCT projection between `parent` and its child
-// LOGICAL_FILTER (which must carry a >=2-predicate matcher), then rewrite every JSONO `->>`
-// in the parent's expression lists to a cheap struct_extract over that single shared pass.
-// The struct sits above the filter, so it materializes only surviving rows, and the shared
-// header-parse/root-layout read is paid once per row instead of once per extracted path.
-// Works for any parent that reads several constant `->>` paths off the same filtered column:
-// a grouped aggregate (groups + aggregate args) or a plain projection (select/order/window).
+// Insert one __jsono_internal_project STRUCT projection between `parent` and its child, then
+// rewrite every JSONO `->>` in the parent's expression lists to a cheap struct_extract over
+// that single shared pass: the shared header-parse/root-layout read is paid once per row
+// instead of once per extracted path. Fires for any parent that reads >=2 distinct constant
+// `->>` paths off the same JSONO column: a grouped aggregate (groups + aggregate args) or a
+// plain projection (select/order-after-filter or bare filterless multi-extract). When the
+// child is a filter the struct sits above it, so it materializes only surviving rows.
 bool RewriteJsonoProjector(OptimizerExtensionInput &input, LogicalOperator &parent,
                            const vector<vector<unique_ptr<Expression>> *> &expression_lists) {
-	if (parent.children.size() != 1 || parent.children[0]->type != LogicalOperatorType::LOGICAL_FILTER) {
+	if (parent.children.size() != 1) {
 		return false;
 	}
-	auto &filter = parent.children[0]->Cast<LogicalFilter>();
-	ColumnBinding source_binding;
-	LogicalType source_type;
-	string source_alias;
-	idx_t predicate_count = 0;
-	auto found_matcher = false;
-	for (auto &expression : filter.expressions) {
-		if (TryReadInternalMatchSource(*expression, source_binding, source_type, source_alias, predicate_count) &&
-		    predicate_count >= 2) {
-			found_matcher = true;
+	vector<JsonoProjectSource> sources;
+	for (auto *expression_list : expression_lists) {
+		for (auto &expression : *expression_list) {
+			CollectProjectSources(input.context, *expression, sources);
+		}
+	}
+	JsonoProjectSource *source = nullptr;
+	for (auto &candidate : sources) {
+		if (candidate.fields.size() >= 2) {
+			source = &candidate;
 			break;
 		}
 	}
-	if (!found_matcher) {
+	if (!source) {
 		return false;
 	}
 
-	vector<JsonoProjectField> fields;
-	for (auto *expression_list : expression_lists) {
-		for (auto &expression : *expression_list) {
-			CollectProjectFields(input.context, *expression, source_binding, fields);
-		}
-	}
-	if (fields.size() < 2) {
+	auto &child = *parent.children[0];
+	child.ResolveOperatorTypes();
+	auto child_bindings = child.GetColumnBindings();
+	if (FindBindingIndex(child_bindings, source->binding) == DConstants::INVALID_INDEX) {
 		return false;
 	}
-
-	filter.ResolveOperatorTypes();
 	JsonoProjectRewriteState state {input.context,
-	                                source_binding,
-	                                source_type,
-	                                source_alias,
-	                                filter.GetColumnBindings(),
-	                                filter.types,
-	                                std::move(fields),
+	                                source->binding,
+	                                source->type,
+	                                source->alias,
+	                                std::move(child_bindings),
+	                                child.types,
+	                                std::move(source->fields),
 	                                LogicalType::INVALID,
 	                                ColumnBinding(),
 	                                input.optimizer.binder.GenerateTableIndex()};
@@ -1628,8 +1370,8 @@ bool RewriteJsonoProjector(OptimizerExtensionInput &input, LogicalOperator &pare
 	}
 
 	auto projection = make_uniq<LogicalProjection>(state.projection_index, std::move(projection_expressions));
-	if (filter.has_estimated_cardinality) {
-		projection->SetEstimatedCardinality(filter.estimated_cardinality);
+	if (child.has_estimated_cardinality) {
+		projection->SetEstimatedCardinality(child.estimated_cardinality);
 	}
 	projection->children.push_back(std::move(parent.children[0]));
 	projection->ResolveOperatorTypes();
@@ -1791,27 +1533,32 @@ private:
 	// column directly. A non-shred path reads the residual natively (cheap): only shred leaves
 	// are stripped, so a non-shred path keeps its own value there. Two cases reconstruct
 	// instead: a json-valued extract of a shred (its value may be stripped from the residual),
-	// and a json-valued extract of a subtree that contains a stripped shred leaf.
+	// and any extract of a subtree that contains a stripped shred leaf — string extracts
+	// serialize containers, so they need the leaf as much as json-valued ones.
 	unique_ptr<Expression> RewriteShreddedExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast) {
 		bool string_fn = expr.function.name == "->>" || expr.function.name == "json_extract_string" ||
 		                 expr.function.name == "jsono_extract_string";
 		string path;
 		vector<PathStep> steps;
-		if (TryReadExtractPath(context, *expr.children[1], path, steps)) {
-			for (auto &shred : CollectShreddedShreds(shredded_cast.child->return_type)) {
-				if (PathStepsEqual(shred.steps, steps)) {
-					if (string_fn) {
-						auto alias = expr.GetAlias();
-						return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
-					}
-					return nullptr; // json-valued shred extract: reconstruct via the inner cast
+		if (!TryReadExtractPath(context, *expr.children[1], path, steps)) {
+			// Non-constant (or otherwise unreadable) path: leave the plan untouched. The
+			// core-named extracts support per-row paths over the reconstruct cast, and the
+			// jsono-named extracts already refused such a path at their own bind.
+			return nullptr;
+		}
+		for (auto &shred : CollectShreddedShreds(shredded_cast.child->return_type)) {
+			if (PathStepsEqual(shred.steps, steps)) {
+				if (string_fn) {
+					auto alias = expr.GetAlias();
+					return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
 				}
-				// A json-valued read of a subtree holding a stripped shred leaf would miss it
-				// in the residual; reconstruct. (`->>` of an object is NULL regardless, and a
-				// stripped scalar leaf is itself a shred, handled by the exact match above.)
-				if (!string_fn && PathStepsObjectKeyPrefix(steps, shred.steps)) {
-					return nullptr;
-				}
+				return nullptr; // json-valued shred extract: reconstruct via the inner cast
+			}
+			// A read of a subtree holding a stripped shred leaf would miss it in the
+			// residual; reconstruct. (A stripped scalar leaf is itself a shred, handled
+			// by the exact match above.)
+			if (PathStepsObjectKeyPrefix(steps, shred.steps)) {
+				return nullptr;
 			}
 		}
 		return MakeResidualExtract(expr, shredded_cast, string_fn);

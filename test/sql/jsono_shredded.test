@@ -86,6 +86,37 @@ SELECT to_json(j) FROM shred_sentinel;
 ----
 {"did":"d1","kind":"commit"}
 
+# A dynamic (non-constant) path must not be broken by the shredded rewrite: the
+# core-named extracts bind core json's per-row-path overload over the reconstruct
+# cast, and the rewrite must leave that plan alone instead of binding the
+# constant-path-only jsono extract (which throws from the optimizer).
+statement ok
+CREATE TABLE dyn_paths(c VARCHAR);
+
+statement ok
+INSERT INTO dyn_paths VALUES ('kind'), ('extra'), ('missing');
+
+query TT
+SELECT c, j ->> c FROM shred, dyn_paths ORDER BY c;
+----
+extra	e1
+kind	commit
+missing	NULL
+
+query TT
+SELECT c, j -> c FROM shred, dyn_paths ORDER BY c;
+----
+extra	"e1"
+kind	"commit"
+missing	NULL
+
+# the jsono-named extract keeps the jsono-wide constant-path contract, refusing at
+# its own bind exactly like a plain jsono column does
+statement error
+SELECT jsono_extract_string(j, c) FROM shred, dyn_paths;
+----
+path must be constant
+
 # Multi-row, a NULL struct row, and a Parquet round-trip (the DuckLake-shaped
 # path: the shredded struct loses no fields through Parquet and the rewrite still
 # fires on the read_parquet-sourced column). Shreds are computed from the value so

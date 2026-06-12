@@ -1,6 +1,8 @@
 #include "jsono.hpp"
+#include "jsono_locate.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_row_read.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
@@ -54,64 +56,9 @@ void SetListRowNull(Vector &result, idx_t row) {
 // string heap cursor so nested string payloads resolve correctly. Returns false
 // when a step misses (absent key, out-of-range index, or stepping into a
 // non-container). Wildcard steps are rejected at bind, so they never reach here.
-bool NavigateToPath(const JsonoView &view, const vector<PathStep> &steps, size_t &pos, size_t &string_cursor) {
-	pos = 0;
-	string_cursor = 0;
-	for (auto &step : steps) {
-		if (pos >= view.Slots()) {
-			return false;
-		}
-		auto slot_tag = SlotTag(view.SlotAt(pos));
-		if (step.kind == PathStepKind::Key) {
-			if (slot_tag != tag::OBJ_START) {
-				return false;
-			}
-			auto layout = ReadObjectLayout(view, pos);
-			nonstd::string_view target(step.key);
-			size_t lo = 0;
-			size_t hi = layout.key_count;
-			while (lo < hi) {
-				auto mid = lo + (hi - lo) / 2;
-				auto key_slot = view.SlotAt(layout.key_start + mid);
-				if (SlotTag(key_slot) != tag::KEY) {
-					throw InvalidInputException("malformed JSONO: object key slot expected");
-				}
-				if (view.KeyAt(SlotPayload(key_slot)) < target) {
-					lo = mid + 1;
-				} else {
-					hi = mid;
-				}
-			}
-			if (lo >= layout.key_count || view.KeyAt(SlotPayload(view.SlotAt(layout.key_start + lo))) != target) {
-				return false;
-			}
-			size_t value_pos = layout.key_start + layout.key_count;
-			size_t value_string_cursor = string_cursor;
-			for (size_t i = 0; i < lo; i++) {
-				SkipValueFast(view, value_pos, value_string_cursor);
-			}
-			pos = value_pos;
-			string_cursor = value_string_cursor;
-		} else if (step.kind == PathStepKind::Index) {
-			if (slot_tag != tag::ARR_START) {
-				return false;
-			}
-			auto end_pos = ReadArrayEndPos(view, pos);
-			size_t elem_pos = pos + 1;
-			idx_t current = 0;
-			while (elem_pos < end_pos && current < step.index) {
-				SkipValueFast(view, elem_pos, string_cursor);
-				current++;
-			}
-			if (elem_pos >= end_pos || current < step.index) {
-				return false;
-			}
-			pos = elem_pos;
-		} else {
-			return false;
-		}
-	}
-	return true;
+bool NavigateToPath(const JsonoView &view, const vector<PathStep> &steps, JsonoCursor &cursor) {
+	cursor = JsonoCursor();
+	return LocatePathSteps(nullptr, 0, steps, view, cursor);
 }
 
 struct JsonoPathBindData : public FunctionData {
@@ -187,46 +134,46 @@ const vector<PathStep> *PathStepsFromState(ExpressionState &state, idx_t column_
 	return &func_expr.bind_info->Cast<JsonoPathBindData>().steps;
 }
 
-const char *JsonoTypeName(const JsonoView &view, size_t pos, size_t string_cursor) {
-	if (pos >= view.Slots()) {
+const char *JsonoTypeName(const JsonoView &view, JsonoCursor cursor) {
+	if (cursor.pos >= view.Slots()) {
 		return nullptr;
 	}
-	auto slot_tag = SlotTag(view.SlotAt(pos));
+	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
 	if (slot_tag == tag::OBJ_START) {
 		return "OBJECT";
 	}
 	if (slot_tag == tag::ARR_START) {
 		return "ARRAY";
 	}
-	auto scalar = DecodeScalarAt(view, pos, string_cursor);
+	auto scalar = DecodeScalarAt(view, cursor);
 	return JsonoScalarTypeName(scalar.kind);
 }
 
+// jsono_type applies no found-value check: the type tag is invariant under stripping (shred paths
+// are object-key chains, so containers stay containers and a found scalar was never stripped), and
+// the optimizer's whole-document rewrite legitimately reads a manifested residual's root. A path
+// miss covered by the manifest still fails loud (the silent NULL would be the data loss).
 void JsonoTypeExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
-	JsonoVectorData input;
-	InitJsonoVectorData(args.data[0], count, input);
+	JsonoRowReader reader;
+	reader.InitPointRead(args.data[0], count);
 	auto steps = PathStepsFromState(state, args.ColumnCount());
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<string_t>(result);
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
-		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader()) {
+		JsonoCursor cursor;
+		if (steps && !NavigateToPath(view, *steps, cursor)) {
+			reader.CheckPathMiss(view, *steps);
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
-		size_t pos = 0;
-		size_t string_cursor = 0;
-		if (steps && !NavigateToPath(view, *steps, pos, string_cursor)) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		auto type_name = JsonoTypeName(view, pos, string_cursor);
+		auto type_name = JsonoTypeName(view, cursor);
 		if (!type_name) {
 			FlatVector::SetNull(result, row, true);
 		} else {
@@ -238,36 +185,38 @@ void JsonoTypeExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 }
 
+// jsono_keys lists a whole found object, so a manifest leaf strictly inside it (or a covered
+// path miss) fails loud — the key list would silently omit the stripped key. The optimizer's
+// introspect rewrite only feeds the residual a path that holds no shred beneath it, so a hit
+// here is always a narrowed row.
 void JsonoKeysExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
-	JsonoVectorData input;
-	InitJsonoVectorData(args.data[0], count, input);
+	JsonoRowReader reader;
+	reader.InitPointRead(args.data[0], count);
 	auto steps = PathStepsFromState(state, args.ColumnCount());
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	ListVector::SetListSize(result, 0);
 
+	const vector<PathStep> root_steps;
+	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
-		if (!ReadJsonoRowStrict(input, row, blob)) {
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			SetListRowNull(result, row);
 			continue;
 		}
-		JsonoView view = MakeJsonoView(blob);
-		if (!view.ParseHeader() || view.Slots() == 0) {
+		JsonoCursor cursor;
+		if (steps && !NavigateToPath(view, *steps, cursor)) {
+			reader.CheckPathMiss(view, *steps);
 			SetListRowNull(result, row);
 			continue;
 		}
-		size_t pos = 0;
-		size_t string_cursor = 0;
-		if (steps && !NavigateToPath(view, *steps, pos, string_cursor)) {
+		if (SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_START) {
 			SetListRowNull(result, row);
 			continue;
 		}
-		if (SlotTag(view.SlotAt(pos)) != tag::OBJ_START) {
-			SetListRowNull(result, row);
-			continue;
-		}
-		auto layout = ReadObjectLayout(view, pos);
+		reader.CheckContainerRead(view, steps ? *steps : root_steps);
+		auto layout = ReadObjectLayout(view, cursor.pos);
 		auto start = ListVector::GetListSize(result);
 		idx_t length = 0;
 		for (size_t i = 0; i < layout.key_count; i++) {

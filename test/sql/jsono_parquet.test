@@ -16,7 +16,7 @@ CREATE TABLE events AS
 query I
 SELECT typeof(j) FROM events LIMIT 1;
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 statement ok
 COPY events TO '__TEST_DIR__/events_jsono.parquet';
@@ -25,7 +25,7 @@ COPY events TO '__TEST_DIR__/events_jsono.parquet';
 query I
 SELECT typeof(j) FROM '__TEST_DIR__/events_jsono.parquet' LIMIT 1;
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 # jsono ops bind to the STRUCT structurally, so to_json works on the read-back value directly.
 query II

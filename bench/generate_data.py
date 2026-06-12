@@ -22,7 +22,14 @@ from datetime import datetime, timezone
 
 import duckdb
 
-from config import DATA_DIR, NUMBERS_SIZES, SIZES, URL_DEFAULT_SIZES, URL_SIZES
+from config import (
+    DATA_DIR,
+    NUMBERS_SIZES,
+    SIZES,
+    URL_DEFAULT_SIZES,
+    URL_SIZES,
+    WIDE_FLAT_SIZES,
+)
 
 # ────────────────────────────────────────────────────────────────────────
 # Value pools
@@ -670,6 +677,244 @@ def generate_numbers_data(size_name: str, num_rows: int, seed: int) -> None:
     print(f"  Saved to {output_path}")
 
 
+# ────────────────────────────────────────────────────────────────────────
+# Wide-flat dataset — page_view-class telemetry hit: one schema-stable object
+# of ~100 scalar top-level keys, no nesting. Key names share group prefixes
+# (browser_*, screen_*, ...) like real hit payloads, so sorted-key comparison
+# cost is realistic. Exists because merge-family performance is shape-dependent:
+# wide-flat objects stress the sorted-key merge in a way the deep-nested retail
+# sample does not.
+# ────────────────────────────────────────────────────────────────────────
+
+WIDE_FLAT_TOKENS = [
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "direct",
+    "organic",
+    "internal",
+    "none",
+    "unknown",
+    "mobile",
+    "desktop",
+    "tablet",
+]
+
+# group prefix -> [(key suffix, value kind)]; flattened to f"{group}_{suffix}".
+WIDE_FLAT_GROUPS = {
+    "event": [
+        ("ts", "int"),
+        ("id", "digits"),
+        ("session_id", "digits"),
+        ("hit_id", "digits"),
+        ("counter_id", "digits"),
+        ("watch_id", "digits"),
+        ("visit_id", "digits"),
+    ],
+    "browser": [
+        ("name", "token"),
+        ("major_version", "int"),
+        ("minor_version", "int"),
+        ("engine", "token"),
+        ("engine_version", "int"),
+        ("language", "token"),
+        ("country", "token"),
+        ("cookies", "flag"),
+    ],
+    "screen": [
+        ("width", "int"),
+        ("height", "int"),
+        ("colors", "int"),
+        ("format", "token"),
+        ("orientation", "token"),
+        ("physical_width", "int"),
+        ("physical_height", "int"),
+    ],
+    "window": [
+        ("client_width", "int"),
+        ("client_height", "int"),
+    ],
+    "region": [
+        ("country", "token"),
+        ("country_id", "digits"),
+        ("area", "token"),
+        ("area_id", "digits"),
+        ("city", "token"),
+        ("city_id", "digits"),
+    ],
+    "utm": [
+        ("source", "token"),
+        ("medium", "token"),
+        ("campaign", "token"),
+        ("content", "token"),
+        ("term", "token"),
+    ],
+    "offline_call": [
+        ("talk_duration", "int"),
+        ("hold_duration", "int"),
+        ("missed", "flag"),
+        ("tag", "sparse_token"),
+        ("first_time_caller", "flag"),
+        ("url", "url"),
+    ],
+    "share": [
+        ("service", "sparse_token"),
+        ("url", "url"),
+        ("title", "token"),
+    ],
+    "openstat": [
+        ("ad", "sparse_token"),
+        ("campaign", "sparse_token"),
+        ("service", "sparse_token"),
+        ("source", "sparse_token"),
+    ],
+    "last": [
+        ("traffic_source", "sparse_token"),
+        ("search_engine", "sparse_token"),
+        ("search_engine_root", "sparse_token"),
+        ("adv_engine", "sparse_token"),
+        ("social_network", "sparse_token"),
+        ("social_network_profile", "sparse_token"),
+    ],
+    "client": [
+        ("id", "digits"),
+        ("time_zone", "int"),
+        ("user_id_hash", "digits"),
+        ("ip", "digits"),
+    ],
+    "page": [
+        ("url", "url"),
+        ("referer", "url"),
+        ("title", "token"),
+        ("charset", "token"),
+        ("link", "url"),
+        ("download", "flag"),
+        ("not_bounce", "flag"),
+        ("http_error", "flag"),
+    ],
+    "device": [
+        ("category", "token"),
+        ("mobile_phone", "sparse_token"),
+        ("mobile_phone_model", "sparse_token"),
+        ("os", "token"),
+        ("os_root", "token"),
+    ],
+    "flags": [
+        ("javascript_enabled", "flag"),
+        ("third_party_cookie_enabled", "flag"),
+        ("is_turbo_page", "flag"),
+        ("is_turbo_app", "flag"),
+        ("has_gclid", "flag"),
+        ("iframe", "flag"),
+        ("messenger", "sparse_token"),
+    ],
+    "network": [
+        ("type", "token"),
+    ],
+}
+
+WIDE_FLAT_FIELDS = [
+    (f"{group}_{suffix}", kind)
+    for group, suffixes in WIDE_FLAT_GROUPS.items()
+    for suffix, kind in suffixes
+] + [
+    (f"custom_param_{i:02d}", "token" if i % 2 == 0 else "sparse_token")
+    for i in range(1, 21)
+]
+
+
+def wide_flat_value(rng: random.Random, kind: str) -> object:
+    match kind:
+        case "int":
+            return rng.randint(0, 4096)
+        case "digits":
+            return str(rng.randint(1_000_000_000, 9_999_999_999))
+        case "token":
+            return rng.choice(WIDE_FLAT_TOKENS)
+        case "sparse_token":
+            return "" if rng.random() < 0.75 else f"tok_{rng.randint(0, 99)}"
+        case "flag":
+            return rng.choice(["0", "1"])
+        case "url":
+            return make_page_url(rng, rng.choice(PAGE_PATHS))
+        case _:
+            raise ValueError(f"unknown wide_flat value kind: {kind}")
+
+
+def generate_wide_flat_row(row_idx: int, seed: int) -> dict:
+    rng = make_rng(seed, row_idx)
+    event: dict = {"event_name": "page_view"}
+    for key, kind in WIDE_FLAT_FIELDS:
+        event[key] = wide_flat_value(rng, kind)
+    return {
+        "json_wide_flat": json.dumps(event, separators=(",", ":")),
+        "g1e1": f"g_{row_idx % 10}",
+        "g1e4": f"g_{row_idx % 10000}",
+    }
+
+
+def generate_wide_flat_data(size_name: str, num_rows: int, seed: int) -> None:
+    print(f"Generating wide_flat {size_name} ({num_rows:,} rows) with seed={seed}...")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = DATA_DIR / f"wide_flat_{size_name}.parquet"
+
+    conn = duckdb.connect()
+
+    batch_size = 50_000
+    rows_generated = 0
+    temp_table_created = False
+
+    while rows_generated < num_rows:
+        batch_rows = min(batch_size, num_rows - rows_generated)
+        batch = [
+            generate_wide_flat_row(rows_generated + i, seed) for i in range(batch_rows)
+        ]
+
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE batch (
+                json_wide_flat JSON,
+                g1e1 VARCHAR,
+                g1e4 VARCHAR
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO batch VALUES (?, ?, ?)",
+            [(r["json_wide_flat"], r["g1e1"], r["g1e4"]) for r in batch],
+        )
+
+        if not temp_table_created:
+            conn.execute("CREATE OR REPLACE TABLE data AS SELECT * FROM batch")
+            temp_table_created = True
+        else:
+            conn.execute("INSERT INTO data SELECT * FROM batch")
+
+        rows_generated += batch_rows
+        print(f"  {rows_generated:,} / {num_rows:,}")
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        f"""
+        COPY data TO '{output_path}' (
+            FORMAT PARQUET,
+            KV_METADATA {{
+                seed: '{seed}',
+                size: '{size_name}',
+                rows: '{num_rows}',
+                generated_at: '{generated_at}',
+                schema_version: 'wide_flat_pageview_v1'
+            }}
+        )
+        """
+    )
+    conn.close()
+
+    print(f"  Saved to {output_path}")
+
+
 def clean_path(path: str) -> str:
     return path.split("?", 1)[0]
 
@@ -826,7 +1071,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--kind",
-        choices=["all", "events", "urls", "numbers"],
+        choices=["all", "events", "urls", "numbers", "wide_flat"],
         default="all",
         help="Dataset kind to generate (default: all)",
     )
@@ -842,6 +1087,8 @@ def main() -> None:
             generate_url_data(args.size, URL_SIZES[args.size], args.seed)
         if args.kind in ("all", "numbers") and args.size in NUMBERS_SIZES:
             generate_numbers_data(args.size, NUMBERS_SIZES[args.size], args.seed)
+        if args.kind in ("all", "wide_flat") and args.size in WIDE_FLAT_SIZES:
+            generate_wide_flat_data(args.size, WIDE_FLAT_SIZES[args.size], args.seed)
     else:
         if args.kind in ("all", "events"):
             for size_name, num_rows in SIZES.items():
@@ -852,6 +1099,9 @@ def main() -> None:
         if args.kind in ("all", "numbers"):
             for size_name, num_rows in NUMBERS_SIZES.items():
                 generate_numbers_data(size_name, num_rows, args.seed)
+        if args.kind in ("all", "wide_flat"):
+            for size_name, num_rows in WIDE_FLAT_SIZES.items():
+                generate_wide_flat_data(size_name, num_rows, args.seed)
 
 
 if __name__ == "__main__":

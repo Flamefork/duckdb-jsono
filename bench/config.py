@@ -87,6 +87,47 @@ NUMBERS_SIZES = {
 }
 NUMBERS_PARSE_COPY_PATH = RESULTS_DIR / "numbers_parse_copy.parquet"
 
+# Wide-flat page_view-class dataset: one schema-stable object of ~100 scalar
+# top-level keys, no nesting. Merge-family performance is shape-dependent
+# (wide-flat sorted-key merge vs deep-nested descent), so merge scenarios need
+# this shape represented next to the deep-nested retail sample.
+WIDE_FLAT_SIZES = {
+    "100k": 100_000,
+}
+
+# Shred set for shredded scenarios over the field_sample page_view shape:
+# always-present scalar keys, matching the rick/data deployment plan.
+FIELD_SAMPLE_SHREDDING_SPEC = {
+    "clientID": "VARCHAR",
+    "event_name": "VARCHAR",
+    "url": "VARCHAR",
+    "UTMSource": "VARCHAR",
+}
+
+# Filterless multi-extract projection paths: two covered by
+# FIELD_SAMPLE_SHREDDING_SPEC, three residual-only, so the shredded variant
+# exercises both the struct_extract rewrite and the per-path residual reads
+# that O-1/O-2 want to fuse.
+FIELD_SAMPLE_PROJECT_PATHS = [
+    "$.clientID",
+    "$.event_name",
+    "$.browser",
+    "$.regionCity",
+    "$.operatingSystem",
+]
+
+# Filtered multi-predicate read: three residual-only paths (none in
+# FIELD_SAMPLE_SHREDDING_SPEC), each an IN over its common values so most rows
+# pass several predicates and the matcher pays all three residual locates. The
+# matcher fuses them into one __jsono_internal_match over a single residual read
+# (O-2); without the fuse the shredded variant pays three residual reads + three
+# manifest checks per row.
+FIELD_SAMPLE_FILTER_PREDICATES = [
+    {"path": "$.browser", "values": ["chrome", "yandex_browser", "safari_mobile"]},
+    {"path": "$.operatingSystem", "values": ["windows10", "ios18", "android"]},
+    {"path": "$.regionCity", "values": ["Moscow", "Saint Petersburg", "Kiev"]},
+]
+
 PLUCK_CORE_SPEC = {
     "event_name": "VARCHAR",
     "event_id": "VARCHAR",

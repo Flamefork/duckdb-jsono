@@ -85,7 +85,7 @@ void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, 
 constexpr const char *JSONO_LAYOUT = "jsono";
 
 // Parse one layout field (top-level child name + its STRUCT type) into `out`. The body must be the
-// four-BLOB body struct as field 0; a shredded layout adds its typed shreds as the remaining sibling
+// six-BLOB body struct as field 0; a shredded layout adds its typed shreds as the remaining sibling
 // fields. Shreds sit beside `body` (not in a nested struct) deliberately: `body` is then a field
 // every two JSONO types share, so DuckDB's by-name struct cast binds between ANY two of them —
 // including fully disjoint shred sets — and the optimizer can rewrite every such cast into the
@@ -183,6 +183,8 @@ LogicalType JsonoBodyStructType() {
 	children.emplace_back("key_heap", LogicalType::BLOB);
 	children.emplace_back("string_heap", LogicalType::BLOB);
 	children.emplace_back("skips", LogicalType::BLOB);
+	children.emplace_back("lengths", LogicalType::BLOB);
+	children.emplace_back("nums", LogicalType::BLOB);
 	return LogicalType::STRUCT(std::move(children));
 }
 

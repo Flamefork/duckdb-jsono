@@ -17,13 +17,13 @@ namespace {
 using namespace jsono;
 using namespace jsono_dom;
 
-// Per-thread state for jsono. Lifting the parser allocator, builder, and
-// shape cache out of the per-chunk stack means heap capacities stabilise
-// after one chunk and the LRU shape cache survives across chunks for the
-// duration of the query — the whole point of the cache.
+// Per-thread state for jsono. Lifting the parser allocator, direct-writer
+// state, and shape cache out of the per-chunk stack means heap capacities
+// stabilise after one chunk and the shape cache survives across chunks for
+// the duration of the query — the whole point of the cache.
 struct JsonoParseLocalState : public FunctionLocalState {
 	YyjsonAllocator parser;
-	DomJsonoBuilder builder;
+	DomDirectState dom;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -39,8 +39,7 @@ struct JsonoParseLocalState : public FunctionLocalState {
 	}
 };
 
-bool HandleJsonoInputError(const string &message, Vector &result, Vector &key_heap_vec, Vector &string_heap_vec,
-                           Vector &slots_vec, Vector &skips_vec, idx_t row, bool null_on_error,
+bool HandleJsonoInputError(const string &message, JsonoBodyWriter &writer, idx_t row, bool null_on_error,
                            CastParameters *parameters) {
 	if (!null_on_error) {
 		if (parameters) {
@@ -49,7 +48,7 @@ bool HandleJsonoInputError(const string &message, Vector &result, Vector &key_he
 			throw InvalidInputException(message);
 		}
 	}
-	SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+	writer.SetRowNull(row);
 	return false;
 }
 
@@ -59,44 +58,27 @@ bool ParseJsonoVector(Vector &input, idx_t count, Vector &result, JsonoParseLoca
 	input.ToUnifiedFormat(count, input_fmt);
 	auto inputs = UnifiedVectorFormat::GetData<string_t>(input_fmt);
 
-	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
-	InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
-	auto &slots_vec = *slots_p;
-	auto &key_heap_vec = *key_heap_p;
-	auto &string_heap_vec = *string_heap_p;
-	auto &skips_vec = *skips_p;
-	auto slots_data = FlatVector::GetData<string_t>(slots_vec);
-	auto key_heap_data = FlatVector::GetData<string_t>(key_heap_vec);
-	auto string_heap_data = FlatVector::GetData<string_t>(string_heap_vec);
-	auto skips_data = FlatVector::GetData<string_t>(skips_vec);
+	JsonoBodyWriter writer;
+	writer.Init(result);
 
-	// One pass to sum input bytes for the reserve heuristic. Cheap relative to
-	// the actual parse/emit work and pays for itself in avoided reallocs on
-	// the first chunk; subsequent chunks no-op out of the reserve calls.
-	size_t total_input_bytes = 0;
-	for (idx_t i = 0; i < count; i++) {
-		auto idx = input_fmt.sel->get_index(i);
-		if (input_fmt.validity.RowIsValid(idx)) {
-			total_input_bytes += inputs[idx].GetSize();
-		}
-	}
-	lstate.builder.ReserveForChunk(total_input_bytes);
-
-	auto &builder = lstate.builder;
+	auto &dom = lstate.dom;
 	auto &parser = lstate.parser;
 	bool all_converted = true;
+	// try_jsono sets null_on_error; TRY_CAST signals tolerance via a non-null error_message slot
+	// instead. Writer-limit throws from the emit path (nesting depth, key/string size) must honour
+	// both, while the strict forms keep throwing.
+	bool tolerate_limit_errors = null_on_error || (parameters && parameters->error_message);
 
 	for (idx_t i = 0; i < count; i++) {
 		auto idx = input_fmt.sel->get_index(i);
 		if (!input_fmt.validity.RowIsValid(idx)) {
-			SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, i);
+			writer.SetRowNull(i);
 			continue;
 		}
 		auto input = inputs[idx];
 		if (input.GetSize() == 0) {
 			all_converted = false;
-			HandleJsonoInputError("jsono: input is empty", result, key_heap_vec, string_heap_vec, slots_vec, skips_vec,
-			                      i, null_on_error, parameters);
+			HandleJsonoInputError("jsono: input is empty", writer, i, null_on_error, parameters);
 			continue;
 		}
 
@@ -105,23 +87,22 @@ bool ParseJsonoVector(Vector &input, idx_t count, Vector &result, JsonoParseLoca
 		if (!doc) {
 			all_converted = false;
 			auto message = StringUtil::Format("jsono: invalid JSON - %s", err.msg);
-			HandleJsonoInputError(message, result, key_heap_vec, string_heap_vec, slots_vec, skips_vec, i,
-			                      null_on_error, parameters);
+			HandleJsonoInputError(message, writer, i, null_on_error, parameters);
 			continue;
 		}
 
-		builder.Reset();
-		bool emitted = EmitDomElement(yyjson_doc_get_root(doc), builder);
-		yyjson_doc_free(doc);
-		if (!emitted) {
+		try {
+			EmitDomRowDirect(yyjson_doc_get_root(doc), dom, writer, i);
+		} catch (const InvalidInputException &ex) {
+			yyjson_doc_free(doc);
+			if (!tolerate_limit_errors) {
+				throw;
+			}
 			all_converted = false;
-			HandleJsonoInputError("jsono: unsupported JSON value", result, key_heap_vec, string_heap_vec, slots_vec,
-			                      skips_vec, i, null_on_error, parameters);
+			HandleJsonoInputError(ex.what(), writer, i, null_on_error, parameters);
 			continue;
 		}
-
-		WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_data, key_heap_data,
-		                 string_heap_data, skips_data, i, builder);
+		yyjson_doc_free(doc);
 	}
 
 	if (input.GetVectorType() == VectorType::CONSTANT_VECTOR && count > 0) {

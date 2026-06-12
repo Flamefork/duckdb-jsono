@@ -16,24 +16,48 @@
 namespace duckdb {
 namespace jsono {
 
+// The number of body BLOBs and their fixed child order inside the body STRUCT.
+constexpr idx_t BODY_BLOB_COUNT = 6;
+constexpr idx_t BODY_SLOTS = 0;
+constexpr idx_t BODY_KEY_HEAP = 1;
+constexpr idx_t BODY_STRING_HEAP = 2;
+constexpr idx_t BODY_SKIPS = 3;
+constexpr idx_t BODY_LENGTHS = 4;
+constexpr idx_t BODY_NUMS = 5;
+
 struct JsonoBuilder {
 	std::vector<uint64_t> slots;
 	std::vector<char> key_heap;
 	std::vector<char> string_heap;
+	std::vector<uint32_t> lengths;
+	std::vector<uint64_t> nums;
+	// Sparse span storage: spans exist only for arrays, objects with
+	// child_count > OBJECT_CHECKPOINT_STRIDE, and objects whose immediate children
+	// include a container. `span_ids` holds their container ids; it is sorted by
+	// construction (ids are assigned in container-start order, and a span is pushed
+	// either at the container's own start or at its first container child's start —
+	// at which point its subtree has produced no spans yet). `skips` is the parallel
+	// span array.
+	std::vector<uint32_t> span_ids;
 	std::vector<ContainerSpan> skips;
 	std::vector<ObjectCheckpointIndex> object_checkpoint_index;
 	std::vector<ObjectCursorCheckpoint> object_checkpoints;
+	uint64_t container_count = 0;
+
+	static constexpr size_t NO_SPAN = std::numeric_limits<size_t>::max();
 
 	struct OpenContainer {
 		uint64_t id;
 		uint64_t tag;
 		uint32_t child_count;
 		uint32_t checkpoint_offset;
-		size_t checkpoint_index_pos;
 		uint16_t checkpoint_stride;
 		uint32_t next_child_index;
+		size_t span_index;
 		size_t start_slot;
 		size_t start_string;
+		size_t start_length;
+		size_t start_num;
 	};
 
 	std::vector<OpenContainer> open_containers;
@@ -42,27 +66,19 @@ struct JsonoBuilder {
 		slots.clear();
 		key_heap.clear();
 		string_heap.clear();
+		lengths.clear();
+		nums.clear();
+		span_ids.clear();
 		skips.clear();
 		object_checkpoint_index.clear();
 		object_checkpoints.clear();
 		open_containers.clear();
-	}
-
-	void Reserve(size_t slot_count, size_t key_bytes, size_t value_bytes) {
-		if (slots.capacity() < slot_count) {
-			slots.reserve(slot_count);
-		}
-		if (key_heap.capacity() < key_bytes) {
-			key_heap.reserve(key_bytes);
-		}
-		if (string_heap.capacity() < value_bytes) {
-			string_heap.reserve(value_bytes);
-		}
+		container_count = 0;
 	}
 
 	// Push a KEY slot referencing key bytes already present at [offset, offset+len).
 	// KEY payload packs a 36-bit heap offset and 24-bit length; reject rather than
-	// silently truncate (string values get the full 60-bit length, but keys do not).
+	// silently truncate.
 	void PushKeySlot(uint64_t offset, uint64_t len) {
 		if (len > HEAP_LEN_MASK) {
 			throw InvalidInputException("jsono: object key exceeds maximum length");
@@ -79,27 +95,35 @@ struct JsonoBuilder {
 		key_heap.insert(key_heap.end(), sv.begin(), sv.end());
 	}
 
+	// Append one `lengths` entry. The fixed u32 width is what keeps LengthAt(i) O(1)
+	// for checkpoint jumps, so longer payloads are rejected rather than widened.
+	void PushLength(size_t len) {
+		if (len > std::numeric_limits<uint32_t>::max()) {
+			throw InvalidInputException("jsono: string value exceeds storage limits");
+		}
+		lengths.push_back(uint32_t(len));
+	}
+
 	void EmitString(nonstd::string_view s) {
+		PushLength(s.size());
 		string_heap.insert(string_heap.end(), s.begin(), s.end());
-		slots.push_back(MakeSlot(tag::VAL_STR_HEAP, MakeStringPayload(uint64_t(s.size()))));
+		slots.push_back(MakeSlot(tag::VAL_STR_HEAP, 0));
 	}
 
 	void EmitInt(int64_t v) {
-		if (FitsInt60(v)) {
-			slots.push_back(MakeSlot(tag::VAL_INT60, EncodeInt60(v)));
-		} else {
-			slots.push_back(MakeExtSlot(ext_subtype::INT64));
-			slots.push_back(uint64_t(v));
-		}
+		slots.push_back(FitsInt60(v) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64));
+		nums.push_back(uint64_t(v));
 	}
 
 	void EmitUInt(uint64_t v) {
-		if (v <= uint64_t(INT60_MAX)) {
-			slots.push_back(MakeSlot(tag::VAL_INT60, EncodeInt60(int64_t(v))));
-		} else {
-			slots.push_back(MakeExtSlot(ext_subtype::UINT64));
-			slots.push_back(v);
+		// Stay on the encoding ladder: an int64-representable value takes INT60/VAL_EXT-INT64 so
+		// its slot tag never depends on which writer produced it; only 2^63..2^64-1 is UINT64.
+		if (v <= uint64_t(std::numeric_limits<int64_t>::max())) {
+			EmitInt(int64_t(v));
+			return;
 		}
+		slots.push_back(MakeExtSlot(ext_subtype::UINT64));
+		nums.push_back(v);
 	}
 
 	void EmitDouble(double v) {
@@ -111,18 +135,20 @@ struct JsonoBuilder {
 		slots.push_back(MakeExtSlot(ext_subtype::DOUBLE));
 		uint64_t bits;
 		std::memcpy(&bits, &v, sizeof(bits));
-		slots.push_back(bits);
+		nums.push_back(bits);
 	}
 
 	void EmitDec60(bool negative, uint64_t abs_mantissa, uint64_t scale) {
-		slots.push_back(MakeSlot(tag::VAL_DEC60, MakeDec60Payload(negative, abs_mantissa, scale)));
+		slots.push_back(MakeSlot(tag::VAL_DEC60, 0));
+		nums.push_back(MakeDec60Payload(negative, abs_mantissa, scale));
 	}
 
 	// VAL_EXT/NUMBER: raw byte-exact number text stored in string_heap and
 	// consumed in walk order, like a string value.
 	void EmitNumberText(nonstd::string_view text) {
+		PushLength(text.size());
 		string_heap.insert(string_heap.end(), text.begin(), text.end());
-		slots.push_back(MakeNumberExtSlot(uint64_t(text.size())));
+		slots.push_back(MakeExtSlot(ext_subtype::NUMBER));
 	}
 
 	void EmitBool(bool b) {
@@ -133,6 +159,39 @@ struct JsonoBuilder {
 		slots.push_back(MakeSlot(tag::VAL_NULL, 0));
 	}
 
+	// Whether a container stores a ContainerSpan regardless of its children: every array
+	// (no inline child count, so a skip cannot walk it without one) and every object
+	// large enough to get cursor checkpoints. An object whose immediate children include
+	// a container also stores a span — skipping it would otherwise walk the whole child
+	// subtree — but that is only known once a container child opens, so it is allocated
+	// lazily (EnsureParentObjectSpan) or eagerly by direct emitters whose child shapes
+	// are static. Small flat objects (scalars only) store nothing: their skip is a cheap
+	// walk over their own slots.
+	static bool ContainerStoresSpan(uint64_t container_tag, uint32_t child_count) {
+		return container_tag == tag::ARR_START ||
+		       (container_tag == tag::OBJ_START && child_count > OBJECT_CHECKPOINT_STRIDE);
+	}
+
+	void PushContainerSpanPlaceholder(uint64_t id, size_t &span_index) {
+		span_index = skips.size();
+		span_ids.push_back(uint32_t(id));
+		skips.push_back(ContainerSpan {0, 0, 0, 0, 0});
+	}
+
+	// Called when a container child opens: its parent object's skip is now a subtree
+	// walk, so the parent stores a span too. At the first container child's start the
+	// parent's subtree has produced no spans yet (an earlier spanned descendant would
+	// have allocated the parent already), so appending keeps `span_ids` sorted.
+	void EnsureParentObjectSpan() {
+		if (open_containers.empty()) {
+			return;
+		}
+		auto &parent = open_containers.back();
+		if (parent.tag == tag::OBJ_START && parent.span_index == NO_SPAN) {
+			PushContainerSpanPlaceholder(parent.id, parent.span_index);
+		}
+	}
+
 	void EmitContainerStart(uint64_t container_tag, uint32_t child_count) {
 		// open_containers.size() is the current nesting depth; reject before opening
 		// another level so deep input cannot overflow the recursive tape walkers.
@@ -140,17 +199,19 @@ struct JsonoBuilder {
 			throw InvalidInputException("jsono: nesting depth exceeds maximum of %llu",
 			                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
 		}
-		if (skips.size() > CONTAINER_ID_MAX) {
+		// The sparse span index stores u32 ids (and CONTAINER_ID_MAX bounds the payload).
+		if (container_count > std::numeric_limits<uint32_t>::max() || container_count > CONTAINER_ID_MAX) {
 			throw InvalidInputException("jsono: too many containers for storage");
 		}
-		auto id = uint64_t(skips.size());
+		EnsureParentObjectSpan();
+		auto id = container_count++;
+		auto span_index = NO_SPAN;
+		if (ContainerStoresSpan(container_tag, child_count)) {
+			PushContainerSpanPlaceholder(id, span_index);
+		}
 		auto checkpoint_offset = NO_OBJECT_CHECKPOINTS;
-		auto checkpoint_index_pos = std::numeric_limits<size_t>::max();
 		auto checkpoint_stride = uint16_t(0);
 		if (container_tag == tag::OBJ_START && child_count > OBJECT_CHECKPOINT_STRIDE) {
-			if (id > std::numeric_limits<uint32_t>::max()) {
-				throw InvalidInputException("jsono: too many containers for object cursor index");
-			}
 			checkpoint_stride = child_count >= LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT ? LARGE_OBJECT_CHECKPOINT_STRIDE
 			                                                                           : OBJECT_CHECKPOINT_STRIDE;
 			auto checkpoint_count = (child_count - 1) / checkpoint_stride;
@@ -158,15 +219,13 @@ struct JsonoBuilder {
 				throw InvalidInputException("jsono: too many object cursor checkpoints for storage");
 			}
 			checkpoint_offset = uint32_t(object_checkpoints.size());
-			checkpoint_index_pos = object_checkpoint_index.size();
 			object_checkpoint_index.push_back(
 			    ObjectCheckpointIndex {uint32_t(id), checkpoint_offset, checkpoint_stride, 0});
 			object_checkpoints.resize(object_checkpoints.size() + checkpoint_count);
 		}
-		skips.push_back(ContainerSpan {0, 0, 0});
-		open_containers.push_back(OpenContainer {id, container_tag, child_count, checkpoint_offset,
-		                                         checkpoint_index_pos, checkpoint_stride, 0, slots.size(),
-		                                         string_heap.size()});
+		open_containers.push_back(OpenContainer {id, container_tag, child_count, checkpoint_offset, checkpoint_stride,
+		                                         0, span_index, slots.size(), string_heap.size(), lengths.size(),
+		                                         nums.size()});
 		slots.push_back(MakeSlot(container_tag, MakeContainerPayload(id, child_count)));
 	}
 
@@ -183,12 +242,17 @@ struct JsonoBuilder {
 			auto value_start = open.start_slot + 1 + size_t(open.child_count);
 			auto slot_delta = slots.size() - value_start;
 			auto string_delta = string_heap.size() - open.start_string;
+			auto length_delta = lengths.size() - open.start_length;
+			auto num_delta = nums.size() - open.start_num;
 			if (slot_delta > std::numeric_limits<uint32_t>::max() ||
-			    string_delta > std::numeric_limits<uint32_t>::max()) {
+			    string_delta > std::numeric_limits<uint32_t>::max() ||
+			    length_delta > std::numeric_limits<uint32_t>::max() ||
+			    num_delta > std::numeric_limits<uint32_t>::max()) {
 				throw InvalidInputException("jsono: object cursor checkpoint exceeds storage limits");
 			}
 			object_checkpoints[open.checkpoint_offset + open.next_child_index / open.checkpoint_stride - 1] =
-			    ObjectCursorCheckpoint {uint32_t(slot_delta), uint32_t(string_delta)};
+			    ObjectCursorCheckpoint {uint32_t(slot_delta), uint32_t(string_delta), uint32_t(length_delta),
+			                            uint32_t(num_delta)};
 		}
 		open.next_child_index++;
 	}
@@ -202,16 +266,22 @@ struct JsonoBuilder {
 		if (open.tag == tag::OBJ_START && open.next_child_index != open.child_count) {
 			throw InternalException("jsono writer: object child count mismatch");
 		}
+		if (open.span_index == NO_SPAN) {
+			return;
+		}
 		auto slot_span = slots.size() - open.start_slot;
 		auto string_byte_span = string_heap.size() - open.start_string;
+		auto length_count = lengths.size() - open.start_length;
+		auto num_count = nums.size() - open.start_num;
 		if (slot_span > std::numeric_limits<uint32_t>::max() ||
-		    string_byte_span > std::numeric_limits<uint32_t>::max()) {
+		    string_byte_span > std::numeric_limits<uint32_t>::max() ||
+		    length_count > std::numeric_limits<uint32_t>::max() || num_count > std::numeric_limits<uint32_t>::max()) {
 			throw InvalidInputException("jsono: container span exceeds storage limits");
 		}
-		// Objects carry a shape_hash over their stored (sorted) KEY slots; arrays leave it 0.
-		// The struct constructor's external_root_keys fast path writes KEY slots whose
-		// offsets point into a shared external key_heap (not this builder's), so guard the
-		// fingerprint on the last key being in-bounds; that owner patches skips afterward.
+		// Spanned objects carry a shape_hash over their stored (sorted) KEY slots; arrays
+		// leave it 0. The struct constructor's external_root_keys fast path writes KEY slots
+		// whose offsets point into a shared external key_heap (not this builder's), so guard
+		// the fingerprint on the last key being in-bounds; that owner patches skips afterward.
 		uint64_t shape_hash = 0;
 		if (open.tag == tag::OBJ_START && open.child_count > 0) {
 			auto last_key_payload = SlotPayload(slots[open.start_slot + open.child_count]);
@@ -221,7 +291,8 @@ struct JsonoBuilder {
 		} else if (open.tag == tag::OBJ_START) {
 			shape_hash = HASH_SEED; // empty object: stable constant, matches HashObjectKeySlots(0 keys)
 		}
-		skips[open.id] = ContainerSpan {uint32_t(slot_span), uint32_t(string_byte_span), shape_hash};
+		skips[open.span_index] = ContainerSpan {uint32_t(slot_span), uint32_t(string_byte_span), shape_hash,
+		                                        uint32_t(length_count), uint32_t(num_count)};
 	}
 
 	void EmitObjectStart(uint64_t N) {
@@ -277,11 +348,13 @@ inline string_t WriteJsonoBlobInto(Vector &vec, const JsonoBuilder &builder) {
 // `manifest` is the pre-serialized shred-manifest tail (see ShredManifestEntry in jsono.hpp),
 // appended after the checkpoint sections; only the shred writer passes one.
 inline string_t WriteSkipsBlobInto(Vector &vec, const JsonoBuilder &builder, const std::string *manifest = nullptr) {
+	auto span_ids_bytes = builder.span_ids.size() * sizeof(uint32_t);
 	auto spans_bytes = builder.skips.size() * sizeof(ContainerSpan);
 	auto index_bytes = builder.object_checkpoint_index.size() * sizeof(ObjectCheckpointIndex);
 	auto checkpoints_bytes = builder.object_checkpoints.size() * sizeof(ObjectCursorCheckpoint);
 	auto manifest_bytes = manifest ? manifest->size() : 0;
-	auto total = sizeof(ContainerMetadataHeader) + spans_bytes + index_bytes + checkpoints_bytes + manifest_bytes;
+	auto total = sizeof(ContainerMetadataHeader) + span_ids_bytes + spans_bytes + index_bytes + checkpoints_bytes +
+	             manifest_bytes;
 	auto skips_str = StringVector::EmptyString(vec, total);
 	auto skips_dst = skips_str.GetDataWriteable();
 
@@ -291,40 +364,46 @@ inline string_t WriteSkipsBlobInto(Vector &vec, const JsonoBuilder &builder, con
 		throw InvalidInputException("jsono: skips blob exceeds storage limits");
 	}
 	ContainerMetadataHeader header;
-	header.container_count = uint32_t(builder.skips.size());
+	header.span_count = uint32_t(builder.skips.size());
 	header.checkpoint_index_count = uint32_t(builder.object_checkpoint_index.size());
 	header.checkpoint_count = uint32_t(builder.object_checkpoints.size());
 	std::memcpy(skips_dst, &header, sizeof(header));
+	auto offset = sizeof(header);
+	if (span_ids_bytes > 0) {
+		std::memcpy(skips_dst + offset, builder.span_ids.data(), span_ids_bytes);
+	}
+	offset += span_ids_bytes;
 	if (spans_bytes > 0) {
-		std::memcpy(skips_dst + sizeof(header), builder.skips.data(), spans_bytes);
+		std::memcpy(skips_dst + offset, builder.skips.data(), spans_bytes);
 	}
+	offset += spans_bytes;
 	if (index_bytes > 0) {
-		std::memcpy(skips_dst + sizeof(header) + spans_bytes, builder.object_checkpoint_index.data(), index_bytes);
+		std::memcpy(skips_dst + offset, builder.object_checkpoint_index.data(), index_bytes);
 	}
+	offset += index_bytes;
 	if (checkpoints_bytes > 0) {
-		std::memcpy(skips_dst + sizeof(header) + spans_bytes + index_bytes, builder.object_checkpoints.data(),
-		            checkpoints_bytes);
+		std::memcpy(skips_dst + offset, builder.object_checkpoints.data(), checkpoints_bytes);
 	}
+	offset += checkpoints_bytes;
 	if (manifest_bytes > 0) {
-		std::memcpy(skips_dst + sizeof(header) + spans_bytes + index_bytes + checkpoints_bytes, manifest->data(),
-		            manifest_bytes);
+		std::memcpy(skips_dst + offset, manifest->data(), manifest_bytes);
 	}
 	skips_str.Finalize();
 	return skips_str;
 }
 
-inline void WriteJsonoStruct(Vector &slots_vec, Vector &key_heap_vec, Vector &string_heap_vec, Vector &skips_vec,
-                             string_t *slots_data, string_t *key_heap_data, string_t *string_heap_data,
-                             string_t *skips_data, idx_t row, const JsonoBuilder &builder,
-                             const std::string *manifest = nullptr) {
-	slots_data[row] = WriteJsonoBlobInto(slots_vec, builder);
-	key_heap_data[row] = WriteBlobInto(key_heap_vec, builder.key_heap.data(), builder.key_heap.size());
-	string_heap_data[row] = WriteBlobInto(string_heap_vec, builder.string_heap.data(), builder.string_heap.size());
-	skips_data[row] = WriteSkipsBlobInto(skips_vec, builder, manifest);
+inline string_t WriteLengthsBlobInto(Vector &vec, const JsonoBuilder &builder) {
+	return WriteBlobInto(vec, reinterpret_cast<const char *>(builder.lengths.data()),
+	                     builder.lengths.size() * sizeof(uint32_t));
+}
+
+inline string_t WriteNumsBlobInto(Vector &vec, const JsonoBuilder &builder) {
+	return WriteBlobInto(vec, reinterpret_cast<const char *>(builder.nums.data()),
+	                     builder.nums.size() * sizeof(uint64_t));
 }
 
 // The body struct vector of a jsono result vector (plain or shredded): top-level layout field [0]
-// -> body [0]. The four blob vectors are its children.
+// -> body [0]. The six blob vectors are its children.
 inline Vector &JsonoBodyVector(Vector &result) {
 	auto &layout = *StructVector::GetEntries(result)[0];
 	return *StructVector::GetEntries(layout)[0];
@@ -337,41 +416,77 @@ inline Vector &JsonoShredVector(Vector &result, idx_t shred_index) {
 	return *StructVector::GetEntries(layout)[1 + shred_index];
 }
 
-// Resolve a jsono result vector's four body blob child vectors, flattening the nested struct chain
-// (result -> layout -> body -> blobs) so the caller can write flat blob data. Mirrors
-// InitJsonoVectorData's navigation on the write side; the rest of the writer is layout-agnostic.
-// Only the result and the four leaf blobs are flattened — the intermediate layout/body (and shreds)
-// structs are never NULL-set by the writer (a NULL row nulls only the top level, which the reader
-// short-circuits on), so they need no per-chunk validity reset.
-inline void InitJsonoBodyWrite(Vector &result, Vector *&slots, Vector *&key_heap, Vector *&string_heap,
-                               Vector *&skips) {
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &layout = *StructVector::GetEntries(result)[0];
-	auto &body = *StructVector::GetEntries(layout)[0];
-	auto &blobs = StructVector::GetEntries(body);
-	for (auto &blob : blobs) {
-		blob->SetVectorType(VectorType::FLAT_VECTOR);
-	}
-	slots = blobs[0].get();
-	key_heap = blobs[1].get();
-	string_heap = blobs[2].get();
-	skips = blobs[3].get();
-}
+// Write-side handle over a jsono result vector's six body blob children, flattening the nested
+// struct chain (result -> layout -> body -> blobs) once so per-row writes are flat data stores.
+// Mirrors InitJsonoVectorData's navigation on the write side; the rest of the writer is
+// layout-agnostic. The validity masks of all nine levels are cached at Init so a NULL row is
+// nine direct mask stores instead of FlatVector::SetNull's per-row recursion through
+// StructVector::GetEntries (which dominated extract scenarios with many absent-path rows).
+struct JsonoBodyWriter {
+	static constexpr idx_t NULL_MASK_COUNT = BODY_BLOB_COUNT + 3;
 
-// Null a jsono row: the top-level struct plus its four body blobs. The top-level NULL is what makes
-// the row read back as SQL NULL (the reader short-circuits on it before any inner level), so the
-// intermediate layout/body structs are intentionally left untouched — nulling them per row showed up
-// as the dominant cost on extract scenarios with many absent-path rows. A shredded result's shred
-// columns are nulled by the caller (they are written per-row anyway). Mirrors the flat-layout writer:
-// result + four blobs.
-inline void SetJsonoStructNull(Vector &result, Vector &slots_vec, Vector &key_heap_vec, Vector &string_heap_vec,
-                               Vector &skips_vec, idx_t row) {
-	FlatVector::SetNull(result, row, true);
-	FlatVector::SetNull(slots_vec, row, true);
-	FlatVector::SetNull(key_heap_vec, row, true);
-	FlatVector::SetNull(string_heap_vec, row, true);
-	FlatVector::SetNull(skips_vec, row, true);
-}
+	Vector *result = nullptr;
+	Vector *vec[BODY_BLOB_COUNT] = {nullptr};
+	string_t *data[BODY_BLOB_COUNT] = {nullptr};
+	ValidityMask *null_masks[NULL_MASK_COUNT] = {nullptr};
+
+	void Init(Vector &result_p) {
+		result = &result_p;
+		result_p.SetVectorType(VectorType::FLAT_VECTOR);
+		auto &layout = *StructVector::GetEntries(result_p)[0];
+		auto &body = *StructVector::GetEntries(layout)[0];
+		null_masks[0] = &FlatVector::Validity(result_p);
+		null_masks[1] = &FlatVector::Validity(layout);
+		null_masks[2] = &FlatVector::Validity(body);
+		auto &blobs = StructVector::GetEntries(body);
+		for (idx_t i = 0; i < BODY_BLOB_COUNT; i++) {
+			blobs[i]->SetVectorType(VectorType::FLAT_VECTOR);
+			vec[i] = blobs[i].get();
+			data[i] = FlatVector::GetData<string_t>(*blobs[i]);
+			null_masks[3 + i] = &FlatVector::Validity(*blobs[i]);
+		}
+	}
+
+	Vector &Slots() {
+		return *vec[BODY_SLOTS];
+	}
+	Vector &KeyHeap() {
+		return *vec[BODY_KEY_HEAP];
+	}
+	Vector &StringHeap() {
+		return *vec[BODY_STRING_HEAP];
+	}
+	Vector &Skips() {
+		return *vec[BODY_SKIPS];
+	}
+	Vector &Lengths() {
+		return *vec[BODY_LENGTHS];
+	}
+	Vector &Nums() {
+		return *vec[BODY_NUMS];
+	}
+
+	void WriteRow(idx_t row, const JsonoBuilder &builder, const std::string *manifest = nullptr) {
+		data[BODY_SLOTS][row] = WriteJsonoBlobInto(Slots(), builder);
+		data[BODY_KEY_HEAP][row] = WriteBlobInto(KeyHeap(), builder.key_heap.data(), builder.key_heap.size());
+		data[BODY_STRING_HEAP][row] =
+		    WriteBlobInto(StringHeap(), builder.string_heap.data(), builder.string_heap.size());
+		data[BODY_SKIPS][row] = WriteSkipsBlobInto(Skips(), builder, manifest);
+		data[BODY_LENGTHS][row] = WriteLengthsBlobInto(Lengths(), builder);
+		data[BODY_NUMS][row] = WriteNumsBlobInto(Nums(), builder);
+	}
+
+	// Null a jsono row: all nine levels (result, layout, body, six blobs), matching what
+	// FlatVector::SetNull's struct recursion would set — the top-level NULL is what makes the
+	// row read back as SQL NULL, and the children must be null too so downstream consumers
+	// never read undefined string_t data. A shredded result's shred columns are nulled by the
+	// caller (they are written per-row anyway).
+	void SetRowNull(idx_t row) {
+		for (idx_t i = 0; i < NULL_MASK_COUNT; i++) {
+			null_masks[i]->SetInvalid(row);
+		}
+	}
+};
 
 } // namespace jsono
 } // namespace duckdb

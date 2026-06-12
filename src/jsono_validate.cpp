@@ -2,6 +2,7 @@
 #include "jsono.hpp"
 #include "jsono_number.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_row_read.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -85,7 +86,7 @@ bool IsValidJsonNumberText(nonstd::string_view text) {
 }
 
 size_t ExpectedSkipsSize(const ContainerMetadataHeader &metadata) {
-	return sizeof(ContainerMetadataHeader) + size_t(metadata.container_count) * sizeof(ContainerSpan) +
+	return sizeof(ContainerMetadataHeader) + size_t(metadata.span_count) * (sizeof(uint32_t) + sizeof(ContainerSpan)) +
 	       size_t(metadata.checkpoint_index_count) * sizeof(ObjectCheckpointIndex) +
 	       size_t(metadata.checkpoint_count) * sizeof(ObjectCursorCheckpoint);
 }
@@ -100,8 +101,8 @@ bool IsValidJsonoUtf8(nonstd::string_view text) {
 	return true;
 }
 
-void ValidateScalar(const JsonoView &view, size_t &pos, size_t &string_cursor) {
-	auto scalar = DecodeScalarAt(view, pos, string_cursor);
+void ValidateScalar(const JsonoView &view, JsonoCursor &cursor) {
+	auto scalar = DecodeScalarAt(view, cursor);
 	switch (scalar.kind) {
 	case JsonoScalarKind::String:
 		if (!Value::StringIsValid(scalar.text.data(), scalar.text.size())) {
@@ -131,16 +132,45 @@ void ValidateScalar(const JsonoView &view, size_t &pos, size_t &string_cursor) {
 	}
 }
 
-void ValidateValue(const JsonoView &view, size_t &pos, size_t &string_cursor, size_t depth,
-                   std::vector<uint32_t> &container_child_counts) {
+// Validate one stored container span against the cursor deltas the walk actually
+// produced. Spans must exist exactly for arrays, objects with child_count >
+// OBJECT_CHECKPOINT_STRIDE, and objects whose immediate children include a container;
+// a spanned object additionally stores the shape_hash of its sorted key sequence.
+void ValidateContainerSpan(const JsonoView &view, uint64_t container_id, bool span_eligible, uint64_t expected_hash,
+                           const JsonoCursor &start, const JsonoCursor &end, size_t &validated_span_count) {
+	ContainerSpan span;
+	bool has_span = view.TryContainerSpan(container_id, span);
+	if (has_span != span_eligible) {
+		throw InvalidInputException(has_span ? "malformed JSONO: unexpected container span"
+		                                     : "malformed JSONO: container span missing");
+	}
+	if (!has_span) {
+		return;
+	}
+	validated_span_count++;
+	if (size_t(span.slot_span) != end.pos - start.pos ||
+	    size_t(span.string_byte_span) != end.string_cursor - start.string_cursor ||
+	    size_t(span.length_count) != end.length_cursor - start.length_cursor ||
+	    size_t(span.num_count) != end.num_cursor - start.num_cursor) {
+		throw InvalidInputException("malformed JSONO: container span does not match its subtree");
+	}
+	if (span.shape_hash != expected_hash) {
+		throw InvalidInputException("malformed JSONO: container shape hash mismatch");
+	}
+}
+
+// Returns whether the validated value is a container (the caller's span eligibility
+// depends on its children's kinds).
+bool ValidateValue(const JsonoView &view, JsonoCursor &cursor, size_t depth,
+                   std::vector<uint32_t> &container_child_counts, size_t &validated_span_count) {
 	if (depth > JSONO_MAX_NESTING_DEPTH) {
 		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
 		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
 	}
-	if (pos >= view.Slots()) {
+	if (cursor.pos >= view.Slots()) {
 		throw InvalidInputException("malformed JSONO: value position out of bounds");
 	}
-	auto slot = view.SlotAt(pos);
+	auto slot = view.SlotAt(cursor.pos);
 	auto slot_tag = SlotTag(slot);
 	auto payload = SlotPayload(slot);
 	switch (slot_tag) {
@@ -149,8 +179,10 @@ void ValidateValue(const JsonoView &view, size_t &pos, size_t &string_cursor, si
 		if (container_id != container_child_counts.size()) {
 			throw InvalidInputException("malformed JSONO: non-sequential container id");
 		}
-		auto layout = ReadObjectLayout(view, pos);
+		auto layout = ReadObjectLayout(view, cursor.pos);
 		container_child_counts.push_back(uint32_t(layout.key_count));
+		JsonoCursor start = cursor;
+		uint64_t shape_hash = HASH_SEED;
 		nonstd::string_view previous_key;
 		for (size_t i = 0; i < layout.key_count; i++) {
 			auto key_slot = view.SlotAt(layout.key_start + i);
@@ -164,17 +196,21 @@ void ValidateValue(const JsonoView &view, size_t &pos, size_t &string_cursor, si
 			if (i > 0 && CompareJsonoKeys(previous_key, key) >= 0) {
 				throw InvalidInputException("malformed JSONO: object keys are not strictly sorted");
 			}
+			shape_hash = HashKey(shape_hash, key);
 			previous_key = key;
 		}
-		auto value_pos = layout.value_start;
+		cursor.pos = layout.value_start;
+		bool has_container_child = false;
 		for (size_t i = 0; i < layout.key_count; i++) {
-			ValidateValue(view, value_pos, string_cursor, depth + 1, container_child_counts);
+			has_container_child |= ValidateValue(view, cursor, depth + 1, container_child_counts, validated_span_count);
 		}
-		if (value_pos != layout.after_pos - 1) {
+		if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
 			throw InvalidInputException("malformed JSONO: object value span mismatch");
 		}
-		pos = layout.after_pos;
-		return;
+		cursor.pos++;
+		ValidateContainerSpan(view, container_id, layout.key_count > OBJECT_CHECKPOINT_STRIDE || has_container_child,
+		                      shape_hash, start, cursor, validated_span_count);
+		return true;
 	}
 	case tag::ARR_START: {
 		auto container_id = ContainerId(payload);
@@ -184,25 +220,28 @@ void ValidateValue(const JsonoView &view, size_t &pos, size_t &string_cursor, si
 		if (ContainerChildCount(payload) != 0) {
 			throw InvalidInputException("malformed JSONO: array child count payload must be zero");
 		}
-		auto end_pos = ReadArrayEndPos(view, pos);
+		auto end_pos = ReadArrayEndPos(view, cursor.pos);
 		container_child_counts.push_back(JSONO_ARRAY_CONTAINER);
-		pos++;
-		while (pos < end_pos) {
-			ValidateValue(view, pos, string_cursor, depth + 1, container_child_counts);
+		JsonoCursor start = cursor;
+		cursor.pos++;
+		while (cursor.pos < end_pos) {
+			ValidateValue(view, cursor, depth + 1, container_child_counts, validated_span_count);
 		}
-		if (pos != end_pos) {
+		if (cursor.pos != end_pos) {
 			throw InvalidInputException("malformed JSONO: array value span mismatch");
 		}
-		pos = end_pos + 1;
-		return;
+		cursor.pos = end_pos + 1;
+		ValidateContainerSpan(view, container_id, true, 0, start, cursor, validated_span_count);
+		return true;
 	}
 	default:
-		ValidateScalar(view, pos, string_cursor);
-		return;
+		ValidateScalar(view, cursor);
+		return false;
 	}
 }
 
-void ValidateMetadata(const JsonoView &view, const std::vector<uint32_t> &container_child_counts) {
+void ValidateMetadata(const JsonoView &view, const std::vector<uint32_t> &container_child_counts,
+                      size_t validated_span_count) {
 	auto &metadata = view.MetadataHeader();
 	if (ExpectedSkipsSize(metadata) != view.SkipsSize()) {
 		// The only legal tail after the checkpoint sections is a shred manifest; parsing it
@@ -210,8 +249,20 @@ void ValidateMetadata(const JsonoView &view, const std::vector<uint32_t> &contai
 		std::vector<jsono::ShredManifestEntry> manifest;
 		view.ReadShredManifest(manifest);
 	}
-	if (metadata.container_count != container_child_counts.size()) {
+	// The walk validated every span-eligible container against a stored span, so an
+	// extra stored span is exactly a count mismatch. The sparse id index must be
+	// strictly sorted (the readers binary-search it) and in container-id range.
+	if (metadata.span_count != validated_span_count) {
 		throw InvalidInputException("malformed JSONO: container metadata count mismatch");
+	}
+	for (uint32_t i = 0; i < metadata.span_count; i++) {
+		auto id = view.SpanIdAt(i);
+		if (id >= container_child_counts.size()) {
+			throw InvalidInputException("malformed JSONO: span container id out of bounds");
+		}
+		if (i > 0 && id <= view.SpanIdAt(i - 1)) {
+			throw InvalidInputException("malformed JSONO: span id index is not sorted");
+		}
 	}
 	uint32_t previous_container_id = 0;
 	uint32_t next_checkpoint_offset = 0;
@@ -251,6 +302,12 @@ void ValidateMetadata(const JsonoView &view, const std::vector<uint32_t> &contai
 			if (checkpoint.string_delta > span.string_byte_span) {
 				throw InvalidInputException("malformed JSONO: object cursor checkpoint heap out of bounds");
 			}
+			if (checkpoint.length_delta > span.length_count) {
+				throw InvalidInputException("malformed JSONO: object cursor checkpoint lengths out of bounds");
+			}
+			if (checkpoint.num_delta > span.num_count) {
+				throw InvalidInputException("malformed JSONO: object cursor checkpoint nums out of bounds");
+			}
 		}
 		next_checkpoint_offset += checkpoint_count;
 		previous_container_id = index.container_id;
@@ -260,7 +317,7 @@ void ValidateMetadata(const JsonoView &view, const std::vector<uint32_t> &contai
 	}
 }
 
-bool ValidateJsonoBlob(const JsonoBlobRow &blob) {
+bool ValidateJsonoBlob(const JsonoBlobRow &blob, ShredManifestVerifier &verifier) {
 	try {
 		JsonoView view = MakeJsonoView(blob);
 		if (!view.ParseHeader() || view.Slots() == 0) {
@@ -269,14 +326,18 @@ bool ValidateJsonoBlob(const JsonoBlobRow &blob) {
 		if (view.HeaderFlags() != flags::SORTED_KEYS || view.HeaderReserved() != 0) {
 			return false;
 		}
-		size_t pos = 0;
-		size_t string_cursor = 0;
+		JsonoCursor cursor;
 		std::vector<uint32_t> container_child_counts;
-		ValidateValue(view, pos, string_cursor, 0, container_child_counts);
-		if (pos != view.Slots() || string_cursor != view.StringHeapSize()) {
+		size_t validated_span_count = 0;
+		ValidateValue(view, cursor, 0, container_child_counts, validated_span_count);
+		if (cursor.pos != view.Slots() || cursor.string_cursor != view.StringHeapSize() ||
+		    cursor.length_cursor != view.LengthCount() || cursor.num_cursor != view.NumCount()) {
 			return false;
 		}
-		ValidateMetadata(view, container_child_counts);
+		ValidateMetadata(view, container_child_counts, validated_span_count);
+		// A narrowed row (its manifest lists a shred the column type lost) is unreadable by
+		// every reader; validate reports it as invalid rather than blessing the framing alone.
+		verifier.Verify(view);
 		return true;
 	} catch (const InvalidInputException &) {
 		return false;
@@ -289,6 +350,9 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 	JsonoVectorData input;
 	InitJsonoVectorData(args.data[0], count, input);
 
+	ShredManifestVerifier verifier;
+	verifier.InitFromType(args.data[0].GetType());
+
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<bool>(result);
 
@@ -298,7 +362,7 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
-		result_data[row] = ValidateJsonoBlob(blob);
+		result_data[row] = ValidateJsonoBlob(blob, verifier);
 	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);

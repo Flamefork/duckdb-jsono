@@ -21,3 +21,34 @@ statement error
 SELECT jsono(repeat('{"a":', 1001) || '1' || repeat('}', 1001));
 ----
 nesting depth exceeds maximum
+
+# The tolerant form maps writer-limit errors (here: depth) to NULL instead of throwing.
+query I
+SELECT try_jsono(repeat('[', 1500) || '1' || repeat(']', 1500)) IS NULL;
+----
+true
+
+query I
+SELECT try_jsono(repeat('{"a":', 1500) || '1' || repeat('}', 1500)) IS NULL;
+----
+true
+
+# TRY_CAST(VARCHAR -> jsono struct) goes through the same parse path and must also yield NULL.
+query I
+SELECT TRY_CAST(repeat('[', 1500) || '1' || repeat(']', 1500)
+                AS STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB,
+                                                   skips BLOB, lengths BLOB, nums BLOB)))) IS NULL;
+----
+true
+
+# Per-row recovery: a too-deep row turns NULL while sibling rows in the same vector still parse.
+query II
+SELECT id, to_json(try_jsono(s)) FROM (VALUES
+    (1, '{"a":1}'),
+    (2, repeat('[', 1500) || '1' || repeat(']', 1500)),
+    (3, '[true]')
+) t(id, s) ORDER BY id;
+----
+1	{"a":1}
+2	NULL
+3	[true]

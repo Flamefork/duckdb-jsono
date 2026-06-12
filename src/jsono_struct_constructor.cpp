@@ -2,6 +2,7 @@
 #include "jsono_dom.hpp"
 #include "jsono_number.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_row_read.hpp"
 #include "jsono_shred.hpp"
 #include "jsono_writer.hpp"
 
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -103,9 +105,20 @@ struct JsonoStructPlan {
 
 struct JsonoStructBindData : public FunctionData {
 	JsonoStructPlan plan;
-	// When non-empty, the constructor builds a plain residual and then shreds these
-	// top-level scalar fields into shred columns (result is a shredded JSONO struct).
+	// When non-empty, the constructor shreds these top-level scalar fields into shred
+	// columns (result is a shredded JSONO struct).
 	vector<std::pair<string, LogicalType>> shreds;
+	// One-pass shredded write (ExecuteStructConstructorShredded): shred values copy straight
+	// from the typed input children and the residual emits only the non-shred fields, so the
+	// full plain value is never materialized. Eligible when every shred name is a literal
+	// top-level key; a '$...'-named field addresses a nested path (ParseShredFieldPath) and
+	// keeps the locate-and-strip path. `shred_fields` maps each shred to its input child,
+	// `residual_fields` lists the non-shred children in input order, and `residual_plan`
+	// is a constructor plan over just those fields (unset when every field is a shred).
+	bool one_pass_shred = false;
+	vector<idx_t> shred_fields;
+	vector<idx_t> residual_fields;
+	JsonoStructPlan residual_plan;
 
 	explicit JsonoStructBindData(JsonoStructPlan plan_p) : plan(std::move(plan_p)) {
 	}
@@ -116,6 +129,10 @@ struct JsonoStructBindData : public FunctionData {
 		// still allocate the shredded return type, leaving the shred children uninitialized.
 		auto copy = make_uniq<JsonoStructBindData>(plan);
 		copy->shreds = shreds;
+		copy->one_pass_shred = one_pass_shred;
+		copy->shred_fields = shred_fields;
+		copy->residual_fields = residual_fields;
+		copy->residual_plan = residual_plan;
 		return std::move(copy);
 	}
 
@@ -143,6 +160,10 @@ struct JsonoStructLocalState : public FunctionLocalState {
 	YyjsonAllocator parser;
 	DomJsonoBuilder builder;
 	unique_ptr<FunctionLocalState> source_cast_state;
+	// Verifies the shred manifest of embedded plain JSONO values (StructValueStrategy::Jsono):
+	// the subtree re-emit drops the manifest, so a narrowed value must fail loud here instead
+	// of laundering the loss. Plain values carry no shreds, so the signature set is empty.
+	jsono::ShredManifestVerifier embedded_jsono_verifier;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -176,11 +197,6 @@ struct JsonoStructVectorData {
 	JsonoVectorData jsono_data;
 	vector<JsonoStructVectorData> children;
 };
-
-void SetJsonoRowNull(Vector &result, Vector &slots_vec, Vector &key_heap_vec, Vector &string_heap_vec,
-                     Vector &skips_vec, idx_t row) {
-	jsono::SetJsonoStructNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
-}
 
 bool IsJsonType(const LogicalType &type) {
 	return type.id() == LogicalTypeId::VARCHAR && type.HasAlias() && type.GetAlias() == LogicalType::JSON_TYPE_NAME;
@@ -241,6 +257,14 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 			return plan;
 		}
 		plan.strategy = StructValueStrategy::Struct;
+		// The format requires unique sorted object keys (readers binary-search, rank-cache and
+		// shape_hash on that invariant). An unnamed struct would emit every field under the
+		// duplicate key "", so reject it here, where both the constructor and the cast bind.
+		if (StructType::IsUnnamed(source_type)) {
+			throw BinderException("%s: unnamed STRUCT (row(...)) has no field names to use as object keys; "
+			                      "use named fields like {'k': ...}",
+			                      function_name);
+		}
 		auto &children = StructType::GetChildTypes(source_type);
 		child_list_t<LogicalType> bound_children;
 		plan.children.reserve(children.size());
@@ -284,6 +308,15 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 		}
 		std::sort(plan.field_perm.begin(), plan.field_perm.end(),
 		          [&](uint32_t left, uint32_t right) { return plan.field_names[left] < plan.field_names[right]; });
+		// Duplicate names are unreachable from SQL (DuckDB's binder rejects them in every struct
+		// constructor), but type-level duplicates would corrupt the unique-key invariant, so fail
+		// loud rather than silently dropping a field the caller passed.
+		for (idx_t i = 1; i < plan.field_perm.size(); i++) {
+			if (plan.field_names[plan.field_perm[i - 1]] == plan.field_names[plan.field_perm[i]]) {
+				throw BinderException("%s: duplicate STRUCT field name '%s'", function_name,
+				                      plan.field_names[plan.field_perm[i]]);
+			}
+		}
 		for (auto field_idx : plan.field_perm) {
 			auto &field_name = plan.field_names[field_idx];
 			auto offset = plan.key_heap.size();
@@ -397,18 +430,18 @@ bool ConstructorValueRowIsNull(const JsonoStructVectorData &data, idx_t row) {
 	}
 }
 
-void EmitJsonoSubtree(const JsonoView &view, size_t &pos, size_t &string_cursor, JsonoBuilder &builder) {
-	if (pos >= view.Slots()) {
+void EmitJsonoSubtree(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &builder) {
+	if (cursor.pos >= view.Slots()) {
 		builder.EmitNull();
 		return;
 	}
-	auto slot_tag = SlotTag(view.SlotAt(pos));
+	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
 	switch (slot_tag) {
 	case tag::OBJ_START: {
-		auto layout = ReadObjectLayout(view, pos);
+		auto layout = ReadObjectLayout(view, cursor.pos);
 		auto key_start = layout.key_start;
 		auto key_count = layout.key_count;
-		auto val_cursor = layout.value_start;
+		cursor.pos = layout.value_start;
 		builder.EmitObjectStart(key_count);
 		for (size_t i = 0; i < key_count; i++) {
 			auto key_slot = view.SlotAt(key_start + i);
@@ -419,28 +452,28 @@ void EmitJsonoSubtree(const JsonoView &view, size_t &pos, size_t &string_cursor,
 		}
 		for (size_t i = 0; i < key_count; i++) {
 			builder.EmitObjectChildStart();
-			EmitJsonoSubtree(view, val_cursor, string_cursor, builder);
+			EmitJsonoSubtree(view, cursor, builder);
 		}
 		builder.EmitObjectEnd();
-		if (val_cursor != layout.after_pos - 1) {
+		if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
 			throw InvalidInputException("malformed JSONO: object value span mismatch");
 		}
-		pos = layout.after_pos;
+		cursor.pos++;
 		return;
 	}
 	case tag::ARR_START: {
-		auto end_pos = ReadArrayEndPos(view, pos);
+		auto end_pos = ReadArrayEndPos(view, cursor.pos);
 		builder.EmitArrayStart();
-		pos++;
-		while (pos < end_pos) {
-			EmitJsonoSubtree(view, pos, string_cursor, builder);
+		cursor.pos++;
+		while (cursor.pos < end_pos) {
+			EmitJsonoSubtree(view, cursor, builder);
 		}
-		pos = end_pos + 1;
+		cursor.pos = end_pos + 1;
 		builder.EmitArrayEnd();
 		return;
 	}
 	default: {
-		auto scalar = DecodeScalarAt(view, pos, string_cursor);
+		auto scalar = DecodeScalarAt(view, cursor);
 		switch (scalar.kind) {
 		case JsonoScalarKind::String:
 			builder.EmitString(scalar.text);
@@ -605,31 +638,60 @@ bool EmitConstructorScalarValue(const JsonoStructVectorData &data, idx_t row, Do
 	return false;
 }
 
-uint64_t BeginConstructorDirectContainer(DomJsonoBuilder &builder, uint64_t container_tag, uint32_t child_count) {
+// The direct emitters' cursor snapshot at container start, paired with the sparse span
+// slot the container reserved (JsonoBuilder::NO_SPAN for a small object).
+struct DirectContainerStart {
+	size_t span_index;
+	size_t start_slot;
+	size_t start_string;
+	size_t start_length;
+	size_t start_num;
+};
+
+// `has_container_child` forces the span for an object the caller statically knows holds a
+// container child (the lazy EnsureParentObjectSpan only sees children opened through the
+// builder, and the direct emitters do not register themselves in open_containers).
+DirectContainerStart BeginConstructorDirectContainer(DomJsonoBuilder &builder, uint64_t container_tag,
+                                                     uint32_t child_count, bool has_container_child) {
 	if (child_count > CONTAINER_CHILD_COUNT_MASK) {
 		throw InvalidInputException("jsono: object has too many keys for storage");
 	}
-	if (builder.skips.size() > CONTAINER_ID_MAX) {
+	if (builder.container_count > std::numeric_limits<uint32_t>::max() || builder.container_count > CONTAINER_ID_MAX) {
 		throw InvalidInputException("jsono: too many containers for storage");
 	}
-	auto id = uint64_t(builder.skips.size());
-	builder.skips.push_back(ContainerSpan {0, 0, 0});
+	// A direct container nested inside a general-path object is that object's container
+	// child; the enclosing one_list root (if any) is direct itself and already spanned.
+	builder.EnsureParentObjectSpan();
+	auto id = builder.container_count++;
+	auto span_index = JsonoBuilder::NO_SPAN;
+	if (JsonoBuilder::ContainerStoresSpan(container_tag, child_count) || has_container_child) {
+		builder.PushContainerSpanPlaceholder(id, span_index);
+	}
+	DirectContainerStart start {span_index, builder.slots.size(), builder.string_heap.size(), builder.lengths.size(),
+	                            builder.nums.size()};
 	builder.slots.push_back(MakeSlot(container_tag, MakeContainerPayload(id, child_count)));
-	return id;
+	return start;
 }
 
 // shape_hash is supplied by the caller from the (constant-per-plan) plan.shape_hash
 // rather than recomputed from builder slots: the external_root_keys fast path writes
 // KEY slots whose offsets point into an external key_heap, so builder.key_heap may be
 // empty here. Arrays pass 0.
-void FinishConstructorDirectContainer(DomJsonoBuilder &builder, uint64_t container_id, size_t start_slot,
-                                      size_t start_string, uint64_t shape_hash) {
-	auto slot_span = builder.slots.size() - start_slot;
-	auto string_byte_span = builder.string_heap.size() - start_string;
-	if (slot_span > std::numeric_limits<uint32_t>::max() || string_byte_span > std::numeric_limits<uint32_t>::max()) {
+void FinishConstructorDirectContainer(DomJsonoBuilder &builder, const DirectContainerStart &start,
+                                      uint64_t shape_hash) {
+	if (start.span_index == JsonoBuilder::NO_SPAN) {
+		return;
+	}
+	auto slot_span = builder.slots.size() - start.start_slot;
+	auto string_byte_span = builder.string_heap.size() - start.start_string;
+	auto length_count = builder.lengths.size() - start.start_length;
+	auto num_count = builder.nums.size() - start.start_num;
+	if (slot_span > std::numeric_limits<uint32_t>::max() || string_byte_span > std::numeric_limits<uint32_t>::max() ||
+	    length_count > std::numeric_limits<uint32_t>::max() || num_count > std::numeric_limits<uint32_t>::max()) {
 		throw InvalidInputException("jsono: container span exceeds storage limits");
 	}
-	builder.skips[container_id] = ContainerSpan {uint32_t(slot_span), uint32_t(string_byte_span), shape_hash};
+	builder.skips[start.span_index] = ContainerSpan {uint32_t(slot_span), uint32_t(string_byte_span), shape_hash,
+	                                                 uint32_t(length_count), uint32_t(num_count)};
 }
 
 void EmitConstructorObjectKeys(const JsonoStructPlan &plan, DomJsonoBuilder &builder) {
@@ -732,9 +794,7 @@ void EmitConstructorFlatScalarObject(const JsonoStructVectorData &data, idx_t ro
 
 void EmitConstructorDirectFlatScalarObject(const JsonoStructVectorData &data, idx_t row, DomJsonoBuilder &builder) {
 	auto &plan = *data.plan;
-	auto start_slot = builder.slots.size();
-	auto start_string = builder.string_heap.size();
-	auto container_id = BeginConstructorDirectContainer(builder, tag::OBJ_START, uint32_t(plan.field_perm.size()));
+	auto start = BeginConstructorDirectContainer(builder, tag::OBJ_START, uint32_t(plan.field_perm.size()), false);
 	EmitConstructorObjectKeys(plan, builder);
 	for (auto field_idx : plan.field_perm) {
 		if (!EmitConstructorScalarValue(data.children[field_idx], row, builder)) {
@@ -742,7 +802,7 @@ void EmitConstructorDirectFlatScalarObject(const JsonoStructVectorData &data, id
 		}
 	}
 	builder.slots.push_back(MakeSlot(tag::OBJ_END, 0));
-	FinishConstructorDirectContainer(builder, container_id, start_slot, start_string, plan.shape_hash);
+	FinishConstructorDirectContainer(builder, start, plan.shape_hash);
 }
 
 void EmitConstructorDirectListOfFlatScalarObjects(const JsonoStructVectorData &data, idx_t row,
@@ -754,9 +814,7 @@ void EmitConstructorDirectListOfFlatScalarObjects(const JsonoStructVectorData &d
 	}
 	auto entry = data.list_entries[idx];
 	auto &child = data.children[0];
-	auto start_slot = builder.slots.size();
-	auto start_string = builder.string_heap.size();
-	auto container_id = BeginConstructorDirectContainer(builder, tag::ARR_START, 0);
+	auto start = BeginConstructorDirectContainer(builder, tag::ARR_START, 0, false);
 	auto child_all_valid = child.fmt.validity.AllValid();
 	for (idx_t child_i = entry.offset; child_i < entry.offset + entry.length; child_i++) {
 		if (!child_all_valid && ConstructorValueRowIsNull(child, child_i)) {
@@ -766,14 +824,23 @@ void EmitConstructorDirectListOfFlatScalarObjects(const JsonoStructVectorData &d
 		}
 	}
 	builder.slots.push_back(MakeSlot(tag::ARR_END, 0));
-	FinishConstructorDirectContainer(builder, container_id, start_slot, start_string, 0);
+	FinishConstructorDirectContainer(builder, start, 0);
 }
 
 void EmitConstructorOneListFlatScalarObject(const JsonoStructVectorData &data, idx_t row, DomJsonoBuilder &builder) {
 	auto &plan = *data.plan;
-	auto start_slot = builder.slots.size();
-	auto start_string = builder.string_heap.size();
-	auto container_id = BeginConstructorDirectContainer(builder, tag::OBJ_START, uint32_t(plan.field_perm.size()));
+	// The one list child is this object's only possible container child; per row it is a
+	// container child only when the list itself is non-NULL (a NULL list emits VAL_NULL).
+	bool has_container_child = false;
+	for (auto field_idx : plan.field_perm) {
+		auto &child = data.children[field_idx];
+		if (child.plan->strategy == StructValueStrategy::List &&
+		    child.fmt.validity.RowIsValid(RowIndex(child.fmt, row))) {
+			has_container_child = true;
+		}
+	}
+	auto start =
+	    BeginConstructorDirectContainer(builder, tag::OBJ_START, uint32_t(plan.field_perm.size()), has_container_child);
 	EmitConstructorObjectKeys(plan, builder);
 	for (auto field_idx : plan.field_perm) {
 		auto &child = data.children[field_idx];
@@ -784,7 +851,7 @@ void EmitConstructorOneListFlatScalarObject(const JsonoStructVectorData &data, i
 		}
 	}
 	builder.slots.push_back(MakeSlot(tag::OBJ_END, 0));
-	FinishConstructorDirectContainer(builder, container_id, start_slot, start_string, plan.shape_hash);
+	FinishConstructorDirectContainer(builder, start, plan.shape_hash);
 }
 
 void EmitConstructorObject(const JsonoStructVectorData &data, idx_t row, JsonoStructLocalState &lstate,
@@ -829,9 +896,9 @@ void EmitConstructorValue(const JsonoStructVectorData &data, idx_t row, JsonoStr
 			builder.EmitNull();
 			return;
 		}
-		size_t pos = 0;
-		size_t string_cursor = 0;
-		EmitJsonoSubtree(view, pos, string_cursor, builder);
+		lstate.embedded_jsono_verifier.Verify(view);
+		JsonoCursor cursor;
+		EmitJsonoSubtree(view, cursor, builder);
 		return;
 	}
 
@@ -907,33 +974,35 @@ void WriteSlotInto(char *slots_dst, idx_t slot_idx, uint64_t slot) {
 	std::memcpy(slots_dst + JSONO_HEADER_SIZE + slot_idx * sizeof(uint64_t), &slot, sizeof(slot));
 }
 
-string_t WriteSingleContainerSkipsBlobInto(Vector &vec, uint32_t slot_span, uint32_t string_byte_span,
-                                           uint64_t shape_hash) {
-	auto total = sizeof(ContainerMetadataHeader) + sizeof(ContainerSpan);
+// Skips blob of a single root container: header only when the container stores no span
+// (a small object), header + one sparse id + one span otherwise. No checkpoints — the
+// direct string-object path never writes them (readers treat checkpoints as optional).
+string_t WriteSingleContainerSkipsBlobInto(Vector &vec, bool spanned, const ContainerSpan &span) {
+	auto total = sizeof(ContainerMetadataHeader) + (spanned ? sizeof(uint32_t) + sizeof(ContainerSpan) : 0);
 	auto skips_str = StringVector::EmptyString(vec, total);
 	auto skips_dst = skips_str.GetDataWriteable();
 
 	ContainerMetadataHeader header;
-	header.container_count = 1;
+	header.span_count = spanned ? 1 : 0;
 	header.checkpoint_index_count = 0;
 	header.checkpoint_count = 0;
 	std::memcpy(skips_dst, &header, sizeof(header));
-
-	ContainerSpan span {slot_span, string_byte_span, shape_hash};
-	std::memcpy(skips_dst + sizeof(header), &span, sizeof(span));
+	if (spanned) {
+		uint32_t id = 0;
+		std::memcpy(skips_dst + sizeof(header), &id, sizeof(id));
+		std::memcpy(skips_dst + sizeof(header) + sizeof(id), &span, sizeof(span));
+	}
 
 	skips_str.Finalize();
 	return skips_str;
 }
 
-void WriteConstructorStringObjectDirect(const JsonoStructVectorData &data, idx_t row, Vector &string_heap_vec,
-                                        Vector &slots_vec, Vector &skips_vec, string_t *string_heap_data,
-                                        string_t *slots_data, string_t *skips_data) {
+void WriteConstructorStringObjectDirect(const JsonoStructVectorData &data, idx_t row, JsonoBodyWriter &writer) {
 	auto &plan = *data.plan;
 	auto field_count = plan.field_perm.size();
 	auto slot_count = uint32_t(2 + field_count * 2);
 	auto slots_total = JSONO_HEADER_SIZE + size_t(slot_count) * sizeof(uint64_t);
-	auto slots_str = StringVector::EmptyString(slots_vec, slots_total);
+	auto slots_str = StringVector::EmptyString(writer.Slots(), slots_total);
 	auto slots_dst = slots_str.GetDataWriteable();
 
 	JsonoHeader header;
@@ -948,6 +1017,7 @@ void WriteConstructorStringObjectDirect(const JsonoStructVectorData &data, idx_t
 	std::array<string_t, 64> values;
 	std::array<uint8_t, 64> value_valid;
 	size_t values_size = 0;
+	size_t non_null_count = 0;
 	if (field_count <= values.size()) {
 		for (idx_t value_idx = 0; value_idx < field_count; value_idx++) {
 			auto &child = data.children[plan.field_perm[value_idx]];
@@ -956,6 +1026,7 @@ void WriteConstructorStringObjectDirect(const JsonoStructVectorData &data, idx_t
 				value_valid[value_idx] = 1;
 				values[value_idx] = child.string_data[child_idx];
 				values_size += values[value_idx].GetSize();
+				non_null_count++;
 			} else {
 				value_valid[value_idx] = 0;
 			}
@@ -966,15 +1037,20 @@ void WriteConstructorStringObjectDirect(const JsonoStructVectorData &data, idx_t
 			auto child_idx = RowIndex(child.fmt, row);
 			if (child.fmt.validity.RowIsValid(child_idx)) {
 				values_size += child.string_data[child_idx].GetSize();
+				non_null_count++;
 			}
 		}
 	}
 	if (values_size > std::numeric_limits<uint32_t>::max()) {
 		throw InvalidInputException("jsono: container string span exceeds storage limits");
 	}
-	auto values_str = StringVector::EmptyString(string_heap_vec, values_size);
+	auto values_str = StringVector::EmptyString(writer.StringHeap(), values_size);
 	auto values_dst = values_str.GetDataWriteable();
+	// One u32 length per non-null string value, in value order (walk order).
+	auto lengths_str = StringVector::EmptyString(writer.Lengths(), non_null_count * sizeof(uint32_t));
+	auto lengths_dst = lengths_str.GetDataWriteable();
 	size_t value_offset = 0;
+	size_t length_idx = 0;
 	auto value_start = field_count + 1;
 	for (idx_t value_idx = 0; value_idx < field_count; value_idx++) {
 		string_t value;
@@ -997,15 +1073,22 @@ void WriteConstructorStringObjectDirect(const JsonoStructVectorData &data, idx_t
 			std::memcpy(values_dst + value_offset, value.GetData(), value.GetSize());
 		}
 		value_offset += value.GetSize();
-		WriteSlotInto(slots_dst, value_start + value_idx,
-		              MakeSlot(tag::VAL_STR_HEAP, MakeStringPayload(value.GetSize())));
+		uint32_t value_length = uint32_t(value.GetSize());
+		std::memcpy(lengths_dst + length_idx * sizeof(uint32_t), &value_length, sizeof(value_length));
+		length_idx++;
+		WriteSlotInto(slots_dst, value_start + value_idx, MakeSlot(tag::VAL_STR_HEAP, 0));
 	}
 	values_str.Finalize();
+	lengths_str.Finalize();
 	slots_str.Finalize();
 
-	string_heap_data[row] = values_str;
-	slots_data[row] = slots_str;
-	skips_data[row] = WriteSingleContainerSkipsBlobInto(skips_vec, slot_count, uint32_t(values_size), plan.shape_hash);
+	writer.data[BODY_STRING_HEAP][row] = values_str;
+	writer.data[BODY_LENGTHS][row] = lengths_str;
+	writer.data[BODY_NUMS][row] = WriteBlobInto(writer.Nums(), nullptr, 0);
+	writer.data[BODY_SLOTS][row] = slots_str;
+	auto spanned = JsonoBuilder::ContainerStoresSpan(tag::OBJ_START, uint32_t(field_count));
+	ContainerSpan span {slot_count, uint32_t(values_size), plan.shape_hash, uint32_t(non_null_count), 0};
+	writer.data[BODY_SKIPS][row] = WriteSingleContainerSkipsBlobInto(writer.Skips(), spanned, span);
 }
 
 void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const JsonoStructPlan &plan,
@@ -1013,28 +1096,22 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 	JsonoStructVectorData input_data;
 	InitStructConstructorVectorData(input, count, plan, input_data);
 
-	Vector *slots_p, *key_heap_p, *string_heap_p, *skips_p;
-	jsono::InitJsonoBodyWrite(result, slots_p, key_heap_p, string_heap_p, skips_p);
-	auto &slots_vec = *slots_p;
-	auto &key_heap_vec = *key_heap_p;
-	auto &string_heap_vec = *string_heap_p;
-	auto &skips_vec = *skips_p;
-	auto slots_data = FlatVector::GetData<string_t>(slots_vec);
-	auto key_heap_data = FlatVector::GetData<string_t>(key_heap_vec);
-	auto string_heap_data = FlatVector::GetData<string_t>(string_heap_vec);
-	auto skips_data = FlatVector::GetData<string_t>(skips_vec);
+	JsonoBodyWriter writer;
+	writer.Init(result);
 
 	if (plan.strategy == StructValueStrategy::Jsono) {
 		for (idx_t row = 0; row < count; row++) {
 			JsonoBlobRow blob;
 			if (!ReadJsonoRowStrict(input_data.jsono_data, row, blob)) {
-				SetJsonoRowNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+				writer.SetRowNull(row);
 				continue;
 			}
-			key_heap_data[row] = StringVector::AddStringOrBlob(key_heap_vec, blob.key_heap);
-			string_heap_data[row] = StringVector::AddStringOrBlob(string_heap_vec, blob.string_heap);
-			slots_data[row] = StringVector::AddStringOrBlob(slots_vec, blob.slots);
-			skips_data[row] = StringVector::AddStringOrBlob(skips_vec, blob.skips);
+			writer.data[BODY_SLOTS][row] = StringVector::AddStringOrBlob(writer.Slots(), blob.slots);
+			writer.data[BODY_KEY_HEAP][row] = StringVector::AddStringOrBlob(writer.KeyHeap(), blob.key_heap);
+			writer.data[BODY_STRING_HEAP][row] = StringVector::AddStringOrBlob(writer.StringHeap(), blob.string_heap);
+			writer.data[BODY_SKIPS][row] = StringVector::AddStringOrBlob(writer.Skips(), blob.skips);
+			writer.data[BODY_LENGTHS][row] = StringVector::AddStringOrBlob(writer.Lengths(), blob.lengths);
+			writer.data[BODY_NUMS][row] = StringVector::AddStringOrBlob(writer.Nums(), blob.nums);
 		}
 		if (input.GetVectorType() == VectorType::CONSTANT_VECTOR && count > 0) {
 			result.SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -1046,13 +1123,13 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 	auto use_static_keys = plan.strategy == StructValueStrategy::Struct && plan.flat_scalar_object;
 	auto use_direct_string_object = use_static_keys && plan.string_object;
 	if (use_static_keys) {
-		static_keys = WriteBlobInto(key_heap_vec, plan.key_heap.data(), plan.key_heap.size());
+		static_keys = WriteBlobInto(writer.KeyHeap(), plan.key_heap.data(), plan.key_heap.size());
 	}
 
 	auto &builder = lstate.builder;
 	for (idx_t row = 0; row < count; row++) {
 		if (ConstructorValueRowIsNull(input_data, row)) {
-			SetJsonoRowNull(result, slots_vec, key_heap_vec, string_heap_vec, skips_vec, row);
+			writer.SetRowNull(row);
 			continue;
 		}
 		builder.Reset();
@@ -1060,9 +1137,8 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 			builder.external_root_keys = true;
 		}
 		if (use_direct_string_object) {
-			key_heap_data[row] = static_keys;
-			WriteConstructorStringObjectDirect(input_data, row, string_heap_vec, slots_vec, skips_vec, string_heap_data,
-			                                   slots_data, skips_data);
+			writer.data[BODY_KEY_HEAP][row] = static_keys;
+			WriteConstructorStringObjectDirect(input_data, row, writer);
 			continue;
 		}
 		if (plan.strategy == StructValueStrategy::Struct) {
@@ -1071,19 +1147,21 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 			EmitConstructorValue(input_data, row, lstate, builder);
 		}
 		if (use_static_keys) {
-			key_heap_data[row] = static_keys;
-			string_heap_data[row] =
-			    WriteBlobInto(string_heap_vec, builder.string_heap.data(), builder.string_heap.size());
+			writer.data[BODY_KEY_HEAP][row] = static_keys;
+			writer.data[BODY_STRING_HEAP][row] =
+			    WriteBlobInto(writer.StringHeap(), builder.string_heap.data(), builder.string_heap.size());
 			// The root object's keys are external (external_root_keys), so FinishContainer
 			// could not fingerprint them; set the root span's shape_hash from the plan.
-			if (!builder.skips.empty()) {
+			// The root (container id 0) stores a span only when it has > stride keys.
+			if (!builder.span_ids.empty() && builder.span_ids[0] == 0) {
 				builder.skips[0].shape_hash = plan.shape_hash;
 			}
-			slots_data[row] = WriteJsonoBlobInto(slots_vec, builder);
-			skips_data[row] = WriteSkipsBlobInto(skips_vec, builder);
+			writer.data[BODY_SLOTS][row] = WriteJsonoBlobInto(writer.Slots(), builder);
+			writer.data[BODY_SKIPS][row] = WriteSkipsBlobInto(writer.Skips(), builder);
+			writer.data[BODY_LENGTHS][row] = WriteLengthsBlobInto(writer.Lengths(), builder);
+			writer.data[BODY_NUMS][row] = WriteNumsBlobInto(writer.Nums(), builder);
 		} else {
-			WriteJsonoStruct(slots_vec, key_heap_vec, string_heap_vec, skips_vec, slots_data, key_heap_data,
-			                 string_heap_data, skips_data, row, builder);
+			writer.WriteRow(row, builder);
 		}
 	}
 
@@ -1130,6 +1208,41 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 			shred_types.emplace_back(shred.first, shred.second);
 		}
 		bound_function.return_type = JsonoShreddedStructType(shred_types);
+
+		bind_data->one_pass_shred = true;
+		for (auto &shred : bind_data->shreds) {
+			if (!shred.first.empty() && shred.first[0] == '$') {
+				bind_data->one_pass_shred = false;
+				break;
+			}
+		}
+		if (bind_data->one_pass_shred) {
+			auto &children = StructType::GetChildTypes(input_type);
+			auto shred_for_name = [&](const string &name) {
+				for (idx_t f = 0; f < bind_data->shreds.size(); f++) {
+					if (bind_data->shreds[f].first == name) {
+						return f;
+					}
+				}
+				return idx_t(DConstants::INVALID_INDEX);
+			};
+			bind_data->shred_fields.resize(bind_data->shreds.size());
+			child_list_t<LogicalType> residual_children;
+			for (idx_t i = 0; i < children.size(); i++) {
+				auto f = shred_for_name(children[i].first);
+				if (f != DConstants::INVALID_INDEX) {
+					bind_data->shred_fields[f] = i;
+				} else {
+					residual_children.push_back(children[i]);
+					bind_data->residual_fields.push_back(i);
+				}
+			}
+			if (!bind_data->residual_fields.empty()) {
+				bind_data->residual_plan =
+				    BuildStructConstructorPlan(LogicalType::STRUCT(std::move(residual_children)), "jsono()");
+				AssignStructConstructorKeyCacheIndexes(bind_data->residual_plan, next_key_cache_index);
+			}
+		}
 	}
 	return std::move(bind_data);
 }
@@ -1146,6 +1259,235 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 unique_ptr<FunctionData> JsonoStructBindPlain(ClientContext &context, ScalarFunction &bound_function,
                                               vector<unique_ptr<Expression>> &arguments) {
 	return JsonoStructBindShared(bound_function, arguments, false);
+}
+
+// Typed reads for one shred column: the value copies straight from the input child vector
+// (no plain materialization, no per-row locate). A UBIGINT shred reads the RAW input child —
+// the plan promotes UBIGINT to text for the residual number ladder, but the shred wants the
+// native value.
+struct ShredColumnSource {
+	StructValueStrategy strategy = StructValueStrategy::Null;
+	bool raw_uint = false;
+	UnifiedVectorFormat fmt;
+	const string_t *string_data = nullptr;
+	const int64_t *int_data = nullptr;
+	const double *double_data = nullptr;
+	const bool *bool_data = nullptr;
+	const uint64_t *uint_data = nullptr;
+};
+
+// One-pass shredded constructor: shred values copy from the typed input children, the residual
+// emits only the non-shred fields, and the manifest is written along the way — the two-pass path
+// (full plain emit, then per-row locate + strip + re-emit in JsonoShredFromSpec) is skipped
+// entirely. Per row only the shred fields' NULL mask varies: every non-NULL shred field is
+// losslessly captured by construction (a VARCHAR field is a real JSON string, BIGINT/DOUBLE/
+// BOOLEAN/UBIGINT match their stored kind exactly) and is stripped from the residual; a NULL
+// shred field stays in the residual as an explicit null, since a NULL shred means "value lives
+// in the residual" to every reader.
+void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, idx_t count, Vector &result,
+                                      const JsonoStructBindData &bind_data, JsonoStructLocalState &lstate) {
+	auto &plan = bind_data.plan;
+	auto &shreds = bind_data.shreds;
+	auto shred_count = shreds.size();
+
+	UnifiedVectorFormat parent_fmt;
+	casted_input.ToUnifiedFormat(count, parent_fmt);
+	auto &casted_children = StructVector::GetEntries(casted_input);
+
+	vector<ShredColumnSource> sources(shred_count);
+	vector<Vector *> shred_out(shred_count);
+	for (idx_t f = 0; f < shred_count; f++) {
+		auto field_idx = bind_data.shred_fields[f];
+		auto &src = sources[f];
+		shred_out[f] = &JsonoShredVector(result, f);
+		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
+		if (shreds[f].second.id() == LogicalTypeId::UBIGINT) {
+			auto &raw_child = *StructVector::GetEntries(raw_input)[field_idx];
+			raw_child.ToUnifiedFormat(count, src.fmt);
+			src.uint_data = UnifiedVectorFormat::GetData<uint64_t>(src.fmt);
+			src.raw_uint = true;
+			continue;
+		}
+		auto &child = *casted_children[field_idx];
+		child.ToUnifiedFormat(count, src.fmt);
+		src.strategy = plan.children[field_idx].strategy;
+		switch (src.strategy) {
+		case StructValueStrategy::String:
+			src.string_data = UnifiedVectorFormat::GetData<string_t>(src.fmt);
+			// The shred output references the input strings; keep their buffer alive.
+			StringVector::AddHeapReference(*shred_out[f], child);
+			break;
+		case StructValueStrategy::Int:
+			src.int_data = UnifiedVectorFormat::GetData<int64_t>(src.fmt);
+			break;
+		case StructValueStrategy::Double:
+			src.double_data = UnifiedVectorFormat::GetData<double>(src.fmt);
+			break;
+		case StructValueStrategy::Bool:
+			src.bool_data = UnifiedVectorFormat::GetData<bool>(src.fmt);
+			break;
+		default:
+			throw InternalException("jsono constructor: unexpected shred field strategy");
+		}
+	}
+
+	// Residual vector data over the non-shred children, addressed by the residual plan.
+	JsonoStructVectorData residual_data;
+	bool residual_empty = bind_data.residual_fields.empty();
+	if (!residual_empty) {
+		residual_data.plan = &bind_data.residual_plan;
+		casted_input.ToUnifiedFormat(count, residual_data.fmt);
+		residual_data.children.resize(bind_data.residual_fields.size());
+		for (idx_t j = 0; j < bind_data.residual_fields.size(); j++) {
+			InitStructConstructorVectorData(*casted_children[bind_data.residual_fields[j]], count,
+			                                bind_data.residual_plan.children[j], residual_data.children[j]);
+		}
+	}
+
+	// field_perm walk metadata for the partial-null rows: per plan field, its shred position
+	// (INVALID for a residual field) and its position among the residual children.
+	vector<idx_t> shred_pos(plan.children.size(), DConstants::INVALID_INDEX);
+	vector<idx_t> residual_pos(plan.children.size(), DConstants::INVALID_INDEX);
+	for (idx_t f = 0; f < shred_count; f++) {
+		shred_pos[bind_data.shred_fields[f]] = f;
+	}
+	for (idx_t j = 0; j < bind_data.residual_fields.size(); j++) {
+		residual_pos[bind_data.residual_fields[j]] = j;
+	}
+
+	// Manifest bytes: per-shred entry once, plus the full all-stripped manifest (the hot case).
+	vector<std::string> manifest_entries(shred_count);
+	std::string hot_manifest;
+	uint32_t hot_entry_count = uint32_t(shred_count);
+	hot_manifest.append(reinterpret_cast<const char *>(&hot_entry_count), sizeof(hot_entry_count));
+	for (idx_t f = 0; f < shred_count; f++) {
+		manifest_entries[f] = JsonoShredManifestEntry(shreds[f].first, shreds[f].second);
+		hot_manifest.append(manifest_entries[f]);
+	}
+
+	JsonoBodyWriter writer;
+	writer.Init(result);
+	auto &builder = lstate.builder;
+
+	// All-stripped rows with an empty residual share constant blobs (header + {} + manifest).
+	bool hot_blobs_ready = false;
+	string_t hot_blobs[BODY_BLOB_COUNT];
+
+	vector<uint8_t> stripped(shred_count);
+	std::string manifest;
+	for (idx_t row = 0; row < count; row++) {
+		if (!parent_fmt.validity.RowIsValid(parent_fmt.sel->get_index(row))) {
+			writer.SetRowNull(row);
+			for (idx_t f = 0; f < shred_count; f++) {
+				FlatVector::SetNull(*shred_out[f], row, true);
+			}
+			continue;
+		}
+		idx_t stripped_count = 0;
+		for (idx_t f = 0; f < shred_count; f++) {
+			auto &src = sources[f];
+			auto idx = src.fmt.sel->get_index(row);
+			if (!src.fmt.validity.RowIsValid(idx)) {
+				FlatVector::SetNull(*shred_out[f], row, true);
+				stripped[f] = 0;
+				continue;
+			}
+			stripped[f] = 1;
+			stripped_count++;
+			if (src.raw_uint) {
+				FlatVector::GetData<uint64_t>(*shred_out[f])[row] = src.uint_data[idx];
+				continue;
+			}
+			switch (src.strategy) {
+			case StructValueStrategy::String:
+				FlatVector::GetData<string_t>(*shred_out[f])[row] = src.string_data[idx];
+				break;
+			case StructValueStrategy::Int:
+				FlatVector::GetData<int64_t>(*shred_out[f])[row] = src.int_data[idx];
+				break;
+			case StructValueStrategy::Double: {
+				auto value = src.double_data[idx];
+				// The value no longer passes through EmitDouble, but its gate still holds:
+				// a non-finite double must fail loud, not slip into a shred.
+				if (!std::isfinite(value)) {
+					throw InvalidInputException("jsono: cannot store non-finite double value (NaN/Infinity)");
+				}
+				FlatVector::GetData<double>(*shred_out[f])[row] = value;
+				break;
+			}
+			case StructValueStrategy::Bool:
+				FlatVector::GetData<bool>(*shred_out[f])[row] = src.bool_data[idx];
+				break;
+			default:
+				throw InternalException("jsono constructor: unexpected shred field strategy");
+			}
+		}
+		FlatVector::Validity(result).SetValid(row);
+
+		if (stripped_count == shred_count) {
+			if (residual_empty) {
+				if (!hot_blobs_ready) {
+					builder.Reset();
+					builder.EmitObjectStart(0);
+					builder.EmitObjectEnd();
+					hot_blobs[BODY_SLOTS] = WriteJsonoBlobInto(writer.Slots(), builder);
+					hot_blobs[BODY_KEY_HEAP] = WriteBlobInto(writer.KeyHeap(), nullptr, 0);
+					hot_blobs[BODY_STRING_HEAP] = WriteBlobInto(writer.StringHeap(), nullptr, 0);
+					hot_blobs[BODY_SKIPS] = WriteSkipsBlobInto(writer.Skips(), builder, &hot_manifest);
+					hot_blobs[BODY_LENGTHS] = WriteBlobInto(writer.Lengths(), nullptr, 0);
+					hot_blobs[BODY_NUMS] = WriteBlobInto(writer.Nums(), nullptr, 0);
+					hot_blobs_ready = true;
+				}
+				for (idx_t b = 0; b < BODY_BLOB_COUNT; b++) {
+					writer.data[b][row] = hot_blobs[b];
+				}
+				continue;
+			}
+			builder.Reset();
+			EmitConstructorObject(residual_data, row, lstate, builder);
+			writer.WriteRow(row, builder, &hot_manifest);
+			continue;
+		}
+
+		// Some shred fields are NULL this row: they stay in the residual as explicit nulls,
+		// interleaved with the residual fields in sorted key order.
+		builder.Reset();
+		builder.EmitObjectStart(plan.field_perm.size() - stripped_count);
+		for (auto field_idx : plan.field_perm) {
+			auto f = shred_pos[field_idx];
+			if (f != DConstants::INVALID_INDEX && stripped[f]) {
+				continue;
+			}
+			auto &name = plan.field_names[field_idx];
+			builder.EmitKeySlot(nonstd::string_view(name.data(), name.size()));
+		}
+		for (auto field_idx : plan.field_perm) {
+			auto f = shred_pos[field_idx];
+			if (f != DConstants::INVALID_INDEX && stripped[f]) {
+				continue;
+			}
+			builder.EmitObjectChildStart();
+			if (f != DConstants::INVALID_INDEX) {
+				builder.EmitNull();
+			} else {
+				EmitConstructorValue(residual_data.children[residual_pos[field_idx]], row, lstate, builder);
+			}
+		}
+		builder.EmitObjectEnd();
+		const std::string *manifest_ptr = nullptr;
+		if (stripped_count > 0) {
+			manifest.clear();
+			uint32_t entry_count = uint32_t(stripped_count);
+			manifest.append(reinterpret_cast<const char *>(&entry_count), sizeof(entry_count));
+			for (idx_t f = 0; f < shred_count; f++) {
+				if (stripped[f]) {
+					manifest.append(manifest_entries[f]);
+				}
+			}
+			manifest_ptr = &manifest;
+		}
+		writer.WriteRow(row, builder, manifest_ptr);
+	}
 }
 
 void JsonoStructExecute(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1167,9 +1509,13 @@ void JsonoStructExecute(DataChunk &args, ExpressionState &state, Vector &result)
 		ExecuteStructConstructor(*input, count, result, bind_data.plan, lstate);
 		return;
 	}
-	Vector plain(JsonoType(), count);
-	ExecuteStructConstructor(*input, count, plain, bind_data.plan, lstate);
-	JsonoShredFromSpec(plain, count, bind_data.shreds, result);
+	if (bind_data.one_pass_shred) {
+		ExecuteStructConstructorShredded(args.data[0], *input, count, result, bind_data, lstate);
+	} else {
+		Vector plain(JsonoType(), count);
+		ExecuteStructConstructor(*input, count, plain, bind_data.plan, lstate);
+		JsonoShredFromSpec(plain, count, bind_data.shreds, result);
+	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
