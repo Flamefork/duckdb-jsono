@@ -1,0 +1,56 @@
+# name: test/sql/jsono_extrema_heap.test
+# description: max/min over a jsono ->> path with non-inlined (>12-byte) values must not corrupt the heap
+# group: [sql]
+
+require jsono
+
+# The optimizer rewrites max/min(jv->>path) into __jsono_internal_(max|min)_varchar_fast, whose
+# aggregate state owns a heap char[] for >12-byte extrema (<=12-byte values stay inlined and never hit
+# the owned-buffer path). A fresh state's text_value was left uninitialized by StateInitialize, and the
+# first string fold flagged the state as owning text before assigning it, so DestroyText freed an
+# uninitialized pointer. The values below are all >12 bytes and non-numeric, so every group's first fold
+# takes the owned-buffer path on a fresh state; high group cardinality forces tens of thousands of such
+# folds over churned hash-table state memory, tripping ASan before the fix.
+
+statement ok
+CREATE TABLE jsono_extrema_heap_probe AS
+SELECT (i % 20000) AS g,
+       jsono('{"s":"value_' || lpad(i::VARCHAR, 6, '0') || '_padding"}') AS j
+FROM range(60000) t(i);
+
+# Ground truth from the un-rewritten plan (core max/min over VARCHAR).
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE jsono_extrema_heap_expected AS
+SELECT g, MIN(j->>'$.s') AS min_s, MAX(j->>'$.s') AS max_s
+FROM jsono_extrema_heap_probe
+GROUP BY g;
+
+statement ok
+RESET disabled_optimizers;
+
+# The optimized aggregate must produce identical results without freeing an uninitialized text buffer.
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_extrema_heap_expected EXCEPT
+   SELECT g, MIN(j->>'$.s') AS min_s, MAX(j->>'$.s') AS max_s
+   FROM jsono_extrema_heap_probe
+   GROUP BY g)
+  UNION ALL
+  (SELECT g, MIN(j->>'$.s') AS min_s, MAX(j->>'$.s') AS max_s
+   FROM jsono_extrema_heap_probe
+   GROUP BY g
+   EXCEPT SELECT * FROM jsono_extrema_heap_expected)
+);
+----
+0
+
+# Ungrouped form mirrors the original crash (parallel worker-thread combine into one global state).
+query II
+SELECT MIN(j->>'$.s'), MAX(j->>'$.s')
+FROM jsono_extrema_heap_probe;
+----
+value_000000_padding	value_059999_padding
