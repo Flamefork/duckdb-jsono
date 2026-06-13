@@ -1231,6 +1231,30 @@ void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix
 	}
 }
 
+// A literal top-level key spelled as a JSON path ('$.a.b') and a nested scalar lifted to that same
+// path resolve to one shred field name. A shredded STRUCT cannot carry duplicate child names:
+// struct_extract would bind one child and leave the other value reachable only via to_json, not ->>.
+// Drop every colliding shred back to the residual, where the plain emit keeps both values losslessly
+// and path resolution stays correct. Mirrors the 'body' guard: auto-shred must not error or corrupt.
+void DropCollidingAutoShreds(vector<pair<string, LogicalType>> &shreds) {
+	vector<bool> colliding(shreds.size(), false);
+	for (idx_t i = 0; i < shreds.size(); i++) {
+		for (idx_t j = i + 1; j < shreds.size(); j++) {
+			if (shreds[i].first == shreds[j].first) {
+				colliding[i] = true;
+				colliding[j] = true;
+			}
+		}
+	}
+	vector<pair<string, LogicalType>> kept;
+	for (idx_t i = 0; i < shreds.size(); i++) {
+		if (!colliding[i]) {
+			kept.push_back(std::move(shreds[i]));
+		}
+	}
+	shreds = std::move(kept);
+}
+
 unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
                                                vector<unique_ptr<Expression>> &arguments, bool allow_shred) {
 	if (arguments.empty() || arguments[0]->return_type.id() != LogicalTypeId::STRUCT) {
@@ -1250,6 +1274,7 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 	auto bind_data = make_uniq<JsonoStructBindData>(std::move(plan));
 	if (allow_shred) {
 		CollectAutoShreds(input_type, string(), true, bind_data->shreds);
+		DropCollidingAutoShreds(bind_data->shreds);
 	}
 	if (!bind_data->shreds.empty()) {
 		// Canonical shred order (sorted by name) so the shredded type is a pure function of the shred
