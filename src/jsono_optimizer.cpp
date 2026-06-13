@@ -676,6 +676,10 @@ struct JsonoExtractExtremaFunction {
 		state.numeric_mode = true;
 		state.numeric_value = 0;
 		state.numeric_width = 0;
+		// State memory is raw (StateInitialize never runs a constructor), so text_value must be put
+		// into a valid, unowned form here. This holds the invariant that DestroyText only ever frees a
+		// buffer AssignExtremaText allocated, never an uninitialized pointer.
+		state.text_value = string_t(uint32_t(0));
 	}
 
 	template <class STATE>
@@ -748,7 +752,7 @@ void EnsureExtremaStringMode(JsonoExtractExtremaState &state) {
 	}
 	auto rendered = std::to_string(state.numeric_value);
 	// Assign while still in numeric mode so DestroyText inside stays a no-op
-	// (text_value is uninitialized in numeric mode); the copy must own its buffer,
+	// (text_value is empty-inlined until a string is assigned); the copy must own its buffer,
 	// a string_t over the local rendering would dangle for >inline-length values.
 	AssignExtremaText(state, nonstd::string_view(rendered.data(), rendered.size()));
 	state.numeric_mode = false;
