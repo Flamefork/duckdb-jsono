@@ -32,11 +32,15 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/struct_stats.hpp"
 
 #include "string_view.hpp"
 
@@ -1457,9 +1461,82 @@ struct ShredPatchNode {
 	}
 };
 
+// Per shredded jsono column (keyed by its base table ColumnBinding), the totality of each shred:
+// entry[child_index] == false means the shred has no SQL NULL across the whole table, i.e. no row
+// fell into the residual for that path (NULL-shred <=> value-in-residual, see jsono_shred WriteShred).
+// A total shred lets the rewriter drop the residual COALESCE arm so a plain typed struct_extract is
+// emitted, which the planner pushes MIN/MAX/filter into the scan's zone-map statistics. Absent /
+// unknown / has-null all leave entry true so the safe COALESCE form stays.
+using ShredTotalityMap = column_binding_map_t<vector<bool>>;
+
+// Walk the plan's LogicalGet leaves and, for each shredded jsono column the scan exposes, pull
+// per-shred null statistics through the table function's statistics_extended pointer (the same one
+// DuckDB's own StatisticsPropagator uses; native tables and Parquet both register it). Descend the
+// returned StructStats twice: top struct child 0 is the layout field, layout child `1 + child_index`
+// is the shred. Fail-safe: no statistics function, nullptr stats, or CanHaveNull() leaves the shred
+// non-total (true).
+void CollectShredTotality(ClientContext &context, const LogicalOperator &op, ShredTotalityMap &totality) {
+	for (auto &child : op.children) {
+		CollectShredTotality(context, *child, totality);
+	}
+	if (op.type != LogicalOperatorType::LOGICAL_GET) {
+		return;
+	}
+	auto &get = op.Cast<LogicalGet>();
+	if (!get.function.statistics_extended && !get.function.statistics) {
+		return;
+	}
+	auto &column_ids = get.GetColumnIds();
+	auto &returned_types = get.returned_types;
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		auto table_index = column_ids[i].GetPrimaryIndex();
+		if (table_index >= returned_types.size()) {
+			continue; // virtual column (rowid etc.); no shredded jsono payload
+		}
+		auto shreds = CollectShreddedShreds(returned_types[table_index]);
+		if (shreds.empty()) {
+			continue;
+		}
+		unique_ptr<BaseStatistics> stats;
+		if (get.function.statistics_extended) {
+			TableFunctionGetStatisticsInput input(get.bind_data.get(), column_ids[i]);
+			stats = get.function.statistics_extended(context, input);
+		} else {
+			stats = get.function.statistics(context, get.bind_data.get(), table_index);
+		}
+		vector<bool> per_shred(shreds.size(), true);
+		if (stats && stats->GetType().id() == LogicalTypeId::STRUCT &&
+		    StructType::GetChildCount(stats->GetType()) >= 1) {
+			auto &layout_stats = StructStats::GetChildStats(*stats, 0);
+			if (layout_stats.GetType().id() == LogicalTypeId::STRUCT) {
+				auto layout_children = StructType::GetChildCount(layout_stats.GetType());
+				for (auto &shred : shreds) {
+					idx_t layout_index = 1 + shred.child_index;
+					if (layout_index < layout_children &&
+					    !StructStats::GetChildStats(layout_stats, layout_index).CanHaveNull()) {
+						per_shred[shred.child_index] = false;
+					}
+				}
+			}
+		}
+		// The same binding can recur across plan leaves (self-join); keep the conservative view —
+		// a shred is total only when every occurrence proves it total.
+		auto binding = ColumnBinding(get.table_index, i);
+		auto existing = totality.find(binding);
+		if (existing == totality.end()) {
+			totality.emplace(binding, std::move(per_shred));
+		} else {
+			for (idx_t k = 0; k < existing->second.size() && k < per_shred.size(); k++) {
+				existing->second[k] = existing->second[k] || per_shred[k];
+			}
+		}
+	}
+}
+
 class JsonoShreddedRewriter : public LogicalOperatorVisitor {
 public:
-	explicit JsonoShreddedRewriter(ClientContext &context) : context(context) {
+	explicit JsonoShreddedRewriter(ClientContext &context, const ShredTotalityMap &totality)
+	    : context(context), totality(totality) {
 	}
 
 protected:
@@ -1611,6 +1688,24 @@ private:
 		return StructExtractAt(StructExtractAt(column.Copy(), 1), int64_t(child_index) + 2);
 	}
 
+	// True when statistics proved this shred carries no SQL NULL anywhere in the table: NULL-shred
+	// <=> value-in-residual, so a null-free shred means no row was narrowed for this path and the
+	// residual COALESCE fallback is provably dead. The shred read can then be a plain struct_extract,
+	// which the planner pushes MIN/MAX/filter into the scan zone-map. Fail-safe: a column that is not
+	// a bare base-table reference (a projection-wrapped value, a CTE, an expression result) is absent
+	// from the map and stays non-total, so the COALESCE form is kept.
+	bool ShredIsTotal(const Expression &column, idx_t child_index) {
+		if (column.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto &column_ref = column.Cast<BoundColumnRefExpression>();
+		auto entry = totality.find(column_ref.binding);
+		if (entry == totality.end() || child_index >= entry->second.size()) {
+			return false;
+		}
+		return !entry->second[child_index];
+	}
+
 	// Read only the residual body of a shredded column as plain JSONO: extract its `.body` struct
 	// (layout field [1] -> body [1], already STRUCT(slots,key_heap,string_heap,skips)) and wrap it
 	// back into the plain layout STRUCT("jsono" STRUCT(body ...)). The result type IS plain
@@ -1716,10 +1811,16 @@ private:
 	// residual as text and casts to T, matching the original CAST's try/strict mode, so
 	// a value kept in the residual still resolves; COALESCE short-circuits so a
 	// homogeneous shred stays a plain typed struct_extract (with column statistics).
+	// When statistics prove the shred total (no residual row), the fallback arm is provably
+	// dead and dropped entirely, leaving a bare struct_extract the planner pushes into the scan.
 	unique_ptr<Expression> MakeTypedShredRead(unique_ptr<Expression> column, const JsonoShred &shred,
 	                                          unique_ptr<Expression> path, const LogicalType &target, bool try_cast,
 	                                          const string &alias) {
 		auto shred_value = ShredExtract(*column, shred.child_index);
+		if (ShredIsTotal(*column, shred.child_index)) {
+			shred_value->SetAlias(alias);
+			return shred_value;
+		}
 		FunctionBinder function_binder(context);
 		auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
 		auto residual = ResidualReinterpret(*column);
@@ -1750,6 +1851,11 @@ private:
 			return shred_value;
 		}
 		auto shred_text = BoundCastExpression::AddCastToType(context, std::move(shred_value), LogicalType::VARCHAR);
+		// A total shred has no residual rows, so the text read needs no fallback.
+		if (ShredIsTotal(*column, shred.child_index)) {
+			shred_text->SetAlias(alias);
+			return shred_text;
+		}
 		auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
 		auto residual = ResidualReinterpret(*column);
 		vector<unique_ptr<Expression>> ext_children;
@@ -1835,6 +1941,7 @@ private:
 	}
 
 	ClientContext &context;
+	const ShredTotalityMap &totality;
 };
 
 //===--------------------------------------------------------------------===//
@@ -1951,11 +2058,11 @@ void NormalizeShreddedCasts(ClientContext &context, LogicalOperator &op) {
 	    op, [&](unique_ptr<Expression> *child) { NormalizeShreddedCastsInExpression(context, *child); });
 }
 
-void RewriteShreddedJsono(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+void RewriteShreddedJsono(ClientContext &context, unique_ptr<LogicalOperator> &plan, const ShredTotalityMap &totality) {
 	if (!plan) {
 		return;
 	}
-	JsonoShreddedRewriter rewriter(context);
+	JsonoShreddedRewriter rewriter(context, totality);
 	rewriter.VisitOperator(*plan);
 }
 
@@ -1982,6 +2089,12 @@ void RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &pl
 }
 
 void JsonoOptimizerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	// Collect per-shred totality from base-table statistics first, while column bindings still match
+	// the LogicalGet leaves (our own rewrites below interpose projections that would obscure them).
+	ShredTotalityMap totality;
+	if (plan) {
+		CollectShredTotality(input.context, *plan, totality);
+	}
 	// Replace lossy by-name shredded casts (INSERT into a differently-shredded column,
 	// set-operation branch widening, CASE/COALESCE arms) with lossless reconstruct+reshred first,
 	// so the shredded rewrites below see canonical shredded values.
@@ -1990,7 +2103,7 @@ void JsonoOptimizerPreOptimize(OptimizerExtensionInput &input, unique_ptr<Logica
 	}
 	// Normalize shredded JSONO ops before the built-in pipeline so the shred
 	// struct_extract is visible to projection and row-group pruning.
-	RewriteShreddedJsono(input.context, plan);
+	RewriteShreddedJsono(input.context, plan, totality);
 	RewritePlan(input, plan);
 }
 
