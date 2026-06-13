@@ -215,6 +215,13 @@ public:
 		return verifier_.VerifiedEntries(view);
 	}
 
+	// The input string_heap child vector (post-flatten). A VARCHAR reader references its heap
+	// into the result so a String/NumberText value can be emitted as a string_t pointing
+	// straight into these bytes — see ZeroCopyHeapText / StringVector::AddHeapReference.
+	Vector &StringHeapVector() {
+		return *data_.string_heap_vec;
+	}
+
 private:
 	struct CoverMemo {
 		const vector<PathStep> *steps = nullptr;

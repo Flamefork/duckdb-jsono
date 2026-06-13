@@ -505,6 +505,8 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<string_t>(result);
+	// Zero-copy text values point into the input string_heap; keep its buffer alive for them.
+	StringVector::AddHeapReference(result, reader.StringHeapVector());
 	std::string scratch;
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
@@ -530,7 +532,7 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 		}
 		auto scalar = DecodeScalarAt(view, cursor);
 		if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
-			result_data[row] = StringVector::AddString(result, scalar.text.data(), scalar.text.size());
+			result_data[row] = ZeroCopyHeapText(scalar.text);
 		} else if (RenderExtractText(scalar, scratch)) {
 			FlatVector::SetNull(result, row, true);
 		} else {

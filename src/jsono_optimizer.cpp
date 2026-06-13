@@ -632,7 +632,7 @@ void WriteLocatedExtractString(JsonoPathLocalState &lstate, JsonoRowReader &read
 	auto scalar = DecodeScalarAt(view, cursor);
 	if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
 		FlatVector::Validity(result).SetValid(row);
-		result_data[row] = StringVector::AddString(result, scalar.text.data(), scalar.text.size());
+		result_data[row] = ZeroCopyHeapText(scalar.text);
 		return;
 	}
 	lstate.scratch.clear();
@@ -941,6 +941,8 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 	auto &children = StructVector::GetEntries(result);
 	for (auto &child : children) {
 		child->SetVectorType(VectorType::FLAT_VECTOR);
+		// Zero-copy text values point into the input string_heap; keep its buffer alive per child.
+		StringVector::AddHeapReference(*child, reader.StringHeapVector());
 	}
 
 	JsonoView view;

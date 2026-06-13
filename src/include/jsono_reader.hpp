@@ -38,6 +38,11 @@ struct JsonoVectorData {
 	const string_t *skips_data = nullptr;
 	const string_t *lengths_data = nullptr;
 	const string_t *nums_data = nullptr;
+	// The string_heap child vector itself (post-flatten): the source of every text value a
+	// point read hands out. A VARCHAR reader references this vector's heap into its result so a
+	// String/NumberText value can be a string_t pointing straight into these bytes (zero-copy)
+	// instead of being copied row by row.
+	Vector *string_heap_vec = nullptr;
 	// All nine levels report AllValid(): per-row reads skip every validity check (the
 	// dominant storage-scan case — six blob children make per-row checks measurable).
 	bool all_valid = false;
@@ -86,6 +91,7 @@ inline void InitJsonoVectorData(Vector &input, idx_t count, JsonoVectorData &dat
 	blobs[3]->ToUnifiedFormat(count, data.skips_fmt);
 	blobs[4]->ToUnifiedFormat(count, data.lengths_fmt);
 	blobs[5]->ToUnifiedFormat(count, data.nums_fmt);
+	data.string_heap_vec = blobs[2].get();
 	data.slots_data = UnifiedVectorFormat::GetData<string_t>(data.slots_fmt);
 	data.key_heap_data = UnifiedVectorFormat::GetData<string_t>(data.key_heap_fmt);
 	data.string_heap_data = UnifiedVectorFormat::GetData<string_t>(data.string_heap_fmt);
@@ -207,6 +213,16 @@ inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlob
 	out.lengths = data.lengths_data[lengths_idx];
 	out.nums = data.nums_data[nums_idx];
 	return true;
+}
+
+// Emit `text` as a result string_t without copying its bytes. For a long value the string_t
+// stores a pointer straight into `text` (which is a view into the row's string_heap); the
+// caller must have referenced that heap into the result vector (StringVector::AddHeapReference
+// over JsonoRowReader::StringHeapVector) so the bytes outlive the result. Short values inline
+// into the string_t and need no reference. The string_t constructor copies the comparison
+// prefix, so this is a drop-in for StringVector::AddString minus the heap copy.
+JSONO_ALWAYS_INLINE string_t ZeroCopyHeapText(nonstd::string_view text) {
+	return string_t(text.data(), UnsafeNumericCast<uint32_t>(text.size()));
 }
 
 inline JsonoView MakeJsonoView(const JsonoBlobRow &blob) {

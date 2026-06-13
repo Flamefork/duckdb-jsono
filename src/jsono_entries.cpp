@@ -225,8 +225,9 @@ struct EntriesSink {
 			break;
 		case JsonoScalarKind::String:
 		case JsonoScalarKind::NumberText:
-			// Already text in the heap — copy straight in, no intermediate std::string.
-			value_data[child_row] = StringVector::AddString(*value_vec, scalar.text.data(), scalar.text.size());
+			// Already text in the input string_heap — point straight at it (zero-copy); the
+			// caller referenced that heap into value_vec so the bytes outlive the result.
+			value_data[child_row] = ZeroCopyHeapText(scalar.text);
 			break;
 		default:
 			scratch.clear();
@@ -352,6 +353,9 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 	std::string path;
 	std::string shred_scratch;
 	EntriesSink sink(result);
+	// Zero-copy text leaves point into the input string_heap; keep its buffer alive on the
+	// value child (the reference survives the list child's Reserve/Resize grows).
+	StringVector::AddHeapReference(*sink.value_vec, reader.StringHeapVector());
 
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
