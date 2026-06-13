@@ -201,3 +201,61 @@ query II
 SELECT j.jsono."$.x" IS NULL, to_json(j)::VARCHAR FROM (SELECT jsono({'$.x': 'v', 'y': 1}) AS j);
 ----
 true	{"$.x":"v","y":1}
+
+# Type-driven auto-shred descends one struct level: top-level scalars keep their bare name, scalars
+# directly inside a nested STRUCT are lifted under their $.parent.child JSON path. The shred set is
+# a pure function of the input type (known at bind), so the constructor's return type carries them.
+query I
+SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR))
+
+# The walk stops after one level: a scalar two or more levels deep stays in the residual (a deep
+# schema would otherwise lift many cold leaves). Only $.b.c is shredded; $.b.d.e is not.
+query I
+SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep'}}}));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$.b.c" VARCHAR, a BIGINT))
+
+# Losslessness holds for the un-shredded deep leaf too: $.b.d.e round-trips through the residual.
+query I
+SELECT to_json(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep'}}}))::VARCHAR;
+----
+{"a":1,"b":{"c":"x","d":{"e":"deep"}}}
+
+# Nested auto-shred is lossless: the reconstructed document equals the plain parse, nesting intact.
+query I
+SELECT to_json(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}))::VARCHAR;
+----
+{"commit":{"collection":"coll","operation":"create"},"did":"d1","kind":"k"}
+
+# A nested NULL scalar stays an explicit null in the residual (NULL shred = value-in-residual);
+# the typed nested shred captures the present value.
+query III
+SELECT j.jsono."$.commit.collection", j.jsono."$.commit.n", to_json(j)::VARCHAR
+FROM (
+    SELECT jsono({'commit': {'collection': c, 'n': n}}) AS j
+    FROM (VALUES ('post', 1::BIGINT), (NULL, NULL::BIGINT)) v(c, n)
+) ORDER BY ALL;
+----
+post	1	{"commit":{"collection":"post","n":1}}
+NULL	NULL	{"commit":{"collection":null,"n":null}}
+
+# A nested key carrying a path-structural character is emitted as a quoted path step and round-trips.
+query I
+SELECT to_json(jsono({'nest': {'a.b': 'v', 'c': 'plain'}}))::VARCHAR;
+----
+{"nest":{"a.b":"v","c":"plain"}}
+
+# A bare top-level $.path read on a nested auto-shred resolves to the typed shred subcolumn (the
+# optimizer's transparency rewrite matches the shred by its parsed path, not by field name string).
+statement ok
+CREATE TABLE nested_shred AS
+SELECT jsono({'did': did, 'commit': {'collection': coll}}) AS j
+FROM (VALUES ('d1', 'app.bsky.feed.post'), ('d2', 'app.bsky.feed.like'), ('d1', 'app.bsky.feed.post')) v(did, coll);
+
+query II
+SELECT j ->> '$.commit.collection' AS c, count(*) FROM nested_shred GROUP BY c ORDER BY c;
+----
+app.bsky.feed.like	1
+app.bsky.feed.post	2

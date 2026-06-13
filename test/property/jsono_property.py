@@ -514,6 +514,60 @@ def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
     assert plain == reshredded, f"reshred changed the value: {text!r} {first} -> {second}: {plain!r} -> {reshredded!r}"
 
 
+# Typed scalars for the STRUCT-input auto-shred test: each carries an explicit DuckDB type so the
+# constructor's bind sees the same eligibility it would from a read_json_auto-detected schema.
+typed_struct_scalars = st.one_of(
+    st.builds(lambda value: (value, "VARCHAR"), st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", max_size=8)),
+    st.builds(lambda value: (value, "BIGINT"), st.integers(min_value=-(2**62), max_value=2**62)),
+    st.builds(lambda value: (value, "BOOLEAN"), st.booleans()),
+)
+typed_struct_documents = st.recursive(
+    typed_struct_scalars,
+    lambda children: st.dictionaries(shred_keys, children, min_size=1, max_size=4),
+    max_leaves=8,
+).filter(lambda value: isinstance(value, dict))
+
+
+def typed_struct_sql(doc: dict[str, Any]) -> str:
+    fields = []
+    for key, value in doc.items():
+        if isinstance(value, dict):
+            fields.append(f"'{key}': {typed_struct_sql(value)}")
+        else:
+            literal, stype = value
+            if stype == "VARCHAR":
+                fields.append(f"'{key}': {sql_literal(literal)}")
+            elif stype == "BOOLEAN":
+                fields.append(f"'{key}': {'true' if literal else 'false'}")
+            else:
+                fields.append(f"'{key}': {literal}::{stype}")
+    return "{" + ", ".join(fields) + "}"
+
+
+def typed_struct_json(doc: dict[str, Any]) -> Any:
+    out: dict[str, Any] = {}
+    for key, value in doc.items():
+        out[key] = typed_struct_json(value) if isinstance(value, dict) else value[0]
+    return out
+
+
+@settings(PROPERTY_SETTINGS)
+@example(doc={"did": ("d1", "VARCHAR"), "commit": {"collection": ("coll", "VARCHAR"), "rev": (1, "BIGINT")}})
+@example(doc={"a": ("x", "VARCHAR"), "b": {"c": (1, "BIGINT"), "d": ("y", "VARCHAR")}})
+@given(doc=typed_struct_documents)
+def test_struct_auto_shred_lossless(doc: dict[str, Any]) -> None:
+    # The type-driven auto-shred (jsono over a typed STRUCT) lifts every scalar field — top-level
+    # ones by bare name, nested ones under a `$.parent.child` path — into a typed shred. Whatever
+    # the shred set, the logical value must equal the plain parse of the same document.
+    if not isinstance(doc, dict) or not doc:
+        return
+    struct_sql = typed_struct_sql(doc)
+    text = json_dumps(typed_struct_json(doc))
+    auto = SESSION.value(f"to_json(jsono({struct_sql}))")
+    plain = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
+    assert auto == plain, f"auto-shred changed the value: {struct_sql} : {auto!r} != plain {plain!r}"
+
+
 @settings(VALIDISH_PROPERTY_SETTINGS)
 @given(doc=shred_documents, data=st.data())
 def test_narrowing_fails_loud(doc: dict[str, Any], data: Any) -> None:
@@ -588,6 +642,7 @@ PROPERTIES = [
     test_keys_sorted,
     test_shred_lossless,
     test_reshred_lossless,
+    test_struct_auto_shred_lossless,
     test_narrowing_fails_loud,
     test_fuzz_text_no_crash,
     test_fuzz_blob_no_crash,
