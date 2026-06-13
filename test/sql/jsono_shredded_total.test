@@ -1,0 +1,126 @@
+# name: test/sql/jsono_shredded_total.test
+# description: COALESCE-free typed-shred read when column statistics prove the shred total (no residual rows)
+# group: [sql]
+
+require jsono
+
+require json
+
+# A homogeneous BIGINT shred: every row's $.x fits the shred type, so no row falls into the residual.
+# The base-table null statistics then prove the shred carries no NULL, and the optimizer emits a bare
+# struct_extract with no residual COALESCE fallback.
+statement ok
+CREATE TABLE total_t AS
+SELECT jsono('{"x": ' || (i * 2)::VARCHAR || ', "k":"a"}', shredding := {'$.x':'BIGINT'}) AS j
+FROM range(2000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# (a) total shred: the typed read has no COALESCE and the scan projects only the shred column.
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM total_t;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM total_t;
+----
+physical_plan	<REGEX>:.*\$\.x.*
+
+# A selective equality filter on the total shred is pushed into the scan as a struct_extract filter
+# (zone-map prunable), not a post-scan COALESCE evaluation.
+query II
+EXPLAIN SELECT count(*) FROM total_t WHERE CAST(j->>'$.x' AS BIGINT) = 1998;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Values stay correct after the COALESCE-free rewrite.
+query II
+SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)) FROM total_t;
+----
+0	3998
+
+query I
+SELECT count(*) FROM total_t WHERE CAST(j->>'$.x' AS BIGINT) = 1998;
+----
+1
+
+# The text contract (->> without an outer cast) also drops the fallback when the shred is total.
+query I
+SELECT count(*) FROM total_t WHERE j->>'$.x' = '1998';
+----
+1
+
+# (b) heterogeneous shred: half the rows hold a string at $.x, which cannot fit a BIGINT shred and is
+# kept in the residual with a NULL shred. The statistics then report the shred CAN have NULL, so the
+# safe COALESCE fallback is retained and the value is still correct.
+statement ok
+CREATE TABLE hetero_t AS
+SELECT jsono(
+  CASE WHEN i % 2 = 0 THEN '{"x": ' || i::VARCHAR || '}' ELSE '{"x": "str"}' END,
+  shredding := {'$.x':'BIGINT'}) AS j
+FROM range(1000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(TRY_CAST(j->>'$.x' AS BIGINT)) FROM hetero_t;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT MIN(TRY_CAST(j->>'$.x' AS BIGINT)), MAX(TRY_CAST(j->>'$.x' AS BIGINT)) FROM hetero_t;
+----
+0	998
+
+# (c) a column with no base-table statistics (an inline VALUES relation, no LogicalGet leaf the
+# optimizer can pull stats from): the total fast path cannot prove totality, so the COALESCE stays.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN
+SELECT MIN(CAST(v->>'$.x' AS BIGINT))
+FROM (VALUES (jsono('{"x":1}', shredding := {'$.x':'BIGINT'})),
+             (jsono('{"x":2}', shredding := {'$.x':'BIGINT'}))) AS rows(v);
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# (d) narrowing-safety: a raw by-name struct cast that drops a shred narrows the row, and any read of
+# the dropped path still fails loud via the shred manifest — the total fast path does not mask it.
+statement ok
+CREATE TABLE narrow_total AS SELECT jsono('{}', shredding := {'$.a':'BIGINT'}) AS j WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+# The raw cast drops $.b: its value was stripped from the residual at write time, so the manifest
+# records the loss.
+statement ok
+INSERT INTO narrow_total SELECT jsono('{"a":1,"b":2}', shredding := {'$.a':'BIGINT','$.b':'BIGINT'});
+
+statement ok
+RESET disabled_optimizers;
+
+# The surviving $.a shred is total (no NULL), so its read is COALESCE-free — yet reading the dropped
+# $.b path on the same narrowed row still fails loud.
+query I
+SELECT CAST(j->>'$.a' AS BIGINT) FROM narrow_total;
+----
+1
+
+statement error
+SELECT j->>'$.b' FROM narrow_total;
+----
+narrowed by a raw struct cast
