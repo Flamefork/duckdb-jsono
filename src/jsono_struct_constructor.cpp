@@ -1170,6 +1170,67 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 	}
 }
 
+// Append `key` to a JSON path under `$`, quoting it when it carries a character ParseJsonoPath
+// would otherwise treat as structural (a bare `.foo` step only spans up to the next . [ ] ").
+void AppendShredPathStep(string &path, const string &key) {
+	bool needs_quote = key.empty();
+	for (char c : key) {
+		if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
+			needs_quote = true;
+			break;
+		}
+	}
+	path.push_back('.');
+	if (!needs_quote) {
+		path.append(key);
+		return;
+	}
+	path.push_back('"');
+	for (char c : key) {
+		if (c == '"' || c == '\\') {
+			path.push_back('\\');
+		}
+		path.push_back(c);
+	}
+	path.push_back('"');
+}
+
+// Type-driven auto-shred: lift shred-eligible scalar fields into typed shreds. Top-level scalars
+// keep their bare key name (the fast one-pass shred path); a scalar one level down inside a nested
+// STRUCT is lifted under its `$.parent.child` JSON path so the existing path-aware two-pass shred
+// writer captures it. The walk descends exactly one struct level: a leaf two or more levels deep
+// stays in the residual. The schema is the only signal available at bind (the return type is a pure
+// function of the input type, no per-row inference), and depth alone does not tell a hot path from a
+// cold one — a deep schema would lift dozens of sparse leaves that are never queried while paying
+// the full write and reconstruct cost. The one-level bound keeps the analytically addressed paths
+// (a named object's direct fields) shredded without that blowup; frequency-aware budgeting of deeper
+// paths belongs to a sampling ingest path, not the bind-time type walk.
+void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix, bool top_level,
+                       vector<pair<string, LogicalType>> &shreds) {
+	for (auto &child : StructType::GetChildTypes(struct_type)) {
+		// A top-level field named 'body' would collide with the layout's residual field, so it stays
+		// in the residual instead of becoming a shred (auto-shred must not error on field names).
+		if (top_level && child.first == "body") {
+			continue;
+		}
+		if (IsShredValueType(child.second)) {
+			if (top_level) {
+				shreds.emplace_back(child.first, child.second);
+			} else {
+				string path = path_prefix;
+				AppendShredPathStep(path, child.first);
+				shreds.emplace_back(std::move(path), child.second);
+			}
+			continue;
+		}
+		if (top_level && child.second.id() == LogicalTypeId::STRUCT) {
+			string path = "$";
+			AppendShredPathStep(path, child.first);
+			CollectAutoShreds(child.second, path, false, shreds);
+		}
+	}
+}
+
 unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
                                                vector<unique_ptr<Expression>> &arguments, bool allow_shred) {
 	if (arguments.empty() || arguments[0]->return_type.id() != LogicalTypeId::STRUCT) {
@@ -1188,13 +1249,7 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 	bound_function.arguments[0] = input_type;
 	auto bind_data = make_uniq<JsonoStructBindData>(std::move(plan));
 	if (allow_shred) {
-		for (auto &child : StructType::GetChildTypes(input_type)) {
-			// A field named 'body' would collide with the layout's residual field, so it stays in
-			// the residual instead of becoming a shred (auto-shred must not error on field names).
-			if (child.first != "body" && IsShredValueType(child.second)) {
-				bind_data->shreds.emplace_back(child.first, child.second);
-			}
-		}
+		CollectAutoShreds(input_type, string(), true, bind_data->shreds);
 	}
 	if (!bind_data->shreds.empty()) {
 		// Canonical shred order (sorted by name) so the shredded type is a pure function of the shred
