@@ -34,35 +34,41 @@ bool EmitDomObject(yyjson_val *obj, DomJsonoBuilder &b) {
 	// (cheaper than sorting kv pairs: 4-byte swaps vs 24-byte), drop duplicate keys
 	// keeping the last occurrence, and cache the result for next time. emit_count is
 	// the post-dedup key count and equals N for the common unique-key case.
-	size_t emit_count;
-	auto cached = b.ShapeCacheFind(shape_hash, uint32_t(N));
-	if (cached) {
-		emit_count = cached->perm.size();
-		std::memcpy(b.indices.data() + idx_offset, cached->perm.data(), emit_count * sizeof(uint32_t));
-	} else {
-		for (size_t i = 0; i < N; i++) {
-			b.indices[idx_offset + i] = uint32_t(i);
-		}
-		// Tie-break equal keys by input index so the last duplicate sorts last in its run.
-		std::sort(b.indices.begin() + idx_offset, b.indices.begin() + idx_offset + N,
-		          [&b, kv_offset](uint32_t a, uint32_t c) {
-			          int cmp = b.kvs[kv_offset + a].first.compare(b.kvs[kv_offset + c].first);
-			          return cmp != 0 ? cmp < 0 : a < c;
-		          });
-		// Collapse runs of equal keys in place, keeping the last (last-wins), so the
-		// stored object has the unique sorted keys the readers' binary search assumes.
-		size_t write = idx_offset;
-		for (size_t read = idx_offset; read < idx_offset + N;) {
-			size_t run_end = read + 1;
-			while (run_end < idx_offset + N &&
-			       b.kvs[kv_offset + b.indices[run_end]].first == b.kvs[kv_offset + b.indices[read]].first) {
-				run_end++;
+	// An empty object has no keys to sort, dedup, cache or copy: emit_count stays 0 and the
+	// whole permutation block is skipped. Beyond saving work, this avoids `indices.data()`/
+	// `indices.begin() + offset` and the cache memcpy on an empty (null-data) vector, which is
+	// undefined behavior the sanitizer build traps.
+	size_t emit_count = 0;
+	if (N > 0) {
+		auto cached = b.ShapeCacheFind(shape_hash, uint32_t(N));
+		if (cached) {
+			emit_count = cached->perm.size();
+			std::memcpy(b.indices.data() + idx_offset, cached->perm.data(), emit_count * sizeof(uint32_t));
+		} else {
+			for (size_t i = 0; i < N; i++) {
+				b.indices[idx_offset + i] = uint32_t(i);
 			}
-			b.indices[write++] = b.indices[run_end - 1];
-			read = run_end;
+			// Tie-break equal keys by input index so the last duplicate sorts last in its run.
+			std::sort(b.indices.begin() + idx_offset, b.indices.begin() + idx_offset + N,
+			          [&b, kv_offset](uint32_t a, uint32_t c) {
+				          int cmp = b.kvs[kv_offset + a].first.compare(b.kvs[kv_offset + c].first);
+				          return cmp != 0 ? cmp < 0 : a < c;
+			          });
+			// Collapse runs of equal keys in place, keeping the last (last-wins), so the
+			// stored object has the unique sorted keys the readers' binary search assumes.
+			size_t write = idx_offset;
+			for (size_t read = idx_offset; read < idx_offset + N;) {
+				size_t run_end = read + 1;
+				while (run_end < idx_offset + N &&
+				       b.kvs[kv_offset + b.indices[run_end]].first == b.kvs[kv_offset + b.indices[read]].first) {
+					run_end++;
+				}
+				b.indices[write++] = b.indices[run_end - 1];
+				read = run_end;
+			}
+			emit_count = write - idx_offset;
+			b.ShapeCacheInsert(shape_hash, uint32_t(N), b.indices.data() + idx_offset, uint32_t(emit_count));
 		}
-		emit_count = write - idx_offset;
-		b.ShapeCacheInsert(shape_hash, uint32_t(N), b.indices.data() + idx_offset, uint32_t(emit_count));
 	}
 
 	b.EmitObjectStart(emit_count);
@@ -234,43 +240,50 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 	size_t N = s.kvs.size() - kv_offset;
 	s.indices.resize(idx_offset + N);
 
-	size_t emit_count;
-	uint64_t sorted_hash;
-	auto cached = s.ShapeCacheFind(shape_hash, uint32_t(N));
-	if (cached) {
-		emit_count = cached->perm.size();
-		std::memcpy(s.indices.data() + idx_offset, cached->perm.data(), emit_count * sizeof(uint32_t));
-		sorted_hash = cached->sorted_hash;
-	} else {
-		for (size_t i = 0; i < N; i++) {
-			s.indices[idx_offset + i] = uint32_t(i);
-		}
-		// Tie-break equal keys by input index so the last duplicate sorts last in its run.
-		std::sort(s.indices.begin() + idx_offset, s.indices.begin() + idx_offset + N,
-		          [&s, kv_offset](uint32_t a, uint32_t c) {
-			          int cmp = s.kvs[kv_offset + a].first.compare(s.kvs[kv_offset + c].first);
-			          return cmp != 0 ? cmp < 0 : a < c;
-		          });
-		// Collapse runs of equal keys in place, keeping the last (last-wins).
-		size_t write = idx_offset;
-		for (size_t read = idx_offset; read < idx_offset + N;) {
-			size_t run_end = read + 1;
-			while (run_end < idx_offset + N &&
-			       s.kvs[kv_offset + s.indices[run_end]].first == s.kvs[kv_offset + s.indices[read]].first) {
-				run_end++;
+	// An empty object has no keys: emit_count stays 0, sorted_hash stays the empty-sequence
+	// seed (what the miss branch would hash over zero keys), and the whole permutation block is
+	// skipped — which also avoids `indices.data()`/`indices.begin() + offset` and the cache
+	// memcpy on an empty (null-data) vector, undefined behavior the sanitizer build traps.
+	size_t emit_count = 0;
+	uint64_t sorted_hash = HASH_SEED;
+	if (N > 0) {
+		auto cached = s.ShapeCacheFind(shape_hash, uint32_t(N));
+		if (cached) {
+			emit_count = cached->perm.size();
+			std::memcpy(s.indices.data() + idx_offset, cached->perm.data(), emit_count * sizeof(uint32_t));
+			sorted_hash = cached->sorted_hash;
+		} else {
+			for (size_t i = 0; i < N; i++) {
+				s.indices[idx_offset + i] = uint32_t(i);
 			}
-			s.indices[write++] = s.indices[run_end - 1];
-			read = run_end;
+			// Tie-break equal keys by input index so the last duplicate sorts last in its run.
+			std::sort(s.indices.begin() + idx_offset, s.indices.begin() + idx_offset + N,
+			          [&s, kv_offset](uint32_t a, uint32_t c) {
+				          int cmp = s.kvs[kv_offset + a].first.compare(s.kvs[kv_offset + c].first);
+				          return cmp != 0 ? cmp < 0 : a < c;
+			          });
+			// Collapse runs of equal keys in place, keeping the last (last-wins).
+			size_t write = idx_offset;
+			for (size_t read = idx_offset; read < idx_offset + N;) {
+				size_t run_end = read + 1;
+				while (run_end < idx_offset + N &&
+				       s.kvs[kv_offset + s.indices[run_end]].first == s.kvs[kv_offset + s.indices[read]].first) {
+					run_end++;
+				}
+				s.indices[write++] = s.indices[run_end - 1];
+				read = run_end;
+			}
+			emit_count = write - idx_offset;
+			// The stored shape_hash fingerprints the sorted key sequence (what
+			// HashObjectKeySlots computes from emitted KEY slots); caching it next
+			// to the permutation makes it free on every subsequent hit.
+			sorted_hash = HASH_SEED;
+			for (size_t i = 0; i < emit_count; i++) {
+				sorted_hash = HashKey(sorted_hash, s.kvs[kv_offset + s.indices[idx_offset + i]].first);
+			}
+			s.ShapeCacheInsert(shape_hash, uint32_t(N), s.indices.data() + idx_offset, uint32_t(emit_count),
+			                   sorted_hash);
 		}
-		emit_count = write - idx_offset;
-		// The stored shape_hash fingerprints the sorted key sequence (what
-		// HashObjectKeySlots computes from emitted KEY slots); caching it next
-		// to the permutation makes it free on every subsequent hit.
-		sorted_hash = HASH_SEED;
-		for (size_t i = 0; i < emit_count; i++) {
-			sorted_hash = HashKey(sorted_hash, s.kvs[kv_offset + s.indices[idx_offset + i]].first);
-		}
-		s.ShapeCacheInsert(shape_hash, uint32_t(N), s.indices.data() + idx_offset, uint32_t(emit_count), sorted_hash);
 	}
 	// Drop dedup leftovers so the plan's perm slice is compact.
 	s.indices.resize(idx_offset + emit_count);
@@ -564,10 +577,11 @@ void WriteDomObjectDirect(DomDirectState &s, DirectDest &d, DirectFrame *parent)
 	auto start_num = d.num_pos;
 
 	d.PushSlot(MakeSlot(tag::OBJ_START, MakeContainerPayload(frame.id, plan.emit_count)));
-	// kvs/indices are frozen after pass 1, so raw pointers stay valid across
-	// the recursion below.
-	const auto *kvs = s.kvs.data() + plan.kv_offset;
-	const auto *perm = s.indices.data() + plan.idx_offset;
+	// kvs/indices are frozen after pass 1, so raw pointers stay valid across the recursion
+	// below. An empty object emits no key/value slots, so offset into the (then null-data)
+	// buffers only when there is something to read — `null + offset` is UB the sanitizer traps.
+	const auto *kvs = plan.emit_count ? s.kvs.data() + plan.kv_offset : nullptr;
+	const auto *perm = plan.emit_count ? s.indices.data() + plan.idx_offset : nullptr;
 	for (uint32_t i = 0; i < plan.emit_count; i++) {
 		auto key = kvs[perm[i]].first;
 		d.PushSlot(MakeSlot(tag::KEY, MakeKeyPayload(d.key_pos, key.size())));

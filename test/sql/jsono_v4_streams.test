@@ -142,3 +142,17 @@ query II
 SELECT to_json(j), jsono_validate(j) FROM read_parquet('__TEST_DIR__/v4_plain.parquet');
 ----
 {"arr":[1,"two",3.5,{"k":"v"}],"big":99999999999999999999,"s":"tail"}	true
+
+# Empty objects exercise the DOM writer's shape-cache replay with zero keys: the second
+# same-shape object hits the cache and copies a zero-length permutation, which must not
+# touch the (empty, null-data) index buffer. Repeated and nested empties cover the cache
+# hit; a leading empty object covers the still-unallocated index buffer. Under the
+# sanitizer build a regression here aborts on the null-pointer offset, not just a value diff.
+query IIII
+SELECT
+  to_json(jsono('[{},{}]')),
+  to_json(jsono('{"a":{},"b":{}}')),
+  to_json(jsono('[{},{},{}]')),
+  to_json(jsono('{"outer":{"x":{},"y":{}},"z":{}}'));
+----
+[{},{}]	{"a":{},"b":{}}	[{},{},{}]	{"outer":{"x":{},"y":{}},"z":{}}

@@ -398,6 +398,10 @@ validish_mutations = st.sampled_from(
 @example(text='{"u":18446744073709551615,"big":9223372036854775000}')
 @example(text='{"d":123456789012345678901234567890123456.12}')
 @example(text='{"b":2,"a":1,"nested":{"y":2,"x":1}}')
+# Repeated/nested empty objects drive the DOM writer's shape-cache replay with zero keys
+# against a still-empty index buffer — the format-v4 null-pointer-offset UB.
+@example(text="[{},{}]")
+@example(text='{"a":{},"b":{}}')
 @given(text=json_documents)
 def test_round_trip_idempotent(text: str) -> None:
     once = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
@@ -411,6 +415,7 @@ def test_round_trip_idempotent(text: str) -> None:
 @example(text='{"a.b":"flat","a":{"b":"nested"}}')
 @example(text='{"d":0.1,"e":123456789012345678901234567890123456.12}')
 @example(text='[1,2,"x",true,null,-9223372036854775000]')
+@example(text='{"a":{},"b":{}}')
 @given(text=json_documents)
 def test_value_parity(text: str) -> None:
     out = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
