@@ -1098,6 +1098,9 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
+	// jsono(struct, shredding) does not yet compute per-row diversion; stay conservative so the
+	// optimizer keeps the COALESCE form for any typed shred (no false value-complete fast path).
+	JsonoFillValueComplete(result, count);
 
 	if (plan.strategy == StructValueStrategy::Jsono) {
 		for (idx_t row = 0; row < count; row++) {
@@ -1208,9 +1211,10 @@ void AppendShredPathStep(string &path, const string &key) {
 void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix, bool top_level,
                        vector<pair<string, LogicalType>> &shreds) {
 	for (auto &child : StructType::GetChildTypes(struct_type)) {
-		// A top-level field named 'body' would collide with the layout's residual field, so it stays
-		// in the residual instead of becoming a shred (auto-shred must not error on field names).
-		if (top_level && child.first == "body") {
+		// A top-level field named 'body' or the reserved value-complete marker would collide with a
+		// layout field, so it stays in the residual instead of becoming a shred (auto-shred must not
+		// error on field names).
+		if (top_level && (child.first == "body" || child.first == JsonoValueCompleteName())) {
 			continue;
 		}
 		if (IsShredValueType(child.second)) {
@@ -1447,6 +1451,11 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
+	// Type-driven auto-shred never diverts: each shred's type is its source field's type, so a
+	// present value always fits the shred and a NULL shred is only an absent field. The value is
+	// therefore always value-complete — which gives jsono(struct, shredding) the COALESCE-free typed
+	// read on read-back, the rick/data ingest path.
+	JsonoFillValueCompleteAllTrue(result, count);
 	auto &builder = lstate.builder;
 
 	// All-stripped rows with an empty residual share constant blobs (header + {} + manifest).

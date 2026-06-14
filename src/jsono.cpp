@@ -83,6 +83,10 @@ void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, 
 }
 
 constexpr const char *JSONO_LAYOUT = "jsono";
+// Reserved name of the optional trailing value-complete marker (see JsonoValueCompleteName). The
+// double `$` cannot occur in a shred path (object-key paths are `$.key…`); the shred-spec parsers
+// reject it outright so no shred can collide.
+constexpr const char *JSONO_VALUE_COMPLETE = "$jsono$vc";
 
 // Parse one layout field (top-level child name + its STRUCT type) into `out`. The body must be the
 // six-BLOB body struct as field 0; a shredded layout adds its typed shreds as the remaining sibling
@@ -108,19 +112,35 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 		out.shreds.clear();
 		return true;
 	}
-	// Every sibling of `body` must be a shred of a shred value type; anything else is not a
-	// JSONO struct (a user struct that happens to carry a body-shaped field stays theirs).
+	// A field named JSONO_VALUE_COMPLETE (BOOLEAN) is the value-complete marker, not a shred, and it
+	// is identified by name at ANY position: a set-operation merged type interleaves it among the
+	// shreds (CombineStructTypes iterates the left branch's fields — body, marker, shreds — then
+	// appends the right branch's unique shreds after the marker), so a positional rule would misread
+	// it as a shred. Every other sibling of `body` must be a shred value type; anything else means
+	// this is not a JSONO struct (a user struct that merely carries a body-shaped field stays theirs).
 	child_list_t<LogicalType> shreds;
+	bool has_value_complete = false;
+	idx_t value_complete_index = 0;
 	for (idx_t i = 1; i < fields.size(); i++) {
+		if (fields[i].first == JSONO_VALUE_COMPLETE && fields[i].second.id() == LogicalTypeId::BOOLEAN) {
+			has_value_complete = true;
+			value_complete_index = i;
+			continue;
+		}
 		if (!IsShredValueType(fields[i].second)) {
 			return false;
 		}
 		shreds.push_back(fields[i]);
 	}
+	if (shreds.empty()) {
+		return false; // body plus only the marker is not a valid shredded value
+	}
 	out.kind = JsonoLayoutKind::Shredded;
 	out.layout_name = name;
 	out.layout_type = layout_type;
 	out.shreds = std::move(shreds);
+	out.has_value_complete = has_value_complete;
+	out.value_complete_index = value_complete_index;
 	return true;
 }
 
@@ -192,9 +212,21 @@ string JsonoLayoutName() {
 	return JSONO_LAYOUT;
 }
 
+string JsonoValueCompleteName() {
+	return JSONO_VALUE_COMPLETE;
+}
+
 LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds) {
 	child_list_t<LogicalType> layout_children;
 	layout_children.emplace_back("body", JsonoBodyStructType());
+	// Every shredded layout carries the value-complete marker, uniformly (a VARCHAR-only shred set
+	// too, where it is always non-NULL). It sits right after `body`, BEFORE the shreds, on purpose:
+	// DuckDB's set-operation type reconciliation (CombineStructTypes) iterates the left branch's
+	// fields then appends the right branch's unique ones, so a marker placed after `body` stays at a
+	// fixed position with the shreds contiguous after it in every branch and their merge — whereas a
+	// trailing marker would be interleaved (body, shreds_left, marker, shreds_right), reordering the
+	// merged type away from the canonical one and breaking the positional struct cast between them.
+	layout_children.emplace_back(JSONO_VALUE_COMPLETE, LogicalType::BOOLEAN);
 	for (auto &shred : shreds) {
 		layout_children.push_back(shred);
 	}

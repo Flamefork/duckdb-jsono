@@ -18,6 +18,7 @@ CREATE TABLE shred AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"kind":"commit","did":"d1","extra":"e1"}')."jsono".body,
+        "$jsono$vc" := true,
         "$.did"  := 'd1',
             "$.kind" := 'commit')
 ) AS j;
@@ -70,6 +71,7 @@ CREATE TABLE shred_sentinel AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"kind":"commit","did":"d1"}')."jsono".body,
+        "$jsono$vc" := true,
         "$.kind" := 'SENTINEL')
 ) AS j;
 
@@ -174,6 +176,7 @@ CREATE TABLE shred_typed AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"n":5,"s":"blob_s"}')."jsono".body,
+        "$jsono$vc" := true,
         "$.n" := 999::BIGINT,
             "$.s" := 'shred_s')
 ) AS j;
@@ -204,6 +207,7 @@ CREATE TABLE typed_het AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"n":"hello"}')."jsono".body,
+        "$jsono$vc" := NULL::BOOLEAN,
         "$.n" := NULL::BIGINT)
 ) AS j;
 

@@ -23,6 +23,7 @@ res AS (
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := res.body,
+        "$jsono$vc" := true,
         "$.commit.collection" := orig ->> '$.commit.collection',
             "$.commit.operation"  := orig ->> '$.commit.operation',
             "$.did"               := orig ->> '$.did',
@@ -83,6 +84,7 @@ CREATE TABLE ov_conflict AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"k":"RESIDUAL","c":"z"}')."jsono".body,
+        "$jsono$vc" := true,
         "$.k" := 'SHRED')
 ) AS j;
 
@@ -124,6 +126,7 @@ CREATE TABLE ov_null AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"b":null,"c":"z"}')."jsono".body,
+        "$jsono$vc" := true,
         "$.a" := 'x',
             "$.b" := NULL::VARCHAR)
 ) AS j;

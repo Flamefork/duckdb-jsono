@@ -78,6 +78,14 @@ LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds);
 // The top-level field name of every layout (plain and shredded): "jsono".
 string JsonoLayoutName();
 
+// The reserved name of the optional trailing value-complete marker field a shredded layout carries
+// when it has at least one typed (non-VARCHAR) shred. The field is BOOLEAN and NULL exactly on rows
+// that diverted a present scalar of that path into the residual (case B); a column whose stats prove
+// it carries no NULL has no such diversion, so the optimizer may read its typed shreds as a bare
+// struct_extract (zone-map pushdown) even when the shred itself has NULLs from absent paths. Not a
+// shred: reserved so no shred path can collide. Carries no value semantics for reconstruction.
+string JsonoValueCompleteName();
+
 // The classification of one JSONO layout field.
 enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 
@@ -88,6 +96,12 @@ struct JsonoLayoutType {
 	string layout_name;
 	LogicalType layout_type;
 	child_list_t<LogicalType> shreds;
+	// True when the shredded layout carries the value-complete marker field (see
+	// JsonoValueCompleteName). In a canonically built type it is the last layout child; a
+	// set-operation merged type can place it between shreds, so its actual layout child index is
+	// recorded in `value_complete_index` rather than assumed positionally.
+	bool has_value_complete = false;
+	idx_t value_complete_index = 0;
 };
 
 // Parse `type` as an ordinary JSONO value: a top-level STRUCT with exactly one valid `jsono`

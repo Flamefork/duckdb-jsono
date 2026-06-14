@@ -81,6 +81,37 @@ SELECT MIN(TRY_CAST(j->>'$.x' AS BIGINT)), MAX(TRY_CAST(j->>'$.x' AS BIGINT)) FR
 ----
 0	998
 
+# (b2) value-complete-but-not-total shred: a third of the rows OMIT $.x (an absent path -> NULL shred,
+# not a residual diversion), the rest are integers. No present scalar was diverted, so the
+# value-complete marker carries no NULL. The shred itself still has NULLs (from the absent rows), yet
+# the optimizer reads it COALESCE-free anyway: a bare struct_extract returns NULL for an absent path,
+# which is the correct read, and MIN/MAX/count (which ignore those NULLs) stay correct. This is the
+# value-complete fast path that lets a typed shred beat ClickHouse without dropping the absent rows.
+statement ok
+CREATE TABLE vc_absent AS
+SELECT jsono(
+  CASE WHEN i % 3 = 0 THEN '{"k":"a"}' ELSE '{"x": ' || i::VARCHAR || '}' END,
+  shredding := {'$.x':'BIGINT'}) AS j
+FROM range(3000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM vc_absent;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# 2000 of 3000 rows carry $.x (the others omit it); MIN/MAX over the present integers, count ignores
+# the absent rows.
+query III
+SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)), COUNT(CAST(j->>'$.x' AS BIGINT)) FROM vc_absent;
+----
+1	2999	2000
+
 # (c) a column with no base-table statistics (an inline VALUES relation, no LogicalGet leaf the
 # optimizer can pull stats from): the total fast path cannot prove totality, so the COALESCE stays.
 statement ok

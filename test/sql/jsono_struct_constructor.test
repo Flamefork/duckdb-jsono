@@ -208,14 +208,14 @@ true	{"$.x":"v","y":1}
 query I
 SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" BOOLEAN, "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR))
 
 # The walk stops after one level: a scalar two or more levels deep stays in the residual (a deep
 # schema would otherwise lift many cold leaves). Only $.b.c is shredded; $.b.d.e is not.
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep'}}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$.b.c" VARCHAR, a BIGINT))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" BOOLEAN, "$.b.c" VARCHAR, a BIGINT))
 
 # Losslessness holds for the un-shredded deep leaf too: $.b.d.e round-trips through the residual.
 query I
@@ -289,4 +289,30 @@ nested	flat
 query I
 SELECT typeof(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$.commit.operation" VARCHAR))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" BOOLEAN, "$.commit.operation" VARCHAR))
+
+# Type-driven auto-shred is always value-complete: a shred's type IS its field's type, so a present
+# value always fits and a NULL is only an absent field, never a residual diversion. A typed shred
+# with absent (NULL) rows is therefore read COALESCE-free — the value-complete fast path that gives
+# jsono(struct, shredding) the zone-map pushdown on read-back (the rick/data ingest path).
+statement ok
+CREATE TABLE sc_value_complete AS
+SELECT jsono({'x': CASE WHEN i % 3 = 0 THEN NULL ELSE i END :: BIGINT, 'k': 'a'}) AS j
+FROM range(3000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM sc_value_complete;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# 2000 of 3000 rows carry $.x (the others are NULL); MIN/MAX over the present integers.
+query III
+SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)), COUNT(CAST(j->>'$.x' AS BIGINT)) FROM sc_value_complete;
+----
+1	2999	2000

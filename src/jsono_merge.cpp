@@ -1176,6 +1176,8 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// except `skips`, which is re-emitted per row below with the output's shred manifest.
 			JsonoBodyWriter writer;
 			writer.Init(result);
+			// The merge reshred fast-path does not recompute per-row diversion; stay conservative.
+			JsonoFillValueComplete(result, count);
 			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
 			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
 			for (idx_t b = 0; b < BODY_BLOB_COUNT; b++) {

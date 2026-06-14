@@ -160,6 +160,9 @@ void CaptureShredLeaf(yyjson_val *value, DomShredKind kind, DomShredCapture &cap
 			cap.state = DomShredCapture::State::String;
 			cap.stripped = true;
 			cap.text = nonstd::string_view(yyjson_get_str(value), yyjson_get_len(value));
+		} else {
+			// Present string at a typed shred path: stays in the residual, shred NULL (case B).
+			cap.diverted_scalar = true;
 		}
 		return;
 	case YYJSON_TYPE_RAW: {
@@ -168,7 +171,9 @@ void CaptureShredLeaf(yyjson_val *value, DomShredKind kind, DomShredCapture &cap
 			return;
 		}
 		if (kind != DomShredKind::Int64 && kind != DomShredKind::Uint64) {
-			// A text number is never stored as kind Double; DOUBLE/BOOLEAN shreds stay NULL.
+			// A text number is never stored as kind Double; DOUBLE/BOOLEAN shreds stay NULL —
+			// a present number they did not capture is a residual-diverted scalar (case B).
+			cap.diverted_scalar = true;
 			return;
 		}
 		auto classified = ClassifyNumberFromText(nonstd::string_view(yyjson_get_raw(value), yyjson_get_len(value)));
@@ -179,16 +184,18 @@ void CaptureShredLeaf(yyjson_val *value, DomShredKind kind, DomShredCapture &cap
 			cap.state = DomShredCapture::State::Int;
 			cap.stripped = true;
 			cap.int_value = int_value;
-		} else if (kind == DomShredKind::Uint64) {
-			if (classified.slot == MakeExtSlot(ext_subtype::UINT64)) {
-				cap.state = DomShredCapture::State::Uint;
-				cap.stripped = true;
-				cap.uint_value = classified.num;
-			} else if (int64_kind && int_value >= 0) {
-				cap.state = DomShredCapture::State::Uint;
-				cap.stripped = true;
-				cap.uint_value = uint64_t(int_value);
-			}
+		} else if (kind == DomShredKind::Uint64 && classified.slot == MakeExtSlot(ext_subtype::UINT64)) {
+			cap.state = DomShredCapture::State::Uint;
+			cap.stripped = true;
+			cap.uint_value = classified.num;
+		} else if (kind == DomShredKind::Uint64 && int64_kind && int_value >= 0) {
+			cap.state = DomShredCapture::State::Uint;
+			cap.stripped = true;
+			cap.uint_value = uint64_t(int_value);
+		} else {
+			// Present number the int/uint shred could not capture (float, or out-of-range/sign):
+			// kept in the residual, shred NULL (case B).
+			cap.diverted_scalar = true;
 		}
 		return;
 	}
@@ -199,10 +206,14 @@ void CaptureShredLeaf(yyjson_val *value, DomShredKind kind, DomShredCapture &cap
 			cap.bool_value = yyjson_get_bool(value);
 		} else if (kind == DomShredKind::Varchar) {
 			cap.state = DomShredCapture::State::ResidualFill;
+		} else {
+			// Present boolean at a numeric shred path: stays in the residual, shred NULL (case B).
+			cap.diverted_scalar = true;
 		}
 		return;
 	default:
-		// null literal or container: shred NULL, value stays in the residual.
+		// null literal or container: shred NULL, value stays in the residual. A `->>`+CAST read
+		// yields NULL here too, so the bare struct_extract stays correct — not a diversion.
 		return;
 	}
 }

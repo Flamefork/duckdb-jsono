@@ -1510,6 +1510,9 @@ void CollectShredTotality(ClientContext &context, const LogicalOperator &op, Shr
 		} else {
 			stats = get.function.statistics(context, get.bind_data.get(), table_index);
 		}
+		JsonoLayoutType layout_info;
+		bool has_value_complete =
+		    TryParseJsonoLayoutType(returned_types[table_index], layout_info) && layout_info.has_value_complete;
 		vector<bool> per_shred(shreds.size(), true);
 		if (stats && stats->GetType().id() == LogicalTypeId::STRUCT &&
 		    StructType::GetChildCount(stats->GetType()) >= 1) {
@@ -1517,9 +1520,23 @@ void CollectShredTotality(ClientContext &context, const LogicalOperator &op, Shr
 			if (layout_stats.GetType().id() == LogicalTypeId::STRUCT) {
 				auto layout_children = StructType::GetChildCount(layout_stats.GetType());
 				for (auto &shred : shreds) {
-					idx_t layout_index = 1 + shred.child_index;
+					// Canonical base-table layout: body (0), value-complete marker (1), shreds (2+).
+					idx_t layout_index = 2 + shred.child_index;
 					if (layout_index < layout_children &&
 					    !StructStats::GetChildStats(layout_stats, layout_index).CanHaveNull()) {
+						per_shred[shred.child_index] = false;
+					}
+				}
+				// Value-complete: the marker field carries no NULL, so no row diverted a present
+				// scalar into the residual. Every typed shred's NULLs are then absent paths, where a
+				// bare struct_extract reads the correct NULL — so all shreds are safe to read
+				// COALESCE-free, even those that still carry (absent) NULLs. (A base-table column is
+				// canonical, so the marker is the last layout child; value_complete_index carries its
+				// exact position regardless.)
+				idx_t vc_index = layout_info.value_complete_index;
+				if (has_value_complete && vc_index < layout_children &&
+				    !StructStats::GetChildStats(layout_stats, vc_index).CanHaveNull()) {
+					for (auto &shred : shreds) {
 						per_shred[shred.child_index] = false;
 					}
 				}
@@ -1688,10 +1705,11 @@ private:
 		return function_binder.BindScalarFunction(StructExtractAtFun::GetFunction(), std::move(se_children));
 	}
 
-	// Shred `child_index` (0-based over the shred set) of a shredded column: the shreds are the
-	// layout field's children after `body`, so shred k is layout child 2 + k (1-based).
+	// Shred `child_index` (0-based over the shred set) of a shredded column: a canonical layout is
+	// `body` (1-based 1), the value-complete marker (2), then the shreds, so shred k is layout child
+	// 3 + k (1-based). Base-table columns the optimizer reads are always canonical.
 	unique_ptr<Expression> ShredExtract(const Expression &column, idx_t child_index) {
-		return StructExtractAt(StructExtractAt(column.Copy(), 1), int64_t(child_index) + 2);
+		return StructExtractAt(StructExtractAt(column.Copy(), 1), int64_t(child_index) + 3);
 	}
 
 	// True when statistics proved this shred carries no SQL NULL anywhere in the table: NULL-shred

@@ -228,6 +228,9 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec) {
 			throw BinderException("jsono shred: a shred cannot be named 'body' (the residual field); "
 			                      "shred the JSON key through its path form '$.body'");
 		}
+		if (path == JsonoValueCompleteName()) {
+			throw BinderException("jsono shred: '%s' is a reserved layout field name", path);
+		}
 		ShredField field;
 		field.path_name = path;
 		field.steps = ParseShredFieldPath(path);
@@ -361,8 +364,15 @@ Location LocatePath(const JsonoView &view, const vector<PathStep> &steps) {
 // captured by the shred type (so the path may be stripped from the residual). A VARCHAR
 // shred stores the `->>` text for any scalar but only a real JSON string round-trips; a
 // typed shred stores the value only when its kind matches exactly.
+// `diverted` (optional out) is set true only when a PRESENT scalar fails a typed shred's kind gate
+// and is kept in the residual instead — the case-B diversion that makes a bare struct_extract read
+// NULL where the residual `->>`+CAST would yield the value. Absence, a present container, and a
+// VARCHAR shred (which renders any scalar) all leave it false: a bare read is then correct.
 bool WriteShred(const ShredField &field, const JsonoView &view, const Location &location, Vector &shred, idx_t row,
-                std::string &scratch) {
+                std::string &scratch, bool *diverted = nullptr) {
+	if (diverted) {
+		*diverted = false;
+	}
 	if (!location.found) {
 		FlatVector::SetNull(shred, row, true);
 		return false;
@@ -419,6 +429,11 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const Location &
 		}
 		break;
 	}
+	// Reached only by a typed shred whose present scalar did not match its kind gate: the value
+	// stays in the residual, so this row is not value-complete for that shred.
+	if (diverted) {
+		*diverted = true;
+	}
 	FlatVector::SetNull(shred, row, true);
 	return false;
 }
@@ -433,6 +448,10 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
+	// Value-complete marker, computed per row: NULL when a present scalar diverted into the residual
+	// (case B), non-NULL otherwise. WriteShred reports the diversion below.
+	Vector *vc_out = &JsonoVcVector(result);
+	vc_out->SetVectorType(VectorType::FLAT_VECTOR);
 	vector<Vector *> shred_children;
 	shred_children.reserve(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
@@ -445,6 +464,8 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		for (auto &shred : shred_children) {
 			FlatVector::SetNull(*shred, row, true);
 		}
+		// A NULL jsono row diverts nothing: a bare struct_extract reads the correct NULL.
+		FlatVector::GetData<bool>(*vc_out)[row] = true;
 	};
 
 	// Per-field manifest entry bytes, built once: the per-row manifest concatenates the entries
@@ -468,14 +489,22 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		FlatVector::Validity(result).SetValid(row);
 		lstate.strip_paths.clear();
 		stripped_fields.clear();
+		bool diverted_row = false;
 		for (idx_t f = 0; f < fields.size(); f++) {
 			auto &field = fields[f];
 			auto location = LocatePath(view, field.steps);
-			bool strippable = WriteShred(field, view, location, *shred_children[f], row, lstate.text);
+			bool diverted = false;
+			bool strippable = WriteShred(field, view, location, *shred_children[f], row, lstate.text, &diverted);
+			diverted_row = diverted_row || diverted;
 			if (strippable && IsObjectKeyPath(field.steps)) {
 				lstate.strip_paths.push_back(&field.steps);
 				stripped_fields.push_back(f);
 			}
+		}
+		if (diverted_row) {
+			FlatVector::SetNull(*vc_out, row, true);
+		} else {
+			FlatVector::GetData<bool>(*vc_out)[row] = true;
 		}
 
 		lstate.builder.Reset();
@@ -523,6 +552,8 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
+	// Reshred does not yet recompute per-row diversion for the new shred set; stay conservative.
+	JsonoFillValueComplete(result, count);
 	vector<Vector *> shred_out(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		shred_out[f] = &JsonoShredVector(result, f);
@@ -698,6 +729,12 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 		shred_out[f] = &JsonoShredVector(result, f);
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
 	}
+	// Value-complete marker (every shredded result carries one): NULL on a row that kept a present
+	// scalar in the residual (case B), non-NULL otherwise. A column whose marker carries no NULL has
+	// no such diversion, so the optimizer reads its typed shreds as a bare struct_extract. For a
+	// VARCHAR-only shred set it stays uniformly non-NULL (a VARCHAR shred never diverts).
+	Vector *vc_out = &JsonoVcVector(result);
+	vc_out->SetVectorType(VectorType::FLAT_VECTOR);
 
 	vector<std::string> manifest_entries(fields.size());
 	jsono_dom::DomShredContext ctx;
@@ -742,6 +779,12 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 			for (idx_t f = 0; f < fields.size(); f++) {
 				FlatVector::SetNull(*shred_out[f], row, true);
 			}
+			// A NULL jsono row has no value to divert: its shreds read NULL via a bare struct_extract
+			// (struct-null propagates), which is the correct result, so the marker stays non-NULL so a
+			// table of value-complete rows plus NULL rows is still value-complete.
+			if (vc_out) {
+				FlatVector::GetData<bool>(*vc_out)[row] = true;
+			}
 			continue;
 		}
 		auto input = inputs[idx];
@@ -757,8 +800,10 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 		try {
 			jsono_dom::EmitDomRowDirect(yyjson_doc_get_root(doc), dom, writer, row, &ctx);
 			FlatVector::Validity(result).SetValid(row);
+			bool diverted = false;
 			for (idx_t f = 0; f < fields.size(); f++) {
 				auto &cap = ctx.captures[f];
+				diverted = diverted || cap.diverted_scalar;
 				switch (cap.state) {
 				case jsono_dom::DomShredCapture::State::Missing:
 					FlatVector::SetNull(*shred_out[f], row, true);
@@ -779,6 +824,13 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 				case jsono_dom::DomShredCapture::State::ResidualFill:
 					needs_residual_fill = true;
 					break;
+				}
+			}
+			if (vc_out) {
+				if (diverted) {
+					FlatVector::SetNull(*vc_out, row, true);
+				} else {
+					FlatVector::GetData<bool>(*vc_out)[row] = true;
 				}
 			}
 		} catch (...) {
