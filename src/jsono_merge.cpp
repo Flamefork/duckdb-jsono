@@ -1190,6 +1190,12 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				VectorOperations::Copy(*fr_blobs[b], *writer.vec[b], count, 0, 0);
 			}
 			auto &result_validity = FlatVector::Validity(result);
+			auto &vc = JsonoVcVector(result);
+			for (idx_t row = 0; row < count; row++) {
+				if (!result_validity.RowIsValid(row)) {
+					FlatVector::SetNull(vc, row, true);
+				}
+			}
 			for (auto &shred : bind_data.shreds) {
 				FastCopyShred(args, ncols, count, mode, shred, JsonoShredVector(result, shred.result_child_index),
 				              result_validity);

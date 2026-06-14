@@ -464,8 +464,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		for (auto &shred : shred_children) {
 			FlatVector::SetNull(*shred, row, true);
 		}
-		// A NULL jsono row diverts nothing: a bare struct_extract reads the correct NULL.
-		FlatVector::GetData<bool>(*vc_out)[row] = true;
+		FlatVector::SetNull(*vc_out, row, true);
 	};
 
 	// Per-field manifest entry bytes, built once: the per-row manifest concatenates the entries
@@ -589,8 +588,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		for (auto *shred : shred_out) {
 			FlatVector::SetNull(*shred, row, true);
 		}
-		// A NULL jsono row diverts nothing: a bare struct_extract reads the correct NULL.
-		FlatVector::GetData<bool>(*vc_out)[row] = true;
+		FlatVector::SetNull(*vc_out, row, true);
 	};
 
 	JsonoVectorData input;
@@ -805,11 +803,8 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 			for (idx_t f = 0; f < fields.size(); f++) {
 				FlatVector::SetNull(*shred_out[f], row, true);
 			}
-			// A NULL jsono row has no value to divert: its shreds read NULL via a bare struct_extract
-			// (struct-null propagates), which is the correct result, so the marker stays non-NULL so a
-			// table of value-complete rows plus NULL rows is still value-complete.
 			if (vc_out) {
-				FlatVector::GetData<bool>(*vc_out)[row] = true;
+				FlatVector::SetNull(*vc_out, row, true);
 			}
 			continue;
 		}

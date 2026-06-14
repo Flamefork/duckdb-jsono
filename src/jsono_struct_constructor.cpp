@@ -1464,6 +1464,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	for (idx_t row = 0; row < count; row++) {
 		if (!parent_fmt.validity.RowIsValid(parent_fmt.sel->get_index(row))) {
 			writer.SetRowNull(row);
+			FlatVector::SetNull(JsonoVcVector(result), row, true);
 			for (idx_t f = 0; f < shred_count; f++) {
 				FlatVector::SetNull(*shred_out[f], row, true);
 			}
