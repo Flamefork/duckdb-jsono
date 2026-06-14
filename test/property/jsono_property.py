@@ -8,10 +8,10 @@ from json import dumps as json_dumps
 from json import loads as json_loads
 from os import environ
 from pathlib import Path
-from subprocess import DEVNULL
 from subprocess import PIPE
 from subprocess import Popen
 from sys import stderr
+from tempfile import TemporaryFile
 from typing import Any
 
 from hypothesis import HealthCheck
@@ -54,19 +54,42 @@ class JsonoSession:
         self.binary = binary
         self.extension = extension
         self.proc: Popen[bytes] | None = None
+        self.stderr_file: Any = None
         self._start()
 
     def _start(self) -> None:
+        # stderr goes to a temp file, not DEVNULL: SQL errors are still dropped from the
+        # result stream (only stdout is parsed), but when the process dies the file holds
+        # its last words — an ASan/UBSan stack trace under the sanitizer build — which the
+        # crash message then surfaces. Detaching it entirely turned every sanitizer crash
+        # into an undiagnosable "exited before sentinel" with no trace.
+        self.stderr_file = TemporaryFile()
         self.proc = Popen(
             [str(self.binary), "-unsigned", "-batch", "-json"],
             stdin=PIPE,
             stdout=PIPE,
-            stderr=DEVNULL,
+            stderr=self.stderr_file,
             bufsize=0,
         )
         self._send(".mode json")
         self._send(f"LOAD '{self.extension}';")
         self._drain()
+
+    def _stderr_tail(self) -> str:
+        if self.stderr_file is None:
+            return ""
+        self.stderr_file.seek(0)
+        text = self.stderr_file.read().decode("utf-8", "replace")
+        # The CLI's stderr also carries the pre-crash SQL errors of a long-lived session;
+        # the actionable part is the final sanitizer report. A report begins with its header
+        # and prints the top access stack *before* the long shadow-byte dump and SUMMARY, so
+        # a fixed tail can drop the most useful frames. Anchor on the last report header and
+        # return everything from there — the report is self-bounded, the noise before it is not.
+        markers = ("ERROR: AddressSanitizer", "ERROR: LeakSanitizer", "runtime error:")
+        start = max(text.rfind(marker) for marker in markers)
+        if start < 0:
+            return text[-8000:]
+        return text[text.rfind("\n", 0, start) + 1 :]
 
     def _send(self, line: str) -> None:
         assert self.proc is not None and self.proc.stdin is not None
@@ -80,7 +103,9 @@ class JsonoSession:
         while True:
             raw = self.proc.stdout.readline()
             if raw == b"":
-                raise JsonoCrash("CLI process exited before sentinel")
+                tail = self._stderr_tail()
+                detail = f"\n--- CLI stderr tail ---\n{tail}" if tail.strip() else ""
+                raise JsonoCrash(f"CLI process exited before sentinel{detail}")
             line = raw.decode("utf-8", "replace").rstrip("\n")
             if line == SENTINEL_LINE:
                 return lines
@@ -373,6 +398,10 @@ validish_mutations = st.sampled_from(
 @example(text='{"u":18446744073709551615,"big":9223372036854775000}')
 @example(text='{"d":123456789012345678901234567890123456.12}')
 @example(text='{"b":2,"a":1,"nested":{"y":2,"x":1}}')
+# Repeated/nested empty objects drive the DOM writer's shape-cache replay with zero keys
+# against a still-empty index buffer — the format-v4 null-pointer-offset UB.
+@example(text="[{},{}]")
+@example(text='{"a":{},"b":{}}')
 @given(text=json_documents)
 def test_round_trip_idempotent(text: str) -> None:
     once = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
@@ -386,6 +415,7 @@ def test_round_trip_idempotent(text: str) -> None:
 @example(text='{"a.b":"flat","a":{"b":"nested"}}')
 @example(text='{"d":0.1,"e":123456789012345678901234567890123456.12}')
 @example(text='[1,2,"x",true,null,-9223372036854775000]')
+@example(text='{"a":{},"b":{}}')
 @given(text=json_documents)
 def test_value_parity(text: str) -> None:
     out = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
