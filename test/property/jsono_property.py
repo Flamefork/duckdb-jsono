@@ -8,10 +8,10 @@ from json import dumps as json_dumps
 from json import loads as json_loads
 from os import environ
 from pathlib import Path
-from subprocess import DEVNULL
 from subprocess import PIPE
 from subprocess import Popen
 from sys import stderr
+from tempfile import TemporaryFile
 from typing import Any
 
 from hypothesis import HealthCheck
@@ -54,19 +54,33 @@ class JsonoSession:
         self.binary = binary
         self.extension = extension
         self.proc: Popen[bytes] | None = None
+        self.stderr_file: Any = None
         self._start()
 
     def _start(self) -> None:
+        # stderr goes to a temp file, not DEVNULL: SQL errors are still dropped from the
+        # result stream (only stdout is parsed), but when the process dies the file holds
+        # its last words — an ASan/UBSan stack trace under the sanitizer build — which the
+        # crash message then surfaces. Detaching it entirely turned every sanitizer crash
+        # into an undiagnosable "exited before sentinel" with no trace.
+        self.stderr_file = TemporaryFile()
         self.proc = Popen(
             [str(self.binary), "-unsigned", "-batch", "-json"],
             stdin=PIPE,
             stdout=PIPE,
-            stderr=DEVNULL,
+            stderr=self.stderr_file,
             bufsize=0,
         )
         self._send(".mode json")
         self._send(f"LOAD '{self.extension}';")
         self._drain()
+
+    def _stderr_tail(self) -> str:
+        if self.stderr_file is None:
+            return ""
+        self.stderr_file.seek(0)
+        text = self.stderr_file.read().decode("utf-8", "replace")
+        return text[-4000:]
 
     def _send(self, line: str) -> None:
         assert self.proc is not None and self.proc.stdin is not None
@@ -80,7 +94,9 @@ class JsonoSession:
         while True:
             raw = self.proc.stdout.readline()
             if raw == b"":
-                raise JsonoCrash("CLI process exited before sentinel")
+                tail = self._stderr_tail()
+                detail = f"\n--- CLI stderr tail ---\n{tail}" if tail.strip() else ""
+                raise JsonoCrash(f"CLI process exited before sentinel{detail}")
             line = raw.decode("utf-8", "replace").rstrip("\n")
             if line == SENTINEL_LINE:
                 return lines
