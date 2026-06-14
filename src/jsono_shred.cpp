@@ -552,8 +552,10 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
-	// Reshred does not yet recompute per-row diversion for the new shred set; stay conservative.
-	JsonoFillValueComplete(result, count);
+	// Value-complete marker, recomputed per row for the new shred set: NULL when a present scalar
+	// stays in the residual for one of this target's typed shreds (case B), non-NULL otherwise.
+	Vector *vc_out = &JsonoVcVector(result);
+	vc_out->SetVectorType(VectorType::FLAT_VECTOR);
 	vector<Vector *> shred_out(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		shred_out[f] = &JsonoShredVector(result, f);
@@ -587,6 +589,8 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		for (auto *shred : shred_out) {
 			FlatVector::SetNull(*shred, row, true);
 		}
+		// A NULL jsono row diverts nothing: a bare struct_extract reads the correct NULL.
+		FlatVector::GetData<bool>(*vc_out)[row] = true;
 	};
 
 	JsonoVectorData input;
@@ -619,21 +623,43 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		FlatVector::Validity(result).SetValid(row);
 		lstate.strip_paths.clear();
 		stripped_fields.clear();
+		bool diverted_row = false;
 		for (idx_t f = 0; f < fields.size(); f++) {
 			if (bind_data.keep_src[f] != DConstants::INVALID_INDEX) {
 				// The kept shred's stripped-or-not state carries over from the input row's manifest.
 				if (manifest_has_path(fields[f].path_name)) {
 					stripped_fields.push_back(f);
 				}
+				// A kept TYPED shred that is NULL this row is case A (absent) unless a present scalar
+				// sits at its path in the residual — which can only be a value the source diverted
+				// (case B), since a captured value would have been stripped. That makes the row not
+				// value-complete: a bare struct_extract would miss the residual value.
+				if (fields[f].primitive != ShredPrimitive::Varchar &&
+				    !FlatVector::Validity(*shred_out[f]).RowIsValid(row)) {
+					auto location = LocatePath(view, fields[f].steps);
+					if (location.found) {
+						auto value_tag = SlotTag(view.SlotAt(location.cursor.pos));
+						if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
+							diverted_row = true;
+						}
+					}
+				}
 				continue;
 			}
 			auto &field = fields[f];
 			auto location = LocatePath(view, field.steps);
-			bool strippable = WriteShred(field, view, location, *shred_out[f], row, lstate.text);
+			bool diverted = false;
+			bool strippable = WriteShred(field, view, location, *shred_out[f], row, lstate.text, &diverted);
+			diverted_row = diverted_row || diverted;
 			if (strippable && IsObjectKeyPath(field.steps)) {
 				lstate.strip_paths.push_back(&field.steps);
 				stripped_fields.push_back(f);
 			}
+		}
+		if (diverted_row) {
+			FlatVector::SetNull(*vc_out, row, true);
+		} else {
+			FlatVector::GetData<bool>(*vc_out)[row] = true;
 		}
 
 		if (lstate.strip_paths.empty()) {

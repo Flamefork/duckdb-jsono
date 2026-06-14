@@ -1176,8 +1176,11 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// except `skips`, which is re-emitted per row below with the output's shred manifest.
 			JsonoBodyWriter writer;
 			writer.Init(result);
-			// The merge reshred fast-path does not recompute per-row diversion; stay conservative.
-			JsonoFillValueComplete(result, count);
+			// The fast path is reached only when no shred key appears in the folded residual (the
+			// no-conflict gate above). A diverted scalar (case B) would sit in that residual at the
+			// shred's key and trip the gate to the fallback — so every NULL shred here is an absent
+			// path (case A), never a diversion: the result is value-complete by construction.
+			JsonoFillValueCompleteAllTrue(result, count);
 			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
 			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
 			for (idx_t b = 0; b < BODY_BLOB_COUNT; b++) {

@@ -155,3 +155,83 @@ statement error
 SELECT j->>'$.b' FROM narrow_total;
 ----
 narrowed by a raw struct cast
+
+# (e) set-operation reshred of value-complete typed shreds: a UNION of two differently-shredded
+# branches reshreds each to the merged shred set {$.x, $.a, $.b}. The kept BIGINT shred $.x diverted
+# nothing in either branch, so the reshredded result stays value-complete and the stored column reads
+# COALESCE-free — the fast path now reaches set-op / CASE / INSERT-into-shredded outputs.
+statement ok
+CREATE TABLE reshred_vc AS
+SELECT jsono('{"x":' || i || ',"a":"A"}', shredding := {'$.x':'BIGINT','$.a':'VARCHAR'}) AS j FROM range(1000) tt(i)
+UNION ALL
+SELECT jsono('{"x":' || (i + 1000) || ',"b":"B"}', shredding := {'$.x':'BIGINT','$.b':'VARCHAR'}) AS j FROM range(1000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM reshred_vc;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query III
+SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)), COUNT(CAST(j->>'$.x' AS BIGINT)) FROM reshred_vc;
+----
+0	1999	2000
+
+# (f) reshred over a DIVERTED source: $.x is a numeric STRING in one branch — a present scalar that
+# fails the merged BIGINT shred and stays in the residual. The reshredded result is then NOT
+# value-complete (the kept-shred residual probe catches it), the COALESCE fallback is retained, and
+# it recovers the residual value. Were the row wrongly marked value-complete, the bare read would
+# miss those values and MIN would be 1000 instead of 0.
+statement ok
+CREATE TABLE reshred_div AS
+SELECT jsono('{"x":"' || i || '","a":"A"}', shredding := {'$.x':'BIGINT','$.a':'VARCHAR'}) AS j FROM range(10) tt(i)
+UNION ALL
+SELECT jsono('{"x":' || (i + 1000) || ',"b":"B"}', shredding := {'$.x':'BIGINT','$.b':'VARCHAR'}) AS j FROM range(10) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(TRY_CAST(j->>'$.x' AS BIGINT)) FROM reshred_div;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT MIN(TRY_CAST(j->>'$.x' AS BIGINT)), MAX(TRY_CAST(j->>'$.x' AS BIGINT)) FROM reshred_div;
+----
+0	1009
+
+# (g) merge fast-path is value-complete by construction: it is taken only when no shred key appears
+# in the folded residual (the no-conflict gate). A diverted scalar would sit in that residual at the
+# shred's key and divert to the correct reshred fallback — so every NULL shred in the fast path is an
+# absent path, and the merged result reads COALESCE-free.
+statement ok
+CREATE TABLE merge_vc AS
+SELECT jsono_merge_patch(
+         jsono('{"x":' || i || '}', shredding := {'$.x':'BIGINT'}),
+         jsono('{"y":"' || i || '"}', shredding := {'$.y':'VARCHAR'})) AS j
+FROM range(1000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM merge_vc;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)) FROM merge_vc;
+----
+0	999

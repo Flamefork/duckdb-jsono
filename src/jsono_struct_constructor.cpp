@@ -1098,9 +1098,6 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
-	// jsono(struct, shredding) does not yet compute per-row diversion; stay conservative so the
-	// optimizer keeps the COALESCE form for any typed shred (no false value-complete fast path).
-	JsonoFillValueComplete(result, count);
 
 	if (plan.strategy == StructValueStrategy::Jsono) {
 		for (idx_t row = 0; row < count; row++) {

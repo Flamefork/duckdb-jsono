@@ -424,39 +424,6 @@ inline Vector &JsonoVcVector(Vector &result) {
 	return *StructVector::GetEntries(layout)[1];
 }
 
-// Fill a freshly built shredded jsono result's value-complete marker for a producer that does not
-// compute per-row diversion itself. A VARCHAR-only shred set can never divert (a VARCHAR shred
-// captures every present scalar as its `->>` text), so its marker is uniformly TRUE — which also
-// keeps a reshredded VARCHAR value structurally equal to a directly built one (the marker is part of
-// the struct, so `=` compares it). A shred set with a typed shred *might* divert and this producer
-// does not check, so it stays conservatively NULL: the optimizer reads that as "can have NULL" and
-// keeps the safe COALESCE form — never a false fast path. The canonical layout places the marker at
-// layout child 1, right after body; writers always build canonical.
-inline void JsonoFillValueComplete(Vector &result, idx_t count) {
-	auto &layout_type = StructType::GetChildTypes(result.GetType())[0].second;
-	auto &fields = StructType::GetChildTypes(layout_type);
-	if (fields.size() < 2 || fields[1].first != JsonoValueCompleteName()) {
-		return; // plain layout, or no marker: nothing to fill
-	}
-	bool any_typed = false;
-	for (idx_t i = 2; i < fields.size(); i++) {
-		if (fields[i].second.id() != LogicalTypeId::VARCHAR) {
-			any_typed = true;
-			break;
-		}
-	}
-	auto &vc = JsonoVcVector(result);
-	vc.SetVectorType(VectorType::FLAT_VECTOR);
-	if (any_typed) {
-		FlatVector::Validity(vc).SetAllInvalid(count);
-	} else {
-		auto data = FlatVector::GetData<bool>(vc);
-		for (idx_t row = 0; row < count; row++) {
-			data[row] = true;
-		}
-	}
-}
-
 // Mark the whole result value-complete (marker non-NULL on every row): for a producer that by
 // construction never diverts a present scalar into the residual — e.g. type-driven auto-shred, where
 // each shred's type IS its source field's type, so a present value always fits and a NULL is only an
