@@ -80,7 +80,16 @@ class JsonoSession:
             return ""
         self.stderr_file.seek(0)
         text = self.stderr_file.read().decode("utf-8", "replace")
-        return text[-4000:]
+        # The CLI's stderr also carries the pre-crash SQL errors of a long-lived session;
+        # the actionable part is the final sanitizer report. A report begins with its header
+        # and prints the top access stack *before* the long shadow-byte dump and SUMMARY, so
+        # a fixed tail can drop the most useful frames. Anchor on the last report header and
+        # return everything from there — the report is self-bounded, the noise before it is not.
+        markers = ("ERROR: AddressSanitizer", "ERROR: LeakSanitizer", "runtime error:")
+        start = max(text.rfind(marker) for marker in markers)
+        if start < 0:
+            return text[-8000:]
+        return text[text.rfind("\n", 0, start) + 1 :]
 
     def _send(self, line: str) -> None:
         assert self.proc is not None and self.proc.stdin is not None
