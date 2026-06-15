@@ -316,10 +316,14 @@ constexpr uint32_t LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT = 64;
 // stay above any realistic document (real JSON nests a few dozen levels deep). A
 // sanitizer build gets a far lower bound: AddressSanitizer's fat frames sit atop a
 // deep execution pipeline on a ~512 KiB macOS worker-thread stack, and the
-// over-limit exception is itself serialized (yyjson) at the throw site, so the
-// guard must fire much sooner there to stay ahead of a stack overflow.
+// over-limit exception is itself serialized (yyjson, via DuckDB's ToJSON exception
+// constructor) at the deepest recursion frame, so the guard must fire much sooner
+// there to stay ahead of a stack overflow. 50 was still too high — the serialized
+// throw overflowed ~2/3 of runs (ASLR-dependent). 32 clears the deepest exercised
+// document (depth 30 in jsono_depth_limit.test) yet leaves ~18 recursion frames of
+// headroom below the observed overflow point for the throw's own serialization.
 #ifdef JSONO_ADDRESS_SANITIZER
-constexpr size_t JSONO_MAX_NESTING_DEPTH = 50;
+constexpr size_t JSONO_MAX_NESTING_DEPTH = 32;
 #else
 constexpr size_t JSONO_MAX_NESTING_DEPTH = 1000;
 #endif

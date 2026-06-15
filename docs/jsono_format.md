@@ -88,9 +88,11 @@ round-trips losslessly through the shred type (a JSON string in a `VARCHAR` shre
 an integer in a `BIGINT` shred). A value that does not fit — a string in a `BIGINT`
 shred, an explicit JSON `null`, a missing key, or a number whose shred type would
 re-encode it differently — stays in the residual, and its shred is a redundant
-read copy. Pure object-key paths that round-trip through their shred type are
-removed from the residual; array-index paths and non-lossless shred values stay in
-the residual.
+read copy. Pure object-key scalar paths that round-trip through their shred type
+are removed from the residual; array-index paths and non-lossless shred values
+stay in the residual. A whole regular array is a separate case — see
+[Array shreds](#array-shreds-liststruct), which lift element subfields while
+leaving a skeleton array in the residual.
 
 The original value is recovered by overlaying the shreds onto the residual,
 **residual-authoritative**: a path absent from the residual is filled from its
@@ -122,6 +124,54 @@ proves it. Every reader of a shredded residual verifies the row's manifest
 against the shreds actually available and fails loud on a mismatch instead of
 silently returning partial data. Extra shreds beyond the manifest are legal (a
 widening cast `NULL`-fills them; readers fall back to the residual).
+
+### Array shreds (`LIST<STRUCT>`)
+
+A shred type may be a `LIST<STRUCT<…>>` whose every struct child is one of the
+five scalar shred types. Such an *array shred* lifts the chosen leaf subfields of
+every element of a regular array — addressed by an object-key path like
+`$.products`, not `$.products[*].name` — into one parallel typed `LIST<STRUCT>`
+column (`jsono(value, shredding := {'$.products': 'STRUCT(name VARCHAR, id
+UBIGINT, …)[]'})`). On shape-stable data this is a large storage win: Parquet
+stores each element subfield as its own low-cardinality dictionary column,
+where the whole-document residual would store them in one mixed heap.
+
+The array is **not** removed from the residual. It stays in place as a
+*skeleton array*: every element keeps its tail (the keys not in the shred
+schema) verbatim, but the lifted subfields are stripped per element (the same
+per-scalar lossless gate as object-key shreds, applied to each element). The
+skeleton carries everything reconstruction needs with no new format primitive:
+
+- the **array length** is the skeleton's element count (authoritative — a
+  non-`NULL` shred list of a different length is a corrupt row and fails loud);
+- the **element order** is the skeleton's order, in lockstep with the shred
+  `LIST`;
+- a **non-object / null / scalar element** stays verbatim in the skeleton, its
+  shred-`LIST` slot a `NULL` struct, so heterogeneous arrays round-trip;
+- the three-way distinction per subfield — *lifted* (absent from the skeleton,
+  present in the shred), *explicit JSON null* (a `VAL_NULL` in the skeleton, never
+  lifted), and *absent* (absent from both) — falls out of the same
+  residual-authoritative overlay, with no extra bits.
+
+The shred `LIST` has one struct per skeleton element (`NULL`-struct for the
+non-object ones), so its length equals the skeleton array length. Reconstruction
+walks the two in lockstep: each object element's present subfields are overlaid
+back onto its skeleton tail (residual-authoritative — the tail and any kept
+explicit-null subfield win), and every other element is emitted verbatim.
+
+The manifest lists the array's object-key path with its `LIST<STRUCT>` type
+string when at least one element's subfield was lifted, exactly as for a scalar
+shred — so a raw cast that drops or retypes the array shred is caught the same
+way (the skeleton elements are missing their lifted subfields and the residual
+alone cannot reproduce them).
+
+The binary blob format is unchanged: a skeleton residual is an ordinary value
+and the manifest reuses the length-prefixed `(path, type)` framing (the
+`LIST<STRUCT>` type string is just longer). The shred `LIST<STRUCT>` is a
+DuckDB/Parquet column beside `body`, not part of the blob, so no `version` bump
+is needed; an old reader lacking array-shred support rejects the unknown
+`LIST<STRUCT>` sibling at bind or fails loud on the manifest rather than
+silently dropping data.
 
 ## Compatibility policy
 

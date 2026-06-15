@@ -544,6 +544,71 @@ def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
     assert plain == reshredded, f"reshred changed the value: {text!r} {first} -> {second}: {plain!r} -> {reshredded!r}"
 
 
+# Array shredding: a regular array's element subfields lift into a parallel LIST<STRUCT> column, the
+# element tail staying in the residual skeleton. Elements are heterogeneous (object/null/scalar/
+# nested array); an element object draws its subfields from a small shared name set so a schema can
+# over- or under-cover them (missing subfield, tail key) and pick any shred type (matching or not).
+array_subfield_names = ["id", "name", "price", "qty", "sku"]
+array_element = st.one_of(
+    st.dictionaries(st.sampled_from(array_subfield_names), json_scalars, min_size=0, max_size=5),
+    st.none(),
+    json_scalars,
+    st.lists(st.integers(min_value=0, max_value=5), max_size=2),
+)
+array_documents = st.fixed_dictionaries({"items": st.lists(array_element, max_size=6)})
+array_shred_types = st.sampled_from(["VARCHAR", "BIGINT", "UBIGINT", "DOUBLE", "BOOLEAN"])
+# A LIST<STRUCT> element schema: a non-empty subset of the subfield names, each with any shred type.
+# The field order is the dict's, so it is frequently unsorted (the overlay patch must re-sort it).
+array_element_schemas = st.dictionaries(
+    st.sampled_from(array_subfield_names), array_shred_types, min_size=1, max_size=5
+).map(lambda fields: "STRUCT(" + ", ".join(f"{name} {stype}" for name, stype in fields.items()) + ")[]")
+
+
+@settings(PROPERTY_SETTINGS)
+@example(doc={"items": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(doc={"items": []}, schema="STRUCT(id BIGINT)[]")
+@example(doc={"items": [None, {"id": 1}, 5, "x"]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(doc={"items": [{"id": 1, "name": None, "sku": "s"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(doc={"items": [{"qty": 2, "sku": "s1"}]}, schema="STRUCT(sku VARCHAR, qty BIGINT)[]")
+@given(doc=array_documents, schema=array_element_schemas)
+def test_array_shred_lossless(doc: dict[str, Any], schema: str) -> None:
+    # Shredding a regular array's element subfields into a LIST<STRUCT> column must never change the
+    # logical value — for heterogeneous elements, missing / type-mismatched / explicit-null
+    # subfields, tail keys, and empty arrays. The schema keys are often unsorted (the overlay patch
+    # must re-sort them) and may name subfields absent from every element.
+    text = json_dumps(doc)
+    spec = "{'$.items': '" + schema + "'}"
+    plain = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
+    shredded = SESSION.value(f"to_json(jsono({sql_literal(text)}, shredding := {spec}))")
+    assert plain == shredded, f"array shred changed the value: {text!r} spec {spec!r}: {plain!r} -> {shredded!r}"
+
+
+# Descend-read parity fuzzes the FULL scalar space (floats, control chars, the int boundaries) over
+# the same array_element/array_documents the lossless test uses. The optimizer reconstructs such a
+# read and extracts natively, so both the routing (reconstruct vs a silent residual NULL) and the
+# value text (jsono's own renderer, not core json's normalizing/uppercasing `->>`) must match a plain
+# parse — including the edge doubles (1e16) and control chars that used to cross a core-JSON boundary.
+@settings(PROPERTY_SETTINGS)
+@example(doc={"items": [{"id": 1, "name": "a", "sku": "tail"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(doc={"items": [{"id": 1}, None, 5]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(doc={"items": [{"price": 1e16}]}, schema="STRUCT(price DOUBLE)[]")
+@given(doc=array_documents, schema=array_element_schemas)
+def test_array_descend_read_parity(doc: dict[str, Any], schema: str) -> None:
+    # A read that descends INTO a shredded array ($.items[i].field, or the whole $.items) must
+    # match a plain parse: the lifted element subfields are stripped from the skeleton residual, so
+    # the optimizer must reconstruct rather than silently read NULL/wrong text from it. This is the
+    # optimizer-routing class the whole-value to_json parity does not exercise.
+    text = json_dumps(doc)
+    spec = "{'$.items': '" + schema + "'}"
+    reads = [f"$.items[{i}].{f}" for i in (0, 1, 2, 9) for f in array_subfield_names]
+    reads.append("$.items")  # whole array as ->> text (was a LIST<STRUCT>-text bug)
+    cond = " AND ".join(f"(s ->> '{r}') IS NOT DISTINCT FROM (p ->> '{r}')" for r in reads)
+    ok = SESSION.value(
+        f"SELECT ({cond}) FROM (SELECT jsono({sql_literal(text)}, shredding := {spec}) s, jsono({sql_literal(text)}) p)"
+    )
+    assert ok == "true", f"array descend read differs shredded vs plain: {text!r} spec {spec!r}"
+
+
 # Typed scalars for the STRUCT-input auto-shred test: each carries an explicit DuckDB type so the
 # constructor's bind sees the same eligibility it would from a read_json_auto-detected schema.
 typed_struct_scalars = st.one_of(
@@ -596,6 +661,44 @@ def test_struct_auto_shred_lossless(doc: dict[str, Any]) -> None:
     auto = SESSION.value(f"to_json(jsono({struct_sql}))")
     plain = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
     assert auto == plain, f"auto-shred changed the value: {struct_sql} : {auto!r} != plain {plain!r}"
+
+
+# Constructor (native STRUCT) auto-shred of a top-level LIST<STRUCT> field: the lifted array must
+# reconstruct to the same JSON as parsing the equivalent document. The element subfield types are
+# fixed (a DuckDB list is homogeneous); values and null elements are fuzzed.
+array_struct_leaf = st.fixed_dictionaries(
+    {
+        "id": st.integers(min_value=-(2**40), max_value=2**40),
+        "name": st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", max_size=6),
+        "flag": st.booleans(),
+    }
+)
+array_struct_elements = st.lists(st.one_of(array_struct_leaf, st.none()), max_size=5)
+
+
+def array_struct_sql(elements: list[Any]) -> str:
+    parts = []
+    for el in elements:
+        if el is None:
+            parts.append("NULL")
+        else:
+            flag = "true" if el["flag"] else "false"
+            parts.append(f"{{'id': {el['id']}::BIGINT, 'name': {sql_literal(el['name'])}, 'flag': {flag}}}")
+    return "[" + ", ".join(parts) + "]::STRUCT(id BIGINT, \"name\" VARCHAR, flag BOOLEAN)[]"
+
+
+@settings(PROPERTY_SETTINGS)
+@example(elements=[{"id": 1, "name": "a", "flag": True}, None])
+@example(elements=[])
+@given(elements=array_struct_elements)
+def test_struct_array_auto_shred_lossless(elements: list[Any]) -> None:
+    list_sql = array_struct_sql(elements)
+    from_struct = SESSION.value(f"to_json(jsono({{'items': {list_sql}}}))")
+    json_doc = {
+        "items": [None if el is None else {"id": el["id"], "name": el["name"], "flag": el["flag"]} for el in elements]
+    }
+    plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps(json_doc))}))")
+    assert from_struct == plain, f"struct array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
 
 
 @settings(VALIDISH_PROPERTY_SETTINGS)
@@ -672,7 +775,10 @@ PROPERTIES = [
     test_keys_sorted,
     test_shred_lossless,
     test_reshred_lossless,
+    test_array_shred_lossless,
+    test_array_descend_read_parity,
     test_struct_auto_shred_lossless,
+    test_struct_array_auto_shred_lossless,
     test_narrowing_fails_loud,
     test_fuzz_text_no_crash,
     test_fuzz_blob_no_crash,

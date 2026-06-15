@@ -28,23 +28,7 @@ namespace {
 
 using namespace jsono;
 
-void EnsureListCapacity(Vector &result, idx_t needed) {
-	if (needed <= ListVector::GetListCapacity(result)) {
-		return;
-	}
-	auto next = std::max<idx_t>(needed, std::max<idx_t>(ListVector::GetListCapacity(result) * 2, 1));
-	ListVector::Reserve(result, next);
-}
-
-void FinishListRow(Vector &result, idx_t row, idx_t start_offset, idx_t length) {
-	ListVector::GetData(result)[row] = {start_offset, length};
-	ListVector::SetListSize(result, start_offset + length);
-}
-
-void SetListRowNull(Vector &result, idx_t row) {
-	FlatVector::SetNull(result, row, true);
-	ListVector::GetData(result)[row] = {0, 0};
-}
+// EnsureListCapacity / FinishListRow / SetListRowNull are shared LIST helpers in jsono_writer.hpp.
 
 enum class JsonoEntriesKeyStyle : uint8_t { JsonPath, Dotted };
 

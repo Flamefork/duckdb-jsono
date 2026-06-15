@@ -13,6 +13,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression.hpp"
 
 #include <algorithm>
@@ -65,12 +66,17 @@ void JsonoVersionExecute(DataChunk &args, ExpressionState &state, Vector &result
 // through JsonoShreddedStructType, so the declared column is byte-identical to a value built from
 // the same shreds.
 void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	(void)state;
+	// Parser::ParseColumnList parses the DDL but leaves binder-resolved type aliases (UBIGINT and the
+	// other unsigned ints, nested ones included) as unresolved USER types; bind each shred type so a
+	// declared storage column matches a value the constructor builds from the same shreds.
+	auto binder = Binder::CreateBinder(state.GetContext());
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t shreds) {
 		auto columns = Parser::ParseColumnList(shreds.GetString());
 		child_list_t<LogicalType> shred_types;
 		for (auto &col : columns.Logical()) {
-			shred_types.emplace_back(col.Name(), col.Type());
+			auto type = col.Type();
+			binder->BindLogicalType(type);
+			shred_types.emplace_back(col.Name(), type);
 		}
 		// Canonical shred order (sorted by name) so the DDL matches a value built from the same shreds
 		// regardless of the order they are written in here vs the shredding spec.
@@ -127,7 +133,7 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 			value_complete_index = i;
 			continue;
 		}
-		if (!IsShredValueType(fields[i].second)) {
+		if (!IsShredValueType(fields[i].second) && !IsShredArrayType(fields[i].second)) {
 			return false;
 		}
 		shreds.push_back(fields[i]);

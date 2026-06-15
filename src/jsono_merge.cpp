@@ -1,5 +1,6 @@
 #include "jsono_ops.hpp"
 #include "jsono.hpp"
+#include "jsono_locate.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_row_read.hpp"
@@ -819,11 +820,171 @@ void EmitReconShredScalar(JsonoBuilder &builder, const ReconShred &shred, const 
 	}
 }
 
-// Reconstruct a shredded JSONO `input` (four-BLOB residual + shred columns) into the plain
-// JSONO `result` by overlaying each row's shred values back onto its residual object. Shreds
-// are disjoint from residual keys (the shred invariant), so the overlay re-inserts them.
-// Top-level shreds are emitted as one flat patch (the common jsono({...}) case); nested-path
-// shreds (`$.a.b`) accumulate a one-path chain overlay each so any depth round-trips.
+// True if an array shred's pure object-key path ends at / continues past `key` when matched at
+// `depth`. Shared by the read overlay and the write skeleton emit (which it precedes in the TU).
+static bool ArrayPathTerminates(const vector<PathStep> &path, size_t depth, nonstd::string_view key) {
+	return path.size() == depth + 1 && nonstd::string_view(path[depth].key.data(), path[depth].key.size()) == key;
+}
+
+static bool ArrayPathContinues(const vector<PathStep> &path, size_t depth, nonstd::string_view key) {
+	return path.size() > depth + 1 && nonstd::string_view(path[depth].key.data(), path[depth].key.size()) == key;
+}
+
+// ---- Array shred overlay (read side) ----
+// A LIST<STRUCT> shred column holds, per row, one struct per element of the skeleton array, in
+// lockstep. Reconstruct rebuilds the array: each object element merges its present shred subfields
+// (residual-authoritative) back over its skeleton tail; a non-object/null element or a NULL shred
+// struct is emitted verbatim. The skeleton array length is authoritative — a non-NULL shred list of
+// a different length is a corrupt row (e.g. a struct cast that truncated the LIST) and fails loud.
+struct ArrayReconShred {
+	idx_t child;                                      // shred index over the shred set
+	vector<PathStep> path;                            // pure object-key chain to the array
+	vector<std::pair<string, LogicalType>> subfields; // element subfield (name, scalar type), struct order
+	// Subfield indices in sorted-key order: the overlay patch object must emit keys ascending
+	// (the JSONO object invariant and the sorted-key two-pointer MergeTwoObjects both require it).
+	vector<idx_t> sorted_subfields;
+	UnifiedVectorFormat list_fmt; // list_entry_t + per-row validity
+	const list_entry_t *list_entries = nullptr;
+	UnifiedVectorFormat struct_fmt;      // per-element struct validity
+	vector<UnifiedVectorFormat> sub_fmt; // per subfield: value + validity
+};
+
+struct ArrayOverlayScratch {
+	JsonoBuilder patch_builder;
+	OwnedJsonoBlob patch_storage;
+};
+
+// Rebuild one array (cursor at ARR_START), overlaying the row's shred subfields onto each skeleton
+// element, advancing `cursor` past ARR_END.
+void OverlayArray(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &builder, const ArrayReconShred &shred,
+                  idx_t row, ArrayOverlayScratch &scratch, size_t depth) {
+	auto end_pos = ReadArrayEndPos(view, cursor.pos);
+	builder.EmitArrayStart();
+	cursor.pos++; // first element; ARR_START consumes no stream entries
+	auto list_idx = shred.list_fmt.sel->get_index(row);
+	if (!shred.list_fmt.validity.RowIsValid(list_idx)) {
+		// NULL shred list: the array stayed whole in the residual (nothing lifted) — emit verbatim.
+		while (cursor.pos < end_pos) {
+			EmitValueVerbatim(view, cursor, builder, depth + 1);
+		}
+		builder.EmitArrayEnd();
+		cursor.pos = end_pos + 1;
+		return;
+	}
+	auto entry = shred.list_entries[list_idx];
+	idx_t i = 0;
+	while (cursor.pos < end_pos) {
+		if (i >= entry.length) {
+			throw InvalidInputException("malformed JSONO: array shred list is shorter than the residual array "
+			                            "(a struct cast truncated it)");
+		}
+		idx_t child = entry.offset + i;
+		bool is_object = SlotTag(view.SlotAt(cursor.pos)) == tag::OBJ_START;
+		bool struct_present = is_object && shred.struct_fmt.validity.RowIsValid(shred.struct_fmt.sel->get_index(child));
+		size_t present = 0;
+		if (struct_present) {
+			for (size_t j = 0; j < shred.subfields.size(); j++) {
+				if (shred.sub_fmt[j].validity.RowIsValid(shred.sub_fmt[j].sel->get_index(child))) {
+					present++;
+				}
+			}
+		}
+		if (present > 0) {
+			// The patch object must list its keys ascending (sorted_subfields), so the merge's
+			// sorted-key two-pointer walk and the JSONO object invariant both hold.
+			scratch.patch_builder.Reset();
+			scratch.patch_builder.EmitObjectStart(present);
+			for (auto j : shred.sorted_subfields) {
+				if (shred.sub_fmt[j].validity.RowIsValid(shred.sub_fmt[j].sel->get_index(child))) {
+					scratch.patch_builder.EmitKeySlot(
+					    nonstd::string_view(shred.subfields[j].first.data(), shred.subfields[j].first.size()));
+				}
+			}
+			for (auto j : shred.sorted_subfields) {
+				auto sub_idx = shred.sub_fmt[j].sel->get_index(child);
+				if (shred.sub_fmt[j].validity.RowIsValid(sub_idx)) {
+					scratch.patch_builder.EmitObjectChildStart();
+					ReconShred sub_shred {0, shred.subfields[j].second, {}};
+					EmitReconShredScalar(scratch.patch_builder, sub_shred, shred.sub_fmt[j], sub_idx);
+				}
+			}
+			scratch.patch_builder.EmitObjectEnd();
+			SerializeBuilderToBlob(scratch.patch_builder, scratch.patch_storage);
+			JsonoView patch_view = ViewOfBlob(scratch.patch_storage);
+			patch_view.ParseHeader();
+			// A authoritative (the skeleton element keeps its tail and any kept null/diverted subfield);
+			// B fills the lifted subfields that were stripped from the skeleton.
+			MergeTwoObjects(view, cursor, patch_view, JsonoCursor(), builder, MergeMode::Overlay, depth + 1);
+			SkipValueFast(view, cursor);
+		} else {
+			EmitValueVerbatim(view, cursor, builder, depth + 1);
+		}
+		i++;
+	}
+	if (i != entry.length) {
+		throw InvalidInputException("malformed JSONO: array shred list is longer than the residual array "
+		                            "(a struct cast altered it)");
+	}
+	builder.EmitArrayEnd();
+	cursor.pos = end_pos + 1;
+}
+
+// Walk the scalar-overlaid value, replacing each array-shred path's skeleton array with the
+// overlaid array; advances `cursor` past the emitted value (mirrors EmitValueVerbatim).
+void EmitArrayOverlay(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &builder,
+                      const std::vector<const ArrayReconShred *> &array_shreds, idx_t row, ArrayOverlayScratch &scratch,
+                      size_t depth) {
+	if (SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_START) {
+		EmitValueVerbatim(view, cursor, builder, depth);
+		return;
+	}
+	auto layout = ReadObjectLayout(view, cursor.pos);
+	auto key_at = [&](size_t i) {
+		auto key_slot = view.SlotAt(layout.key_start + i);
+		if (SlotTag(key_slot) != tag::KEY) {
+			throw InvalidInputException("malformed JSONO: expected KEY slot");
+		}
+		return view.KeyAt(SlotPayload(key_slot));
+	};
+	builder.EmitObjectStart(layout.key_count);
+	for (size_t i = 0; i < layout.key_count; i++) {
+		builder.EmitKeySlot(key_at(i));
+	}
+	cursor.pos = layout.value_start;
+	for (size_t i = 0; i < layout.key_count; i++) {
+		auto key = key_at(i);
+		builder.EmitObjectChildStart();
+		const ArrayReconShred *terminal = nullptr;
+		std::vector<const ArrayReconShred *> deeper;
+		for (auto *shred : array_shreds) {
+			if (ArrayPathTerminates(shred->path, depth, key)) {
+				terminal = shred;
+			} else if (ArrayPathContinues(shred->path, depth, key)) {
+				deeper.push_back(shred);
+			}
+		}
+		auto value_tag = SlotTag(view.SlotAt(cursor.pos));
+		if (terminal && value_tag == tag::ARR_START) {
+			OverlayArray(view, cursor, builder, *terminal, row, scratch, depth);
+		} else if (!deeper.empty() && value_tag == tag::OBJ_START) {
+			EmitArrayOverlay(view, cursor, builder, deeper, row, scratch, depth + 1);
+		} else {
+			EmitValueVerbatim(view, cursor, builder, depth + 1);
+		}
+	}
+	builder.EmitObjectEnd();
+	if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
+		throw InvalidInputException("malformed JSONO: object value span mismatch");
+	}
+	cursor.pos++;
+}
+
+// Reconstruct a shredded JSONO `input` (six-BLOB residual + shred columns) into the plain
+// JSONO `result` by overlaying each row's shred values back onto its residual object. Scalar
+// shreds are disjoint from residual keys (the shred invariant), so the overlay re-inserts them:
+// top-level shreds as one flat patch (the common jsono({...}) case), nested-path shreds (`$.a.b`)
+// as a one-path chain overlay each. An array shred (LIST<STRUCT>) instead carries a skeleton array
+// in the residual; after the scalar overlay, EmitArrayOverlay rebuilds each such array in lockstep.
 // A valid row with a NULL residual blob never comes from the writer (a NULL value nulls the
 // whole struct): it throws — the row is the trace of a struct cast NULL-filling the body.
 // `shred_filter` (shred indices over the shred set) restricts the overlay to those shreds — the
@@ -834,6 +995,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 	JsonoLayoutType layout;
 	TryParseJsonoLayoutType(input.GetType(), layout);
 	vector<ReconShred> shreds;
+	vector<ArrayReconShred> array_shreds;
 	bool all_top_level = true;
 	for (idx_t i = 0; i < layout.shreds.size(); i++) {
 		if (shred_filter && std::find(shred_filter->begin(), shred_filter->end(), i) == shred_filter->end()) {
@@ -851,6 +1013,17 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			if (step.kind != PathStepKind::Key) {
 				throw InvalidInputException("jsono reconstruct: shred path '%s' is not an object-key path", name);
 			}
+		}
+		if (IsShredArrayType(layout.shreds[i].second)) {
+			ArrayReconShred ars;
+			ars.child = i;
+			ars.path = std::move(steps);
+			auto &element = ListType::GetChildType(layout.shreds[i].second);
+			for (auto &sub : StructType::GetChildTypes(element)) {
+				ars.subfields.emplace_back(sub.first, sub.second);
+			}
+			array_shreds.push_back(std::move(ars));
+			continue;
 		}
 		if (steps.size() != 1) {
 			all_top_level = false;
@@ -875,15 +1048,58 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 	for (idx_t k = 0; k < shreds.size(); k++) {
 		JsonoShredVector(input, shreds[k].child).ToUnifiedFormat(count, shred_fmt[k]);
 	}
+	// Array shred read handles: the per-row list entries, per-element struct validity, and per
+	// subfield value+validity, set up once the array_shreds vector is stable.
+	for (auto &ars : array_shreds) {
+		auto &list_vec = JsonoShredVector(input, ars.child);
+		list_vec.ToUnifiedFormat(count, ars.list_fmt);
+		ars.list_entries = UnifiedVectorFormat::GetData<list_entry_t>(ars.list_fmt);
+		auto &struct_vec = ListVector::GetEntry(list_vec);
+		auto child_size = ListVector::GetListSize(list_vec);
+		struct_vec.ToUnifiedFormat(child_size, ars.struct_fmt);
+		auto &subs = StructVector::GetEntries(struct_vec);
+		ars.sub_fmt.resize(subs.size());
+		for (idx_t j = 0; j < subs.size(); j++) {
+			subs[j]->ToUnifiedFormat(child_size, ars.sub_fmt[j]);
+		}
+		ars.sorted_subfields.resize(ars.subfields.size());
+		for (idx_t j = 0; j < ars.subfields.size(); j++) {
+			ars.sorted_subfields[j] = j;
+		}
+		std::sort(ars.sorted_subfields.begin(), ars.sorted_subfields.end(),
+		          [&](idx_t a, idx_t b) { return ars.subfields[a].first < ars.subfields[b].first; });
+	}
+	std::vector<const ArrayReconShred *> array_shred_ptrs;
+	for (auto &ars : array_shreds) {
+		array_shred_ptrs.push_back(&ars);
+	}
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
 
 	JsonoBuilder patch_builder;
 	JsonoBuilder out_builder;
+	JsonoBuilder final_builder;
 	OwnedJsonoBlob patch_storage;
 	OwnedJsonoBlob acc_storage;
+	OwnedJsonoBlob scalar_storage;
+	ArrayOverlayScratch overlay_scratch;
 	JsonoView residual_view;
+	// Finish a row: with array shreds, rebuild each skeleton array over the scalar-overlaid value;
+	// otherwise write the scalar overlay directly.
+	auto finish_row = [&](idx_t row, JsonoBuilder &value_builder) {
+		if (array_shred_ptrs.empty()) {
+			writer.WriteRow(row, value_builder);
+			return;
+		}
+		SerializeBuilderToBlob(value_builder, scalar_storage);
+		JsonoView scalar_view = ViewOfBlob(scalar_storage);
+		scalar_view.ParseHeader();
+		final_builder.Reset();
+		JsonoCursor cursor;
+		EmitArrayOverlay(scalar_view, cursor, final_builder, array_shred_ptrs, row, overlay_scratch, 0);
+		writer.WriteRow(row, final_builder);
+	};
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob {};
 		if (residual_reader.Read(row, blob, residual_view) != JsonoRowState::Value) {
@@ -891,13 +1107,20 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			continue;
 		}
 		if (SlotTag(residual_view.SlotAt(0)) != tag::OBJ_START) {
-			// A non-object residual (scalar/array) is the whole value: shreds are object-key paths,
-			// so a well-formed shredded value cannot have any present here. Emit it verbatim rather
-			// than overlaying onto a non-object (which the object merge cannot handle).
+			// A non-object residual (scalar/array) is the whole value: object-key shreds (scalar or
+			// array) cannot match it, so emit it verbatim — no overlay applies.
 			out_builder.Reset();
 			JsonoCursor cursor;
 			EmitValueVerbatim(residual_view, cursor, out_builder, 0);
 			writer.WriteRow(row, out_builder);
+			continue;
+		}
+		if (shreds.empty()) {
+			// Array-only shred set: no scalar overlay, the residual is the skeleton to rebuild.
+			out_builder.Reset();
+			JsonoCursor cursor;
+			EmitValueVerbatim(residual_view, cursor, out_builder, 0);
+			finish_row(row, out_builder);
 			continue;
 		}
 		if (all_top_level) {
@@ -927,7 +1150,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			out_builder.Reset();
 			MergeTwoObjects(residual_view, JsonoCursor(), patch_view, JsonoCursor(), out_builder, MergeMode::Overlay,
 			                0);
-			writer.WriteRow(row, out_builder);
+			finish_row(row, out_builder);
 			continue;
 		}
 		// Nested shreds: overlay one single-path chain at a time onto the accumulator. The
@@ -963,7 +1186,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		out_builder.Reset();
 		JsonoCursor cursor;
 		EmitValueVerbatim(any ? *acc : residual_view, cursor, out_builder, 0);
-		writer.WriteRow(row, out_builder);
+		finish_row(row, out_builder);
 	}
 }
 
@@ -1635,6 +1858,135 @@ void JsonoEmitObjectStrippingPaths(const JsonoView &view, const std::vector<cons
 		return;
 	}
 	EmitObjectStrippingPaths(view, jsono::JsonoCursor(), builder, paths, 0);
+}
+
+// ---- Residual skeleton emit for array shreds (write side) ----
+// The array stays in the residual as a skeleton: each object element keeps its tail keys but loses
+// the subfields lifted into the LIST<STRUCT> shred column. Length, element order, and non-object/
+// null elements carry the lossless reconstruct (the parallel shred LIST overlays back). The strip
+// gate is JsonoScalarFitsShredType — the same one WriteArrayShred uses — so write and skeleton agree.
+
+// True if `name` is present in the element object at `element_cursor` as a scalar that fits `type`
+// byte-for-byte (so its shred captured it and the skeleton drops it). Mirrors WriteShred's gate.
+static bool ElementSubfieldStrippable(const JsonoView &view, const JsonoCursor &element_cursor, const string &name,
+                                      const LogicalType &type) {
+	JsonoCursor probe = element_cursor;
+	if (!LocatePathStep(nullptr, 0, view, PathStep {PathStepKind::Key, name, 0}, probe)) {
+		return false;
+	}
+	auto tag = SlotTag(view.SlotAt(probe.pos));
+	if (tag == tag::OBJ_START || tag == tag::ARR_START) {
+		return false;
+	}
+	auto scalar = DecodeScalarAt(view, probe);
+	return JsonoScalarFitsShredType(scalar, type);
+}
+
+// Emit the skeleton array (cursor at ARR_START): each object element minus its strippable
+// subfields, every other element verbatim.
+static void EmitSkeletonArray(const JsonoView &view, const JsonoCursor &array_cursor, JsonoBuilder &builder,
+                              const vector<std::pair<string, LogicalType>> &subfields, size_t depth) {
+	auto end_pos = ReadArrayEndPos(view, array_cursor.pos);
+	builder.EmitArrayStart();
+	JsonoCursor cursor = array_cursor;
+	cursor.pos++; // first element; ARR_START consumes no stream entries
+	std::vector<std::vector<PathStep>> strip_storage;
+	std::vector<const std::vector<PathStep> *> strip;
+	while (cursor.pos < end_pos) {
+		if (SlotTag(view.SlotAt(cursor.pos)) == tag::OBJ_START) {
+			strip_storage.clear();
+			for (auto &sub : subfields) {
+				if (ElementSubfieldStrippable(view, cursor, sub.first, sub.second)) {
+					strip_storage.push_back({PathStep {PathStepKind::Key, sub.first, 0}});
+				}
+			}
+			strip.clear();
+			for (auto &path : strip_storage) {
+				strip.push_back(&path);
+			}
+			EmitObjectStrippingPaths(view, cursor, builder, strip, 0);
+			SkipValueFast(view, cursor);
+		} else {
+			EmitValueVerbatim(view, cursor, builder, depth + 1);
+		}
+	}
+	builder.EmitArrayEnd();
+}
+
+// One object level of the residual skeleton: strip the scalar leaves (`scalar_paths`) and replace
+// the array at each terminal array-shred key with its skeleton, recursing for deeper paths.
+static void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cursor, JsonoBuilder &builder,
+                               const std::vector<const std::vector<PathStep> *> &scalar_paths,
+                               const std::vector<const JsonoArrayShredSpec *> &array_specs, size_t depth) {
+	auto layout = ReadObjectLayout(view, obj_cursor.pos);
+	auto key_at = [&](size_t i) {
+		auto key_slot = view.SlotAt(layout.key_start + i);
+		if (SlotTag(key_slot) != tag::KEY) {
+			throw InvalidInputException("malformed JSONO: expected KEY slot");
+		}
+		return view.KeyAt(SlotPayload(key_slot));
+	};
+	size_t surviving = 0;
+	for (size_t i = 0; i < layout.key_count; i++) {
+		if (!PathTerminatesOnKey(scalar_paths, depth, key_at(i))) {
+			surviving++;
+		}
+	}
+	builder.EmitObjectStart(surviving);
+	for (size_t i = 0; i < layout.key_count; i++) {
+		auto key = key_at(i);
+		if (!PathTerminatesOnKey(scalar_paths, depth, key)) {
+			builder.EmitKeySlot(key);
+		}
+	}
+	JsonoCursor value_cursor = obj_cursor;
+	value_cursor.pos = layout.value_start;
+	for (size_t i = 0; i < layout.key_count; i++) {
+		auto key = key_at(i);
+		if (PathTerminatesOnKey(scalar_paths, depth, key)) {
+			SkipValueFast(view, value_cursor);
+			continue;
+		}
+		builder.EmitObjectChildStart();
+		std::vector<const std::vector<PathStep> *> deeper_scalar;
+		for (auto *path : scalar_paths) {
+			auto &step = (*path)[depth];
+			if (depth + 1 < path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
+				deeper_scalar.push_back(path);
+			}
+		}
+		const JsonoArrayShredSpec *terminal_array = nullptr;
+		std::vector<const JsonoArrayShredSpec *> deeper_array;
+		for (auto *spec : array_specs) {
+			if (ArrayPathTerminates(spec->path, depth, key)) {
+				terminal_array = spec;
+			} else if (ArrayPathContinues(spec->path, depth, key)) {
+				deeper_array.push_back(spec);
+			}
+		}
+		auto value_tag = SlotTag(view.SlotAt(value_cursor.pos));
+		if (terminal_array && value_tag == tag::ARR_START) {
+			EmitSkeletonArray(view, value_cursor, builder, terminal_array->subfields, depth);
+			SkipValueFast(view, value_cursor);
+		} else if ((!deeper_scalar.empty() || !deeper_array.empty()) && value_tag == tag::OBJ_START) {
+			EmitSkeletonObject(view, value_cursor, builder, deeper_scalar, deeper_array, depth + 1);
+			SkipValueFast(view, value_cursor);
+		} else {
+			EmitValueVerbatim(view, value_cursor, builder, depth + 1);
+		}
+	}
+	builder.EmitObjectEnd();
+}
+
+void JsonoEmitResidualSkeleton(const JsonoView &view, const std::vector<const std::vector<PathStep> *> &scalar_paths,
+                               const std::vector<const JsonoArrayShredSpec *> &array_specs, JsonoBuilder &builder) {
+	if ((scalar_paths.empty() && array_specs.empty()) || view.Slots() == 0 ||
+	    SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+		jsono::JsonoCursor cursor;
+		EmitValueVerbatim(view, cursor, builder, 0);
+		return;
+	}
+	EmitSkeletonObject(view, jsono::JsonoCursor(), builder, scalar_paths, array_specs, 0);
 }
 
 // The jsono_merge_patch function, exposed so the optimizer's shredded

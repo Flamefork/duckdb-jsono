@@ -1,0 +1,94 @@
+# name: test/sql/jsono_double_render.test
+# description: a double value renders identically through to_json and ->> (one canonical jsono form); shredded reads never escape into DuckDB's double-cast or core-json's normalizing/uppercasing serializer
+# group: [sql]
+
+require jsono
+
+require json
+
+# ---------------------------------------------------------------------------
+# (A) A typed DOUBLE shred read by `->>` must render through jsono's own double
+# formatter (the shortest round-trippable decimal, == to_json), not DuckDB's
+# native DOUBLE->VARCHAR cast (which prints 1e+16 / 1e-07 / 1e+308).
+# ---------------------------------------------------------------------------
+query II
+SELECT jsono({'n': 1e16::DOUBLE}) ->> '$.n', to_json(jsono({'n': 1e16::DOUBLE}));
+----
+10000000000000000.0	{"n":10000000000000000.0}
+
+# to_json and ->> agree on the same double across the full range, including the
+# forms where DuckDB's cast and yyjson disagree (1e16, 1e-5, 1e21, 1e308).
+query I
+WITH v(d) AS (
+    VALUES (1e16::DOUBLE), (1e-7::DOUBLE), (1e308::DOUBLE), (1e-308::DOUBLE),
+           (1e21::DOUBLE), (1e-5::DOUBLE), (123.456::DOUBLE), (100.0::DOUBLE),
+           (0.1::DOUBLE), (-2.5::DOUBLE), (0.0::DOUBLE),
+           (9007199254740992.0::DOUBLE), (1234567890123.0::DOUBLE)
+)
+SELECT bool_and(to_json(jsono({'n': d})) = '{"n":' || (jsono({'n': d}) ->> '$.n') || '}') FROM v;
+----
+true
+
+# The canonical form is jsono's (== core DuckDB json's to_json of the same double).
+query I
+WITH v(d) AS (
+    VALUES (1e16::DOUBLE), (1e-7::DOUBLE), (1e308::DOUBLE), (1e21::DOUBLE),
+           (1e-5::DOUBLE), (123.456::DOUBLE), (0.1::DOUBLE), (-2.5::DOUBLE)
+)
+SELECT bool_and((jsono({'n': d}) ->> '$.n') = to_json(d)) FROM v;
+----
+true
+
+# A non-constant column exercises the real shredded-scan rewrite (not constant folding).
+statement ok
+CREATE TABLE doubles AS SELECT jsono({'n': d}) AS j, d FROM (
+    VALUES (1e16::DOUBLE), (1e-7::DOUBLE), (1e308::DOUBLE), (1e-5::DOUBLE),
+           (0.1::DOUBLE), (-2.5::DOUBLE), (42.0::DOUBLE)
+) t(d);
+
+query I
+SELECT bool_and((j ->> '$.n') = to_json(d)) FROM doubles;
+----
+true
+
+# ---------------------------------------------------------------------------
+# (B) A `->>` descending into a shredded array reconstructs through jsono's own
+# extract, which preserves the number's original text (1e16) the same way a
+# plain read does — not core json's `->>`, which re-renders it to
+# 10000000000000000.0. A text number never enters a typed DOUBLE shred (it fails
+# the kind gate and stays in the residual), so plain and shredded must match.
+# ---------------------------------------------------------------------------
+query I
+SELECT jsono('{"items":[{"price":1e16}]}', shredding := {'$.items': 'STRUCT(price DOUBLE)[]'}) ->> '$.items[0].price';
+----
+1e16
+
+query I
+SELECT (jsono('{"items":[{"price":1e16}]}', shredding := {'$.items': 'STRUCT(price DOUBLE)[]'}) ->> '$.items[0].price')
+     = (jsono('{"items":[{"price":1e16}]}') ->> '$.items[0].price');
+----
+true
+
+# A binary double constructed (not parsed) into an auto-shredded array element is held in the
+# LIST<STRUCT> shred; the descend `->>` renders it through jsono's formatter, matching to_json.
+query II
+SELECT jsono({'items': [{'price': 1e16::DOUBLE}]}) ->> '$.items[0].price',
+       to_json(jsono({'items': [{'price': 1e16::DOUBLE}]}));
+----
+10000000000000000.0	{"items":[{"price":10000000000000000.0}]}
+
+# ---------------------------------------------------------------------------
+# (C) A container `->>` over a shredded value (the read overlaps a stripped shred
+# leaf, so it reconstructs) escapes control characters with jsono's own
+# serializer: lowercase \uXXXX, the same 6-char escape to_json emits — not core
+# json's `->>` (uppercase \uXXXX). The 0x1f byte (e'\x1f') is preserved as a value.
+# ---------------------------------------------------------------------------
+query I
+SELECT jsono({'a': {'s': e'x\x1fy'}}) ->> '$.a';
+----
+{"s":"x\u001fy"}
+
+query I
+SELECT to_json(jsono({'a': {'s': e'x\x1fy'}}));
+----
+{"a":{"s":"x\u001fy"}}

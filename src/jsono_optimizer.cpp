@@ -251,6 +251,24 @@ bool PathStepsObjectKeyPrefix(const vector<PathStep> &prefix, const vector<PathS
 	return true;
 }
 
+// True if `read` descends INTO an array shred — the shred's pure-key path is a strict prefix of
+// `read` (e.g. read `$.products[0].category` for the array shred `$.products`), whatever follows
+// (an `[index]` then a subfield). The residual carries only the skeleton array — the lifted element
+// subfields are stripped — so such a read cannot be served from the residual and must reconstruct.
+bool ReadDescendsIntoArrayShred(const LogicalType &shred_type, const vector<PathStep> &shred_steps,
+                                const vector<PathStep> &read) {
+	if (!IsShredArrayType(shred_type) || shred_steps.size() >= read.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < shred_steps.size(); i++) {
+		if (shred_steps[i].kind != PathStepKind::Key || read[i].kind != PathStepKind::Key ||
+		    shred_steps[i].key != read[i].key) {
+			return false;
+		}
+	}
+	return true;
+}
+
 JsonoCompiledPath CompileJsonoPath(const vector<PathStep> &steps) {
 	JsonoCompiledPath compiled_path;
 	if (steps.size() == 1 && steps[0].kind == PathStepKind::Key) {
@@ -985,6 +1003,47 @@ ScalarFunction MakeJsonoInternalProjectFunction(const LogicalType &return_type) 
 	return fun;
 }
 
+// Render a DOUBLE through jsono's own formatter — the shortest round-trippable decimal yyjson emits,
+// byte-identical to to_json and a plain `->>`. A typed DOUBLE shred read by `->>` must use this, not
+// DuckDB's native DOUBLE->VARCHAR cast: the cast switches to scientific notation at a different
+// threshold (1e+16, 1e-07, 1e+308), which would make a double shred's `->>` text disagree with
+// to_json for the same value. NULL propagates so the shred-read COALESCE falls back to a residual
+// read for a row whose value stayed in the residual.
+void JsonoInternalDoubleTextExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)state;
+	auto count = args.size();
+	UnifiedVectorFormat in;
+	args.data[0].ToUnifiedFormat(count, in);
+	auto in_data = UnifiedVectorFormat::GetData<double>(in);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data = FlatVector::GetData<string_t>(result);
+	auto &result_validity = FlatVector::Validity(result);
+	std::string buf;
+	for (idx_t row = 0; row < count; row++) {
+		auto idx = in.sel->get_index(row);
+		if (!in.validity.RowIsValid(idx)) {
+			result_validity.SetInvalid(row);
+			continue;
+		}
+		buf.clear();
+		EmitDouble(in_data[idx], buf);
+		result_data[row] = StringVector::AddString(result, buf.data(), buf.size());
+	}
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
+ScalarFunction MakeJsonoInternalDoubleTextFunction() {
+	ScalarFunction fun("__jsono_internal_double_text", {LogicalType::DOUBLE}, LogicalType::VARCHAR,
+	                   JsonoInternalDoubleTextExecute);
+	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	return fun;
+}
+
 idx_t ConservativePredicateRank(const JsonoMatchPredicate &predicate) {
 	auto root_path = predicate.steps.size() <= 1;
 	auto multi_value = predicate.values.size() > 1;
@@ -1648,17 +1707,25 @@ private:
 		}
 		for (auto &shred : CollectShreddedShreds(shredded_cast.child->return_type)) {
 			if (PathStepsEqual(shred.steps, steps)) {
-				if (string_fn) {
+				if (string_fn && !IsShredArrayType(shred.type)) {
 					auto alias = expr.GetAlias();
 					return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
 				}
-				return nullptr; // json-valued shred extract: reconstruct via the inner cast
+				// A json-valued extract, or an array shred (whose LIST<STRUCT> column is not the JSON
+				// array text a `->>` expects): reconstruct and extract natively (jsono's renderer),
+				// not core json's `->>`, so numbers/escapes match to_json.
+				return MakeReconstructExtract(expr, shredded_cast, string_fn);
 			}
 			// A read of a subtree holding a stripped shred leaf would miss it in the
 			// residual; reconstruct. (A stripped scalar leaf is itself a shred, handled
 			// by the exact match above.)
 			if (PathStepsObjectKeyPrefix(steps, shred.steps)) {
-				return nullptr;
+				return MakeReconstructExtract(expr, shredded_cast, string_fn);
+			}
+			// A read descending into a shredded array ($.products[i].subfield) cannot be served from
+			// the skeleton residual (the lifted element subfields are stripped); reconstruct.
+			if (ReadDescendsIntoArrayShred(shred.type, shred.steps, steps)) {
+				return MakeReconstructExtract(expr, shredded_cast, string_fn);
 			}
 		}
 		return MakeResidualExtract(expr, shredded_cast, string_fn);
@@ -1689,7 +1756,8 @@ private:
 			return;
 		}
 		for (auto &shred : CollectShreddedShreds(shredded_cast->child->return_type)) {
-			if (PathStepsEqual(shred.steps, steps) || PathStepsObjectKeyPrefix(steps, shred.steps)) {
+			if (PathStepsEqual(shred.steps, steps) || PathStepsObjectKeyPrefix(steps, shred.steps) ||
+			    ReadDescendsIntoArrayShred(shred.type, shred.steps, steps)) {
 				return;
 			}
 		}
@@ -1769,16 +1837,15 @@ private:
 		return make_uniq<BoundCaseExpression>(std::move(is_null), std::move(null_jsono), std::move(residual));
 	}
 
-	// Extract a non-shred path natively from the residual JSONO, matching a
-	// non-shredded column's extract cost — no serialize/parse round-trip through core
-	// json. Correct because only shred leaves are stripped: a non-shred scalar keeps its
-	// value, and a json-valued read overlapping a stripped shred already reconstructed.
-	unique_ptr<Expression> MakeResidualExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast,
-	                                           bool string_fn) {
+	// Bind a native jsono extract of the original path over `source` (a plain-JSONO expression: a
+	// residual reinterpret or a full reconstruct). Keeps `->>`/json_extract on jsono's own renderer
+	// — text-preserving numbers, lowercase \u escapes — instead of core json's STRUCT->JSON->extract
+	// path, which re-renders numbers and uppercases escapes (a visible to_json-vs-extract divergence).
+	unique_ptr<Expression> MakeNativeExtractOver(BoundFunctionExpression &expr, unique_ptr<Expression> source,
+	                                             bool string_fn) {
 		auto path_type = expr.children[1]->return_type;
-		auto residual = ResidualReinterpret(*shredded_cast.child);
 		vector<unique_ptr<Expression>> children;
-		children.push_back(std::move(residual));
+		children.push_back(std::move(source));
 		children.push_back(std::move(expr.children[1]));
 		auto alias = expr.GetAlias();
 		FunctionBinder function_binder(context);
@@ -1796,6 +1863,26 @@ private:
 		auto result = BoundCastExpression::AddCastToType(context, std::move(extracted), target_type);
 		result->SetAlias(alias);
 		return result;
+	}
+
+	// Extract a non-shred path natively from the residual JSONO, matching a
+	// non-shredded column's extract cost — no serialize/parse round-trip through core
+	// json. Correct because only shred leaves are stripped: a non-shred scalar keeps its
+	// value, and a json-valued read overlapping a stripped shred already reconstructed.
+	unique_ptr<Expression> MakeResidualExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast,
+	                                           bool string_fn) {
+		return MakeNativeExtractOver(expr, ResidualReinterpret(*shredded_cast.child), string_fn);
+	}
+
+	// A shredded read whose value the residual alone cannot serve — its leaf is stripped into a
+	// shred, the read descends into a shredded array, or it is a json-valued extract of a shred:
+	// reconstruct the full plain JSONO value (the array-aware reconstruct cast) and extract natively.
+	// This keeps the result on jsono's own renderer, so it is byte-identical to to_json and a plain
+	// read instead of diverging through core json's normalizing/uppercasing `->>`.
+	unique_ptr<Expression> MakeReconstructExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast,
+	                                              bool string_fn) {
+		auto reconstruct = BoundCastExpression::AddCastToType(context, shredded_cast.child->Copy(), JsonoType());
+		return MakeNativeExtractOver(expr, std::move(reconstruct), string_fn);
 	}
 
 	// Detect CAST(string-shred-extract AS T) where the shred's own type is exactly T, and
@@ -1874,7 +1961,19 @@ private:
 			shred_value->SetAlias(alias);
 			return shred_value;
 		}
-		auto shred_text = BoundCastExpression::AddCastToType(context, std::move(shred_value), LogicalType::VARCHAR);
+		unique_ptr<Expression> shred_text;
+		if (shred.type.id() == LogicalTypeId::DOUBLE) {
+			// DuckDB's native DOUBLE->VARCHAR cast (1e+16) diverges from jsono's canonical JSON
+			// number text (10000000000000000.0, == to_json and a plain `->>`). A typed DOUBLE shred
+			// only ever holds a binary double (a text number fails the kind gate and stays in the
+			// residual), so its sole canonical text is jsono's own EmitDouble — render through that.
+			vector<unique_ptr<Expression>> double_text_children;
+			double_text_children.push_back(std::move(shred_value));
+			shred_text = make_uniq<BoundFunctionExpression>(LogicalType::VARCHAR, MakeJsonoInternalDoubleTextFunction(),
+			                                                std::move(double_text_children), nullptr);
+		} else {
+			shred_text = BoundCastExpression::AddCastToType(context, std::move(shred_value), LogicalType::VARCHAR);
+		}
 		// A total shred has no residual rows, so the text read needs no fallback.
 		if (ShredIsTotal(*column, shred.child_index)) {
 			shred_text->SetAlias(alias);
@@ -1922,6 +2021,19 @@ private:
 	// overlay is skipped.
 	unique_ptr<Expression> ReconstructShreddedToJson(unique_ptr<Expression> column) {
 		auto shreds = CollectShreddedShreds(column->return_type);
+		// An array shred (LIST<STRUCT>) leaves a skeleton array in the residual; the object-key patch
+		// overlay below is residual-authoritative, so it would keep the skeleton and ignore the shred.
+		// Reconstruct the full plain value via the array-aware reconstruct cast, then serialize that
+		// (the cast propagates a NULL value through to a NULL JSON, so no struct_pack NULL guard).
+		for (auto &shred : shreds) {
+			if (IsShredArrayType(shred.type)) {
+				auto alias = column->GetAlias();
+				auto plain = BoundCastExpression::AddCastToType(context, std::move(column), JsonoType());
+				auto json = BoundCastExpression::AddCastToType(context, std::move(plain), LogicalType::JSON());
+				json->SetAlias(alias);
+				return json;
+			}
+		}
 		ShredPatchNode root;
 		for (auto &shred : shreds) {
 			bool object_key = !shred.steps.empty();

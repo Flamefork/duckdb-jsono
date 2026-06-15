@@ -1,0 +1,249 @@
+# name: test/sql/jsono_shredded_array.test
+# description: jsono array shredding — $.products into a LIST<STRUCT> shred column, element tail kept in residual, lossless reconstruct
+# group: [sql]
+
+require jsono
+
+require json
+
+# Peek the raw residual skeleton (body blobs repacked as plain jsono, shreds dropped).
+statement ok
+CREATE MACRO jsono_residual(j) AS struct_pack(
+    "jsono" := struct_pack(
+        body := struct_extract_at(struct_extract_at(j, 1), 1)));
+
+# ---------------------------------------------------------------------------
+# Core: a regular array of fixed-shape objects shreds into LIST<STRUCT>; both
+# subfields round-trip losslessly, so the elements are stripped to {} in the
+# residual skeleton and the whole document reconstructs through to_json.
+# ---------------------------------------------------------------------------
+query I
+SELECT to_json(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+----
+{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}
+
+# The shred column is a real typed LIST<STRUCT>, queryable directly.
+query II
+SELECT (j."jsono"."$.products")[1].name, (j."jsono"."$.products")[2].id
+FROM (SELECT jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
+                   shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}) AS j);
+----
+a	2
+
+# The type is a pure function of the shred set (matches jsono_storage_type).
+query I
+SELECT typeof(jsono('{"products":[{"id":1,"name":"a"}]}',
+                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))
+     = jsono_storage_type('"$.products" STRUCT(id UBIGINT, name VARCHAR)[]');
+----
+true
+
+# ---------------------------------------------------------------------------
+# Element tail: keys not in the element schema stay verbatim in the residual.
+# ---------------------------------------------------------------------------
+query I
+SELECT to_json(jsono('{"products":[{"id":1,"name":"a","sku":"x","qty":3}]}',
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+----
+{"products":[{"id":1,"name":"a","qty":3,"sku":"x"}]}
+
+# The residual skeleton keeps the tail; the stripped subfields are gone (read away from
+# them still answers, the whole value fails loud on the stripped row).
+query I
+SELECT jsono_residual(jsono('{"products":[{"id":1,"name":"a","sku":"x"}]}',
+                            shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})) ->> '$.products[0].sku';
+----
+x
+
+statement error
+SELECT to_json(jsono_residual(jsono('{"products":[{"id":1,"name":"a","sku":"x"}]}',
+                                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})));
+----
+row was shredded with shred '$.products
+
+# ---------------------------------------------------------------------------
+# Edge cases — all lossless through reconstruct.
+# ---------------------------------------------------------------------------
+
+# Empty array (length 0, not absent).
+query I
+SELECT to_json(jsono('{"products":[]}', shredding := {'$.products':'STRUCT(id UBIGINT)[]'}));
+----
+{"products":[]}
+
+# Absent array path: nothing stripped, value round-trips unchanged.
+query I
+SELECT to_json(jsono('{"x":1}', shredding := {'$.products':'STRUCT(id UBIGINT)[]'}));
+----
+{"x":1}
+
+# Path present but not an array: stays whole in the residual.
+query I
+SELECT to_json(jsono('{"products":"scalar"}', shredding := {'$.products':'STRUCT(id UBIGINT)[]'}));
+----
+{"products":"scalar"}
+
+# Null element kept verbatim; the object element next to it shreds.
+query I
+SELECT to_json(jsono('{"products":[null,{"id":1,"name":"a"}]}',
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+----
+{"products":[null,{"id":1,"name":"a"}]}
+
+# Heterogeneous: a scalar element coexists with object elements.
+query I
+SELECT to_json(jsono('{"products":[5,{"id":1,"name":"a"}]}',
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+----
+{"products":[5,{"id":1,"name":"a"}]}
+
+# An element missing a shredded subfield: it stays missing (absent skeleton + NULL shred).
+query I
+SELECT to_json(jsono('{"products":[{"id":1},{"id":2,"name":"b"}]}',
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+----
+{"products":[{"id":1},{"id":2,"name":"b"}]}
+
+# Type-mismatched subfield (string in a UBIGINT column): kept in the residual, not stripped.
+query I
+SELECT to_json(jsono('{"products":[{"id":"notnum","name":"a"}]}',
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+----
+{"products":[{"id":"notnum","name":"a"}]}
+
+# Explicit JSON null subfield: a null never fits a typed shred, so it stays as an
+# explicit null in the residual (distinct from absent and from shredded-away).
+query I
+SELECT to_json(jsono('{"products":[{"id":null,"name":"a"}]}',
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+----
+{"products":[{"id":null,"name":"a"}]}
+
+# Nested array path.
+query I
+SELECT to_json(jsono('{"order":{"items":[{"sku":"s1","qty":2}]}}',
+                     shredding := {'$.order.items':'STRUCT(sku VARCHAR, qty UBIGINT)[]'}));
+----
+{"order":{"items":[{"qty":2,"sku":"s1"}]}}
+
+# Array shred coexisting with a top-level scalar shred.
+query I
+SELECT to_json(jsono('{"kind":"order","products":[{"id":1,"name":"a"}]}',
+                     shredding := {'$.kind':'VARCHAR','$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+----
+{"kind":"order","products":[{"id":1,"name":"a"}]}
+
+# ---------------------------------------------------------------------------
+# Multi-row over a table, including a NULL row and a row missing the array.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE orders AS
+SELECT * FROM (VALUES
+    (1, '{"products":[{"id":1,"name":"a"}]}'),
+    (2, '{"products":[]}'),
+    (3, '{"other":true}'),
+    (4, NULL)
+) AS v(id, doc);
+
+query II
+SELECT id, to_json(jsono(doc, shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})) AS full
+FROM orders ORDER BY id;
+----
+1	{"products":[{"id":1,"name":"a"}]}
+2	{"products":[]}
+3	{"other":true}
+4	NULL
+
+# ---------------------------------------------------------------------------
+# Casting a shredded-array value to the plain jsono STRUCT is lossless reconstruct.
+# ---------------------------------------------------------------------------
+query I
+SELECT to_json(jsono('{"products":[{"id":1,"name":"a","sku":"x"}]}',
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+----
+{"products":[{"id":1,"name":"a","sku":"x"}]}
+
+# Secondary form: shred an already-plain jsono value.
+query I
+SELECT to_json(jsono(jsono('{"products":[{"id":1,"name":"a"}]}'),
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+----
+{"products":[{"id":1,"name":"a"}]}
+
+# ---------------------------------------------------------------------------
+# jsono(STRUCT) auto-shred: a top-level LIST<STRUCT<scalars>> field lifts into an
+# array shred (bare name), with the residual skeleton carried for reconstruct.
+# ---------------------------------------------------------------------------
+query I
+SELECT typeof(jsono({'products': [{'id': 1::UBIGINT, 'name': 'a'}]}))
+     = jsono_storage_type('"products" STRUCT(id UBIGINT, name VARCHAR)[]');
+----
+true
+
+# Mixed: a top-level scalar (kind) auto-shreds alongside the array (products).
+query I
+SELECT to_json(jsono({'kind': 'order', 'products': [{'id': 1::UBIGINT, 'name': 'a'}, {'id': 2::UBIGINT, 'name': 'b'}]}));
+----
+{"kind":"order","products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}
+
+# The array shred column is the typed list, queryable directly (bare field name).
+query II
+SELECT (j."jsono"."products")[1].name, (j."jsono"."products")[2].id
+FROM (SELECT jsono({'products': [{'id': 1::UBIGINT, 'name': 'a'}, {'id': 2::UBIGINT, 'name': 'b'}]}) AS j);
+----
+a	2
+
+# A NULL list element round-trips (skeleton null, NULL shred struct).
+query I
+SELECT to_json(jsono({'items': [{'x': 1::BIGINT}, NULL]}));
+----
+{"items":[{"x":1},null]}
+
+# A nested LIST<STRUCT> one struct level deep lifts under its $.parent.items path.
+query I
+SELECT to_json(jsono({'order': {'items': [{'sku': 's1', 'qty': 2::UBIGINT}]}}));
+----
+{"order":{"items":[{"qty":2,"sku":"s1"}]}}
+
+# An empty list and a list of all-NULL structs both round-trip.
+query I
+SELECT to_json(jsono({'a': []::STRUCT(x BIGINT)[], 'b': [NULL]::STRUCT(x BIGINT)[]}));
+----
+{"a":[],"b":[null]}
+
+# ---------------------------------------------------------------------------
+# Reads that descend INTO a shredded array ($.products[i].subfield) must
+# reconstruct, not silently read the skeleton residual — the lifted element
+# subfields are stripped from it. The optimizer routes such reads to reconstruct
+# (correct), and they match a plain parse of the same document exactly.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE arr_reads AS SELECT
+  jsono('{"products":[{"id":1,"category":"A","name":"x","sku":"S1"},{"id":2,"category":"B","name":"y"}]}',
+        shredding := {'$.products':'STRUCT(id UBIGINT, category VARCHAR, name VARCHAR)[]'}) AS s,
+  jsono('{"products":[{"id":1,"category":"A","name":"x","sku":"S1"},{"id":2,"category":"B","name":"y"}]}') AS p;
+
+# A lifted element subfield: was a silent-NULL bug (read the stripped skeleton); now reconstructs.
+query I
+SELECT s ->> '$.products[0].category' FROM arr_reads;
+----
+A
+
+# Parity of every descend-into-array read between the shredded and plain forms.
+query IIIIII
+SELECT (s ->> '$.products[1].category') = (p ->> '$.products[1].category'),
+       (s ->> '$.products[0].id')       = (p ->> '$.products[0].id'),
+       (s ->> '$.products[0].sku')      = (p ->> '$.products[0].sku'),
+       (s ->> '$.products')             = (p ->> '$.products'),
+       (s -> '$.products[1]')::VARCHAR  = (p -> '$.products[1]')::VARCHAR,
+       jsono_type(s, '$.products[0].id') = jsono_type(p, '$.products[0].id')
+FROM arr_reads;
+----
+true	true	true	true	true	true
+
+# A tail key (kept in the skeleton) and an out-of-range index read correctly.
+query II
+SELECT s ->> '$.products[0].sku', s ->> '$.products[9].category' FROM arr_reads;
+----
+S1	NULL

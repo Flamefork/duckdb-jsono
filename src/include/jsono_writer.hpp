@@ -8,6 +8,7 @@
 
 #include "string_view.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -514,6 +515,26 @@ struct JsonoBodyWriter {
 		}
 	}
 };
+
+// LIST result-vector helpers shared by the producers that emit LIST columns (jsono_entries and the
+// array shred writer): grow the child capacity, finalize a row's list entry, and null a list row.
+inline void EnsureListCapacity(Vector &result, idx_t needed) {
+	if (needed <= ListVector::GetListCapacity(result)) {
+		return;
+	}
+	auto next = std::max<idx_t>(needed, std::max<idx_t>(ListVector::GetListCapacity(result) * 2, 1));
+	ListVector::Reserve(result, next);
+}
+
+inline void FinishListRow(Vector &result, idx_t row, idx_t start_offset, idx_t length) {
+	ListVector::GetData(result)[row] = {start_offset, length};
+	ListVector::SetListSize(result, start_offset + length);
+}
+
+inline void SetListRowNull(Vector &result, idx_t row) {
+	FlatVector::SetNull(result, row, true);
+	ListVector::GetData(result)[row] = {0, 0};
+}
 
 } // namespace jsono
 } // namespace duckdb

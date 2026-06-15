@@ -378,6 +378,21 @@ u1	app.bsky.feed.post
 u2	app.bsky.feed.like
 u5	NULL
 
+# __jsono_internal_double_text: a typed DOUBLE shred read for its text renders through jsono's own
+# double formatter (== to_json), not DuckDB's native cast. The helper is injected fully bound and
+# must decline serialization like the others, so this round-trips under verify_serializer.
+# (jsono_extract_string keeps this file free of a `require json` the bare `->>` over a shred needs.)
+statement ok
+CREATE TEMP TABLE jsono_double_shred_probe AS
+SELECT jsono({'n': d}) AS j FROM (VALUES (1e16::DOUBLE), (1e-7::DOUBLE), (0.1::DOUBLE)) t(d);
+
+query T
+SELECT jsono_extract_string(j, '$.n') AS n FROM jsono_double_shred_probe ORDER BY n;
+----
+0.1
+10000000000000000.0
+1e-7
+
 # --- Filterless projector fuse: >=2 distinct constant ->> paths off one JSONO column fuse
 #     into a single __jsono_internal_project pass even without a matcher-carrying filter
 #     (bare multi-extract projection, GROUP BY over extracts). ---
