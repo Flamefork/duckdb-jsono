@@ -1,0 +1,270 @@
+# name: test/sql/jsono_group_merge_keyed.test
+# description: order-independent keyed group merge (jsono_group_merge_max / _min) — parity with the ORDER BY form, no row buffering
+# group: [sql]
+
+require jsono
+
+require json
+
+# --- Parity with the ORDER BY form: _max == ORDER BY key, _min == ORDER BY key DESC ---
+
+# Nested objects, IGNORE NULLS (a:null at the latest key does not overwrite), per-leaf winners.
+query III
+WITH p(j, ts) AS (VALUES
+  (jsono('{"a":1,"b":{"x":1}}'), 1),
+  (jsono('{"a":null,"b":{"y":2}}'), 2),
+  (jsono('{"c":3,"a":9}'), 3))
+SELECT
+  to_json(jsono_group_merge_max(j, ts)) = to_json(jsono_group_merge(j ORDER BY ts)),
+  to_json(jsono_group_merge_min(j, ts)) = to_json(jsono_group_merge(j ORDER BY ts DESC)),
+  to_json(jsono_group_merge_max(j, ts))
+FROM p;
+----
+true	true	{"a":9,"b":{"x":1,"y":2},"c":3}
+
+# A null leaf in the highest-key row must not overwrite a lower row's non-null leaf.
+query II
+WITH p(j, ts) AS (VALUES
+  (jsono('{"a":1,"b":2}'), 1),
+  (jsono('{"a":null}'), 5),
+  (jsono('{"b":null,"c":3}'), 3))
+SELECT to_json(jsono_group_merge_max(j, ts)),
+       to_json(jsono_group_merge_max(j, ts)) = to_json(jsono_group_merge(j ORDER BY ts))
+FROM p;
+----
+{"a":1,"b":2,"c":3}	true
+
+# Arrays replace wholesale by key; deep nesting merges per leaf.
+query II
+WITH p(j, ts) AS (VALUES
+  (jsono('{"arr":[1,2],"o":{"d":{"e":1}}}'), 1),
+  (jsono('{"arr":[9],"o":{"d":{"f":2}}}'), 3),
+  (jsono('{"o":{"d":{"e":7}}}'), 2))
+SELECT to_json(jsono_group_merge_max(j, ts)),
+       to_json(jsono_group_merge_max(j, ts)) = to_json(jsono_group_merge(j ORDER BY ts))
+FROM p;
+----
+{"arr":[9],"o":{"d":{"e":7,"f":2}}}	true
+
+# _min picks the smallest-key value per leaf (earliest-wins).
+query II
+WITH p(j, ts) AS (VALUES
+  (jsono('{"a":1,"b":{"x":1}}'), 1),
+  (jsono('{"a":2,"b":{"y":2}}'), 2),
+  (jsono('{"a":3,"c":3}'), 3))
+SELECT to_json(jsono_group_merge_min(j, ts)),
+       to_json(jsono_group_merge_min(j, ts)) = to_json(jsono_group_merge(j ORDER BY ts DESC))
+FROM p;
+----
+{"a":1,"b":{"x":1,"y":2},"c":3}	true
+
+# --- Composite key: ROW(...) compares lexicographically and breaks ties on the primary key ---
+
+query III
+WITH p(j, a, b) AS (VALUES
+  (jsono('{"k":"x"}'), 1, 1),
+  (jsono('{"k":"y"}'), 1, 2),
+  (jsono('{"k":"z"}'), 1, 3))
+SELECT
+  to_json(jsono_group_merge_max(j, ROW(a, b))),
+  to_json(jsono_group_merge_max(j, ROW(a, b))) = to_json(jsono_group_merge(j ORDER BY ROW(a, b))),
+  to_json(jsono_group_merge_min(j, ROW(a, b)))
+FROM p;
+----
+{"k":"z"}	true	{"k":"x"}
+
+# --- Order independence: the result must not depend on the physical row order ---
+
+# Feeding the same rows ascending vs descending into the aggregate yields the identical value.
+query I
+WITH p(j, ts) AS (VALUES
+  (jsono('{"a":1,"n":{"p":1}}'), 1),
+  (jsono('{"a":2,"n":{"q":2}}'), 2),
+  (jsono('{"a":3,"n":{"p":9}}'), 3),
+  (jsono('{"b":4}'), 4))
+SELECT
+  (SELECT to_json(jsono_group_merge_max(j, ts)) FROM (SELECT * FROM p ORDER BY ts))
+  = (SELECT to_json(jsono_group_merge_max(j, ts)) FROM (SELECT * FROM p ORDER BY ts DESC));
+----
+true
+
+# --- Commutativity / associativity across partitions: parity holds under multiple threads ---
+
+statement ok
+CREATE TABLE keyed_hits AS
+  SELECT (i % 200) AS g,
+         i AS ts,
+         jsono('{"f' || (i % 7) || '":' || i || ',"common":' || (i % 200) || '}') AS j
+  FROM range(20000) t(i);
+
+statement ok
+SET threads = 4;
+
+# Every group's keyed-max output must equal its ORDER BY output (the Combine path runs across threads).
+query I
+SELECT count(*) FILTER (WHERE to_json(a) IS DISTINCT FROM to_json(b))
+FROM (
+  SELECT g,
+         jsono_group_merge_max(j, ts) AS a,
+         jsono_group_merge(j ORDER BY ts) AS b
+  FROM keyed_hits GROUP BY g
+);
+----
+0
+
+# Same for the min direction.
+query I
+SELECT count(*) FILTER (WHERE to_json(a) IS DISTINCT FROM to_json(b))
+FROM (
+  SELECT g,
+         jsono_group_merge_min(j, ts) AS a,
+         jsono_group_merge(j ORDER BY ts DESC) AS b
+  FROM keyed_hits GROUP BY g
+);
+----
+0
+
+statement ok
+RESET threads;
+
+# --- Sticky shredding: a shredded input reshreds back to its own type ---
+
+query III
+SELECT to_json(m), m ->> 'event_name', typeof(m) = jsono_storage_type('event_name VARCHAR')
+FROM (
+  SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
+    (jsono('{"event_name":"search","x":1}', shredding := {'event_name':'VARCHAR'}), 1),
+    (jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}), 2)
+  ) t(j, ts)
+);
+----
+{"event_name":"page_view","x":1}	page_view	true
+
+# _min reshreds the same way, picking the earliest value.
+query III
+SELECT to_json(m), m ->> 'event_name', typeof(m) = jsono_storage_type('event_name VARCHAR')
+FROM (
+  SELECT jsono_group_merge_min(j, ts) AS m FROM (VALUES
+    (jsono('{"event_name":"search","x":1}', shredding := {'event_name':'VARCHAR'}), 1),
+    (jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}), 2)
+  ) t(j, ts)
+);
+----
+{"event_name":"search","x":1}	search	true
+
+# Nested-path shred ($.a.b) sticks through the keyed fold.
+query III
+SELECT to_json(m), m ->> '$.a.b', (jsono_storage_size(m)).shreds
+FROM (
+  SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
+    (jsono('{"a":{"b":1}}', shredding := {'$.a.b':'BIGINT'}), 1),
+    (jsono('{"a":{"b":2}}', shredding := {'$.a.b':'BIGINT'}), 2)
+  ) t(j, ts)
+);
+----
+{"a":{"b":2}}	2	8
+
+# GROUP BY over a shredded input: each group reshreds to its own value.
+query III
+SELECT g, to_json(m), m ->> 'k'
+FROM (
+  SELECT g, jsono_group_merge_max(j, ts) AS m
+  FROM (VALUES
+    ('a', jsono('{"k":"a1"}', shredding := {'k':'VARCHAR'}), 1),
+    ('a', jsono('{"k":"a2","p":1}', shredding := {'k':'VARCHAR'}), 2),
+    ('b', jsono('{"k":"b1"}', shredding := {'k':'VARCHAR'}), 1)
+  ) t(g, j, ts)
+  GROUP BY g
+) s
+ORDER BY g;
+----
+a	{"k":"a2","p":1}	a2
+b	{"k":"b1"}	b1
+
+# Many single-row groups (> vector size) exercise Finalize across chunks at nonzero offsets.
+query I
+SELECT count(*) FROM (
+  SELECT g, jsono_group_merge_max(j, 1) AS m
+  FROM (
+    SELECT i AS g, jsono('{"k":"v' || i || '"}', shredding := {'k':'VARCHAR'}) AS j
+    FROM range(5000) t(i)
+  ) GROUP BY g
+) WHERE (m ->> 'k') = 'v' || g;
+----
+5000
+
+# --- Window function: a full-frame keyed merge materializes per output row ---
+
+query I
+SELECT DISTINCT to_json(m) FROM (
+  SELECT jsono_group_merge_max(j, ts) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS m
+  FROM (VALUES
+    (jsono('{"k":"a"}'), 1),
+    (jsono('{"k":"b"}'), 2)
+  ) t(j, ts)
+);
+----
+{"k":"b"}
+
+# --- Return contract: plain input stays plain; a bare NULL keeps the plain contract ---
+
+query I
+SELECT typeof(jsono_group_merge_max(jsono('{"a":1}'), 1)) = jsono_storage_type();
+----
+true
+
+query I
+SELECT typeof(jsono_group_merge_min(NULL, 1)) = jsono_storage_type();
+----
+true
+
+# A group whose values are all non-object leaves folds by key (no objects, no shadowing risk).
+query II
+WITH p(j, ts) AS (VALUES
+  (jsono('5'), 1),
+  (jsono('7'), 3),
+  (jsono('6'), 2))
+SELECT to_json(jsono_group_merge_max(j, ts)), to_json(jsono_group_merge_min(j, ts))
+FROM p;
+----
+7	5
+
+# --- Structurally-inconsistent paths fail loud (per-leaf LWW would be order-dependent) ---
+
+# A path that is an object in one row and a scalar in another is rejected, not silently order-
+# dependent. The ORDER BY form remains available for such data.
+statement error
+WITH p(j, ts) AS (VALUES
+  (jsono('{"x":{"a":1}}'), 1),
+  (jsono('{"x":7}'), 2))
+SELECT to_json(jsono_group_merge_max(j, ts)) FROM p;
+----
+order-dependent
+
+# Same rejection at the document root (object then scalar).
+statement error
+WITH p(j, ts) AS (VALUES
+  (jsono('{"k":"x"}'), 1),
+  (jsono('5'), 2))
+SELECT to_json(jsono_group_merge_max(j, ts)) FROM p;
+----
+order-dependent
+
+# Object vs array at the same path is the same kind of conflict.
+statement error
+WITH p(j, ts) AS (VALUES
+  (jsono('{"x":{"a":1}}'), 1),
+  (jsono('{"x":[1,2]}'), 2))
+SELECT to_json(jsono_group_merge_max(j, ts)) FROM p;
+----
+order-dependent
+
+# --- Bind-time errors ---
+
+statement error
+SELECT jsono_group_merge_max(jsono('{"a":1}'));
+----
+
+statement error
+SELECT jsono_group_merge_max('not json', 1);
+----

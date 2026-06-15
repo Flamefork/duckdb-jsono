@@ -33,6 +33,7 @@ Merge and aggregate:
 
 - [`jsono_merge_patch(target, patch[, ...])`](#jsono_merge_patch) — RFC 7396 merge patch (later patches win; a `null` member deletes the key).
 - [`jsono_group_merge(value [ORDER BY ...])`](#jsono_group_merge) — aggregate a stream of patches into one value.
+- [`jsono_group_merge_max(value, order_key)` / `jsono_group_merge_min(value, order_key)`](#jsono_group_merge_max--jsono_group_merge_min) — order-independent keyed merge: per leaf, the value from the row with the greatest (`_max`) or smallest (`_min`) `order_key` wins, without buffering the input.
 
 Shredded storage:
 
@@ -349,6 +350,45 @@ ORDER BY id;
 2  {"lang":"en","theme":"dark"}
 3  {"lang":"en","theme":"light"}
 ```
+
+### `jsono_group_merge_max` / `jsono_group_merge_min`
+
+Order-independent variants of `jsono_group_merge` that take the ordering key as an ordinary second argument instead of an `ORDER BY` clause. Per leaf, the value from the row with the **greatest** `order_key` wins (`jsono_group_merge_max`) or the **smallest** wins (`jsono_group_merge_min`); `null` object members never overwrite, exactly like `jsono_group_merge`. They are drop-in replacements for the ordered form:
+
+```text
+jsono_group_merge_max(value, order_key)  ≡  jsono_group_merge(value ORDER BY order_key)
+jsono_group_merge_min(value, order_key)  ≡  jsono_group_merge(value ORDER BY order_key DESC)
+```
+
+```sql
+WITH hits(params, event_ts) AS (
+    VALUES
+        (jsono('{"utm":{"source":"google"},"page":"/a"}'), 1),
+        (jsono('{"utm":{"medium":"cpc"}}'), 2),
+        (jsono('{"page":"/b"}'), 3)
+)
+SELECT to_json(jsono_group_merge_max(params, event_ts)) AS latest_wins,
+       to_json(jsono_group_merge_min(params, event_ts)) AS earliest_wins
+FROM hits;
+```
+*Result:*
+```text
+latest_wins                                          earliest_wins
+{"page":"/b","utm":{"medium":"cpc","source":"google"}}   {"page":"/a","utm":{"medium":"cpc","source":"google"}}
+```
+
+`order_key` is any comparable type; for a composite tie-break pass a `ROW(...)`/struct, which compares lexicographically:
+
+```sql
+SELECT to_json(jsono_group_merge_max(params, ROW(event_ts, hit_id)))
+FROM hits;
+```
+
+**Why a separate function?** `jsono_group_merge(value ORDER BY key)` is order-dependent, so DuckDB buffers and sorts *every* input row before folding — `O(rows)` memory, which can exhaust memory on large groups. The keyed variants resolve conflicts per leaf by the key argument, so they are commutative and associative: DuckDB streams rows straight into the aggregate with no buffer and the state stays `O(distinct leaves per group)`. Use these when folding a large stream (e.g. collapsing event hits into sessions) where the ordered form runs out of memory.
+
+A shredded input keeps its shredding in the output, just like `jsono_group_merge`.
+
+These functions require each path to keep a consistent kind across rows (always an object, or always a scalar/array). A path that is an object in one row and a scalar/array in another makes per-leaf last-write-wins order-dependent, so it is rejected with a clear error — use `jsono_group_merge(value ORDER BY key)` for such structurally-inconsistent data.
 
 ### `jsono_merge_patch`
 

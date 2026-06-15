@@ -786,6 +786,53 @@ def test_fuzz_manifest_no_crash(doc: tuple[str, str], mutation: str) -> None:
     SESSION.value(f"to_json({struct})")
 
 
+# Rows for the keyed group-merge invariant. Every path is kind-consistent (scalar leaves under
+# fixed keys; an optional nested object under "n" is never a scalar), so the order-independent
+# jsono_group_merge_max/_min must reproduce the sequential ORDER BY fold exactly.
+lww_scalars = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(min_value=-1000, max_value=1000),
+    st.text(max_size=4),
+)
+lww_leaf_keys = st.sampled_from(["a", "b", "c"])
+lww_rows = st.lists(
+    st.builds(
+        lambda flat, nested, has_nested: {**flat, **({"n": nested} if has_nested else {})},
+        st.dictionaries(lww_leaf_keys, lww_scalars, max_size=3),
+        st.dictionaries(lww_leaf_keys, lww_scalars, max_size=3),
+        st.booleans(),
+    ),
+    min_size=1,
+    max_size=8,
+)
+
+
+@settings(PROPERTY_SETTINGS)
+@example(rows=[{"a": 1, "n": {"x": 1}}, {"a": None, "n": {"y": 2}}, {"b": 3}], data=None)
+@example(rows=[{"a": 1}, {"a": 2}, {"a": 3}], data=None)
+@given(rows=lww_rows, data=st.data())
+def test_group_merge_keyed_parity(rows: list[dict[str, Any]], data: Any) -> None:
+    # Distinct per-row keys (a permutation) so the ORDER BY fold is itself deterministic and the
+    # keyed result has a single well-defined target to match.
+    order_keys = list(range(len(rows))) if data is None else data.draw(st.permutations(list(range(len(rows)))))
+    values = ", ".join(f"(jsono({sql_literal(json_dumps(row))}), {key})" for row, key in zip(rows, order_keys))
+    cte = f"WITH t(j, ok) AS (VALUES {values})"
+    keyed_max = SESSION.value(f"({cte} SELECT to_json(jsono_group_merge_max(j, ok)) FROM t)")
+    ordered_asc = SESSION.value(f"({cte} SELECT to_json(jsono_group_merge(j ORDER BY ok)) FROM t)")
+    assert keyed_max == ordered_asc, f"max != ORDER BY: {rows!r} -> {keyed_max!r} vs {ordered_asc!r}"
+
+    keyed_min = SESSION.value(f"({cte} SELECT to_json(jsono_group_merge_min(j, ok)) FROM t)")
+    ordered_desc = SESSION.value(f"({cte} SELECT to_json(jsono_group_merge(j ORDER BY ok DESC)) FROM t)")
+    assert keyed_min == ordered_desc, f"min != ORDER BY DESC: {rows!r} -> {keyed_min!r} vs {ordered_desc!r}"
+
+    # Order independence: the physical row order fed to the aggregate must not change the result.
+    keyed_reordered = SESSION.value(
+        f"({cte} SELECT to_json(jsono_group_merge_max(j, ok)) FROM (SELECT * FROM t ORDER BY ok DESC))"
+    )
+    assert keyed_max == keyed_reordered, f"order-dependent: {rows!r} -> {keyed_max!r} vs {keyed_reordered!r}"
+
+
 PROPERTIES = [
     test_round_trip_idempotent,
     test_value_parity,
@@ -796,6 +843,7 @@ PROPERTIES = [
     test_struct_auto_shred_lossless,
     test_struct_array_auto_shred_lossless,
     test_narrowing_fails_loud,
+    test_group_merge_keyed_parity,
     test_fuzz_text_no_crash,
     test_fuzz_blob_no_crash,
     test_fuzz_validish_blob_no_crash,

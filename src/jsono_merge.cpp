@@ -11,6 +11,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/aggregate_function.hpp"
+#include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -1706,6 +1707,17 @@ void JsonoGroupMergeCombine(Vector &source, Vector &target, AggregateInputData &
 	}
 }
 
+// Copy a serialized accumulator blob's six streams into the body writer at row `rid`.
+void WriteOwnedBlobRow(JsonoBodyWriter &writer, idx_t rid, const OwnedJsonoBlob &blob) {
+	writer.data[BODY_SLOTS][rid] = WriteBlobInto(writer.Slots(), blob.slots.data(), blob.slots.size());
+	writer.data[BODY_KEY_HEAP][rid] = WriteBlobInto(writer.KeyHeap(), blob.key_heap.data(), blob.key_heap.size());
+	writer.data[BODY_STRING_HEAP][rid] =
+	    WriteBlobInto(writer.StringHeap(), blob.string_heap.data(), blob.string_heap.size());
+	writer.data[BODY_SKIPS][rid] = WriteBlobInto(writer.Skips(), blob.skips.data(), blob.skips.size());
+	writer.data[BODY_LENGTHS][rid] = WriteBlobInto(writer.Lengths(), blob.lengths.data(), blob.lengths.size());
+	writer.data[BODY_NUMS][rid] = WriteBlobInto(writer.Nums(), blob.nums.data(), blob.nums.size());
+}
+
 // Write each group's accumulated plain blob (or an empty object for an empty/NULL group) into a
 // plain JSONO struct vector `out` at row base+i. Shared by the plain finalize (writes straight
 // into the result at the chunk offset) and the shredded finalize (writes a temp at base 0).
@@ -1729,15 +1741,7 @@ void FinalizePlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMerge
 			continue;
 		}
 		// The accumulator is already a serialized blob; copy each component verbatim.
-		writer.data[BODY_SLOTS][rid] = WriteBlobInto(writer.Slots(), state.acc->slots.data(), state.acc->slots.size());
-		writer.data[BODY_KEY_HEAP][rid] =
-		    WriteBlobInto(writer.KeyHeap(), state.acc->key_heap.data(), state.acc->key_heap.size());
-		writer.data[BODY_STRING_HEAP][rid] =
-		    WriteBlobInto(writer.StringHeap(), state.acc->string_heap.data(), state.acc->string_heap.size());
-		writer.data[BODY_SKIPS][rid] = WriteBlobInto(writer.Skips(), state.acc->skips.data(), state.acc->skips.size());
-		writer.data[BODY_LENGTHS][rid] =
-		    WriteBlobInto(writer.Lengths(), state.acc->lengths.data(), state.acc->lengths.size());
-		writer.data[BODY_NUMS][rid] = WriteBlobInto(writer.Nums(), state.acc->nums.data(), state.acc->nums.size());
+		WriteOwnedBlobRow(writer, rid, *state.acc);
 	}
 }
 
@@ -1760,6 +1764,607 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 	JsonoShredFromSpec(plain, count, bind_data.shreds, shredded);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	VectorOperations::Copy(shredded, result, count, 0, offset);
+}
+
+// ===== Order-independent last-write-wins group merge (jsono_group_merge_max / _min) =====
+//
+// jsono_group_merge(value ORDER BY key) is order_dependent, so DuckDB drives it through the
+// ordered-aggregate path that buffers and sorts EVERY input row before folding — O(rows) memory.
+// These keyed variants take the ordering key as an ordinary second argument and resolve per-leaf
+// conflicts themselves, so the aggregate is commutative and associative (registered WITHOUT
+// order_dependent): DuckDB streams rows straight into Update with no buffer and state stays
+// O(distinct leaves per group).
+//
+// Drop-in semantics (identical to the ORDER BY form on structurally-stable data):
+//   _max(value, key)  ==  jsono_group_merge(value ORDER BY key)        — greatest key wins per leaf
+//   _min(value, key)  ==  jsono_group_merge(value ORDER BY key DESC)   — smallest key wins per leaf
+// Per leaf the value from the row with the winning key wins; null object members never overwrite
+// (RFC 7396 IGNORE NULLS, exactly like jsono_group_merge). The key is any comparable type —
+// composite keys via ROW(...)/STRUCT compare lexicographically — encoded once per row into a
+// sort-key blob (CreateSortKey, NULLS FIRST so a NULL key never wins) so per-leaf comparison is a
+// memcmp and arbitrary types/null ordering are handled by DuckDB's own sort encoding. Exact ties
+// on the key fall back to a deterministic comparison of the value bytes so the result is fully
+// order-independent; supply a unique (composite) key when ties must resolve a specific way.
+//
+// State carries two parallel JSONO blobs: `values` is the merged document; `keys` mirrors its
+// object structure with every leaf replaced by the winning row's sort-key bytes, stored as a
+// string value (read/written only through the verbatim cursor path — never validated or rendered
+// as JSON, so arbitrary sort-key bytes are fine). Object<->scalar type changes at the same path
+// across rows are resolved wholesale by the larger subtree key; for such structurally-unstable
+// paths the result stays order-independent but may differ from the sequential ORDER BY fold.
+
+struct GroupMergeLWWBindData : public FunctionData {
+	OrderModifiers modifiers;
+	// Same sticky-shredded contract as jsono_group_merge: a shredded input reshreds back to its
+	// own type in Finalize (empty for a plain input).
+	vector<std::pair<string, LogicalType>> shreds;
+
+	explicit GroupMergeLWWBindData(OrderModifiers modifiers) : modifiers(modifiers) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<GroupMergeLWWBindData>(modifiers);
+		result->shreds = shreds;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<GroupMergeLWWBindData>();
+		return modifiers == other.modifiers && shreds == other.shreds;
+	}
+};
+
+struct GroupMergeLWWState {
+	OwnedJsonoBlob *values;
+	OwnedJsonoBlob *keys;
+	bool has_input;
+};
+
+struct GroupMergeLWWFunction {
+	static void Initialize(GroupMergeLWWState &state) {
+		state.values = nullptr;
+		state.keys = nullptr;
+		state.has_input = false;
+	}
+
+	template <class STATE>
+	static void Destroy(STATE &state, AggregateInputData &) {
+		delete state.values;
+		delete state.keys;
+		state.values = nullptr;
+		state.keys = nullptr;
+		state.has_input = false;
+	}
+};
+
+// Read a key-tree leaf's stored sort-key bytes (a VAL_STR_HEAP string value at `cursor`).
+nonstd::string_view KeyLeafBytes(const JsonoView &kview, const JsonoCursor &cursor) {
+	auto len = kview.LengthAt(cursor.length_cursor);
+	return kview.StringAt(cursor.string_cursor, len);
+}
+
+// The representative key of a key-tree node: its own sort-key if it is a leaf, else the maximum
+// over its subtree's leaves. Only the object branch (an object<->scalar transition) recurses; the
+// common leaf-vs-leaf conflict reads one string directly with no allocation.
+nonstd::string_view MaxKeyInSubtree(const JsonoView &kview, const JsonoCursor &cursor) {
+	auto t = SlotTag(kview.SlotAt(cursor.pos));
+	if (t != tag::OBJ_START) {
+		if (t != tag::VAL_STR_HEAP) {
+			throw InternalException("jsono_group_merge: malformed key tree leaf");
+		}
+		return KeyLeafBytes(kview, cursor);
+	}
+	auto layout = ReadObjectLayout(kview, cursor.pos);
+	std::vector<MergeChild> kids;
+	CollectObjectChildren(kview, layout, cursor, kids);
+	nonstd::string_view best;
+	bool have = false;
+	for (auto &kid : kids) {
+		auto cand = MaxKeyInSubtree(kview, kid.cursor);
+		if (!have || CompareJsonoKeys(cand, best) > 0) {
+			best = cand;
+			have = true;
+		}
+	}
+	if (!have) {
+		throw InternalException("jsono_group_merge: empty key-tree object");
+	}
+	return best;
+}
+
+template <class T>
+int CompareVecBytes(const std::vector<T> &a, const std::vector<T> &b) {
+	size_t na = a.size() * sizeof(T);
+	size_t nb = b.size() * sizeof(T);
+	size_t n = std::min(na, nb);
+	if (n > 0) {
+		int c = std::memcmp(a.data(), b.data(), n);
+		if (c != 0) {
+			return c;
+		}
+	}
+	return na < nb ? -1 : (na > nb ? 1 : 0);
+}
+
+// Deterministic total order over two JSONO values, used only to break an exact key tie so the
+// fold stays order-independent. Serializes each value standalone (heaps start at 0, so equal
+// values produce byte-identical streams) and compares the streams in a fixed order.
+int CompareValueTie(const JsonoView &va, const JsonoCursor &ca, const JsonoView &vb, const JsonoCursor &cb) {
+	static thread_local JsonoBuilder ta;
+	static thread_local JsonoBuilder tb;
+	ta.Reset();
+	tb.Reset();
+	JsonoCursor x = ca;
+	EmitValueVerbatim(va, x, ta, 0);
+	JsonoCursor y = cb;
+	EmitValueVerbatim(vb, y, tb, 0);
+	if (int c = CompareVecBytes(ta.slots, tb.slots)) {
+		return c;
+	}
+	if (int c = CompareVecBytes(ta.string_heap, tb.string_heap)) {
+		return c;
+	}
+	if (int c = CompareVecBytes(ta.nums, tb.nums)) {
+		return c;
+	}
+	if (int c = CompareVecBytes(ta.key_heap, tb.key_heap)) {
+		return c;
+	}
+	return CompareVecBytes(ta.lengths, tb.lengths);
+}
+
+// Per-leaf last-write-wins is well-defined only when every path has a consistent kind across rows
+// (always an object, or always a non-object leaf). When a path is a non-empty object in one row and
+// a scalar/array in another, the sequential RFC 7396 fold's result depends on row order, so a
+// commutative per-leaf rule cannot reproduce it — failing loud beats a silently order-dependent
+// answer. The accumulator never stores empty/stripped objects, so an OBJ_START here is always a real
+// structural object.
+[[noreturn]] void ThrowMixedKindConflict() {
+	throw InvalidInputException(
+	    "jsono_group_merge_max/min: a path is an object in one row and a scalar/array in another; "
+	    "last-write-wins per leaf is order-dependent for such structurally-inconsistent data. "
+	    "Use jsono_group_merge(value ORDER BY key) instead for paths that change kind across rows.");
+}
+
+// >0 if the A subtree's key wins the conflict, <0 if B wins, 0 on an exact key tie.
+int CompareConflict(const JsonoView &va, const JsonoCursor &ca, const JsonoView &ka, const JsonoCursor &cka,
+                    const JsonoView &vb, const JsonoCursor &cb, const JsonoView &kb, const JsonoCursor &ckb) {
+	int c = CompareJsonoKeys(MaxKeyInSubtree(ka, cka), MaxKeyInSubtree(kb, ckb));
+	if (c != 0) {
+		return c;
+	}
+	return CompareValueTie(va, ca, vb, cb);
+}
+
+void MergeLWW(const JsonoView &va, const JsonoCursor &ca, const JsonoView &ka, const JsonoCursor &cka,
+              const JsonoView &vb, const JsonoCursor &cb, const JsonoView &kb, const JsonoCursor &ckb,
+              JsonoBuilder &out_v, JsonoBuilder &out_k, size_t depth);
+
+// Merge two object nodes (with their mirrored key nodes) into out_v/out_k. Both sides are
+// non-null, non-empty objects (the accumulator never stores nulls/empties, and incoming rows are
+// null-stripped before merge), so this is a pure sorted-key two-pointer with no null bookkeeping.
+void MergeLWWObjects(const JsonoView &va, const JsonoCursor &ca, const JsonoView &ka, const JsonoCursor &cka,
+                     const JsonoView &vb, const JsonoCursor &cb, const JsonoView &kb, const JsonoCursor &ckb,
+                     JsonoBuilder &out_v, JsonoBuilder &out_k, size_t depth) {
+	if (depth > JSONO_MAX_NESTING_DEPTH) {
+		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
+		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+	}
+	// The key children align with the value children by index (same keys, same order), so the
+	// two-pointer compares value keys and indexes the key children with the same rank.
+	std::vector<MergeChild> cva, cka_ch, cvb, ckb_ch;
+	CollectObjectChildren(va, ReadObjectLayout(va, ca.pos), ca, cva);
+	CollectObjectChildren(ka, ReadObjectLayout(ka, cka.pos), cka, cka_ch);
+	CollectObjectChildren(vb, ReadObjectLayout(vb, cb.pos), cb, cvb);
+	CollectObjectChildren(kb, ReadObjectLayout(kb, ckb.pos), ckb, ckb_ch);
+
+	struct PlanEntry {
+		nonstd::string_view key;
+		MergeSrc src;
+		size_t ra;
+		size_t rb;
+	};
+	std::vector<PlanEntry> plan;
+	plan.reserve(cva.size() + cvb.size());
+	size_t ia = 0;
+	size_t ib = 0;
+	while (ia < cva.size() || ib < cvb.size()) {
+		int cmp;
+		if (ib >= cvb.size()) {
+			cmp = -1;
+		} else if (ia >= cva.size()) {
+			cmp = 1;
+		} else {
+			cmp = CompareJsonoKeys(cva[ia].key, cvb[ib].key);
+		}
+		if (cmp < 0) {
+			plan.push_back(PlanEntry {cva[ia].key, MergeSrc::A, ia, 0});
+			ia++;
+		} else if (cmp > 0) {
+			plan.push_back(PlanEntry {cvb[ib].key, MergeSrc::B, 0, ib});
+			ib++;
+		} else {
+			if (cva[ia].tag == tag::OBJ_START && cvb[ib].tag == tag::OBJ_START) {
+				plan.push_back(PlanEntry {cva[ia].key, MergeSrc::Recurse, ia, ib});
+			} else {
+				if (cva[ia].tag == tag::OBJ_START || cvb[ib].tag == tag::OBJ_START) {
+					ThrowMixedKindConflict();
+				}
+				int c = CompareConflict(va, cva[ia].cursor, ka, cka_ch[ia].cursor, vb, cvb[ib].cursor, kb,
+				                        ckb_ch[ib].cursor);
+				plan.push_back(PlanEntry {cva[ia].key, c >= 0 ? MergeSrc::A : MergeSrc::B, ia, ib});
+			}
+			ia++;
+			ib++;
+		}
+	}
+
+	out_v.EmitObjectStart(plan.size());
+	for (auto &p : plan) {
+		out_v.EmitKeySlot(p.key);
+	}
+	out_k.EmitObjectStart(plan.size());
+	for (auto &p : plan) {
+		out_k.EmitKeySlot(p.key);
+	}
+	for (auto &p : plan) {
+		out_v.EmitObjectChildStart();
+		out_k.EmitObjectChildStart();
+		if (p.src == MergeSrc::Recurse) {
+			MergeLWW(va, cva[p.ra].cursor, ka, cka_ch[p.ra].cursor, vb, cvb[p.rb].cursor, kb, ckb_ch[p.rb].cursor,
+			         out_v, out_k, depth + 1);
+		} else if (p.src == MergeSrc::A) {
+			JsonoCursor vc = cva[p.ra].cursor;
+			EmitValueVerbatim(va, vc, out_v, depth + 1);
+			JsonoCursor kc = cka_ch[p.ra].cursor;
+			EmitValueVerbatim(ka, kc, out_k, depth + 1);
+		} else {
+			JsonoCursor vc = cvb[p.rb].cursor;
+			EmitValueVerbatim(vb, vc, out_v, depth + 1);
+			JsonoCursor kc = ckb_ch[p.rb].cursor;
+			EmitValueVerbatim(kb, kc, out_k, depth + 1);
+		}
+	}
+	out_v.EmitObjectEnd();
+	out_k.EmitObjectEnd();
+}
+
+void MergeLWW(const JsonoView &va, const JsonoCursor &ca, const JsonoView &ka, const JsonoCursor &cka,
+              const JsonoView &vb, const JsonoCursor &cb, const JsonoView &kb, const JsonoCursor &ckb,
+              JsonoBuilder &out_v, JsonoBuilder &out_k, size_t depth) {
+	bool a_obj = SlotTag(va.SlotAt(ca.pos)) == tag::OBJ_START;
+	bool b_obj = SlotTag(vb.SlotAt(cb.pos)) == tag::OBJ_START;
+	if (a_obj && b_obj) {
+		MergeLWWObjects(va, ca, ka, cka, vb, cb, kb, ckb, out_v, out_k, depth);
+		return;
+	}
+	if (a_obj || b_obj) {
+		ThrowMixedKindConflict();
+	}
+	// Both sides are non-object leaves at this path: the higher key wins the whole node.
+	int c = CompareConflict(va, ca, ka, cka, vb, cb, kb, ckb);
+	if (c >= 0) {
+		JsonoCursor vc = ca;
+		EmitValueVerbatim(va, vc, out_v, depth);
+		JsonoCursor kc = cka;
+		EmitValueVerbatim(ka, kc, out_k, depth);
+	} else {
+		JsonoCursor vc = cb;
+		EmitValueVerbatim(vb, vc, out_v, depth);
+		JsonoCursor kc = ckb;
+		EmitValueVerbatim(kb, kc, out_k, depth);
+	}
+}
+
+void BuildIncomingValue(const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K, JsonoBuilder &out_v,
+                        JsonoBuilder &out_k, size_t depth);
+
+// Emit one incoming object into out_v (null members stripped, IGNORE NULLS) and the mirrored
+// key tree into out_k (every surviving leaf gets the row's sort key K). Models EmitObjectStrip's
+// survival mask but with the parallel key emission and recursion.
+void BuildIncomingObject(const JsonoView &V, const JsonoCursor &obj_cursor, nonstd::string_view K, JsonoBuilder &out_v,
+                         JsonoBuilder &out_k, size_t depth) {
+	if (depth > JSONO_MAX_NESTING_DEPTH) {
+		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
+		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+	}
+	auto layout = ReadObjectLayout(V, obj_cursor.pos);
+	JsonoCursor value_start = obj_cursor;
+	value_start.pos = layout.value_start;
+	static constexpr size_t MASK_STACK = 128;
+	char keep[MASK_STACK];
+	bool cached = layout.key_count <= MASK_STACK;
+	size_t count = 0;
+	{
+		JsonoCursor vc = value_start;
+		for (size_t i = 0; i < layout.key_count; i++) {
+			bool survives = MemberSurvivesStrip(V, vc.pos, MergeMode::IgnoreNulls);
+			if (cached) {
+				keep[i] = survives ? 1 : 0;
+			}
+			count += survives ? 1 : 0;
+			SkipValueFast(V, vc);
+		}
+	}
+	out_v.EmitObjectStart(count);
+	out_k.EmitObjectStart(count);
+	{
+		JsonoCursor vc = value_start;
+		for (size_t i = 0; i < layout.key_count; i++) {
+			bool survives = cached ? (keep[i] != 0) : MemberSurvivesStrip(V, vc.pos, MergeMode::IgnoreNulls);
+			if (survives) {
+				auto key_slot = V.SlotAt(layout.key_start + i);
+				if (SlotTag(key_slot) != tag::KEY) {
+					throw InvalidInputException("malformed JSONO: object key slot expected");
+				}
+				auto key = V.KeyAt(SlotPayload(key_slot));
+				out_v.EmitKeySlot(key);
+				out_k.EmitKeySlot(key);
+			}
+			SkipValueFast(V, vc);
+		}
+	}
+	{
+		JsonoCursor vc = value_start;
+		for (size_t i = 0; i < layout.key_count; i++) {
+			bool survives = cached ? (keep[i] != 0) : MemberSurvivesStrip(V, vc.pos, MergeMode::IgnoreNulls);
+			if (!survives) {
+				SkipValueFast(V, vc);
+				continue;
+			}
+			out_v.EmitObjectChildStart();
+			out_k.EmitObjectChildStart();
+			BuildIncomingValue(V, vc, K, out_v, out_k, depth + 1);
+		}
+	}
+	out_v.EmitObjectEnd();
+	out_k.EmitObjectEnd();
+}
+
+void BuildIncomingValue(const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K, JsonoBuilder &out_v,
+                        JsonoBuilder &out_k, size_t depth) {
+	auto slot_tag = SlotTag(V.SlotAt(cursor.pos));
+	if (slot_tag == tag::OBJ_START) {
+		BuildIncomingObject(V, cursor, K, out_v, out_k, depth);
+		SkipValueFast(V, cursor);
+		return;
+	}
+	if (slot_tag == tag::ARR_START) {
+		// Arrays are a single leaf (replaced wholesale), exactly like jsono_group_merge.
+		EmitValueVerbatim(V, cursor, out_v, depth);
+		out_k.EmitString(K);
+		return;
+	}
+	// Any scalar, including a top-level JSON null (a non-object incoming replaces wholesale).
+	EmitScalarVerbatim(V, cursor, out_v);
+	out_k.EmitString(K);
+}
+
+// Serialize the incoming row into the value/key builders, then either seed an empty group or
+// merge into the accumulator. Mirrors FoldIntoGroupState but maintains the parallel key tree.
+void FoldRowLWW(GroupMergeLWWState &state, const JsonoView &V, nonstd::string_view K) {
+	static thread_local JsonoBuilder inc_v;
+	static thread_local JsonoBuilder inc_k;
+	inc_v.Reset();
+	inc_k.Reset();
+	JsonoCursor cursor;
+	BuildIncomingValue(V, cursor, K, inc_v, inc_k, 0);
+
+	if (!state.has_input) {
+		state.values = new OwnedJsonoBlob();
+		state.keys = new OwnedJsonoBlob();
+		SerializeBuilderToBlob(inc_v, *state.values);
+		SerializeBuilderToBlob(inc_k, *state.keys);
+		state.has_input = true;
+		return;
+	}
+
+	static thread_local OwnedJsonoBlob inc_v_blob;
+	static thread_local OwnedJsonoBlob inc_k_blob;
+	SerializeBuilderToBlob(inc_v, inc_v_blob);
+	SerializeBuilderToBlob(inc_k, inc_k_blob);
+
+	static thread_local JsonoBuilder out_v;
+	static thread_local JsonoBuilder out_k;
+	out_v.Reset();
+	out_k.Reset();
+	JsonoView acc_v = ViewOfBlob(*state.values);
+	JsonoView acc_k = ViewOfBlob(*state.keys);
+	JsonoView iv = ViewOfBlob(inc_v_blob);
+	JsonoView ik = ViewOfBlob(inc_k_blob);
+	if (!acc_v.ParseHeader() || !acc_k.ParseHeader() || !iv.ParseHeader() || !ik.ParseHeader()) {
+		throw InternalException("jsono_group_merge: malformed accumulator blob");
+	}
+	MergeLWW(acc_v, JsonoCursor(), acc_k, JsonoCursor(), iv, JsonoCursor(), ik, JsonoCursor(), out_v, out_k, 0);
+	SerializeBuilderToBlob(out_v, *state.values);
+	SerializeBuilderToBlob(out_k, *state.keys);
+}
+
+unique_ptr<FunctionData> JsonoGroupMergeLWWBind(ClientContext &context, AggregateFunction &function,
+                                                vector<unique_ptr<Expression>> &arguments, OrderType direction) {
+	if (arguments.size() != 2) {
+		throw BinderException("%s requires a JSONO value and an order key argument", function.name);
+	}
+	if (arguments[0]->HasParameter() || arguments[1]->HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
+	auto &type = arguments[0]->return_type;
+	JsonoRequireExtensionOptimizerForShredded(context, type, function.name);
+	auto bind_data = make_uniq<GroupMergeLWWBindData>(OrderModifiers(direction, OrderByNullType::NULLS_FIRST));
+	if (IsShreddedJsonoType(type)) {
+		// Sticky shredding, same as jsono_group_merge: keep the shredded argument native (Update
+		// reconstructs it to plain) and capture the shreds so Finalize reshreds back to this type.
+		JsonoLayoutType layout;
+		TryParseJsonoLayoutType(type, layout);
+		for (auto &shred : layout.shreds) {
+			bind_data->shreds.emplace_back(shred.first, shred.second);
+		}
+		function.arguments[0] = type;
+		function.return_type = type;
+	} else if (type.id() == LogicalTypeId::SQLNULL || IsJsonoType(type)) {
+		function.arguments[0] = JsonoType();
+	} else {
+		throw BinderException("%s value argument must be JSONO", function.name);
+	}
+	// arguments[1] (order key) stays its own type (function.arguments[1] is ANY → no cast) so
+	// CreateSortKey sees the real values in Update.
+	return std::move(bind_data);
+}
+
+unique_ptr<FunctionData> JsonoGroupMergeMaxBind(ClientContext &context, AggregateFunction &function,
+                                                vector<unique_ptr<Expression>> &arguments) {
+	return JsonoGroupMergeLWWBind(context, function, arguments, OrderType::ASCENDING);
+}
+
+unique_ptr<FunctionData> JsonoGroupMergeMinBind(ClientContext &context, AggregateFunction &function,
+                                                vector<unique_ptr<Expression>> &arguments) {
+	return JsonoGroupMergeLWWBind(context, function, arguments, OrderType::DESCENDING);
+}
+
+// Encode each row's order key into a memcmp-comparable sort-key blob, with the direction baked in
+// at bind (ASC → greatest wins, DESC → smallest wins; NULLS FIRST so a NULL key never wins).
+void LWWMakeSortKeys(Vector &order_key, idx_t count, const GroupMergeLWWBindData &bind_data, Vector &sort_keys) {
+	CreateSortKeyHelpers::CreateSortKey(order_key, count, bind_data.modifiers, sort_keys);
+}
+
+void JsonoGroupMergeLWWSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                    data_ptr_t state_ptr, idx_t count) {
+	(void)input_count;
+	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeLWWBindData>();
+	Vector reconstructed(JsonoType(), count);
+	JsonoRowReader reader;
+	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
+	Vector sort_keys(LogicalType::BLOB, count);
+	LWWMakeSortKeys(inputs[1], count, bind_data, sort_keys);
+	UnifiedVectorFormat sk_fmt;
+	sort_keys.ToUnifiedFormat(count, sk_fmt);
+	auto sk_data = UnifiedVectorFormat::GetData<string_t>(sk_fmt);
+
+	auto &state = *reinterpret_cast<GroupMergeLWWState *>(state_ptr);
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob;
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			continue;
+		}
+		auto &k = sk_data[sk_fmt.sel->get_index(row)];
+		FoldRowLWW(state, view, nonstd::string_view(k.GetData(), k.GetSize()));
+	}
+}
+
+void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &states,
+                              idx_t count) {
+	(void)input_count;
+	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeLWWBindData>();
+	Vector reconstructed(JsonoType(), count);
+	JsonoRowReader reader;
+	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
+	Vector sort_keys(LogicalType::BLOB, count);
+	LWWMakeSortKeys(inputs[1], count, bind_data, sort_keys);
+	UnifiedVectorFormat sk_fmt;
+	sort_keys.ToUnifiedFormat(count, sk_fmt);
+	auto sk_data = UnifiedVectorFormat::GetData<string_t>(sk_fmt);
+	UnifiedVectorFormat state_fmt;
+	states.ToUnifiedFormat(count, state_fmt);
+	auto state_data = UnifiedVectorFormat::GetData<GroupMergeLWWState *>(state_fmt);
+
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob;
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			continue;
+		}
+		auto &k = sk_data[sk_fmt.sel->get_index(row)];
+		FoldRowLWW(*state_data[RowIndex(state_fmt, row)], view, nonstd::string_view(k.GetData(), k.GetSize()));
+	}
+}
+
+void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
+	(void)aggr_input_data;
+	UnifiedVectorFormat source_fmt;
+	source.ToUnifiedFormat(count, source_fmt);
+	auto source_data = UnifiedVectorFormat::GetData<GroupMergeLWWState *>(source_fmt);
+	auto target_data = FlatVector::GetData<GroupMergeLWWState *>(target);
+
+	static thread_local JsonoBuilder out_v;
+	static thread_local JsonoBuilder out_k;
+	for (idx_t row = 0; row < count; row++) {
+		auto &src = *source_data[RowIndex(source_fmt, row)];
+		if (!src.has_input || !src.values || !src.keys) {
+			continue;
+		}
+		auto &tgt = *target_data[row];
+		if (!tgt.has_input) {
+			tgt.values = new OwnedJsonoBlob(*src.values);
+			tgt.keys = new OwnedJsonoBlob(*src.keys);
+			tgt.has_input = true;
+			continue;
+		}
+		out_v.Reset();
+		out_k.Reset();
+		JsonoView tv = ViewOfBlob(*tgt.values);
+		JsonoView tk = ViewOfBlob(*tgt.keys);
+		JsonoView sv = ViewOfBlob(*src.values);
+		JsonoView sk = ViewOfBlob(*src.keys);
+		if (!tv.ParseHeader() || !tk.ParseHeader() || !sv.ParseHeader() || !sk.ParseHeader()) {
+			throw InternalException("jsono_group_merge: malformed accumulator blob");
+		}
+		MergeLWW(tv, JsonoCursor(), tk, JsonoCursor(), sv, JsonoCursor(), sk, JsonoCursor(), out_v, out_k, 0);
+		SerializeBuilderToBlob(out_v, *tgt.values);
+		SerializeBuilderToBlob(out_k, *tgt.keys);
+	}
+}
+
+// Write each group's merged `values` blob (or an empty object for an empty group) into `out`.
+void FinalizeLWWPlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMergeLWWState *const *state_data,
+                            idx_t count, idx_t base) {
+	JsonoBodyWriter writer;
+	writer.Init(out);
+	JsonoBuilder empty_builder;
+	for (idx_t i = 0; i < count; i++) {
+		auto rid = i + base;
+		auto &state = *state_data[RowIndex(state_fmt, i)];
+		if (!state.has_input || !state.values) {
+			empty_builder.Reset();
+			empty_builder.EmitObjectStart(0);
+			empty_builder.EmitObjectEnd();
+			writer.WriteRow(rid, empty_builder);
+			continue;
+		}
+		WriteOwnedBlobRow(writer, rid, *state.values);
+	}
+}
+
+void JsonoGroupMergeLWWFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
+                                idx_t offset) {
+	UnifiedVectorFormat state_fmt;
+	states.ToUnifiedFormat(count, state_fmt);
+	auto state_data = UnifiedVectorFormat::GetData<GroupMergeLWWState *>(state_fmt);
+
+	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeLWWBindData>();
+	if (bind_data.shreds.empty()) {
+		FinalizeLWWPlainGroups(result, state_fmt, state_data, count, offset);
+		return;
+	}
+	Vector plain(JsonoType(), count);
+	FinalizeLWWPlainGroups(plain, state_fmt, state_data, count, 0);
+	Vector shredded(result.GetType(), count);
+	JsonoShredFromSpec(plain, count, bind_data.shreds, shredded);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	VectorOperations::Copy(shredded, result, count, 0, offset);
+}
+
+AggregateFunction JsonoGroupMergeKeyedFunction(const char *name, bind_aggregate_function_t bind) {
+	AggregateFunction fun(name, {LogicalType::ANY, LogicalType::ANY}, JsonoType(),
+	                      AggregateFunction::StateSize<GroupMergeLWWState>,
+	                      AggregateFunction::StateInitialize<GroupMergeLWWState, GroupMergeLWWFunction>,
+	                      JsonoGroupMergeLWWUpdate, JsonoGroupMergeLWWCombine, JsonoGroupMergeLWWFinalize,
+	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, JsonoGroupMergeLWWSimpleUpdate, bind,
+	                      AggregateFunction::StateDestroy<GroupMergeLWWState, GroupMergeLWWFunction>);
+	// Per-leaf conflict resolution by the key argument is commutative and associative: declaring it
+	// not-order-dependent lets DuckDB stream rows into Update (no ordered-aggregate row buffer).
+	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	return fun;
 }
 
 } // namespace
@@ -2081,6 +2686,10 @@ void RegisterJsonoMerge(ExtensionLoader &loader) {
 		fun.order_dependent = AggregateOrderDependent::ORDER_DEPENDENT;
 		loader.RegisterFunction(std::move(fun));
 	}
+	// Order-independent keyed variants: the order key is an argument, conflicts resolve per leaf,
+	// so these are commutative/associative (no ORDER BY, no O(rows) buffering — memory O(groups)).
+	{ loader.RegisterFunction(JsonoGroupMergeKeyedFunction("jsono_group_merge_max", JsonoGroupMergeMaxBind)); }
+	{ loader.RegisterFunction(JsonoGroupMergeKeyedFunction("jsono_group_merge_min", JsonoGroupMergeMinBind)); }
 }
 
 } // namespace duckdb
