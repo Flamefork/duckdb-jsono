@@ -205,6 +205,8 @@ SELECT jsono_extract_string(jsono('{"a.b":"dot","a":{"b":"nested"}}'), '$.a.b');
 
 JSON strings return unquoted text, numbers and booleans return their JSON text, JSON null and missing paths return SQL `NULL`, and arrays/objects return compact JSON text.
 
+> **Operator precedence.** As in core `json`, the `->` and `->>` operators bind *looser* than `AND`/`OR` — the arrow token is shared with [lambda syntax](https://duckdb.org/docs/stable/sql/functions/lambda.html), whose body must bind loosely. Inside a boolean conjunction you must therefore parenthesize the extraction: write `WHERE cond AND (e ->> '$.k') = 'v'`, not `WHERE cond AND e ->> '$.k' = 'v'` — the latter parses as `(cond AND e) ->> …` and fails trying to cast the JSONO struct to `BOOLEAN`. The named `jsono_extract` / `jsono_extract_string` functions need no parentheses. This is expected DuckDB behavior ([duckdb/duckdb#16970](https://github.com/duckdb/duckdb/issues/16970)).
+
 ### `jsono_transform`
 
 Extracts fields from JSONO into a typed DuckDB `STRUCT`. `spec` must be a constant `STRUCT` mapping each output field name to an extraction rule.

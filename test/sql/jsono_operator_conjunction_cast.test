@@ -1,0 +1,104 @@
+# name: test/sql/jsono_operator_conjunction_cast.test
+# description: Operator precedence of ->> / -> on a JSONO column inside a WHERE conjunction.
+# group: [sql]
+
+#   The ->/->>  arrow token has LOWER precedence than AND/OR in DuckDB's grammar (it is shared
+#   with lambda syntax, whose body must bind loosely). So `X AND e ->> '$.k' <pred>` parses as
+#   `(X AND e) ->> …`, which tries to cast the JSONO struct to BOOLEAN. This is expected DuckDB
+#   behavior, identical to core json (duckdb/duckdb#16970, #14162, #21975): parenthesize the
+#   extraction, or use the named jsono_extract_string / jsono_extract functions, which need none.
+
+require jsono
+
+require json
+
+# ---------------------------------------------------------------------------
+# Plain JSONO column.
+# ---------------------------------------------------------------------------
+statement ok
+create table plain as select jsono('{"k":"v"}') e;
+
+# A single ->> predicate needs no parentheses (no surrounding boolean operator).
+query I
+select count(*) from plain where e ->> '$.k' is not null;
+----
+1
+
+# The named function works inside a conjunction without parentheses.
+query I
+select count(*) from plain where true and jsono_extract_string(e, '$.k') is not null;
+----
+1
+
+# Parenthesized ->> works inside a conjunction (the supported form).
+query I
+select count(*) from plain where true and (e ->> '$.k') is not null;
+----
+1
+
+# Same with a comparison predicate.
+query I
+select count(*) from plain where true and (e ->> '$.k') = 'v';
+----
+1
+
+# Parenthesized -> works inside a conjunction.
+query I
+select count(*) from plain where true and (e -> '$.k') is not null;
+----
+1
+
+# Two parenthesized ->> conjuncts (the original events4 shape).
+query I
+select count(*) from plain where (e ->> '$.k') = 'v' and (e ->> '$.k') is not null;
+----
+1
+
+# Expected behavior: unparenthesized ->> in a conjunction binds as `(true AND e) ->> '$.k'`,
+# so DuckDB tries to cast the JSONO struct to BOOLEAN. Same failure as core json — use parens.
+statement error
+select count(*) from plain where true and e ->> '$.k' is not null;
+----
+-> BOOLEAN)
+
+# Unparenthesized -> binds as `(true AND e) -> ('$.k' IS NOT NULL)` -> json_extract(BOOLEAN, BOOLEAN).
+statement error
+select count(*) from plain where true and e -> '$.k' is not null;
+----
+json_extract(BOOLEAN, BOOLEAN)
+
+# ---------------------------------------------------------------------------
+# Shredded JSONO column — same contract (the struct just carries the shred fields).
+# ---------------------------------------------------------------------------
+statement ok
+create table shred as select jsono('{"k":"v"}', shredding := {'$.k':'VARCHAR'}) e;
+
+query I
+select count(*) from shred where true and (e ->> '$.k') is not null;
+----
+1
+
+statement error
+select count(*) from shred where true and e ->> '$.k' is not null;
+----
+-> BOOLEAN)
+
+# Array-shred descend path in a conjunction (the events4 case), parenthesized.
+statement ok
+create table arr as
+select jsono('{"event_name":"x","products":[{"name":"A"}]}',
+             shredding := {'$.event_name':'VARCHAR','$.products':'STRUCT("name" VARCHAR)[]'}) e;
+
+query I
+select count(*) from arr
+where (e ->> '$.event_name') like 'x%' and (e ->> '$.products[0].name') is not null;
+----
+1
+
+# ---------------------------------------------------------------------------
+# No base table (inline) — same contract.
+# ---------------------------------------------------------------------------
+query I
+select count(*) from (select jsono('{"k":"v"}') e) where true and (e ->> '$.k') is not null;
+----
+1
