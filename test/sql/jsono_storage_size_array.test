@@ -1,0 +1,67 @@
+# name: test/sql/jsono_storage_size_array.test
+# description: jsono_storage_size over a LIST<STRUCT> array shred — per-element subfield byte accounting
+# group: [sql]
+
+require jsono
+
+require json
+
+# An array shred sums each element's lifted subfield bytes: UBIGINT counts 8, VARCHAR its string
+# length. Two elements {id:8, name:"aa"=2} and {id:8, name:"bbb"=3} -> 21; total stays consistent.
+query II
+SELECT s.shreds, s.total = s.slots + s.key_heap + s.string_heap + s.skips + s.lengths + s.nums + s.shreds
+FROM (SELECT jsono_storage_size(jsono('{"products":[{"id":1,"name":"aa"},{"id":2,"name":"bbb"}]}',
+                                       shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})) AS s);
+----
+21	true
+
+# An element missing a shredded subfield contributes 0 for that subfield (NULL leaf): {id:8} only.
+query I
+SELECT (jsono_storage_size(jsono('{"products":[{"id":1}]}',
+                                  shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))).shreds;
+----
+8
+
+# An empty array (length 0) and an absent array path both report 0 shred bytes.
+query II
+SELECT
+  (jsono_storage_size(jsono('{"products":[]}', shredding := {'$.products':'STRUCT(id UBIGINT)[]'}))).shreds,
+  (jsono_storage_size(jsono('{"x":1}', shredding := {'$.products':'STRUCT(id UBIGINT)[]'}))).shreds;
+----
+0	0
+
+# A non-object element (scalar 5) is a NULL struct row -> 0; the sibling object {id:8, name:"z"=1} -> 9.
+query I
+SELECT (jsono_storage_size(jsono('{"products":[5,{"id":7,"name":"z"}]}',
+                                  shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))).shreds;
+----
+9
+
+# Mixed shred set: a top-level VARCHAR scalar shred (kind="order"=5) plus an array shred
+# ({id:8, name:"a"=1}=9) -> 14, exercising both lane kinds in one value.
+query II
+SELECT s.shreds, s.total = s.slots + s.key_heap + s.string_heap + s.skips + s.lengths + s.nums + s.shreds
+FROM (SELECT jsono_storage_size(jsono('{"kind":"order","products":[{"id":1,"name":"a"}]}',
+                                       shredding := {'$.kind':'VARCHAR','$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})) AS s);
+----
+14	true
+
+# Multi-row over a table (object array, empty array, missing path, NULL) accounts each row
+# independently and leaves the NULL row's whole struct NULL.
+statement ok
+CREATE TABLE arr_sizes AS
+SELECT * FROM (VALUES
+    (1, '{"products":[{"id":1,"name":"a"},{"id":2,"name":"bb"}]}'),
+    (2, '{"products":[]}'),
+    (3, '{"other":true}'),
+    (4, NULL)
+) AS v(id, doc);
+
+query II
+SELECT id, (jsono_storage_size(jsono(doc, shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))).shreds
+FROM arr_sizes ORDER BY id;
+----
+1	19
+2	0
+3	0
+4	NULL

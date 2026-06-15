@@ -564,49 +564,66 @@ array_element_schemas = st.dictionaries(
 ).map(lambda fields: "STRUCT(" + ", ".join(f"{name} {stype}" for name, stype in fields.items()) + ")[]")
 
 
+# Every native way to read a shredded value must yield the same result as a plain parse of the same
+# document. Each reader is one entry in ARRAY_READER_PARITY: a function taking the shredded and plain
+# `jsono(...)` SQL expressions and returning a full SELECT that evaluates to 'true' iff the reader
+# agrees on both. Adding a shred-aware reader (or a new way to read a shredded value) is one line.
+def _to_json_parity(shredded: str, plain: str) -> str:
+    # Whole-value reconstruct: the residual skeleton overlaid with the shred columns.
+    return f"SELECT (to_json({shredded}) IS NOT DISTINCT FROM to_json({plain}))"
+
+
+def _descend_reads_parity(shredded: str, plain: str) -> str:
+    # Reads that descend INTO the shredded array ($.items[i].field, and the whole $.items): the lifted
+    # subfields are stripped from the skeleton residual, so the optimizer must reconstruct rather than
+    # read a silent NULL/wrong text. Covers the edge doubles / control chars that once crossed a
+    # core-JSON render boundary.
+    reads = [f"$.items[{i}].{f}" for i in (0, 1, 2, 9) for f in array_subfield_names]
+    reads.append("$.items")
+    cond = " AND ".join(f"(sj ->> '{r}') IS NOT DISTINCT FROM (pj ->> '{r}')" for r in reads)
+    return f"SELECT ({cond}) FROM (SELECT {shredded} sj, {plain} pj)"
+
+
+def _entries_parity(shredded: str, plain: str) -> str:
+    # jsono_entries flattens to leaf (key, value) structs; order is not canonical, so compare the two
+    # flattenings as a multiset via an empty symmetric difference.
+    return (
+        f"SELECT (SELECT count(*) FROM (SELECT unnest(jsono_entries({shredded})) "
+        f"EXCEPT ALL SELECT unnest(jsono_entries({plain})))) = 0 "
+        f"AND (SELECT count(*) FROM (SELECT unnest(jsono_entries({plain})) "
+        f"EXCEPT ALL SELECT unnest(jsono_entries({shredded})))) = 0"
+    )
+
+
+ARRAY_READER_PARITY = [
+    ("to_json", _to_json_parity),
+    ("descend_reads", _descend_reads_parity),
+    ("entries", _entries_parity),
+]
+
+
 @settings(PROPERTY_SETTINGS)
 @example(doc={"items": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
 @example(doc={"items": []}, schema="STRUCT(id BIGINT)[]")
 @example(doc={"items": [None, {"id": 1}, 5, "x"]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
 @example(doc={"items": [{"id": 1, "name": None, "sku": "s"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
 @example(doc={"items": [{"qty": 2, "sku": "s1"}]}, schema="STRUCT(sku VARCHAR, qty BIGINT)[]")
-@given(doc=array_documents, schema=array_element_schemas)
-def test_array_shred_lossless(doc: dict[str, Any], schema: str) -> None:
-    # Shredding a regular array's element subfields into a LIST<STRUCT> column must never change the
-    # logical value — for heterogeneous elements, missing / type-mismatched / explicit-null
-    # subfields, tail keys, and empty arrays. The schema keys are often unsorted (the overlay patch
-    # must re-sort them) and may name subfields absent from every element.
-    text = json_dumps(doc)
-    spec = "{'$.items': '" + schema + "'}"
-    plain = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
-    shredded = SESSION.value(f"to_json(jsono({sql_literal(text)}, shredding := {spec}))")
-    assert plain == shredded, f"array shred changed the value: {text!r} spec {spec!r}: {plain!r} -> {shredded!r}"
-
-
-# Descend-read parity fuzzes the FULL scalar space (floats, control chars, the int boundaries) over
-# the same array_element/array_documents the lossless test uses. The optimizer reconstructs such a
-# read and extracts natively, so both the routing (reconstruct vs a silent residual NULL) and the
-# value text (jsono's own renderer, not core json's normalizing/uppercasing `->>`) must match a plain
-# parse — including the edge doubles (1e16) and control chars that used to cross a core-JSON boundary.
-@settings(PROPERTY_SETTINGS)
-@example(doc={"items": [{"id": 1, "name": "a", "sku": "tail"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
-@example(doc={"items": [{"id": 1}, None, 5]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(doc={"items": [{"id": 1, "name": "a", "sku": "tail"}, None, 5]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(doc={"items": [{"id": None, "name": "b"}, {"id": "x"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(doc={"items": [{"id": False}]}, schema="STRUCT(id VARCHAR)[]")
 @example(doc={"items": [{"price": 1e16}]}, schema="STRUCT(price DOUBLE)[]")
 @given(doc=array_documents, schema=array_element_schemas)
-def test_array_descend_read_parity(doc: dict[str, Any], schema: str) -> None:
-    # A read that descends INTO a shredded array ($.items[i].field, or the whole $.items) must
-    # match a plain parse: the lifted element subfields are stripped from the skeleton residual, so
-    # the optimizer must reconstruct rather than silently read NULL/wrong text from it. This is the
-    # optimizer-routing class the whole-value to_json parity does not exercise.
+def test_array_reader_parity(doc: dict[str, Any], schema: str) -> None:
+    # A shredded array value must read identically to a plain parse across every reader in
+    # ARRAY_READER_PARITY (to_json reconstruct, `->>` descend, jsono_entries leaf multiset). Fuzzes
+    # the full scalar space over heterogeneous elements, missing / type-mismatched / explicit-null
+    # subfields, tail keys, empty arrays, VARCHAR read-copies of non-string scalars, and edge doubles.
     text = json_dumps(doc)
-    spec = "{'$.items': '" + schema + "'}"
-    reads = [f"$.items[{i}].{f}" for i in (0, 1, 2, 9) for f in array_subfield_names]
-    reads.append("$.items")  # whole array as ->> text (was a LIST<STRUCT>-text bug)
-    cond = " AND ".join(f"(s ->> '{r}') IS NOT DISTINCT FROM (p ->> '{r}')" for r in reads)
-    ok = SESSION.value(
-        f"SELECT ({cond}) FROM (SELECT jsono({sql_literal(text)}, shredding := {spec}) s, jsono({sql_literal(text)}) p)"
-    )
-    assert ok == "true", f"array descend read differs shredded vs plain: {text!r} spec {spec!r}"
+    shredded = f"jsono({sql_literal(text)}, shredding := {{'$.items': '{schema}'}})"
+    plain = f"jsono({sql_literal(text)})"
+    for name, build_query in ARRAY_READER_PARITY:
+        ok = SESSION.value(build_query(shredded, plain))
+        assert ok == "true", f"array {name} differs shredded vs plain: {text!r} schema {schema!r}"
 
 
 # Typed scalars for the STRUCT-input auto-shred test: each carries an explicit DuckDB type so the
@@ -775,8 +792,7 @@ PROPERTIES = [
     test_keys_sorted,
     test_shred_lossless,
     test_reshred_lossless,
-    test_array_shred_lossless,
-    test_array_descend_read_parity,
+    test_array_reader_parity,
     test_struct_auto_shred_lossless,
     test_struct_array_auto_shred_lossless,
     test_narrowing_fails_loud,

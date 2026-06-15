@@ -797,26 +797,29 @@ struct ReconShred {
 };
 
 void EmitReconShredScalar(JsonoBuilder &builder, const ReconShred &shred, const UnifiedVectorFormat &fmt, idx_t idx) {
-	switch (shred.type.id()) {
-	case LogicalTypeId::VARCHAR: {
+	ShredPrimitive kind;
+	if (!TypeToShredPrimitive(shred.type, kind)) {
+		throw InternalException("jsono reconstruct: non-scalar shred type '%s'", shred.type.ToString());
+	}
+	// Exhaustive over the closed scalar shred set, so a new scalar shred type fails to compile here.
+	switch (kind) {
+	case ShredPrimitive::Varchar: {
 		auto value = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
 		builder.EmitString(nonstd::string_view(value.GetData(), value.GetSize()));
 		return;
 	}
-	case LogicalTypeId::BIGINT:
+	case ShredPrimitive::Bigint:
 		builder.EmitInt(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx]);
 		return;
-	case LogicalTypeId::UBIGINT:
+	case ShredPrimitive::Ubigint:
 		builder.EmitUInt(UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx]);
 		return;
-	case LogicalTypeId::DOUBLE:
+	case ShredPrimitive::Double:
 		builder.EmitDouble(UnifiedVectorFormat::GetData<double>(fmt)[idx]);
 		return;
-	case LogicalTypeId::BOOLEAN:
+	case ShredPrimitive::Boolean:
 		builder.EmitBool(UnifiedVectorFormat::GetData<bool>(fmt)[idx]);
 		return;
-	default:
-		throw InternalException("jsono reconstruct: unexpected shred type '%s'", shred.type.ToString());
 	}
 }
 

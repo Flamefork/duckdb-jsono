@@ -48,8 +48,6 @@ namespace {
 using namespace jsono;
 using namespace duckdb_yyjson;
 
-enum class ShredPrimitive : uint8_t { Varchar, Bigint, Ubigint, Double, Boolean };
-
 // One subfield lifted out of each array element into the LIST<STRUCT> shred column.
 struct ShredArraySubfield {
 	string name; // element subfield key (= struct field name)
@@ -115,33 +113,6 @@ struct ShredLocalState : public FunctionLocalState {
 		return make_uniq<ShredLocalState>();
 	}
 };
-
-bool TypeToShredPrimitive(const LogicalType &type, ShredPrimitive &out) {
-	switch (type.id()) {
-	case LogicalTypeId::VARCHAR:
-		// A JSON-aliased VARCHAR carries a JSON document (object/array/number), not a string
-		// scalar; it embeds as a sub-tree in the residual and must not be lifted into a shred.
-		if (type.HasAlias() && type.GetAlias() == LogicalType::JSON_TYPE_NAME) {
-			return false;
-		}
-		out = ShredPrimitive::Varchar;
-		return true;
-	case LogicalTypeId::BIGINT:
-		out = ShredPrimitive::Bigint;
-		return true;
-	case LogicalTypeId::UBIGINT:
-		out = ShredPrimitive::Ubigint;
-		return true;
-	case LogicalTypeId::DOUBLE:
-		out = ShredPrimitive::Double;
-		return true;
-	case LogicalTypeId::BOOLEAN:
-		out = ShredPrimitive::Boolean;
-		return true;
-	default:
-		return false;
-	}
-}
 
 // A bare key names a literal top-level object key, not a JSONPath expression.
 vector<PathStep> LiteralKeyPath(const string &name) {
@@ -1012,9 +983,53 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 
 } // namespace
 
+bool TypeToShredPrimitive(const LogicalType &type, ShredPrimitive &out) {
+	switch (type.id()) {
+	case LogicalTypeId::VARCHAR:
+		// A JSON-aliased VARCHAR carries a JSON document (object/array/number), not a string
+		// scalar; it embeds as a sub-tree in the residual and must not be lifted into a shred.
+		if (type.HasAlias() && type.GetAlias() == LogicalType::JSON_TYPE_NAME) {
+			return false;
+		}
+		out = ShredPrimitive::Varchar;
+		return true;
+	case LogicalTypeId::BIGINT:
+		out = ShredPrimitive::Bigint;
+		return true;
+	case LogicalTypeId::UBIGINT:
+		out = ShredPrimitive::Ubigint;
+		return true;
+	case LogicalTypeId::DOUBLE:
+		out = ShredPrimitive::Double;
+		return true;
+	case LogicalTypeId::BOOLEAN:
+		out = ShredPrimitive::Boolean;
+		return true;
+	default:
+		return false;
+	}
+}
+
 bool IsShredValueType(const LogicalType &type) {
 	ShredPrimitive primitive;
 	return TypeToShredPrimitive(type, primitive);
+}
+
+ShredKind ClassifyShredKind(const LogicalType &type) {
+	ShredPrimitive primitive;
+	if (TypeToShredPrimitive(type, primitive)) {
+		return ShredKind::Scalar;
+	}
+	if (IsShredArrayType(type)) {
+		return ShredKind::Array;
+	}
+	throw InternalException("jsono: shred column type '%s' is neither a scalar nor an array shred", type.ToString());
+}
+
+bool ShredPrimitiveStoresReadCopy(ShredPrimitive kind) {
+	// Only a VARCHAR shred renders the `->>` text of any scalar (a read-copy) while stripping just a
+	// real JSON string; the typed shreds set a cell valid only when they capture (strip) the value.
+	return kind == ShredPrimitive::Varchar;
 }
 
 bool IsShredArrayType(const LogicalType &type) {

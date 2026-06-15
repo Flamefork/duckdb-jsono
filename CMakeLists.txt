@@ -40,6 +40,16 @@ set(EXTENSION_SOURCES
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# Treat a switch over an enum that omits a case (with no `default`) as an error in our own sources.
+# The shred-type dispatch (ShredKind / ShredPrimitive) relies on this: adding a shred category or
+# scalar type then fails to compile in every native reader rather than reaching a silently-swallowing
+# runtime `default`. Scoped to the jsono targets so DuckDB's own headers are unaffected.
+if(NOT MSVC)
+  foreach(_jsono_target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
+    target_compile_options(${_jsono_target} PRIVATE -Werror=switch)
+  endforeach()
+endif()
+
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"

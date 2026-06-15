@@ -1,5 +1,7 @@
 #include "jsono.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_shred.hpp"
+#include "jsono_shred_read.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -17,42 +19,57 @@ using namespace jsono;
 
 struct StorageSizeSource {
 	JsonoVectorData body;
-	vector<UnifiedVectorFormat> shred_fmt;
-	vector<LogicalTypeId> shred_kind;
+	vector<ShredLane> shreds;
 };
 
-// Logical payload bytes a shred value occupies (the closed shred type set; a NULL shred is 0).
-// Mirrors the BLOB fields, which report payload bytes, not vector/validity overhead.
-uint64_t ShredValueBytes(const UnifiedVectorFormat &fmt, LogicalTypeId kind, idx_t row) {
+// Logical payload bytes a scalar shred leaf occupies (a NULL leaf is 0). Mirrors the BLOB fields,
+// which report payload bytes, not vector/validity overhead. Reused for both top-level scalar shreds
+// and the per-element subfields of a LIST<STRUCT> array shred. The switch is exhaustive over the
+// closed scalar shred set, so a new scalar shred type fails to compile here rather than at runtime.
+uint64_t ShredValueBytes(const UnifiedVectorFormat &fmt, ShredPrimitive kind, idx_t row) {
 	if (!RowIsValid(fmt, row)) {
 		return 0;
 	}
 	auto idx = RowIndex(fmt, row);
 	switch (kind) {
-	case LogicalTypeId::VARCHAR:
+	case ShredPrimitive::Varchar:
 		return UnifiedVectorFormat::GetData<string_t>(fmt)[idx].GetSize();
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::DOUBLE:
+	case ShredPrimitive::Bigint:
+	case ShredPrimitive::Ubigint:
+	case ShredPrimitive::Double:
 		return 8;
-	case LogicalTypeId::BOOLEAN:
+	case ShredPrimitive::Boolean:
 		return 1;
-	default:
-		throw InternalException("jsono_storage_size: unexpected shred type");
 	}
+	return 0;
 }
 
-void InitStorageSizeSource(Vector &input_vec, idx_t count, const child_list_t<LogicalType> &shreds,
-                           StorageSizeSource &source) {
-	InitJsonoVectorData(input_vec, count, source.body);
-	if (shreds.empty()) {
-		return;
+// Payload bytes a LIST<STRUCT> array shred occupies for one row: each element struct contributes its
+// lifted subfields' scalar bytes (a NULL element struct or absent subfield is 0), summed over the
+// row's list span. Mirrors WriteArrayShred (jsono_shred.cpp), which writes one struct row per array
+// element with the lifted subfields as typed scalars.
+uint64_t ArrayShredBytes(const ShredLane &lane, idx_t row) {
+	if (!RowIsValid(lane.fmt, row)) {
+		return 0;
 	}
-	source.shred_fmt.resize(shreds.size());
-	for (idx_t k = 0; k < shreds.size(); k++) {
-		JsonoShredVector(input_vec, k).ToUnifiedFormat(count, source.shred_fmt[k]);
-		source.shred_kind.push_back(shreds[k].second.id());
+	auto entry = UnifiedVectorFormat::GetData<list_entry_t>(lane.fmt)[RowIndex(lane.fmt, row)];
+	uint64_t bytes = 0;
+	for (idx_t element = entry.offset; element < entry.offset + entry.length; element++) {
+		for (idx_t j = 0; j < lane.sub_fmt.size(); j++) {
+			bytes += ShredValueBytes(lane.sub_fmt[j], lane.sub_kind[j], element);
+		}
 	}
+	return bytes;
+}
+
+uint64_t ShredLaneBytes(const ShredLane &lane, idx_t row) {
+	switch (lane.kind) {
+	case ShredKind::Scalar:
+		return ShredValueBytes(lane.fmt, lane.scalar_kind, row);
+	case ShredKind::Array:
+		return ArrayShredBytes(lane, row);
+	}
+	return 0;
 }
 
 struct StorageSizeResult {
@@ -87,8 +104,8 @@ void SetStorageSizeRowNull(Vector &result, idx_t row) {
 
 uint64_t ShredPayloadBytes(const StorageSizeSource &source, idx_t row) {
 	uint64_t shred_bytes = 0;
-	for (idx_t k = 0; k < source.shred_fmt.size(); k++) {
-		shred_bytes += ShredValueBytes(source.shred_fmt[k], source.shred_kind[k], row);
+	for (auto &lane : source.shreds) {
+		shred_bytes += ShredLaneBytes(lane, row);
 	}
 	return shred_bytes;
 }
@@ -111,7 +128,8 @@ void JsonoStorageSizeExecuteSingle(Vector &input_vec, idx_t count, Vector &resul
 	JsonoLayoutType layout;
 	TryParseJsonoLayoutType(input_vec.GetType(), layout);
 	StorageSizeSource source;
-	InitStorageSizeSource(input_vec, count, layout.shreds, source);
+	InitJsonoVectorData(input_vec, count, source.body);
+	InitShredLanes(input_vec, count, layout.shreds, source.shreds);
 	auto output = InitStorageSizeResult(result);
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;

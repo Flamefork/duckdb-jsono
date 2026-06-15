@@ -1,0 +1,130 @@
+# name: test/sql/jsono_entries_array.test
+# description: jsono_entries over a LIST<STRUCT> array shred — lifted element subfields expand to leaf entries, parity with a plain parse
+# group: [sql]
+
+require jsono
+
+require json
+
+# An array shred expands each element's lifted subfields into leaf entries keyed by element index,
+# exactly as a plain parse flattens the same array of objects.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
+                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e
+) ORDER BY ALL;
+----
+$.products[0].id	1
+$.products[0].name	a
+$.products[1].id	2
+$.products[1].name	b
+
+# Dotted key style indexes elements as a `.N` segment, again matching a plain parse.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a"}]}',
+                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                              key_style := 'dotted')) AS e
+) ORDER BY ALL;
+----
+products.0.id	1
+products.0.name	a
+
+# The lifted subfields (shred) and the element tail / explicit-null / type-mismatch / non-object
+# elements (residual) combine into the full leaf set — shown explicitly here, sorted.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}',
+                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e
+) ORDER BY ALL;
+----
+$.products[0].id	1
+$.products[0].name	a
+$.products[0].sku	S1
+$.products[1]	5
+$.products[2]	NULL
+$.products[3].id	2
+$.products[4].id	NULL
+$.products[4].name	b
+$.products[5].id	x
+$.products[5].name	c
+
+# Differential: entries(shredded) must equal entries(plain) as a multiset for the same complex shape.
+query I
+SELECT (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}',
+                                            shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}'))))) +
+       (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}')))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}',
+                                            shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})))));
+----
+0
+
+# Mixed shred set: a top-level scalar shred (kind) and an array shred (products) both expand, with
+# parity to the plain form.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"kind":"order","products":[{"id":1,"name":"a"}],"note":"x"}',
+                                    shredding := {'$.kind':'VARCHAR','$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e
+) ORDER BY ALL;
+----
+$.kind	order
+$.note	x
+$.products[0].id	1
+$.products[0].name	a
+
+# Nested array path shreds and expands under its parent path.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"order":{"items":[{"sku":"s1","qty":2}]}}',
+                                    shredding := {'$.order.items':'STRUCT(sku VARCHAR, qty UBIGINT)[]'}))) AS e
+) ORDER BY ALL;
+----
+$.order.items[0].qty	2
+$.order.items[0].sku	s1
+
+# Empty array and absent array path expand to nothing (no element leaves), matching plain.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"products":[],"other":true}',
+                                    shredding := {'$.products':'STRUCT(id UBIGINT)[]'}))) AS e
+) ORDER BY ALL;
+----
+$.other	true
+
+# A VARCHAR subfield only strips a real JSON string; a non-string (here a boolean) stays in the
+# residual as a read-copy, so it must be emitted once (by the residual), not doubled by the shred
+# overlay. The stripped string subfield is emitted once by the overlay. No duplicate keys.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":false},{"id":2,"name":"real"}]}',
+                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e
+) ORDER BY ALL;
+----
+$.products[0].id	1
+$.products[0].name	false
+$.products[1].id	2
+$.products[1].name	real
+
+# Multi-row differential over a table, including empty array, missing path, and a NULL row: each
+# row's shredded entries match its plain entries (row id keeps the comparison per-row).
+statement ok
+CREATE TABLE arr_entries AS
+SELECT * FROM (VALUES
+    (1, '{"products":[{"id":1,"name":"a"},{"id":2,"name":"bb","sku":"S"}]}'),
+    (2, '{"products":[]}'),
+    (3, '{"other":true}'),
+    (4, NULL)
+) AS v(id, doc);
+
+query I
+WITH s AS (SELECT id, unnest(jsono_entries(jsono(doc, shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e FROM arr_entries),
+     p AS (SELECT id, unnest(jsono_entries(jsono(doc))) AS e FROM arr_entries)
+SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM p)) +
+       (SELECT count(*) FROM (SELECT * FROM p EXCEPT ALL SELECT * FROM s));
+----
+0

@@ -18,6 +18,32 @@ namespace jsono {
 struct JsonoScalar;
 }
 
+// The scalar types a shred column can hold. The single closed set, shared by the shred writer and
+// every native shred-lane reader (storage_size, entries, reconstruct). Readers switch over it with
+// no `default`, so adding a scalar shred type is a compile error in each reader, not a runtime throw.
+enum class ShredPrimitive : uint8_t { Varchar, Bigint, Ubigint, Double, Boolean };
+
+// The category of a shred column: one scalar value, or a LIST<STRUCT> array shred. Readers switch
+// over it with no `default`, so adding a future shred category (e.g. a map shred) is a compile error
+// in each native reader rather than a silently-swallowed runtime `default`.
+enum class ShredKind : uint8_t { Scalar, Array };
+
+// Classify a scalar shred type into its ShredPrimitive; false if `type` is not a scalar a shred can
+// hold (a JSON-aliased VARCHAR carrying a document, or any non-scalar). The single owner of the
+// scalar shred set — every writer and reader classifies through here, never re-listing the type ids.
+bool TypeToShredPrimitive(const LogicalType &type, ShredPrimitive &out);
+
+// Classify a shred column type into its category. Throws InternalException if `type` is neither a
+// scalar nor an array shred — the single fail-loud point, so readers carry no swallowing `default`.
+// Bind validates shred types up front, so a miss here is a broken invariant, not user input.
+ShredKind ClassifyShredKind(const LogicalType &type);
+
+// True if a shred of this kind keeps a read-copy of a value that ALSO stays in the residual: only
+// VARCHAR, which renders the `->>` text of any scalar for a fast typed read but strips just a real
+// JSON string. A reader that enumerates logical leaves (jsono_entries) must treat such a cell as the
+// residual's and not emit it twice. The single owner of the read-copy rule; see WriteShred.
+bool ShredPrimitiveStoresReadCopy(ShredPrimitive kind);
+
 void RegisterJsonoShred(ExtensionLoader &loader);
 
 // The jsono(jsono, shredding := spec) overload, exposed so the optimizer's set-operation

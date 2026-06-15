@@ -3,6 +3,8 @@
 #include "jsono_reader.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
+#include "jsono_shred.hpp"
+#include "jsono_shred_read.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -20,6 +22,7 @@
 
 #include <algorithm>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace duckdb {
@@ -32,15 +35,18 @@ using namespace jsono;
 
 enum class JsonoEntriesKeyStyle : uint8_t { JsonPath, Dotted };
 
-// A shred of a shredded input: its struct child index, type, and the entry key in both
-// styles (precomputed at bind). A top-level literal shred name `n` keys as `n` (dotted) or
-// `$.n` (jsonpath); a `$.`-prefixed path keys as itself (jsonpath) or without the prefix
-// (dotted). The stripped shred value is flattened alongside the residual entries.
+// A shred of a shredded input: its struct child index, type, and the entry key in both styles
+// (precomputed at bind). A top-level literal shred name `n` keys as `n` (dotted) or `$.n`
+// (jsonpath); a `$.`-prefixed path keys as itself (jsonpath) or without the prefix (dotted). A
+// scalar shred flattens to one entry at its key; an array shred (LIST<STRUCT>) expands each
+// element's lifted subfields into `<key>[i].<subfield>` leaves keyed by `subfield_names`, the key
+// being the array's base path. The runtime value lanes and shred kinds come from InitShredLanes.
 struct EntriesShred {
 	idx_t child_index;
 	LogicalType type;
 	string key_jsonpath;
 	string key_dotted;
+	vector<string> subfield_names; // element-struct order; empty for a scalar shred
 };
 
 struct JsonoEntriesBindData : public FunctionData {
@@ -105,13 +111,18 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 		TryParseJsonoLayoutType(input_type, layout);
 		for (idx_t i = 0; i < layout.shreds.size(); i++) {
 			auto &name = layout.shreds[i].first;
-			EntriesShred shred {i, layout.shreds[i].second, "", ""};
+			EntriesShred shred {i, layout.shreds[i].second, "", "", {}};
 			if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
 				shred.key_jsonpath = name;
 				shred.key_dotted = name.substr(2);
 			} else {
 				shred.key_jsonpath = "$." + name;
 				shred.key_dotted = name;
+			}
+			if (ClassifyShredKind(shred.type) == ShredKind::Array) {
+				for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(shred.type))) {
+					shred.subfield_names.push_back(sub.first);
+				}
 			}
 			shreds.push_back(std::move(shred));
 		}
@@ -252,6 +263,10 @@ struct EntriesWalkSink {
 	std::string &path;
 	JsonoEntriesKeyStyle style;
 	EntriesSink &sink;
+	// When set, every emitted leaf path is recorded so the VARCHAR-shred overlay can tell a
+	// stripped value (residual lacks the path) from a read-copy (residual keeps it). NULL when no
+	// VARCHAR shred is present, since only VARCHAR shreds store a read-copy of a non-string scalar.
+	std::unordered_set<std::string> *seen = nullptr;
 
 	void BeginObject() {
 	}
@@ -278,38 +293,40 @@ struct EntriesWalkSink {
 		path.resize(saved);
 	}
 	void Scalar(const JsonoScalar &scalar) {
+		if (seen) {
+			seen->insert(path);
+		}
 		sink.Append(path, scalar);
 	}
 };
 
-// Render a shredded shred's typed value as the text an entry carries. Shreds are limited
-// to the shred-primitive types, so a small switch covers them; VARCHAR returns the heap
-// string in place, the rest format into `scratch`.
-nonstd::string_view FormatShredValue(const UnifiedVectorFormat &fmt, idx_t idx, const LogicalType &type,
+// Render a shredded shred's typed value as the text an entry carries. The switch is exhaustive over
+// the closed scalar shred set (so a new scalar shred type fails to compile here); VARCHAR returns the
+// heap string in place, the rest format into `scratch`.
+nonstd::string_view FormatShredValue(const UnifiedVectorFormat &fmt, idx_t idx, ShredPrimitive kind,
                                      std::string &scratch) {
-	switch (type.id()) {
-	case LogicalTypeId::VARCHAR: {
+	switch (kind) {
+	case ShredPrimitive::Varchar: {
 		auto &s = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
 		return nonstd::string_view(s.GetData(), s.GetSize());
 	}
-	case LogicalTypeId::BIGINT:
+	case ShredPrimitive::Bigint:
 		scratch.clear();
 		AppendSignedText(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx], scratch);
 		return scratch;
-	case LogicalTypeId::UBIGINT:
+	case ShredPrimitive::Ubigint:
 		scratch.clear();
 		AppendUnsignedText(UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx], scratch);
 		return scratch;
-	case LogicalTypeId::DOUBLE:
+	case ShredPrimitive::Double:
 		scratch.clear();
 		EmitDouble(UnifiedVectorFormat::GetData<double>(fmt)[idx], scratch);
 		return scratch;
-	case LogicalTypeId::BOOLEAN:
+	case ShredPrimitive::Boolean:
 		scratch = UnifiedVectorFormat::GetData<bool>(fmt)[idx] ? "true" : "false";
 		return scratch;
-	default:
-		throw InternalException("jsono_entries: unhandled shred type %s", type.ToString());
 	}
+	return nonstd::string_view();
 }
 
 void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -324,11 +341,33 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 	auto style = bind_data.style;
 	auto &shreds = bind_data.shreds;
 
-	// Read each shred column once so the per-row loop can emit its stripped value.
-	vector<UnifiedVectorFormat> shred_fmt(shreds.size());
+	// Read each shred column's value lanes once (a scalar value lane, or a list_entry lane plus the
+	// element-struct subfield lanes for an array shred). InitShredLanes resolves the LIST<STRUCT> walk
+	// and the shred kinds in one place; lane f corresponds to shreds[f].
+	vector<ShredLane> lanes;
 	if (!shreds.empty()) {
-		for (idx_t f = 0; f < shreds.size(); f++) {
-			JsonoShredVector(args.data[0], shreds[f].child_index).ToUnifiedFormat(count, shred_fmt[f]);
+		JsonoLayoutType layout;
+		TryParseJsonoLayoutType(args.data[0].GetType(), layout);
+		InitShredLanes(args.data[0], count, layout.shreds, lanes);
+	}
+
+	// Only a VARCHAR shred keeps a read-copy of a non-string scalar (the value stays in the residual,
+	// the shred holds the `->>` text for a fast typed read). Such a value would be emitted twice — once
+	// by the residual walk, once by the shred overlay — so when any VARCHAR shred is present, the
+	// residual leaf paths are recorded and the overlay skips a path the residual already carries
+	// (residual is authoritative, matching the reconstruct overlay). ShredPrimitiveStoresReadCopy is
+	// the single owner of which kinds read-copy.
+	bool has_varchar_shred = false;
+	for (auto &lane : lanes) {
+		switch (lane.kind) {
+		case ShredKind::Scalar:
+			has_varchar_shred = has_varchar_shred || ShredPrimitiveStoresReadCopy(lane.scalar_kind);
+			break;
+		case ShredKind::Array:
+			for (auto sub_kind : lane.sub_kind) {
+				has_varchar_shred = has_varchar_shred || ShredPrimitiveStoresReadCopy(sub_kind);
+			}
+			break;
 		}
 	}
 
@@ -336,6 +375,7 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 	ListVector::SetListSize(result, 0);
 	std::string path;
 	std::string shred_scratch;
+	std::unordered_set<std::string> residual_paths;
 	EntriesSink sink(result);
 	// Zero-copy text leaves point into the input string_heap; keep its buffer alive on the
 	// value child (the reference survives the list child's Reserve/Resize grows).
@@ -350,6 +390,9 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 			continue;
 		}
 		auto start = sink.next_child;
+		if (has_varchar_shred) {
+			residual_paths.clear();
+		}
 		if (row_state == JsonoRowState::Value) {
 			path.clear();
 			if (style == JsonoEntriesKeyStyle::JsonPath) {
@@ -357,19 +400,65 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 			}
 			JsonoCursor cursor;
 			EntriesWalkSink walk(path, style, sink);
+			if (has_varchar_shred) {
+				walk.seen = &residual_paths;
+			}
 			WalkJsonoValue(view, cursor, walk, 0);
 		} else if (shreds.empty()) {
 			SetListRowNull(result, row);
 			continue;
 		}
 		for (idx_t f = 0; f < shreds.size(); f++) {
-			auto idx = shred_fmt[f].sel->get_index(row);
-			if (!shred_fmt[f].validity.RowIsValid(idx)) {
-				continue;
+			auto &lane = lanes[f];
+			auto idx = lane.fmt.sel->get_index(row);
+			if (!lane.fmt.validity.RowIsValid(idx)) {
+				continue; // a NULL scalar shred or a NULL array list emits nothing
 			}
-			auto &key = style == JsonoEntriesKeyStyle::JsonPath ? shreds[f].key_jsonpath : shreds[f].key_dotted;
-			auto value = FormatShredValue(shred_fmt[f], idx, shreds[f].type, shred_scratch);
-			sink.AppendText(nonstd::string_view(key.data(), key.size()), false, value);
+			auto &base_key = style == JsonoEntriesKeyStyle::JsonPath ? shreds[f].key_jsonpath : shreds[f].key_dotted;
+			switch (lane.kind) {
+			case ShredKind::Scalar: {
+				// A VARCHAR read-copy the residual still carries is the residual's to emit, not ours.
+				if (ShredPrimitiveStoresReadCopy(lane.scalar_kind) && residual_paths.count(base_key)) {
+					break;
+				}
+				auto value = FormatShredValue(lane.fmt, idx, lane.scalar_kind, shred_scratch);
+				sink.AppendText(nonstd::string_view(base_key.data(), base_key.size()), false, value);
+				break;
+			}
+			case ShredKind::Array: {
+				// Expand each element's lifted subfields into `<base>[i].<subfield>` leaves. A NULL
+				// element struct or absent subfield (a non-object element, a missing/explicit-null/
+				// type-mismatched value) is skipped here — it stays in the residual skeleton, which the
+				// walk above already emitted, so the union matches a plain parse.
+				auto entry = UnifiedVectorFormat::GetData<list_entry_t>(lane.fmt)[idx];
+				path.assign(base_key.begin(), base_key.end());
+				for (idx_t e = 0; e < entry.length; e++) {
+					auto saved_index = path.size();
+					AppendIndexSegment(path, e, style);
+					for (idx_t j = 0; j < lane.sub_fmt.size(); j++) {
+						auto &sub_fmt = lane.sub_fmt[j];
+						auto sub_idx = sub_fmt.sel->get_index(entry.offset + e);
+						if (!sub_fmt.validity.RowIsValid(sub_idx)) {
+							continue;
+						}
+						auto saved_key = path.size();
+						auto &sub_name = shreds[f].subfield_names[j];
+						AppendKeySegment(path, nonstd::string_view(sub_name.data(), sub_name.size()), style);
+						// A VARCHAR subfield read-copy the residual element still carries is the
+						// residual's to emit (the walk above already did), so skip it here.
+						if (ShredPrimitiveStoresReadCopy(lane.sub_kind[j]) && residual_paths.count(path)) {
+							path.resize(saved_key);
+							continue;
+						}
+						auto value = FormatShredValue(sub_fmt, sub_idx, lane.sub_kind[j], shred_scratch);
+						sink.AppendText(nonstd::string_view(path.data(), path.size()), false, value);
+						path.resize(saved_key);
+					}
+					path.resize(saved_index);
+				}
+				break;
+			}
+			}
 		}
 		FinishListRow(result, row, start, sink.next_child - start);
 	}
