@@ -13,6 +13,7 @@
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/function/function.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression.hpp"
@@ -2729,6 +2730,22 @@ void JsonoCheckedResidualExecute(DataChunk &args, ExpressionState &state, Vector
 	result.Reference(args.data[0]);
 }
 
+// __jsono_internal_strip_manifest(skips): drop the shred-manifest tail from a residual's skips blob,
+// so a reader sees it as manifest-free. The soft residual reinterpret (the COALESCE fallback arm of a
+// typed shred read) wraps its skips with this: a read of a shred-lane path absent from the residual
+// then yields plain NULL — the lane holds the value — instead of the point-read manifest guard's
+// narrowing throw. That throw is only correct when the read context lacks the lane (a genuinely
+// narrowed row), which reads through the checked residual, never this fallback. Letting the manifest
+// survive made any EAGER evaluation of the fallback (the projector fuse, any future hoist out of the
+// COALESCE) throw on every row whose value lives in its lane.
+void JsonoStripManifestExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)state;
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t skips) {
+		auto offset = JsonoSkipsManifestOffset(reinterpret_cast<const uint8_t *>(skips.GetData()), skips.GetSize());
+		return StringVector::AddStringOrBlob(result, skips.GetData(), offset);
+	});
+}
+
 } // namespace
 
 ScalarFunction JsonoCheckedResidualFunction() {
@@ -2739,12 +2756,20 @@ ScalarFunction JsonoCheckedResidualFunction() {
 	return fun;
 }
 
+ScalarFunction JsonoStripManifestFunction() {
+	ScalarFunction fun("__jsono_internal_strip_manifest", {LogicalType::BLOB}, LogicalType::BLOB,
+	                   JsonoStripManifestExecute);
+	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	return fun;
+}
+
 void RegisterJsonoMerge(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
 	{ loader.RegisterFunction(JsonoMergePatchFunction()); }
 	// Internal reconstruction helpers, registered for serialization (see JsonoOverlayFunction).
 	{ loader.RegisterFunction(JsonoOverlayFunction()); }
 	{ loader.RegisterFunction(JsonoCheckedResidualFunction()); }
+	{ loader.RegisterFunction(JsonoStripManifestFunction()); }
 	{
 		AggregateFunction fun(
 		    "jsono_group_merge", {LogicalType::ANY}, jsono_type, AggregateFunction::StateSize<GroupMergeState>,

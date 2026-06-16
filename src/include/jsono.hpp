@@ -439,6 +439,30 @@ struct ShredManifestEntry {
 // fewer (or differently typed) shreds than the manifest lists cannot reproduce the value — that row
 // was narrowed by a raw struct cast — and must fail loud instead of silently dropping the value.
 
+// The byte offset within a residual's skips blob where the shred-manifest tail begins (== skips_size
+// for a value with no manifest). The fixed metadata header at the blob's front declares the span and
+// checkpoint section sizes; whatever follows them is the manifest. Shared by JsonoView::ParseHeader
+// and the soft-residual manifest strip so both agree on the boundary.
+inline size_t JsonoSkipsManifestOffset(const uint8_t *skips, size_t skips_size) {
+	if (skips_size == 0) {
+		return 0;
+	}
+	if (skips_size < sizeof(ContainerMetadataHeader)) {
+		// The writer always emits the fixed metadata header, so a shorter non-empty blob is corruption.
+		throw InvalidInputException("malformed JSONO: metadata blob is shorter than its header");
+	}
+	ContainerMetadataHeader header;
+	std::memcpy(&header, skips, sizeof(header));
+	auto required = uint64_t(sizeof(ContainerMetadataHeader)) + uint64_t(header.span_count) * sizeof(uint32_t) +
+	                uint64_t(header.span_count) * sizeof(ContainerSpan) +
+	                uint64_t(header.checkpoint_index_count) * sizeof(ObjectCheckpointIndex) +
+	                uint64_t(header.checkpoint_count) * sizeof(ObjectCursorCheckpoint);
+	if (required > skips_size) {
+		throw InvalidInputException("malformed JSONO: metadata blob is shorter than its declared spans");
+	}
+	return size_t(required);
+}
+
 // Parse a shred manifest from its raw tail bytes into `entries` (string_views into `data`).
 // Returns the entry count; an empty tail is a value without a manifest. Throws on framing
 // corruption (declared entries longer than the tail, or trailing bytes).
@@ -634,25 +658,11 @@ public:
 		if (nums_size_ % sizeof(uint64_t) != 0) {
 			throw InvalidInputException("malformed JSONO: nums blob is not a whole number of 8-byte entries");
 		}
+		manifest_offset_ = JsonoSkipsManifestOffset(skips_, skips_size_);
 		if (skips_size_ >= sizeof(ContainerMetadataHeader)) {
 			std::memcpy(&metadata_header_, skips_, sizeof(metadata_header_));
-			auto span_ids_bytes = uint64_t(metadata_header_.span_count) * sizeof(uint32_t);
-			auto spans_bytes = uint64_t(metadata_header_.span_count) * sizeof(ContainerSpan);
-			auto index_bytes = uint64_t(metadata_header_.checkpoint_index_count) * sizeof(ObjectCheckpointIndex);
-			auto checkpoints_bytes = uint64_t(metadata_header_.checkpoint_count) * sizeof(ObjectCursorCheckpoint);
-			auto required_bytes = uint64_t(sizeof(ContainerMetadataHeader)) + span_ids_bytes + spans_bytes +
-			                      index_bytes + checkpoints_bytes;
-			if (required_bytes > skips_size_) {
-				throw InvalidInputException("malformed JSONO: metadata blob is shorter than its declared spans");
-			}
-			manifest_offset_ = size_t(required_bytes);
-		} else if (skips_size_ > 0) {
-			// The writer always emits the fixed metadata header, so a shorter non-empty blob is
-			// corruption, not a value without spans.
-			throw InvalidInputException("malformed JSONO: metadata blob is shorter than its header");
 		} else {
 			metadata_header_ = {};
-			manifest_offset_ = skips_size_;
 		}
 		slot_count_ = slots_bytes / sizeof(uint64_t);
 		return true;

@@ -55,6 +55,7 @@ namespace duckdb {
 ScalarFunction JsonoStructConstructorFunction();
 ScalarFunction JsonoOverlayFunction();
 ScalarFunction JsonoCheckedResidualFunction();
+ScalarFunction JsonoStripManifestFunction();
 ScalarFunction JsonoExtractStringFunction(const LogicalType &path_type);
 ScalarFunction JsonoExtractFunction(const LogicalType &path_type);
 
@@ -1799,16 +1800,45 @@ private:
 		return !entry->second[child_index];
 	}
 
-	// Read only the residual body of a shredded column as plain JSONO: extract its `.body` struct
-	// (layout field [1] -> body [1], already STRUCT(slots,key_heap,string_heap,skips)) and wrap it
-	// back into the plain layout STRUCT("jsono" STRUCT(body ...)). The result type IS plain
-	// JSONO, so the cast is a no-op reinterpret rather than a reconstruction — plus a manifest
-	// check (__jsono_internal_checked_residual) against the column type's shreds, so a row
-	// narrowed by a raw struct cast fails loud on every residual read instead of silently
-	// reading an incomplete residual.
-	unique_ptr<Expression> ResidualReinterpret(const Expression &column) {
+	// Rebuild the body struct (STRUCT(slots,key_heap,string_heap,skips,lengths,nums)) with the
+	// per-row shred manifest stripped out of its skips blob, so downstream reads see a manifest-free
+	// residual. Used only by the soft residual reinterpret (the shred-lane read fallback).
+	unique_ptr<Expression> StripManifestBody(const Expression &body_struct) {
+		static const char *const body_fields[] = {"slots", "key_heap", "string_heap", "skips", "lengths", "nums"};
 		FunctionBinder function_binder(context);
-		auto body = StructExtractAt(StructExtractAt(column.Copy(), 1), 1);
+		vector<unique_ptr<Expression>> body_children;
+		for (idx_t i = 0; i < 6; i++) {
+			auto field = StructExtractAt(body_struct.Copy(), int64_t(i) + 1);
+			if (i == 3) {
+				vector<unique_ptr<Expression>> strip_children;
+				strip_children.push_back(std::move(field));
+				field = function_binder.BindScalarFunction(JsonoStripManifestFunction(), std::move(strip_children));
+			}
+			field->SetAlias(body_fields[i]);
+			body_children.push_back(std::move(field));
+		}
+		return function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(body_children));
+	}
+
+	// Read only the residual body of a shredded column as plain JSONO: extract its `.body` struct
+	// (layout field [1] -> body [1], already STRUCT(slots,key_heap,string_heap,skips,...)) and wrap it
+	// back into the plain layout STRUCT("jsono" STRUCT(body ...)). The result type IS plain JSONO, so
+	// the cast is a no-op reinterpret rather than a reconstruction.
+	//
+	// `soft` selects which manifest discipline the residual carries. A hard residual (the default)
+	// wraps the reinterpret in __jsono_internal_checked_residual against the column type's shreds, so
+	// a row narrowed by a raw struct cast fails loud on every residual read instead of silently
+	// reading an incomplete residual — the right policy for whole-value reads and non-shred-path
+	// extracts (a narrowed lane reads as a missing residual path there). A soft residual instead
+	// strips the per-row manifest: it backs the COALESCE fallback of a shred-lane read, where the
+	// path IS a lane in the type (so narrowing is impossible) and an absent residual path must read as
+	// plain NULL — the lane holds the value. Stripping makes the fallback safe under EAGER evaluation
+	// (the projector fuse, any hoist out of the COALESCE), which the point-read guard would otherwise
+	// turn into a narrowing throw on every row whose value lives in its lane.
+	unique_ptr<Expression> ResidualReinterpret(const Expression &column, bool soft = false) {
+		FunctionBinder function_binder(context);
+		auto body_struct = StructExtractAt(StructExtractAt(column.Copy(), 1), 1);
+		auto body = soft ? StripManifestBody(*body_struct) : std::move(body_struct);
 		body->SetAlias("body");
 		vector<unique_ptr<Expression>> inner_children;
 		inner_children.push_back(std::move(body));
@@ -1819,7 +1849,7 @@ private:
 		auto outer = function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(outer_children));
 		auto residual = BoundCastExpression::AddCastToType(context, std::move(outer), JsonoType());
 		JsonoLayoutType layout;
-		if (TryParseJsonoLayoutType(column.return_type, layout) && !layout.shreds.empty()) {
+		if (!soft && TryParseJsonoLayoutType(column.return_type, layout) && !layout.shreds.empty()) {
 			vector<Value> shred_signatures;
 			shred_signatures.reserve(layout.shreds.size());
 			for (auto &shred : layout.shreds) {
@@ -1935,7 +1965,10 @@ private:
 		}
 		FunctionBinder function_binder(context);
 		auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
-		auto residual = ResidualReinterpret(*column);
+		// Soft residual: this fallback only runs for rows whose value diverted into the residual (the
+		// lane is NULL). A non-diverted row's lane already won the COALESCE, so a residual miss here
+		// must read as NULL, not a narrowing throw — see ResidualReinterpret.
+		auto residual = ResidualReinterpret(*column, /*soft=*/true);
 		vector<unique_ptr<Expression>> ext_children;
 		ext_children.push_back(std::move(residual));
 		ext_children.push_back(std::move(path));
@@ -1981,7 +2014,9 @@ private:
 			return shred_text;
 		}
 		auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
-		auto residual = ResidualReinterpret(*column);
+		// Soft residual (see MakeTypedShredRead): a non-diverted row's lane wins the COALESCE, so a
+		// residual miss here reads as NULL rather than the point-read guard's narrowing throw.
+		auto residual = ResidualReinterpret(*column, /*soft=*/true);
 		vector<unique_ptr<Expression>> ext_children;
 		ext_children.push_back(std::move(residual));
 		ext_children.push_back(std::move(path));

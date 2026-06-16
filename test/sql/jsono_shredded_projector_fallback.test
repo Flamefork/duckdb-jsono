@@ -1,0 +1,59 @@
+# name: test/sql/jsono_shredded_projector_fallback.test
+# description: >=2 typed/text extracts over the same shredded JSONO column must not route their
+# group: [sql]
+
+#   COALESCE-protected residual fallbacks through the eager __jsono_internal_project: the projector
+#   reads shredded paths from the residual (where the manifest marks them stripped), which threw
+#   "narrowed by a raw struct cast" even though every value lives in its lane.
+
+require jsono
+
+require json
+
+# Two typed extracts of distinct shred lanes in one projection. Each folds to a lane read with a
+# lazy residual fallback; fusing both fallbacks into one eager projector read the lanes from the
+# residual and tripped the shred-manifest guard. Both values live in their lanes, so this must just
+# return them.
+query II
+SELECT (rp->>'pageViewID')::ubigint, (rp->>'watchID')::ubigint
+FROM (VALUES
+  (jsono('{"watchID":100,"pageViewID":50}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'})),
+  (jsono('{"watchID":101,"pageViewID":60}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'}))
+) t(rp)
+ORDER BY 1;
+----
+50	100
+60	101
+
+# Text (uncast) extracts take the same shred-read fold + fallback path.
+query II
+SELECT rp->>'pageViewID', rp->>'watchID'
+FROM (VALUES
+  (jsono('{"watchID":100,"pageViewID":50}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'}))
+) t(rp);
+----
+50	100
+
+# Mixed: one shredded lane + one residual path in the same projection. The shredded path must read
+# its lane; only the genuine residual path may go through a residual read.
+query II
+SELECT (rp->>'pageViewID')::ubigint, rp->>'dateTime'
+FROM (VALUES
+  (jsono('{"pageViewID":50,"dateTime":"x"}', shredding := {'$.pageViewID':'UBIGINT'}))
+) t(rp);
+----
+50	x
+
+# The events4 shape that surfaced it: a keyed group_merge whose order key and GROUP BY each extract
+# a different shred lane of the aggregated shredded column.
+query I
+SELECT (jsono_group_merge_min(rp, (rp->>'watchID')::ubigint) ->> 'pageViewID')::ubigint
+FROM (VALUES
+  (jsono('{"watchID":100,"pageViewID":50}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'}), 10),
+  (jsono('{"watchID":101,"pageViewID":60}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'}), 20)
+) t(rp, dt)
+GROUP BY (rp->>'pageViewID')::ubigint
+ORDER BY 1;
+----
+50
+60
