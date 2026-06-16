@@ -818,8 +818,8 @@ def test_scalar_array_auto_shred_lossless(spec: tuple[str, list[Any]]) -> None:
     # must equal the plain parse of the same document.
     stype, values = spec
     list_sql = "[" + ", ".join(scalar_list_element_sql(v, stype) for v in values) + f"]::{stype}[]"
-    from_struct = SESSION.value(f"to_json(jsono({{'goalsID': {list_sql}}}))")
-    plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps({'goalsID': values}))}))")
+    from_struct = SESSION.value(f"to_json(jsono({{'item_ids': {list_sql}}}))")
+    plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps({'item_ids': values}))}))")
     assert from_struct == plain, f"scalar array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
 
 

@@ -1,5 +1,5 @@
 # name: test/sql/jsono_shredded_scalar_array.test
-# description: jsono scalar-array shredding — $.goalsID into a LIST<scalar> shred column, VAL_NULL placeholder per lifted element in the residual skeleton, lossless reconstruct
+# description: jsono scalar-array shredding — $.item_ids into a LIST<scalar> shred column, VAL_NULL placeholder per lifted element in the residual skeleton, lossless reconstruct
 # group: [sql]
 
 require jsono
@@ -18,24 +18,24 @@ CREATE MACRO jsono_residual(j) AS struct_pack(
 # residual skeleton) and the whole document reconstructs through to_json.
 # ---------------------------------------------------------------------------
 query I
-SELECT to_json(jsono('{"goalsID":[5348936,139733107,3]}',
-                     shredding := {'$.goalsID':'UBIGINT[]'}));
+SELECT to_json(jsono('{"item_ids":[5348936,139733107,3]}',
+                     shredding := {'$.item_ids':'UBIGINT[]'}));
 ----
-{"goalsID":[5348936,139733107,3]}
+{"item_ids":[5348936,139733107,3]}
 
 # The shred column is a real typed LIST<UBIGINT>, queryable directly.
 query II
-SELECT (j."jsono"."$.goalsID")[1], (j."jsono"."$.goalsID")[3]
-FROM (SELECT jsono('{"goalsID":[5348936,139733107,3]}',
-                   shredding := {'$.goalsID':'UBIGINT[]'}) AS j);
+SELECT (j."jsono"."$.item_ids")[1], (j."jsono"."$.item_ids")[3]
+FROM (SELECT jsono('{"item_ids":[5348936,139733107,3]}',
+                   shredding := {'$.item_ids':'UBIGINT[]'}) AS j);
 ----
 5348936	3
 
 # The type is a pure function of the shred set (matches jsono_storage_type).
 query I
-SELECT typeof(jsono('{"goalsID":[1,2,3]}',
-                    shredding := {'$.goalsID':'UBIGINT[]'}))
-     = jsono_storage_type('"$.goalsID" UBIGINT[]');
+SELECT typeof(jsono('{"item_ids":[1,2,3]}',
+                    shredding := {'$.item_ids':'UBIGINT[]'}))
+     = jsono_storage_type('"$.item_ids" UBIGINT[]');
 ----
 true
 
@@ -116,10 +116,10 @@ SELECT to_json(jsono('{"order":{"items":[1,2,3]}}',
 
 # Scalar array coexisting with a top-level scalar shred.
 query I
-SELECT to_json(jsono('{"kind":"order","goalsID":[1,2]}',
-                     shredding := {'$.kind':'VARCHAR','$.goalsID':'UBIGINT[]'}));
+SELECT to_json(jsono('{"kind":"order","item_ids":[1,2]}',
+                     shredding := {'$.kind':'VARCHAR','$.item_ids':'UBIGINT[]'}));
 ----
-{"goalsID":[1,2],"kind":"order"}
+{"item_ids":[1,2],"kind":"order"}
 
 # ---------------------------------------------------------------------------
 # Residual skeleton: a kept (non-conforming) element reads from the skeleton; the
@@ -206,11 +206,11 @@ SELECT (jsono_storage_size(jsono('{"a":[1,2,3,4,5]}',
 # see the lifted list column), matching a plain parse.
 # ---------------------------------------------------------------------------
 query I
-SELECT jsono_transform(jsono('{"goalsID":[5,6,7],"kind":"x"}',
-                             shredding := {'$.goalsID':'UBIGINT[]','$.kind':'VARCHAR'}),
-                       {g:{type:['VARCHAR'], path:'$.goalsID[*]'}, k:{type:'VARCHAR', path:'$.kind'}})::VARCHAR
-     = jsono_transform(jsono('{"goalsID":[5,6,7],"kind":"x"}'),
-                       {g:{type:['VARCHAR'], path:'$.goalsID[*]'}, k:{type:'VARCHAR', path:'$.kind'}})::VARCHAR;
+SELECT jsono_transform(jsono('{"item_ids":[5,6,7],"kind":"x"}',
+                             shredding := {'$.item_ids':'UBIGINT[]','$.kind':'VARCHAR'}),
+                       {g:{type:['VARCHAR'], path:'$.item_ids[*]'}, k:{type:'VARCHAR', path:'$.kind'}})::VARCHAR
+     = jsono_transform(jsono('{"item_ids":[5,6,7],"kind":"x"}'),
+                       {g:{type:['VARCHAR'], path:'$.item_ids[*]'}, k:{type:'VARCHAR', path:'$.kind'}})::VARCHAR;
 ----
 true
 
@@ -263,18 +263,18 @@ SELECT to_json(jsono(jsono('{"a":[1,2,3]}'),
 statement ok
 CREATE TABLE rows AS
 SELECT * FROM (VALUES
-    (1, '{"goalsID":[1,2]}'),
-    (2, '{"goalsID":[]}'),
+    (1, '{"item_ids":[1,2]}'),
+    (2, '{"item_ids":[]}'),
     (3, '{"other":true}'),
     (4, NULL)
 ) AS v(id, doc);
 
 query II
-SELECT id, to_json(jsono(doc, shredding := {'$.goalsID':'UBIGINT[]'})) AS full
+SELECT id, to_json(jsono(doc, shredding := {'$.item_ids':'UBIGINT[]'})) AS full
 FROM rows ORDER BY id;
 ----
-1	{"goalsID":[1,2]}
-2	{"goalsID":[]}
+1	{"item_ids":[1,2]}
+2	{"item_ids":[]}
 3	{"other":true}
 4	NULL
 
@@ -283,21 +283,21 @@ FROM rows ORDER BY id;
 # array shred (bare name), the residual skeleton carried for reconstruct.
 # ---------------------------------------------------------------------------
 query I
-SELECT typeof(jsono({'goalsID': [1,2,3]::UBIGINT[]}))
-     = jsono_storage_type('"goalsID" UBIGINT[]');
+SELECT typeof(jsono({'item_ids': [1,2,3]::UBIGINT[]}))
+     = jsono_storage_type('"item_ids" UBIGINT[]');
 ----
 true
 
 # A top-level LIST<UBIGINT> auto-shreds alongside a scalar field, round-trips.
 query I
-SELECT to_json(jsono({'kind': 'x', 'goalsID': [5348936,139733107]::UBIGINT[]}));
+SELECT to_json(jsono({'kind': 'x', 'item_ids': [5348936,139733107]::UBIGINT[]}));
 ----
-{"goalsID":[5348936,139733107],"kind":"x"}
+{"item_ids":[5348936,139733107],"kind":"x"}
 
 # The scalar-array shred column is the typed list, queryable directly (bare field name).
 query II
-SELECT (j."jsono"."goalsID")[1], (j."jsono"."goalsID")[2]
-FROM (SELECT jsono({'goalsID': [10,20,30]::UBIGINT[]}) AS j);
+SELECT (j."jsono"."item_ids")[1], (j."jsono"."item_ids")[2]
+FROM (SELECT jsono({'item_ids': [10,20,30]::UBIGINT[]}) AS j);
 ----
 10	20
 
@@ -326,12 +326,12 @@ SELECT to_json(jsono({'e': []::UBIGINT[], 'n': [1,NULL,2]::UBIGINT[]}));
 require parquet
 
 statement ok
-COPY (SELECT jsono('{"goalsID":[5348936,139733107],"kind":"x"}',
-                   shredding := {'$.goalsID':'UBIGINT[]'}) AS j)
+COPY (SELECT jsono('{"item_ids":[5348936,139733107],"kind":"x"}',
+                   shredding := {'$.item_ids':'UBIGINT[]'}) AS j)
 TO '__TEST_DIR__/scalar_array.parquet' (FORMAT parquet);
 
 query III
-SELECT to_json(j), (j."jsono"."$.goalsID")[1], j ->> '$.goalsID[1]'
+SELECT to_json(j), (j."jsono"."$.item_ids")[1], j ->> '$.item_ids[1]'
 FROM '__TEST_DIR__/scalar_array.parquet';
 ----
-{"goalsID":[5348936,139733107],"kind":"x"}	5348936	139733107
+{"item_ids":[5348936,139733107],"kind":"x"}	5348936	139733107

@@ -26,7 +26,7 @@ Extract and project:
 
 - [`jsono_extract(value, path)` / `value -> path`](#jsono_extract) — extract one value as JSONO.
 - [`jsono_extract_string(value, path)` / `value ->> path`](#jsono_extract_string) — extract one value as `VARCHAR`.
-- [`jsono_transform(value, spec)`](#jsono_transform) — project many fields into a typed `STRUCT` in one pass (`spec` is a `STRUCT` literal).
+- [`jsono_transform(value, spec[, on_type_mismatch])`](#jsono_transform) — project many fields into a typed `STRUCT` in one pass (`spec` is a `STRUCT` literal; type mismatches default to `convert`).
 - [`jsono_entries(value[, key_style])`](#jsono_entries) — flatten scalar leaves into `STRUCT(key VARCHAR, value VARCHAR)[]`.
 
 Merge and aggregate:
@@ -237,13 +237,33 @@ SELECT jsono_transform(
 
 Paths support nested keys, array indices, quoted keys, and the `[*]` wildcard: `$.user.name`, `$.items[0].id`, `$."my-key"`, `$.tags[*]`.
 
-Collect array elements into a `VARCHAR[]` with a single-element list type, or join them into one string with `join_separator`:
+Type mismatch handling is controlled by the constant `on_type_mismatch` argument:
+
+- `convert` (default): CAST-like scalar coercion to the requested type. Values that cannot be coerced become `NULL`.
+- `null`: keep the legacy silent-NULL behavior. A scalar value is returned only when its stored JSON type already matches the requested projection type.
+- `fail`: use the same scalar coercions as `convert`, but raise an error when a present value cannot be coerced.
+
+Missing paths and explicit JSON `null` return SQL `NULL` in every mode. `on_type_mismatch` applies independently to each projected field and each wildcard list element.
+
+```sql
+SELECT jsono_transform(jsono({'a':'12345'}), {'a':'UBIGINT'});
+-- {'a': 12345}
+
+SELECT jsono_transform(jsono({'a':'12345'}), {'a':'UBIGINT'}, on_type_mismatch := 'null');
+-- {'a': NULL}
+
+SELECT jsono_transform(jsono({'a':'abc'}), {'a':'UBIGINT'}, on_type_mismatch := 'fail');
+-- error: cannot convert value at $.a from VARCHAR to UBIGINT
+```
+
+Collect array elements into a typed list with a single-element list type, or join them into one string with `join_separator`:
 
 ```sql
 SELECT jsono_transform(
-    jsono('{"tags":["a","b","c"]}'),
-    {tags: {type: ['VARCHAR'], path: '$.tags[*]'}}
+    jsono('{"values":["1",2,true,"bad"]}'),
+    {values: {type: ['UBIGINT'], path: '$.values[*]'}}
 );
+-- {'values': [1, 2, 1, NULL]}
 
 SELECT jsono_transform(
     jsono('{"tags":["a","b","c"]}'),
@@ -499,7 +519,7 @@ Use power-of-two values when comparing performance. The default is tuned for loc
 ## Error Handling and Caveats
 
 - Object keys inside JSONO output are sorted, so serialized JSON text may not preserve input object key order.
-- `jsono_transform` requires a constant `STRUCT` spec.
+- `jsono_transform` requires a constant `STRUCT` spec; its optional `on_type_mismatch` argument must also be constant and one of `convert`, `null`, or `fail`.
 - `jsono(value, shredding := spec)` requires a constant `STRUCT` spec and rejects wildcard paths; object-key paths that round-trip through their shred type are physically stripped from the residual, while array-index paths and non-lossless shred values stay in the residual.
 - Shredded values and core json interop: the jsono-named functions (`jsono_extract`, `jsono_extract_string`, `jsono_type`, `jsono_keys`, `jsono_validate`, `jsono_storage_size`), `jsono_group_merge`, the `::VARCHAR` cast, and the shredded→plain JSONO reconstruct are bind-correct — they accept a shredded value directly and work even with the extension optimizer disabled. The operators and casts that resolve to the bundled core `json` extension — `->>`, `->`, `json_extract`, `::JSON`, and `to_json` — are correct over a shredded value only with the extension optimizer enabled (the default): the optimizer rewrites them to read the shreds and residual. With the optimizer fully disabled (`PRAGMA disable_optimizer`) those core-routed operations bind into core json and serialize the physical fields instead. This is a structural limit: core json owns the `STRUCT → JSON` cast and DuckDB's cast registry keeps the first registration, so the extension cannot intercept it.
 - Declare a shredded storage column with `CREATE TABLE … AS SELECT jsono(…, shredding := …)` or from `jsono_storage_type(<shred DDL>)`, and access a shred through `->>`/`to_json` (the optimizer reads the shred) rather than by struct member name — `.body` and the shred fields are physical storage details. Inserting a value shredded on any other shred set — fully disjoint included — lands losslessly (the optimizer reshredds it to the column's shred set). A raw struct cast that drops or retypes a shred column (only possible without the extension optimizer) is caught at read time by the shred manifest: reading the narrowed row raises an error instead of silently losing the stripped value.

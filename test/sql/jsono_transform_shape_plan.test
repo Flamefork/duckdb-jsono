@@ -112,9 +112,10 @@ SELECT i, jsono_transform(j, {
 4	{'joined': n4_0|n4_1, 'names': [n4_0, n4_1], 'first': n4_0, 'third': NULL, 'missing': NULL}
 5	{'joined': n5_0|n5_1|n5_2, 'names': [n5_0, n5_1, n5_2], 'first': n5_0, 'third': n5_2, 'missing': NULL}
 
-# Shredded input: a shred-backed field resolves residual-first per shape — rows where the
-# shred writer stripped the value (it matched the shred kind) read the shred column, rows
-# where it stayed in the residual (kind mismatch) read the residual.
+# Shredded input: a shred-backed field resolves residual-first per shape. Rows where the
+# shred writer stripped the value (it matched the shred kind) read the shred column; rows
+# where it stayed in the residual (kind mismatch) read the residual and default convert
+# mode coerces it to the requested type.
 statement ok
 CREATE TABLE shredded_mix AS
 SELECT i, jsono(CASE i % 2
@@ -127,11 +128,11 @@ query III
 SELECT count(*), count(s.name), sum(s.extra)
 FROM (SELECT jsono_transform(j, {name: 'VARCHAR', extra: 'BIGINT', missing: 'VARCHAR'}) s FROM shredded_mix) q;
 ----
-2000	1000	1999000
+2000	2000	1999000
 
 query II
 SELECT i, jsono_transform(j, {name: 'VARCHAR', extra: 'BIGINT', missing: 'VARCHAR'})
 FROM shredded_mix WHERE i < 2 ORDER BY i;
 ----
 0	{'name': u0, 'extra': 0, 'missing': NULL}
-1	{'name': NULL, 'extra': 1, 'missing': NULL}
+1	{'name': 1, 'extra': 1, 'missing': NULL}

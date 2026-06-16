@@ -253,7 +253,7 @@ bool PathStepsObjectKeyPrefix(const vector<PathStep> &prefix, const vector<PathS
 
 // True if `read` descends INTO an array shred (object array or scalar array) — the shred's pure-key
 // path is a strict prefix of `read` (e.g. read `$.products[0].category` for the array shred
-// `$.products`, or `$.goalsID[0]` for the scalar array `$.goalsID`), whatever follows. The residual
+// `$.products`, or `$.item_ids[0]` for the scalar array `$.item_ids`), whatever follows. The residual
 // carries only the skeleton array — the lifted element subfields / scalars are stripped — so such a
 // read cannot be served from the residual and must reconstruct.
 bool ReadDescendsIntoArrayShred(const LogicalType &shred_type, const vector<PathStep> &shred_steps,

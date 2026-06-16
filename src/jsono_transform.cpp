@@ -35,12 +35,14 @@ using namespace jsono;
 
 enum class TransformPrimitive : uint8_t { Bigint, Ubigint, Double, Varchar, Boolean };
 enum class TransformMode : uint8_t { Scalar, List, Join };
+enum class TransformMismatchMode : uint8_t { Convert, Null, Fail };
 
 struct TransformField {
 	string name;
 	TransformPrimitive primitive;
 	TransformMode mode = TransformMode::Scalar;
 	vector<PathStep> path;
+	string path_text;
 	string join_separator;
 	LogicalType logical_type;
 	// When the input is a shredded JSONO whose shred path equals this scalar field's path,
@@ -86,6 +88,7 @@ struct TransformBindData : public FunctionData {
 	// Scalar fields backed by a shredded shred (field.shred_child_index set); handled directly
 	// from the shred/residual rather than the trie. Empty for a plain JSONO input.
 	vector<idx_t> shred_fields;
+	TransformMismatchMode mismatch_mode = TransformMismatchMode::Convert;
 	// Whether the shape-plan cache may run for this spec: the plan's per-row win is the
 	// scalar fields it resolves to direct stream reads, so a spec with fewer than three of
 	// them cannot recover the per-row key cost (hash + byte compare of slots and key_heap).
@@ -97,7 +100,7 @@ struct TransformBindData : public FunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<TransformBindData>();
-		return spec == other.spec;
+		return spec == other.spec && mismatch_mode == other.mismatch_mode;
 	}
 };
 
@@ -369,6 +372,39 @@ TransformPrimitive ParsePrimitiveType(const string &type) {
 	throw BinderException("jsono_transform: unsupported scalar type '%s'", type);
 }
 
+const char *PrimitiveTypeName(TransformPrimitive primitive) {
+	switch (primitive) {
+	case TransformPrimitive::Bigint:
+		return "BIGINT";
+	case TransformPrimitive::Ubigint:
+		return "UBIGINT";
+	case TransformPrimitive::Double:
+		return "DOUBLE";
+	case TransformPrimitive::Varchar:
+		return "VARCHAR";
+	case TransformPrimitive::Boolean:
+		return "BOOLEAN";
+	}
+	throw InternalException("jsono_transform: unhandled primitive type");
+}
+
+TransformMismatchMode ParseMismatchMode(Value mode) {
+	if (mode.IsNull() || !mode.DefaultTryCastAs(LogicalType::VARCHAR)) {
+		throw BinderException("jsono_transform: on_type_mismatch must be one of 'convert', 'null', or 'fail'");
+	}
+	auto value = StringUtil::Lower(StringValue::Get(mode));
+	if (value == "convert") {
+		return TransformMismatchMode::Convert;
+	}
+	if (value == "null") {
+		return TransformMismatchMode::Null;
+	}
+	if (value == "fail") {
+		return TransformMismatchMode::Fail;
+	}
+	throw BinderException("jsono_transform: on_type_mismatch must be one of 'convert', 'null', or 'fail'");
+}
+
 // Map a shredded shred's column type to the transform primitive that names its lossless
 // kind. A JSON-aliased VARCHAR is not a shred (it holds a document, not a scalar), so it
 // is rejected — matching the shred writer, which never lifts JSON fields into shreds.
@@ -422,16 +458,39 @@ idx_t FindWildcardIndex(const vector<PathStep> &path) {
 	return DConstants::INVALID_INDEX;
 }
 
+string LiteralKeyPathText(nonstd::string_view key) {
+	bool simple = !key.empty();
+	for (auto c : key) {
+		if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
+			simple = false;
+			break;
+		}
+	}
+	if (simple) {
+		return "$." + string(key);
+	}
+	string result = "$.\"";
+	for (auto c : key) {
+		if (c == '"' || c == '\\') {
+			result.push_back('\\');
+		}
+		result.push_back(c);
+	}
+	result.push_back('"');
+	return result;
+}
+
 TransformField MakeField(nonstd::string_view name, TransformPrimitive primitive, TransformMode mode,
-                         vector<PathStep> path, string join_separator) {
+                         vector<PathStep> path, string path_text, string join_separator) {
 	TransformField field;
 	field.name = string(name);
 	field.primitive = primitive;
 	field.mode = mode;
 	field.path = std::move(path);
+	field.path_text = std::move(path_text);
 	field.join_separator = std::move(join_separator);
-	field.logical_type =
-	    mode == TransformMode::List ? LogicalType::LIST(LogicalType::VARCHAR) : PrimitiveLogicalType(primitive);
+	field.logical_type = mode == TransformMode::List ? LogicalType::LIST(PrimitiveLogicalType(primitive))
+	                                                 : PrimitiveLogicalType(primitive);
 	auto wildcard_index = FindWildcardIndex(field.path);
 	if (wildcard_index != DConstants::INVALID_INDEX && mode == TransformMode::Scalar) {
 		throw BinderException("jsono_transform: wildcard path requires list type or join_separator");
@@ -452,11 +511,11 @@ vector<PathStep> LiteralKeyPath(nonstd::string_view name) {
 
 TransformField ParseScalarShorthand(nonstd::string_view name, nonstd::string_view type_name) {
 	return MakeField(name, ParsePrimitiveType(string(type_name)), TransformMode::Scalar, LiteralKeyPath(name),
-	                 string());
+	                 LiteralKeyPathText(name), string());
 }
 
 // A wrapper field is a nested STRUCT {type: ..., path: '...', join_separator: '...'}: `type`
-// is a type string (scalar), or a single-element list `['VARCHAR']` (list mode); `path` and
+// is a type string (scalar), or a single-element list `['TYPE']` (list mode); `path` and
 // `join_separator` are strings. Mirrors the scalar-vs-struct dispatch the JSON form had.
 TransformField ParseWrapperField(nonstd::string_view name, const Value &wrapper) {
 	bool has_type = false;
@@ -477,11 +536,10 @@ TransformField ParseWrapperField(nonstd::string_view name, const Value &wrapper)
 			if (value.type().id() == LogicalTypeId::LIST) {
 				auto &items = ListValue::GetChildren(value);
 				auto item = items.size() == 1 ? items[0] : Value();
-				if (items.size() != 1 || item.IsNull() || !item.DefaultTryCastAs(LogicalType::VARCHAR) ||
-				    StringUtil::Upper(StringValue::Get(item)) != "VARCHAR") {
+				if (items.size() != 1 || item.IsNull() || !item.DefaultTryCastAs(LogicalType::VARCHAR)) {
 					throw BinderException("jsono_transform: unsupported list item type");
 				}
-				primitive = TransformPrimitive::Varchar;
+				primitive = ParsePrimitiveType(StringValue::Get(item));
 				mode = TransformMode::List;
 				continue;
 			}
@@ -519,7 +577,8 @@ TransformField ParseWrapperField(nonstd::string_view name, const Value &wrapper)
 		mode = TransformMode::Join;
 	}
 	auto steps = has_path ? ParseJsonoPath(path, "jsono_transform") : LiteralKeyPath(name);
-	return MakeField(name, primitive, mode, std::move(steps), std::move(join_separator));
+	return MakeField(name, primitive, mode, std::move(steps), has_path ? path : LiteralKeyPathText(name),
+	                 std::move(join_separator));
 }
 
 idx_t GetOrAddKeyChild(TransformBindData &bind_data, idx_t node_index, const string &key) {
@@ -707,10 +766,23 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 	}
 	auto spec_value = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
 	auto bind_data = ParseTransformSpec(spec_value);
+	if (arguments.size() == 3) {
+		if (arguments[2]->HasParameter()) {
+			throw ParameterNotResolvedException();
+		}
+		if (!arguments[2]->IsFoldable()) {
+			throw BinderException("jsono_transform: on_type_mismatch must be constant");
+		}
+		if (arguments[2]->HasAlias() && !StringUtil::CIEquals(arguments[2]->GetAlias(), "on_type_mismatch")) {
+			throw BinderException("jsono_transform: unknown named parameter '%s'; expected on_type_mismatch",
+			                      arguments[2]->GetAlias());
+		}
+		bind_data->mismatch_mode = ParseMismatchMode(ExpressionExecutor::EvaluateScalar(context, *arguments[2]));
+	}
 	// The struct's canonical string identifies the full spec (names, types, paths, joins) for
 	// expression caching — return_type alone is insufficient since a field's path may differ
 	// from its name.
-	bind_data->spec = spec_value.ToString();
+	bind_data->spec = spec_value.ToString() + ":" + std::to_string(uint8_t(bind_data->mismatch_mode));
 	auto &input_type = arguments[0]->return_type;
 	// An array shred (object or scalar) strips values out of the residual into a list column the
 	// transform's residual navigation cannot see, so a shredded value carrying one is reconstructed
@@ -738,31 +810,44 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 			scalar_fields++;
 		}
 	}
-	bind_data->shape_plan_eligible = scalar_fields >= SHAPE_PLAN_MIN_SCALAR_FIELDS;
+	bind_data->shape_plan_eligible =
+	    bind_data->mismatch_mode != TransformMismatchMode::Fail && scalar_fields >= SHAPE_PLAN_MIN_SCALAR_FIELDS;
 	bound_function.return_type = bind_data->return_type;
 	return std::move(bind_data);
 }
 
-void WriteScalarValue(const TransformField &field, const JsonoScalar &scalar, Vector &result, idx_t row) {
+template <class T>
+bool TryCastScalarText(nonstd::string_view text, T &value) {
+	return TryCast::Operation<string_t, T>(string_t(text.data(), uint32_t(text.size())), value, false);
+}
+
+template <class T>
+bool TryCastDec60Text(const JsonoScalar &scalar, T &value) {
+	string text;
+	AppendDec60Text(text, scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
+	return TryCastScalarText(nonstd::string_view(text.data(), text.size()), value);
+}
+
+bool TryWriteExactScalarValue(const TransformField &field, const JsonoScalar &scalar, Vector &result, idx_t row) {
 	switch (field.primitive) {
 	case TransformPrimitive::Bigint:
 		// UInt64 values exceed INT64_MAX by construction, so only Int64 fits a BIGINT target.
 		if (scalar.kind == JsonoScalarKind::Int64) {
 			FlatVector::Validity(result).SetValid(row);
 			FlatVector::GetData<int64_t>(result)[row] = scalar.int_value;
-			return;
+			return true;
 		}
 		break;
 	case TransformPrimitive::Ubigint:
 		if (scalar.kind == JsonoScalarKind::Int64 && scalar.int_value >= 0) {
 			FlatVector::Validity(result).SetValid(row);
 			FlatVector::GetData<uint64_t>(result)[row] = uint64_t(scalar.int_value);
-			return;
+			return true;
 		}
 		if (scalar.kind == JsonoScalarKind::UInt64) {
 			FlatVector::Validity(result).SetValid(row);
 			FlatVector::GetData<uint64_t>(result)[row] = scalar.uint_value;
-			return;
+			return true;
 		}
 		break;
 	case TransformPrimitive::Double: {
@@ -793,7 +878,7 @@ void WriteScalarValue(const TransformField &field, const JsonoScalar &scalar, Ve
 		if (ok) {
 			FlatVector::Validity(result).SetValid(row);
 			FlatVector::GetData<double>(result)[row] = value;
-			return;
+			return true;
 		}
 		break;
 	}
@@ -802,22 +887,197 @@ void WriteScalarValue(const TransformField &field, const JsonoScalar &scalar, Ve
 			FlatVector::Validity(result).SetValid(row);
 			FlatVector::GetData<string_t>(result)[row] =
 			    StringVector::AddString(result, scalar.text.data(), scalar.text.size());
-			return;
+			return true;
 		}
 		break;
 	case TransformPrimitive::Boolean:
 		if (scalar.kind == JsonoScalarKind::Bool) {
 			FlatVector::Validity(result).SetValid(row);
 			FlatVector::GetData<bool>(result)[row] = scalar.bool_value;
-			return;
+			return true;
 		}
 		break;
+	}
+	return false;
+}
+
+bool TryWriteConvertedScalarValue(const TransformField &field, const JsonoScalar &scalar, Vector &result, idx_t row) {
+	switch (field.primitive) {
+	case TransformPrimitive::Bigint: {
+		int64_t value = 0;
+		bool ok = false;
+		switch (scalar.kind) {
+		case JsonoScalarKind::Bool:
+			ok = TryCast::Operation(scalar.bool_value, value, false);
+			break;
+		case JsonoScalarKind::Int64:
+			ok = TryCast::Operation(scalar.int_value, value, false);
+			break;
+		case JsonoScalarKind::UInt64:
+			ok = TryCast::Operation(scalar.uint_value, value, false);
+			break;
+		case JsonoScalarKind::Double:
+			ok = TryCast::Operation(scalar.double_value, value, false);
+			break;
+		case JsonoScalarKind::Dec60:
+			ok = TryCastDec60Text(scalar, value);
+			break;
+		case JsonoScalarKind::NumberText:
+		case JsonoScalarKind::String:
+			ok = TryCastScalarText(scalar.text, value);
+			break;
+		default:
+			break;
+		}
+		if (ok) {
+			FlatVector::Validity(result).SetValid(row);
+			FlatVector::GetData<int64_t>(result)[row] = value;
+			return true;
+		}
+		break;
+	}
+	case TransformPrimitive::Ubigint: {
+		uint64_t value = 0;
+		bool ok = false;
+		switch (scalar.kind) {
+		case JsonoScalarKind::Bool:
+			ok = TryCast::Operation(scalar.bool_value, value, false);
+			break;
+		case JsonoScalarKind::Int64:
+			ok = TryCast::Operation(scalar.int_value, value, false);
+			break;
+		case JsonoScalarKind::UInt64:
+			ok = TryCast::Operation(scalar.uint_value, value, false);
+			break;
+		case JsonoScalarKind::Double:
+			ok = TryCast::Operation(scalar.double_value, value, false);
+			break;
+		case JsonoScalarKind::Dec60:
+			ok = TryCastDec60Text(scalar, value);
+			break;
+		case JsonoScalarKind::NumberText:
+		case JsonoScalarKind::String:
+			ok = TryCastScalarText(scalar.text, value);
+			break;
+		default:
+			break;
+		}
+		if (ok) {
+			FlatVector::Validity(result).SetValid(row);
+			FlatVector::GetData<uint64_t>(result)[row] = value;
+			return true;
+		}
+		break;
+	}
+	case TransformPrimitive::Double: {
+		double value = 0;
+		bool ok = false;
+		switch (scalar.kind) {
+		case JsonoScalarKind::Bool:
+			ok = TryCast::Operation(scalar.bool_value, value, false);
+			break;
+		case JsonoScalarKind::Int64:
+			ok = TryCast::Operation(scalar.int_value, value, false);
+			break;
+		case JsonoScalarKind::UInt64:
+			ok = TryCast::Operation(scalar.uint_value, value, false);
+			break;
+		case JsonoScalarKind::Double:
+			ok = TryCast::Operation(scalar.double_value, value, false);
+			break;
+		case JsonoScalarKind::Dec60:
+			value = Dec60ToDouble(scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
+			ok = true;
+			break;
+		case JsonoScalarKind::NumberText:
+		case JsonoScalarKind::String:
+			ok = TryCastScalarText(scalar.text, value);
+			break;
+		default:
+			break;
+		}
+		if (ok) {
+			FlatVector::Validity(result).SetValid(row);
+			FlatVector::GetData<double>(result)[row] = value;
+			return true;
+		}
+		break;
+	}
+	case TransformPrimitive::Varchar: {
+		FlatVector::Validity(result).SetValid(row);
+		if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
+			FlatVector::GetData<string_t>(result)[row] =
+			    StringVector::AddString(result, scalar.text.data(), scalar.text.size());
+			return true;
+		}
+		string text;
+		if (RenderExtractText(scalar, text)) {
+			return false;
+		}
+		FlatVector::GetData<string_t>(result)[row] = StringVector::AddString(result, text.data(), text.size());
+		return true;
+	}
+	case TransformPrimitive::Boolean: {
+		bool value = false;
+		bool ok = false;
+		switch (scalar.kind) {
+		case JsonoScalarKind::Bool:
+			ok = TryCast::Operation(scalar.bool_value, value, false);
+			break;
+		case JsonoScalarKind::Int64:
+			ok = TryCast::Operation(scalar.int_value, value, false);
+			break;
+		case JsonoScalarKind::UInt64:
+			ok = TryCast::Operation(scalar.uint_value, value, false);
+			break;
+		case JsonoScalarKind::Double:
+			ok = TryCast::Operation(scalar.double_value, value, false);
+			break;
+		case JsonoScalarKind::Dec60:
+			ok = TryCastDec60Text(scalar, value);
+			break;
+		case JsonoScalarKind::NumberText:
+		case JsonoScalarKind::String:
+			ok = TryCastScalarText(scalar.text, value);
+			break;
+		default:
+			break;
+		}
+		if (ok) {
+			FlatVector::Validity(result).SetValid(row);
+			FlatVector::GetData<bool>(result)[row] = value;
+			return true;
+		}
+		break;
+	}
+	}
+	return false;
+}
+
+[[noreturn]] void ThrowTransformMismatch(const TransformField &field, const char *actual_type) {
+	throw InvalidInputException("jsono_transform: cannot convert value at %s from %s to %s", field.path_text.c_str(),
+	                            actual_type, PrimitiveTypeName(field.primitive));
+}
+
+void WriteScalarValue(const TransformField &field, TransformMismatchMode mode, const JsonoScalar &scalar,
+                      Vector &result, idx_t row) {
+	if (scalar.kind == JsonoScalarKind::Null) {
+		FlatVector::SetNull(result, row, true);
+		return;
+	}
+	bool ok = mode == TransformMismatchMode::Null ? TryWriteExactScalarValue(field, scalar, result, row)
+	                                              : TryWriteConvertedScalarValue(field, scalar, result, row);
+	if (ok) {
+		return;
+	}
+	if (mode == TransformMismatchMode::Fail) {
+		ThrowTransformMismatch(field, JsonoScalarTypeName(scalar.kind));
 	}
 	FlatVector::SetNull(result, row, true);
 }
 
 void WriteScalarField(const TransformField &field, const JsonoView &view, const Location &location, Vector &result,
-                      idx_t row) {
+                      idx_t row, TransformMismatchMode mode) {
 	if (!location.found) {
 		FlatVector::SetNull(result, row, true);
 		return;
@@ -825,12 +1085,15 @@ void WriteScalarField(const TransformField &field, const JsonoView &view, const 
 	auto value_tag = SlotTag(view.SlotAt(location.cursor.pos));
 	if (value_tag == tag::OBJ_START || value_tag == tag::ARR_START) {
 		// A container where a scalar was requested is a type mismatch, not malformed input.
+		if (mode == TransformMismatchMode::Fail) {
+			ThrowTransformMismatch(field, value_tag == tag::OBJ_START ? "OBJECT" : "ARRAY");
+		}
 		FlatVector::SetNull(result, row, true);
 		return;
 	}
 	auto cursor = location.cursor;
 	auto scalar = DecodeScalarAt(view, cursor);
-	WriteScalarValue(field, scalar, result, row);
+	WriteScalarValue(field, mode, scalar, result, row);
 }
 
 void EnsureListCapacity(Vector &result, idx_t needed) {
@@ -838,12 +1101,6 @@ void EnsureListCapacity(Vector &result, idx_t needed) {
 		return;
 	}
 	ListVector::Reserve(result, std::max<idx_t>(needed, std::max<idx_t>(ListVector::GetListCapacity(result) * 2, 1)));
-}
-
-void AppendListStringValue(Vector &result, idx_t child_row, nonstd::string_view value) {
-	auto &child = ListVector::GetEntry(result);
-	FlatVector::Validity(child).SetValid(child_row);
-	FlatVector::GetData<string_t>(child)[child_row] = StringVector::AddString(child, value.data(), value.size());
 }
 
 void AppendListNullValue(Vector &result, idx_t child_row) {
@@ -986,13 +1243,41 @@ void AppendListElementNull(Vector &result, idx_t row) {
 	ListVector::SetListSize(result, entry.offset + entry.length);
 }
 
-void AppendListElementString(Vector &result, idx_t row, nonstd::string_view value) {
+void AppendListElementScalar(const TransformField &field, TransformMismatchMode mode, Vector &result, idx_t row,
+                             const JsonoScalar &scalar) {
 	auto &entry = ListVector::GetData(result)[row];
 	auto child_row = entry.offset + entry.length;
 	EnsureListCapacity(result, child_row + 1);
-	AppendListStringValue(result, child_row, value);
+	WriteScalarValue(field, mode, scalar, ListVector::GetEntry(result), child_row);
 	entry.length++;
 	ListVector::SetListSize(result, entry.offset + entry.length);
+}
+
+bool TryGetJoinText(const TransformField &field, TransformMismatchMode mode, const JsonoScalar &scalar, string &scratch,
+                    nonstd::string_view &value) {
+	if (scalar.kind == JsonoScalarKind::Null) {
+		return false;
+	}
+	if (mode == TransformMismatchMode::Null) {
+		if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
+			value = scalar.text;
+			return true;
+		}
+		return false;
+	}
+	if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
+		value = scalar.text;
+		return true;
+	}
+	scratch.clear();
+	if (RenderExtractText(scalar, scratch)) {
+		if (mode == TransformMismatchMode::Fail) {
+			ThrowTransformMismatch(field, JsonoScalarTypeName(scalar.kind));
+		}
+		return false;
+	}
+	value = nonstd::string_view(scratch.data(), scratch.size());
+	return true;
 }
 
 void AppendWildcardMissing(const TransformBindData &bind_data, idx_t node_index, vector<unique_ptr<Vector>> &children,
@@ -1043,7 +1328,7 @@ void ApplyObjectNodeWithCheckpoints(TransformLocalState &lstate, const Transform
 			ApplyTrieNode(lstate, bind_data, edge.child, view, value_cursor, children, row, join_buffers, join_counts);
 		} else {
 			WriteScalarField(bind_data.fields[simple_scalar_leaf], view, Location {value_cursor, true},
-			                 *children[simple_scalar_leaf], row);
+			                 *children[simple_scalar_leaf], row, bind_data.mismatch_mode);
 		}
 	}
 }
@@ -1077,9 +1362,9 @@ void ApplyWildcardObjectNodeWithCheckpoints(TransformLocalState &lstate, const T
 	}
 }
 
-// Materialize one wildcard element for this node's list/join leaves. Every scalar kind
-// carries its `->>` text (the render shared with VARCHAR shreds); JSON null and containers
-// stay a positional NULL in list mode and are skipped by join mode.
+// Materialize one wildcard element for this node's list/join leaves. Missing and JSON null
+// stay a positional NULL in list mode and are skipped by join mode; present containers are
+// scalar mismatches for leaves at this exact wildcard node.
 void MaterializeWildcardLeaves(const TransformBindData &bind_data, idx_t node_index, const JsonoView &view,
                                const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children, idx_t row,
                                vector<string> &join_buffers, vector<idx_t> &join_counts) {
@@ -1088,20 +1373,14 @@ void MaterializeWildcardLeaves(const TransformBindData &bind_data, idx_t node_in
 	if (slot_tag != tag::OBJ_START && slot_tag != tag::ARR_START) {
 		auto value_cursor = cursor;
 		auto scalar = DecodeScalarAt(view, value_cursor);
-		if (scalar.kind != JsonoScalarKind::Null) {
-			// Text scalars render straight from the heap; scratch holds the others.
+		for (auto field_index : node.list_leaves) {
+			AppendListElementScalar(bind_data.fields[field_index], bind_data.mismatch_mode, *children[field_index], row,
+			                        scalar);
+		}
+		for (auto field_index : node.join_leaves) {
 			nonstd::string_view value;
-			std::string scratch;
-			if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
-				value = scalar.text;
-			} else {
-				RenderExtractText(scalar, scratch);
-				value = nonstd::string_view(scratch.data(), scratch.size());
-			}
-			for (auto field_index : node.list_leaves) {
-				AppendListElementString(*children[field_index], row, value);
-			}
-			for (auto field_index : node.join_leaves) {
+			string scratch;
+			if (TryGetJoinText(bind_data.fields[field_index], bind_data.mismatch_mode, scalar, scratch, value)) {
 				auto &buffer = join_buffers[field_index];
 				if (join_counts[field_index] > 0) {
 					buffer.append(bind_data.fields[field_index].join_separator);
@@ -1109,11 +1388,19 @@ void MaterializeWildcardLeaves(const TransformBindData &bind_data, idx_t node_in
 				buffer.append(value.data(), value.size());
 				join_counts[field_index]++;
 			}
-			return;
 		}
+		return;
 	}
 	for (auto field_index : node.list_leaves) {
+		if (bind_data.mismatch_mode == TransformMismatchMode::Fail) {
+			ThrowTransformMismatch(bind_data.fields[field_index], slot_tag == tag::OBJ_START ? "OBJECT" : "ARRAY");
+		}
 		AppendListElementNull(*children[field_index], row);
+	}
+	for (auto field_index : node.join_leaves) {
+		if (bind_data.mismatch_mode == TransformMismatchMode::Fail) {
+			ThrowTransformMismatch(bind_data.fields[field_index], slot_tag == tag::OBJ_START ? "OBJECT" : "ARRAY");
+		}
 	}
 }
 
@@ -1160,7 +1447,7 @@ void ApplyObjectNode(TransformLocalState &lstate, const TransformBindData &bind_
 				              join_buffers, join_counts);
 			} else {
 				WriteScalarField(bind_data.fields[simple_scalar_leaf], view, Location {value_cursor, true},
-				                 *children[simple_scalar_leaf], row);
+				                 *children[simple_scalar_leaf], row, bind_data.mismatch_mode);
 			}
 			edge_index++;
 		}
@@ -1328,7 +1615,8 @@ void ApplyTrieNode(TransformLocalState &lstate, const TransformBindData &bind_da
                    vector<string> &join_buffers, vector<idx_t> &join_counts) {
 	auto &node = bind_data.trie[node_index];
 	for (auto field_index : node.scalar_leaves) {
-		WriteScalarField(bind_data.fields[field_index], view, Location {cursor, true}, *children[field_index], row);
+		WriteScalarField(bind_data.fields[field_index], view, Location {cursor, true}, *children[field_index], row,
+		                 bind_data.mismatch_mode);
 	}
 	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
 	if (!node.key_edges.empty()) {
@@ -1673,7 +1961,8 @@ void ApplyShapePlan(TransformLocalState &lstate, const TransformBindData &bind_d
 		default:
 			break;
 		}
-		WriteScalarValue(bind_data.fields[action.field_index], scalar, *children[action.field_index], row);
+		WriteScalarValue(bind_data.fields[action.field_index], bind_data.mismatch_mode, scalar,
+		                 *children[action.field_index], row);
 	}
 	for (auto &walk : plan.walks) {
 		JsonoCursor cursor;
@@ -1690,7 +1979,7 @@ void ApplyShapePlan(TransformLocalState &lstate, const TransformBindData &bind_d
 		auto idx = RowIndex(fmt, row);
 		if (fmt.validity.RowIsValid(idx)) {
 			auto scalar = SynthShredScalar(field.shred_primitive, fmt, idx);
-			WriteScalarValue(field, scalar, *children[field_index], row);
+			WriteScalarValue(field, bind_data.mismatch_mode, scalar, *children[field_index], row);
 		} else {
 			FlatVector::SetNull(*children[field_index], row, true);
 		}
@@ -1772,14 +2061,14 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 				auto location = LocatePath(view, field.path);
 				if (location.found) {
 					// The residual is authoritative: a value the shred writer kept wins over the shred.
-					WriteScalarField(field, view, location, *children[field_index], row);
+					WriteScalarField(field, view, location, *children[field_index], row, bind_data.mismatch_mode);
 					continue;
 				}
 				auto &fmt = shred_fmt[k];
 				auto idx = RowIndex(fmt, row);
 				if (fmt.validity.RowIsValid(idx)) {
 					auto scalar = SynthShredScalar(field.shred_primitive, fmt, idx);
-					WriteScalarValue(field, scalar, *children[field_index], row);
+					WriteScalarValue(field, bind_data.mismatch_mode, scalar, *children[field_index], row);
 				} else {
 					FlatVector::SetNull(*children[field_index], row, true);
 				}
@@ -1810,11 +2099,19 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 void RegisterJsonoTransform(ExtensionLoader &loader) {
 	// ANY input so a shredded JSONO struct (four BLOB prefix + shred columns) also binds; the
 	// bind validates it is a plain or shredded JSONO and maps shred columns to scalar fields.
-	ScalarFunction fun("jsono_transform", {LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, JsonoTransformExecute,
-	                   JsonoTransformBind, nullptr, nullptr, TransformLocalState::Init);
-	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	loader.RegisterFunction(fun);
+	ScalarFunctionSet set("jsono_transform");
+	ScalarFunction binary({LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, JsonoTransformExecute,
+	                      JsonoTransformBind, nullptr, nullptr, TransformLocalState::Init);
+	binary.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	binary.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	set.AddFunction(std::move(binary));
+
+	ScalarFunction ternary({LogicalType::ANY, LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::ANY,
+	                       JsonoTransformExecute, JsonoTransformBind, nullptr, nullptr, TransformLocalState::Init);
+	ternary.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	ternary.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	set.AddFunction(std::move(ternary));
+	loader.RegisterFunction(set);
 }
 
 } // namespace duckdb

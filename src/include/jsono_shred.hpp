@@ -64,7 +64,7 @@ bool IsShredArrayType(const LogicalType &type);
 
 // True if `type` is a scalar-array shred column type: LIST<TYPE> whose element TYPE is an
 // IsShredValueType scalar (LIST<UBIGINT>, LIST<VARCHAR>, …). Such an array shred lifts each whole
-// scalar element of a regular array (`$.goalsID`) into a parallel typed LIST<TYPE>, leaving a
+// scalar element of a regular array (`$.item_ids`) into a parallel typed LIST<TYPE>, leaving a
 // VAL_NULL placeholder per lifted element in the residual skeleton (non-conforming elements stay
 // verbatim) — see docs/jsono_format.md "Scalar array shreds". Mutually exclusive with
 // IsShredArrayType (a LIST element is either a struct or a scalar, never both).

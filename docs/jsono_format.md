@@ -180,9 +180,9 @@ silently dropping data.
 A shred type may be a `LIST<TYPE>` whose element `TYPE` is one of the five scalar
 shred types (`LIST<UBIGINT>`, `LIST<VARCHAR>`, `LIST<DOUBLE>`, `LIST<BIGINT>`,
 `LIST<BOOLEAN>`). Such a *scalar array shred* lifts each whole scalar element of a
-regular array — addressed by an object-key path like `$.goalsID`, not
-`$.goalsID[*]` — into one parallel typed `LIST<TYPE>` column
-(`jsono(value, shredding := {'$.goalsID': 'UBIGINT[]'})`, or the `jsono(STRUCT)`
+regular array — addressed by an object-key path like `$.item_ids`, not
+`$.item_ids[*]` — into one parallel typed `LIST<TYPE>` column
+(`jsono(value, shredding := {'$.item_ids': 'UBIGINT[]'})`, or the `jsono(STRUCT)`
 auto-shred of a top-level `LIST<scalar>` field). It is the strictly simpler case of
 the object array above: the element is a scalar, not a struct, so there are no
 per-element subfields to overlay — each element is either *lifted* whole or *kept*

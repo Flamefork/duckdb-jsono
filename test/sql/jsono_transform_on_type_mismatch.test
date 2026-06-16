@@ -1,0 +1,91 @@
+# name: test/sql/jsono_transform_on_type_mismatch.test
+# description: jsono_transform on_type_mismatch modes
+# group: [sql]
+
+require jsono
+
+# Default on_type_mismatch is convert: scalar values are CAST-like coerced.
+query I
+SELECT jsono_transform(jsono({'s': '12345', 'u': 12345::UBIGINT, 'n': 12345::UBIGINT, 'b': true, 'd': 42}), {'s':'UBIGINT','u':'BIGINT','n':'VARCHAR','b':'BIGINT','d':'DOUBLE'});
+----
+{'s': 12345, 'u': 12345, 'n': 12345, 'b': 1, 'd': 42.0}
+
+# null keeps the old silent-NULL scalar behavior for type mismatches.
+query I
+SELECT jsono_transform(jsono({'s': '12345', 'u': 12345::UBIGINT, 'n': 12345::UBIGINT, 'b': true, 'd': 42}), {'s':'UBIGINT','u':'BIGINT','n':'VARCHAR','b':'BIGINT','d':'DOUBLE'}, 'null');
+----
+{'s': NULL, 'u': NULL, 'n': NULL, 'b': NULL, 'd': 42.0}
+
+# fail performs the same coercions as convert but throws instead of returning NULL when coercion fails.
+query I
+SELECT jsono_transform(jsono({'s': '12345', 'u': 12345::UBIGINT, 'n': 12345::UBIGINT, 'b': true, 'd': 42}), {'s':'UBIGINT','u':'BIGINT','n':'VARCHAR','b':'BIGINT','d':'DOUBLE'}, on_type_mismatch := 'fail');
+----
+{'s': 12345, 'u': 12345, 'n': 12345, 'b': 1, 'd': 42.0}
+
+# Uncoercible scalar values are NULL in convert mode.
+query I
+SELECT jsono_transform(jsono({'a': 'abc'}), {'a':'UBIGINT'});
+----
+{'a': NULL}
+
+# The fail error names the projection path and actual/requested types.
+statement error
+SELECT jsono_transform(jsono({'a': 'abc'}), {'a':'UBIGINT'}, on_type_mismatch := 'fail');
+----
+cannot convert value at $.a from VARCHAR to UBIGINT
+
+# Present containers are scalar type mismatches; missing paths and JSON nulls still return SQL NULL.
+statement error
+SELECT jsono_transform(jsono('{"a":{},"b":null}'), {'a':'BIGINT','b':'BIGINT'}, on_type_mismatch := 'fail');
+----
+cannot convert value at $.a from OBJECT to BIGINT
+
+# fail must not be bypassed by the scalar shape-plan fast path.
+statement error
+SELECT jsono_transform(jsono('{"a":{},"b":1,"c":2}'), {'a':'BIGINT','b':'BIGINT','c':'BIGINT'}, on_type_mismatch := 'fail');
+----
+cannot convert value at $.a from OBJECT to BIGINT
+
+# on_type_mismatch must be a constant string enum.
+statement error
+SELECT jsono_transform(jsono({'a': 1}), {'a':'BIGINT'}, 'bogus');
+----
+on_type_mismatch
+
+statement error
+SELECT jsono_transform(jsono({'a': 1}), {'a':'BIGINT'}, on_mismatch := 'fail');
+----
+expected on_type_mismatch
+
+statement ok
+CREATE TABLE jsono_transform_modes AS SELECT 'convert' AS mode;
+
+statement error
+SELECT jsono_transform(jsono({'a': 1}), {'a':'BIGINT'}, mode) FROM jsono_transform_modes;
+----
+constant
+
+# List projection item types use the same mismatch mode per wildcard element.
+query I
+SELECT jsono_transform(jsono('{"items":[{"v":"1"},{"v":2},{"v":true},{"v":"abc"},{"v":null},{"v":10000000000000000000}]}'), {'values':{'type':['UBIGINT'],'path':'$.items[*].v'}});
+----
+{'values': [1, 2, 1, NULL, NULL, 10000000000000000000]}
+
+query I
+SELECT jsono_transform(jsono('{"items":[{"v":"1"},{"v":2},{"v":true},{"v":"abc"},{"v":null},{"v":10000000000000000000}]}'), {'values':{'type':['UBIGINT'],'path':'$.items[*].v'}}, 'null');
+----
+{'values': [NULL, 2, NULL, NULL, NULL, 10000000000000000000]}
+
+statement error
+SELECT jsono_transform(jsono('{"items":[{"v":"1"},{"v":2},{"v":true},{"v":"abc"}]}'), {'values':{'type':['UBIGINT'],'path':'$.items[*].v'}}, on_type_mismatch := 'fail');
+----
+cannot convert value at $.items[*].v from VARCHAR to UBIGINT
+
+# VARCHAR list projections preserve old default textualization through convert, while null mode
+# keeps only values that already match the requested scalar projection.
+query II
+SELECT
+  jsono_transform(jsono('{"items":[{"v":2},{"v":true},{"v":"s"}]}'), {'values':{'type':['VARCHAR'],'path':'$.items[*].v'}}),
+  jsono_transform(jsono('{"items":[{"v":2},{"v":true},{"v":"s"}]}'), {'values':{'type':['VARCHAR'],'path':'$.items[*].v'}}, 'null');
+----
+{'values': [2, true, s]}	{'values': [NULL, NULL, s]}
