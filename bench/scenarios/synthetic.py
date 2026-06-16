@@ -9,7 +9,11 @@ from config import (
     PLUCK_CORE_SPEC,
     TRANSFORM_CORE_SPEC,
     TRANSFORM_ECOMMERCE_JOIN_SPEC,
+    WIDE_FLAT_NESTED_PATCH,
+    WIDE_FLAT_NESTED_SHRED_PATCH,
+    WIDE_FLAT_SHREDDING_SPEC,
     WIDE_FLAT_SIZES,
+    WIDE_FLAT_SMALL_PATCH,
 )
 
 SCENARIOS = [
@@ -264,6 +268,63 @@ SCENARIOS = [
         "data_file": DATA_DIR / "wide_flat_100k.parquet",
         "json_column": "json_wide_flat",
         "group_col": "g1e4",
+        "targets": ["jsono"],
+    },
+    # Wide SHREDDED base (~107 lanes) + small patches, the rick/data per-event
+    # document-construction shape. The base is shredded outside timing; the timed
+    # merge builds the merged shredded document per row. Variants isolate which
+    # executor path is taken (jsono-only — shredded has no core-json equivalent):
+    #   - production: plain nested patch (params holds a JSONO value) + small shredded
+    #     patch. All top-level shreds -> the fast path copies the ~107 base lanes
+    #     through and folds only the small residuals.
+    #   - shredded_patch_only: all-shredded inputs, the fast path baseline ceiling.
+    #   - plain_patch_only: a single plain nested patch, isolates the plain-input fast
+    #     path (the relaxation H1 enables).
+    #   - nested_shred_patch: jsono({'params':{...}}) auto-shreds nested scalars into
+    #     '$.params.*' lanes; a nested shred disqualifies the fast path, so this stays
+    #     on the reshred fallback even after H1 — it isolates that separate bottleneck.
+    {
+        "operation": "merge_patch",
+        "scenario": "wide_shredded_base_production",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "patches": [WIDE_FLAT_NESTED_PATCH, WIDE_FLAT_SMALL_PATCH],
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "merge_patch",
+        "scenario": "wide_shredded_base_shredded_patch_only",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "patches": [WIDE_FLAT_SMALL_PATCH],
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "merge_patch",
+        "scenario": "wide_shredded_base_plain_patch_only",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "patches": [WIDE_FLAT_NESTED_PATCH],
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "merge_patch",
+        "scenario": "wide_shredded_base_nested_shred_patch",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "patches": [WIDE_FLAT_NESTED_SHRED_PATCH, WIDE_FLAT_SMALL_PATCH],
         "targets": ["jsono"],
     },
     {

@@ -1313,6 +1313,75 @@ bool ResidualHasTopLevelKey(const JsonoView &view, const string &key) {
 	return SlotTag(ks) == tag::KEY && view.KeyAt(SlotPayload(ks)) == target;
 }
 
+// True if the object has any top-level key that matches a merged shred name. `shreds`
+// is sorted by name (bind canonicalizes it), so each of the object's (few) keys is
+// binary-searched. Used to gate the fast path against a PLAIN input whose top-level
+// key names a shred: a value there collides into the residual (also caught by the
+// per-row residual probe), but an RFC 7396 null at that key DELETES the lane and
+// leaves no trace in the folded residual — the lane copy-through would wrongly keep
+// it, so any such key forces the reshred fallback.
+bool ObjectKeyInShredSet(const JsonoView &view, const vector<MergeShred> &shreds) {
+	if (view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+		return false;
+	}
+	auto layout = ReadObjectLayout(view, 0);
+	for (size_t k = 0; k < layout.key_count; k++) {
+		auto ks = view.SlotAt(layout.key_start + k);
+		if (SlotTag(ks) != tag::KEY) {
+			break;
+		}
+		auto key = view.KeyAt(SlotPayload(ks));
+		size_t lo = 0;
+		size_t hi = shreds.size();
+		while (lo < hi) {
+			auto mid = lo + (hi - lo) / 2;
+			if (nonstd::string_view(shreds[mid].name) < key) {
+				lo = mid + 1;
+			} else {
+				hi = mid;
+			}
+		}
+		if (lo < shreds.size() && nonstd::string_view(shreds[lo].name) == key) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Conflict between a value (folded residual or a plain input) and a NESTED object-key shred
+// path: the lane copy-through is valid only when the value neither carries the path's leaf nor
+// breaks the path's object skeleton. True when the path resolves to a PRESENT value (the value
+// shadows the lane, or an RFC 7396 null at the path would delete it) OR a node along the path
+// before the leaf is a present non-object (the lane cannot overlay into a scalar/array). An
+// absent key short-circuits to no-conflict — the lane safely owns/creates that subtree.
+bool ResidualConflictsWithShredPath(const JsonoView &view, const vector<PathStep> &steps) {
+	JsonoCursor cursor;
+	for (idx_t s = 0; s < steps.size(); s++) {
+		if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_START) {
+			return true; // need to descend into an object but found a non-object/empty
+		}
+		if (!LocatePathStep(nullptr, s, view, steps[s], cursor)) {
+			return false; // key absent at this level (the node is an object) → no conflict
+		}
+	}
+	return true; // full path resolved to a present value
+}
+
+// True if two object-key shred paths overlap structurally: they agree on the full length of the
+// shorter one, so one is a prefix of (or equal to) the other (e.g. `a` and `$.a.a`, or `a` and
+// `$.a`). Such a pair cannot be two independent lanes — one names a scalar leaf, the other lives
+// under it — so only the actual merge (the reshred fallback) can decide which structure wins.
+// Sibling paths (`$.a.b` vs `$.a.c`) diverge before the shorter ends and do not conflict.
+bool ShredPathsStructurallyConflict(const vector<PathStep> &a, const vector<PathStep> &b) {
+	idx_t common = std::min(a.size(), b.size());
+	for (idx_t i = 0; i < common; i++) {
+		if (a[i].key != b[i].key) {
+			return false;
+		}
+	}
+	return true;
+}
+
 // Copy a shred column from the winning input into the result shred, then null it where the
 // merged value is SQL NULL. Patch takes the last input that declares the shred (RFC 7396
 // last-wins); Overlay takes the first (base-authoritative).
@@ -1388,19 +1457,57 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		return;
 	}
 
-	// Fast path: when every input is shredded (no plain residual can shadow a shred key) and
-	// every shred is a top-level key, fold the raw residuals and copy shreds directly — skipping
-	// the reconstruct+reshred — as long as no shred key collides into the merged residual.
+	// Fast path: fold the raw residuals and copy shred lanes through verbatim, skipping the
+	// per-row reconstruct+reshred. Both shredded AND plain inputs ride it: a plain input folds
+	// its whole value into the residual and declares no lanes (FastCopyShred skips it). Every
+	// shred is an object-key lane (top-level `K` or nested `$.p.q`) the read overlay re-inserts
+	// at its path; an ARRAY shred is not a whole-lane copy (its elements interleave the residual
+	// skeleton) so it falls back. The per-row gate diverts to the fallback whenever an input could
+	// make the lane copy-through wrong (a non-object replace, a key/path naming a lane).
 	bool fast_viable = true;
+	vector<idx_t> plain_inputs;
 	for (idx_t i = 0; i < ncols; i++) {
 		auto &t = args.data[i].GetType();
 		if (t.id() != LogicalTypeId::SQLNULL && !IsShreddedJsonoType(t)) {
-			fast_viable = false;
+			plain_inputs.push_back(i);
 		}
 	}
-	for (auto &shred : bind_data.shreds) {
-		if (!shred.name.empty() && shred.name[0] == '$') {
+	// Parse each shred's object-key path once (top-level shreds are a single Key step). An array
+	// shred, or any non-Key step (only reachable through an array path), disqualifies the fast path.
+	vector<vector<PathStep>> shred_paths(bind_data.shreds.size());
+	bool has_nested_shred = false;
+	for (idx_t k = 0; k < bind_data.shreds.size() && fast_viable; k++) {
+		auto &shred = bind_data.shreds[k];
+		if (IsShredArrayType(shred.type) || IsShredScalarArrayType(shred.type)) {
 			fast_viable = false;
+			break;
+		}
+		if (shred.name.size() >= 2 && shred.name[0] == '$' && shred.name[1] == '.') {
+			shred_paths[k] = ParseJsonoPath(shred.name, "jsono merge fast path");
+			for (auto &step : shred_paths[k]) {
+				if (step.kind != PathStepKind::Key) {
+					fast_viable = false;
+					break;
+				}
+			}
+			if (shred_paths[k].size() > 1) {
+				has_nested_shred = true;
+			}
+		} else {
+			shred_paths[k].push_back(PathStep {PathStepKind::Key, shred.name, 0});
+		}
+	}
+	// A nested shred whose path prefixes (or equals) another shred's path is structurally
+	// contradictory — only the reshred fallback can resolve which wins. Two distinct top-level
+	// keys never prefix each other, so this only matters once a nested shred is present.
+	if (fast_viable && has_nested_shred) {
+		for (idx_t a = 0; a < shred_paths.size() && fast_viable; a++) {
+			for (idx_t b = a + 1; b < shred_paths.size(); b++) {
+				if (ShredPathsStructurallyConflict(shred_paths[a], shred_paths[b])) {
+					fast_viable = false;
+					break;
+				}
+			}
 		}
 	}
 
@@ -1414,19 +1521,71 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		JsonoVectorData fr;
 		InitJsonoVectorData(fast_residual, count, fr);
 		bool conflict = false;
+		JsonoView pview;
+		JsonoBlobRow pblob {};
 		for (idx_t row = 0; row < count && !conflict; row++) {
 			JsonoBlobRow blob {};
 			if (!ReadJsonoRowStrict(fr, row, blob)) {
-				continue;
+				continue; // SQL NULL folded residual: the row is NULL and its lanes are nulled below
 			}
 			JsonoView v = MakeJsonoView(blob);
 			if (!v.ParseHeader()) {
 				continue;
 			}
-			for (auto &shred : bind_data.shreds) {
-				if (ResidualHasTopLevelKey(v, shred.name)) {
+			// A non-object merged value (a non-object plain patch replaced the document) carries no
+			// lanes; copying them would attach stale lanes to a scalar/array. The all-shredded case
+			// never folds to a non-object with non-null lanes, so gate this on plain inputs to keep
+			// that case on the fast path unchanged.
+			if (!plain_inputs.empty() && SlotTag(v.SlotAt(0)) != tag::OBJ_START) {
+				conflict = true;
+				break;
+			}
+			for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
+				// A top-level shred conflicts only if its key sits in the folded residual (a
+				// non-object residual is handled by the plain-input gate above, preserving the
+				// all-shredded behaviour). A nested shred additionally conflicts if a node along
+				// its path is a present non-object (its lane cannot overlay into a scalar).
+				bool hit = shred_paths[k].size() == 1 ? ResidualHasTopLevelKey(v, bind_data.shreds[k].name)
+				                                      : ResidualConflictsWithShredPath(v, shred_paths[k]);
+				if (hit) {
 					conflict = true;
 					break;
+				}
+			}
+			if (conflict) {
+				break;
+			}
+			for (idx_t pi : plain_inputs) {
+				if (raw[pi].Read(row, pblob, pview) != JsonoRowState::Value) {
+					continue;
+				}
+				// A non-object plain value replaces the whole document mid-fold (RFC 7396),
+				// discarding the base's lanes — but the lane copy-through still copies them, and a
+				// later object patch can rebuild an object residual so the non-object check on the
+				// folded residual alone misses it. Divert to the fallback on any non-object plain input.
+				if (pview.Slots() == 0 || SlotTag(pview.SlotAt(0)) != tag::OBJ_START) {
+					conflict = true;
+					break;
+				}
+				// A plain input naming a shred also forces the fallback: a value there is caught by
+				// the residual probe above, but an RFC 7396 null-delete of a lane leaves no trace in
+				// the folded residual and the lane copy-through would wrongly keep it. ObjectKeyInShredSet
+				// covers the top-level shred names in one pass; a plain input touching a NESTED shred path
+				// (its leaf or a non-object along it) needs the per-path descent.
+				if (ObjectKeyInShredSet(pview, bind_data.shreds)) {
+					conflict = true;
+					break;
+				}
+				if (has_nested_shred) {
+					for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
+						if (shred_paths[k].size() > 1 && ResidualConflictsWithShredPath(pview, shred_paths[k])) {
+							conflict = true;
+							break;
+						}
+					}
+					if (conflict) {
+						break;
+					}
 				}
 			}
 		}

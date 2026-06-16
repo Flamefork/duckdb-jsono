@@ -544,6 +544,125 @@ def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
     assert plain == reshredded, f"reshred changed the value: {text!r} {first} -> {second}: {plain!r} -> {reshredded!r}"
 
 
+# merge_patch over a SHREDDED base with PLAIN patch arguments must fold identically to the same
+# PLAIN base with the same patches. A plain patch on the fast path is the rick/data per-event shape;
+# this fuzzes every way it can interact with a lane: disjoint append, a value colliding into the
+# residual, an RFC 7396 null that deletes a lane (no trace in the folded residual), and a non-object
+# patch that replaces the whole document. The plain-base fold is the RFC 7396 reference.
+merge_patch_keys = st.sampled_from(["a", "b", "c", "d", "e"])
+merge_patch_scalars = st.one_of(
+    st.none(), st.booleans(), st.integers(min_value=-100, max_value=100), st.text(max_size=4)
+)
+merge_patch_objects = st.dictionaries(
+    merge_patch_keys,
+    st.one_of(merge_patch_scalars, st.dictionaries(merge_patch_keys, merge_patch_scalars, max_size=2)),
+    min_size=0,
+    max_size=4,
+)
+merge_patch_args = st.lists(
+    st.one_of(merge_patch_objects, merge_patch_scalars, st.lists(merge_patch_scalars, max_size=3)),
+    min_size=1,
+    max_size=3,
+)
+merge_patch_base = st.dictionaries(merge_patch_keys, merge_patch_scalars, min_size=1, max_size=5)
+
+
+@settings(PROPERTY_SETTINGS)
+@example(base={"a": 1}, patches=[{"a": None}], spec_keys=["a"])  # RFC 7396 null deletes a lane
+@example(base={"a": 1}, patches=[5], spec_keys=["a"])  # non-object patch replaces the document
+@example(base={"a": 1, "b": 2}, patches=[{"c": 3}], spec_keys=["a", "b"])  # disjoint append, fast path
+@example(base={"a": 1}, patches=[{"a": 2}], spec_keys=["a"])  # value collides into the residual
+@example(base={"a": 1}, patches=[{"a": None}, {"a": 9}], spec_keys=["a"])  # delete then re-add a lane
+@given(
+    base=merge_patch_base,
+    patches=merge_patch_args,
+    spec_keys=st.lists(merge_patch_keys, min_size=1, max_size=5, unique=True),
+)
+def test_merge_patch_shredded_plain_parity(base: dict[str, Any], patches: list[Any], spec_keys: list[str]) -> None:
+    base_text = json_dumps(base)
+    spec_keys = [key for key in spec_keys if key in base]
+    if not spec_keys:
+        return
+    spec = shred_spec_sql({key: "VARCHAR" for key in spec_keys})
+    patch_args = ", ".join(f"jsono({sql_literal(json_dumps(patch))})" for patch in patches)
+    reference = SESSION.value(f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}), {patch_args}))")
+    candidate = SESSION.value(
+        f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}, shredding := {spec}), {patch_args}))"
+    )
+    assert reference == candidate, (
+        f"shredded-base merge diverged from plain: base {base_text!r} patches {patches!r} "
+        f"spec {spec_keys!r}: plain {reference!r} != shredded {candidate!r}"
+    )
+
+
+# A jsono({...}) patch with a NESTED object auto-shreds its scalars into '$.path' lanes — the
+# rick/data jsono({'params': {...}}) shape. Merging it onto a shredded base puts nested shreds in the
+# merged set, which the fast path copies through as lanes overlaid at their paths. The same merge
+# expressed with PLAIN text patches over a plain base is the RFC 7396 reference; the two must agree
+# (disjoint nested add, nested value collision, a scalar replacing the nested parent, a deeper nest).
+def struct_literal_sql(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return sql_literal(value)
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{sql_literal(k)}: {struct_literal_sql(v)}" for k, v in value.items()) + "}"
+    raise ValueError(f"unsupported struct literal value: {value!r}")
+
+
+# Keys are partitioned so a key is consistently scalar OR consistently a one-level object: scalar
+# keys (a/b/c) always carry scalars (top-level or nested leaves), object keys (p/q) always carry a
+# flat object of scalar keys. This keeps the merged shred set free of prefix-overlapping paths (a
+# scalar `a` AND a nested `$.a.x`), which is a separate pre-existing reshred gap, not H3's domain.
+merge_patch_scalar_key = st.sampled_from(["a", "b", "c"])
+merge_patch_object_key = st.sampled_from(["p", "q"])
+merge_patch_struct_scalars = st.one_of(st.booleans(), st.integers(min_value=-100, max_value=100), st.text(max_size=4))
+merge_patch_struct_patch = st.dictionaries(
+    st.one_of(merge_patch_scalar_key, merge_patch_object_key),
+    st.one_of(
+        merge_patch_struct_scalars,
+        st.dictionaries(merge_patch_scalar_key, merge_patch_struct_scalars, min_size=1, max_size=3),
+    ),
+    min_size=1,
+    max_size=4,
+).filter(
+    # Enforce the partition: a scalar key never holds an object, an object key always does.
+    lambda patch: all((isinstance(value, dict)) == (key in ("p", "q")) for key, value in patch.items())
+)
+
+
+@settings(PROPERTY_SETTINGS)
+@example(base={"a": 1}, patches=[{"p": {"a": 1, "b": 2}}], spec_keys=["a"])  # disjoint nested add
+@example(base={"a": 1}, patches=[{"p": {"a": 1}}, {"a": 9}], spec_keys=["a"])  # nested + top-level lane
+@example(base={"a": 1}, patches=[{"p": {"a": 1}}, {"p": {"a": 2}}], spec_keys=["a"])  # nested collision
+@example(base={"a": 1}, patches=[{"p": {"a": 1}}, {"q": {"b": 3}}], spec_keys=["a"])  # two nested parents
+@given(
+    base=merge_patch_base,
+    patches=st.lists(merge_patch_struct_patch, min_size=1, max_size=3),
+    spec_keys=st.lists(merge_patch_scalar_key, min_size=1, max_size=3, unique=True),
+)
+def test_merge_patch_auto_shred_patch_parity(
+    base: dict[str, Any], patches: list[dict[str, Any]], spec_keys: list[str]
+) -> None:
+    base_text = json_dumps(base)
+    spec_keys = [key for key in spec_keys if key in base]
+    if not spec_keys:
+        return
+    spec = shred_spec_sql({key: "VARCHAR" for key in spec_keys})
+    plain_args = ", ".join(f"jsono({sql_literal(json_dumps(patch))})" for patch in patches)
+    shred_args = ", ".join(f"jsono({struct_literal_sql(patch)})" for patch in patches)
+    reference = SESSION.value(f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}), {plain_args}))")
+    candidate = SESSION.value(
+        f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}, shredding := {spec}), {shred_args}))"
+    )
+    assert reference == candidate, (
+        f"auto-shred nested patch merge diverged from plain: base {base_text!r} patches {patches!r} "
+        f"spec {spec_keys!r}: plain {reference!r} != shredded {candidate!r}"
+    )
+
+
 # Array shredding: a regular array's element subfields lift into a parallel LIST<STRUCT> column, the
 # element tail staying in the residual skeleton. Elements are heterogeneous (object/null/scalar/
 # nested array); an element object draws its subfields from a small shared name set so a schema can
@@ -944,6 +1063,8 @@ PROPERTIES = [
     test_keys_sorted,
     test_shred_lossless,
     test_reshred_lossless,
+    test_merge_patch_shredded_plain_parity,
+    test_merge_patch_auto_shred_patch_parity,
     test_array_reader_parity,
     test_struct_auto_shred_lossless,
     test_struct_array_auto_shred_lossless,

@@ -621,23 +621,46 @@ def build_jsono_filter_paths_query(
     )
 
 
+def merge_patch_one_patch_sql(patch: object) -> str:
+    # A tagged patch picks how it is built (and thus the shredded type the merge sees):
+    # {"plain": v} parses text -> a plain jsono value; {"shredded"/"auto_shred": v} runs the
+    # struct constructor -> jsono({...}) auto-shreds (top-level scalars -> lanes, nested scalars
+    # -> '$.path' lanes). A bare value is treated as the struct form for backward compatibility.
+    if isinstance(patch, dict) and set(patch) == {"plain"}:
+        return f"jsono({sql_json(patch['plain'])})"
+    if (
+        isinstance(patch, dict)
+        and set(patch) <= {"shredded", "auto_shred"}
+        and len(patch) == 1
+    ):
+        return f"jsono({sql_typed_literal(next(iter(patch.values())))})"
+    return f"jsono({sql_typed_literal(patch)})"
+
+
+def merge_patch_patches_sql(scenario_config: dict) -> list[str]:
+    patches = scenario_config.get("patches", [scenario_config.get("patch_object")])
+    return [merge_patch_one_patch_sql(patch) for patch in patches]
+
+
 def build_jsono_merge_patch_query(
     scenario_config: dict, data_path: Path
 ) -> BenchmarkQuery:
-    json_column = scenario_config["json_column"]
-    patch_sql = f"jsono({sql_typed_literal(scenario_config['patch_object'])})"
+    # The base is materialized outside timing. With a 'shredding' key it becomes a
+    # wide shredded value (jsono_value_sql), so the timed merge exercises the
+    # shredded executor (fast path or reshred fallback). Patches are tagged plain vs
+    # shredded so the scenario controls which executor path the merge takes.
+    patch_args = ", ".join(merge_patch_patches_sql(scenario_config))
     return BenchmarkQuery(
         prepare_sql=(
             f"""
             CREATE OR REPLACE TEMP TABLE _bench_in AS
-            SELECT
-                jsono({json_column}::VARCHAR) AS base
+            SELECT {jsono_value_sql(scenario_config)} AS base
             FROM {table_sql(data_path)}
             """,
         ),
         timed_sql=f"""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
-            SELECT jsono_merge_patch(base, {patch_sql}) AS r
+            SELECT jsono_merge_patch(base, {patch_args}) AS r
             FROM _bench_in
         """,
     )

@@ -95,6 +95,165 @@ WIDE_FLAT_SIZES = {
     "100k": 100_000,
 }
 
+# Schema of the wide-flat dataset (generate_data.py reads these to emit rows, the
+# shredded merge scenarios read them to build a shred spec that matches the keys
+# exactly). group prefix -> [(key suffix, value kind)], flattened to
+# f"{group}_{suffix}". Single source of truth so the shred spec never drifts from
+# the generated keys.
+WIDE_FLAT_GROUPS = {
+    "event": [
+        ("ts", "int"),
+        ("id", "digits"),
+        ("session_id", "digits"),
+        ("hit_id", "digits"),
+        ("counter_id", "digits"),
+        ("watch_id", "digits"),
+        ("visit_id", "digits"),
+    ],
+    "browser": [
+        ("name", "token"),
+        ("major_version", "int"),
+        ("minor_version", "int"),
+        ("engine", "token"),
+        ("engine_version", "int"),
+        ("language", "token"),
+        ("country", "token"),
+        ("cookies", "flag"),
+    ],
+    "screen": [
+        ("width", "int"),
+        ("height", "int"),
+        ("colors", "int"),
+        ("format", "token"),
+        ("orientation", "token"),
+        ("physical_width", "int"),
+        ("physical_height", "int"),
+    ],
+    "window": [
+        ("client_width", "int"),
+        ("client_height", "int"),
+    ],
+    "region": [
+        ("country", "token"),
+        ("country_id", "digits"),
+        ("area", "token"),
+        ("area_id", "digits"),
+        ("city", "token"),
+        ("city_id", "digits"),
+    ],
+    "utm": [
+        ("source", "token"),
+        ("medium", "token"),
+        ("campaign", "token"),
+        ("content", "token"),
+        ("term", "token"),
+    ],
+    "offline_call": [
+        ("talk_duration", "int"),
+        ("hold_duration", "int"),
+        ("missed", "flag"),
+        ("tag", "sparse_token"),
+        ("first_time_caller", "flag"),
+        ("url", "url"),
+    ],
+    "share": [
+        ("service", "sparse_token"),
+        ("url", "url"),
+        ("title", "token"),
+    ],
+    "openstat": [
+        ("ad", "sparse_token"),
+        ("campaign", "sparse_token"),
+        ("service", "sparse_token"),
+        ("source", "sparse_token"),
+    ],
+    "last": [
+        ("traffic_source", "sparse_token"),
+        ("search_engine", "sparse_token"),
+        ("search_engine_root", "sparse_token"),
+        ("adv_engine", "sparse_token"),
+        ("social_network", "sparse_token"),
+        ("social_network_profile", "sparse_token"),
+    ],
+    "client": [
+        ("id", "digits"),
+        ("time_zone", "int"),
+        ("user_id_hash", "digits"),
+        ("ip", "digits"),
+    ],
+    "page": [
+        ("url", "url"),
+        ("referer", "url"),
+        ("title", "token"),
+        ("charset", "token"),
+        ("link", "url"),
+        ("download", "flag"),
+        ("not_bounce", "flag"),
+        ("http_error", "flag"),
+    ],
+    "device": [
+        ("category", "token"),
+        ("mobile_phone", "sparse_token"),
+        ("mobile_phone_model", "sparse_token"),
+        ("os", "token"),
+        ("os_root", "token"),
+    ],
+    "flags": [
+        ("javascript_enabled", "flag"),
+        ("third_party_cookie_enabled", "flag"),
+        ("is_turbo_page", "flag"),
+        ("is_turbo_app", "flag"),
+        ("has_gclid", "flag"),
+        ("iframe", "flag"),
+        ("messenger", "sparse_token"),
+    ],
+    "network": [
+        ("type", "token"),
+    ],
+}
+
+WIDE_FLAT_FIELDS = [
+    (f"{group}_{suffix}", kind)
+    for group, suffixes in WIDE_FLAT_GROUPS.items()
+    for suffix, kind in suffixes
+] + [
+    (f"custom_param_{i:02d}", "token" if i % 2 == 0 else "sparse_token")
+    for i in range(1, 21)
+]
+
+# Shred spec covering every always-present scalar top-level key (~107 lanes). int
+# values shred as BIGINT, every other kind (digits/token/sparse_token/flag/url) is
+# a JSON string -> VARCHAR. event_name is the fixed archetype key. This mirrors the
+# rick/data group-merged base: a wide value carrying ~90 typed lanes.
+WIDE_FLAT_SHREDDING_SPEC = {
+    "event_name": "VARCHAR",
+    **{
+        name: ("BIGINT" if kind == "int" else "VARCHAR")
+        for name, kind in WIDE_FLAT_FIELDS
+    },
+}
+
+# Patches mirroring the rick/data per-event document construction. A patch entry is tagged
+# with how it is built, because the construction decides the shredded type the merge sees:
+#   {"plain": value}    -> jsono('<json text>'): a PLAIN jsono value (no shreds). This is the
+#                          `jsono({'params': watch_params})` shape where params holds a JSONO
+#                          value, so it is not auto-shredded — the plain argument H1 fast-paths.
+#   {"shredded": value} -> jsono(<struct literal>): jsono({...}) auto-shreds scalar top-level
+#                          fields, mirroring jsono({'event_name':.., 'goals':..}).
+#   {"auto_shred": value} -> jsono(<struct literal>) over a value with NESTED scalars, which
+#                          auto-shred into '$.path' lanes. A nested shred disqualifies the fast
+#                          path (it is not a whole top-level lane), so this stays on the reshred
+#                          fallback even after H1 — it isolates that separate bottleneck.
+WIDE_FLAT_NESTED_PATCH = {
+    "plain": {"params": {"watch_goal_a": "1042", "watch_goal_b": "5530"}}
+}
+WIDE_FLAT_SMALL_PATCH = {
+    "shredded": {"event_name": "page_view_merged", "goals": "g1,g2,g3"}
+}
+WIDE_FLAT_NESTED_SHRED_PATCH = {
+    "auto_shred": {"params": {"watch_goal_a": "1042", "watch_goal_b": "5530"}}
+}
+
 # Shred set for shredded scenarios over the field_sample page_view shape:
 # always-present scalar keys, matching the rick/data deployment plan.
 FIELD_SAMPLE_SHREDDING_SPEC = {
