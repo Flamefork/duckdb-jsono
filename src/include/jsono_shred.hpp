@@ -23,10 +23,11 @@ struct JsonoScalar;
 // no `default`, so adding a scalar shred type is a compile error in each reader, not a runtime throw.
 enum class ShredPrimitive : uint8_t { Varchar, Bigint, Ubigint, Double, Boolean };
 
-// The category of a shred column: one scalar value, or a LIST<STRUCT> array shred. Readers switch
-// over it with no `default`, so adding a future shred category (e.g. a map shred) is a compile error
-// in each native reader rather than a silently-swallowed runtime `default`.
-enum class ShredKind : uint8_t { Scalar, Array };
+// The category of a shred column: one scalar value, a LIST<STRUCT> array shred (every element an
+// object whose subfields lift), or a LIST<scalar> array shred (every element a scalar that lifts as
+// a whole). Readers switch over it with no `default`, so adding a future shred category (e.g. a map
+// shred) is a compile error in each native reader rather than a silently-swallowed runtime `default`.
+enum class ShredKind : uint8_t { Scalar, Array, ScalarArray };
 
 // Classify a scalar shred type into its ShredPrimitive; false if `type` is not a scalar a shred can
 // hold (a JSON-aliased VARCHAR carrying a document, or any non-scalar). The single owner of the
@@ -55,11 +56,24 @@ ScalarFunction JsonoShredFromJsonoFunction();
 // every other field (other scalars, nested objects/arrays) stays in the residual tape.
 bool IsShredValueType(const LogicalType &type);
 
-// True if `type` is an array shred column type: LIST<STRUCT<...>> whose every struct child is
-// itself an IsShredValueType scalar. An array shred lifts the chosen leaf subfields of each
+// True if `type` is an object-array shred column type: LIST<STRUCT<...>> whose every struct child is
+// itself an IsShredValueType scalar. Such an array shred lifts the chosen leaf subfields of each
 // element of a regular array (`$.products`) into a parallel typed LIST<STRUCT>, leaving the
 // element tail in the residual skeleton — see docs/jsono_format.md "Array shreds".
 bool IsShredArrayType(const LogicalType &type);
+
+// True if `type` is a scalar-array shred column type: LIST<TYPE> whose element TYPE is an
+// IsShredValueType scalar (LIST<UBIGINT>, LIST<VARCHAR>, …). Such an array shred lifts each whole
+// scalar element of a regular array (`$.goalsID`) into a parallel typed LIST<TYPE>, leaving a
+// VAL_NULL placeholder per lifted element in the residual skeleton (non-conforming elements stay
+// verbatim) — see docs/jsono_format.md "Scalar array shreds". Mutually exclusive with
+// IsShredArrayType (a LIST element is either a struct or a scalar, never both).
+bool IsShredScalarArrayType(const LogicalType &type);
+
+// True if `type` is any LIST array shred (object array OR scalar array) — the cases a read must
+// reconstruct rather than serve from the residual skeleton, and the cases the constructor routes
+// through the two-pass materialize-then-shred writer. The single owner of "is this a list shred".
+bool IsShredListType(const LogicalType &type);
 
 // The lossless strip gate for one located scalar against a shred column type: true iff the
 // value round-trips through the shred type byte-for-byte (a JSON string in a VARCHAR shred, an
@@ -69,11 +83,15 @@ bool IsShredArrayType(const LogicalType &type);
 bool JsonoScalarFitsShredType(const jsono::JsonoScalar &scalar, const LogicalType &type);
 
 // One array shred for the residual-skeleton emit (write) and the reconstruct overlay (read): the
-// object-key chain to the array, and the element subfields (name, scalar shred type) lifted into
-// the LIST<STRUCT> column, in element-struct order.
+// object-key chain to the array, plus the lifted-element description. An object array
+// (kind == Array) lifts the element subfields (name, scalar shred type) into a LIST<STRUCT> column,
+// in element-struct order. A scalar array (kind == ScalarArray) lifts each whole element into a
+// LIST<element_type> column. The two carry disjoint extra fields; `kind` selects which is valid.
 struct JsonoArrayShredSpec {
 	vector<PathStep> path;
-	vector<std::pair<string, LogicalType>> subfields;
+	ShredKind kind = ShredKind::Array;
+	vector<std::pair<string, LogicalType>> subfields; // kind == Array
+	LogicalType element_type;                         // kind == ScalarArray
 };
 
 // Serialized shred-manifest entry bytes for one shred (u16 path_len, path, u16 type_len,

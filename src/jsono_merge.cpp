@@ -841,16 +841,21 @@ static bool ArrayPathContinues(const vector<PathStep> &path, size_t depth, nonst
 // struct is emitted verbatim. The skeleton array length is authoritative — a non-NULL shred list of
 // a different length is a corrupt row (e.g. a struct cast that truncated the LIST) and fails loud.
 struct ArrayReconShred {
-	idx_t child;                                      // shred index over the shred set
-	vector<PathStep> path;                            // pure object-key chain to the array
+	idx_t child; // shred index over the shred set
+	ShredKind kind = ShredKind::Array;
+	vector<PathStep> path;        // pure object-key chain to the array
+	UnifiedVectorFormat list_fmt; // list_entry_t + per-row validity (both kinds)
+	const list_entry_t *list_entries = nullptr;
+	// kind == Array: the element struct's subfields lifted into a LIST<STRUCT> column.
 	vector<std::pair<string, LogicalType>> subfields; // element subfield (name, scalar type), struct order
 	// Subfield indices in sorted-key order: the overlay patch object must emit keys ascending
 	// (the JSONO object invariant and the sorted-key two-pointer MergeTwoObjects both require it).
 	vector<idx_t> sorted_subfields;
-	UnifiedVectorFormat list_fmt; // list_entry_t + per-row validity
-	const list_entry_t *list_entries = nullptr;
 	UnifiedVectorFormat struct_fmt;      // per-element struct validity
 	vector<UnifiedVectorFormat> sub_fmt; // per subfield: value + validity
+	// kind == ScalarArray: each whole element lifted into a LIST<element_type> column.
+	LogicalType element_type;
+	UnifiedVectorFormat element_fmt; // the list child scalar vector: value + per-element validity
 };
 
 struct ArrayOverlayScratch {
@@ -883,6 +888,21 @@ void OverlayArray(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &buil
 			                            "(a struct cast truncated it)");
 		}
 		idx_t child = entry.offset + i;
+		if (shred.kind == ShredKind::ScalarArray) {
+			// A non-NULL element slot is a lifted scalar (emit it; the skeleton placeholder is skipped);
+			// a NULL slot is a kept element (a non-conforming scalar / null / object / array), emitted
+			// verbatim from the skeleton. Validity alone disambiguates the lifted from the kept.
+			auto elem_idx = shred.element_fmt.sel->get_index(child);
+			if (shred.element_fmt.validity.RowIsValid(elem_idx)) {
+				ReconShred element_shred {0, shred.element_type, {}};
+				EmitReconShredScalar(builder, element_shred, shred.element_fmt, elem_idx);
+				SkipValueFast(view, cursor);
+			} else {
+				EmitValueVerbatim(view, cursor, builder, depth + 1);
+			}
+			i++;
+			continue;
+		}
 		bool is_object = SlotTag(view.SlotAt(cursor.pos)) == tag::OBJ_START;
 		bool struct_present = is_object && shred.struct_fmt.validity.RowIsValid(shred.struct_fmt.sel->get_index(child));
 		size_t present = 0;
@@ -1021,11 +1041,21 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		if (IsShredArrayType(layout.shreds[i].second)) {
 			ArrayReconShred ars;
 			ars.child = i;
+			ars.kind = ShredKind::Array;
 			ars.path = std::move(steps);
 			auto &element = ListType::GetChildType(layout.shreds[i].second);
 			for (auto &sub : StructType::GetChildTypes(element)) {
 				ars.subfields.emplace_back(sub.first, sub.second);
 			}
+			array_shreds.push_back(std::move(ars));
+			continue;
+		}
+		if (IsShredScalarArrayType(layout.shreds[i].second)) {
+			ArrayReconShred ars;
+			ars.child = i;
+			ars.kind = ShredKind::ScalarArray;
+			ars.path = std::move(steps);
+			ars.element_type = ListType::GetChildType(layout.shreds[i].second);
 			array_shreds.push_back(std::move(ars));
 			continue;
 		}
@@ -1052,14 +1082,19 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 	for (idx_t k = 0; k < shreds.size(); k++) {
 		JsonoShredVector(input, shreds[k].child).ToUnifiedFormat(count, shred_fmt[k]);
 	}
-	// Array shred read handles: the per-row list entries, per-element struct validity, and per
-	// subfield value+validity, set up once the array_shreds vector is stable.
+	// Array shred read handles: the per-row list entries plus, per kind, the element lanes —
+	// a LIST<STRUCT>'s per-element struct validity and per-subfield value+validity, or a
+	// LIST<scalar>'s element value+validity — set up once the array_shreds vector is stable.
 	for (auto &ars : array_shreds) {
 		auto &list_vec = JsonoShredVector(input, ars.child);
 		list_vec.ToUnifiedFormat(count, ars.list_fmt);
 		ars.list_entries = UnifiedVectorFormat::GetData<list_entry_t>(ars.list_fmt);
-		auto &struct_vec = ListVector::GetEntry(list_vec);
 		auto child_size = ListVector::GetListSize(list_vec);
+		if (ars.kind == ShredKind::ScalarArray) {
+			ListVector::GetEntry(list_vec).ToUnifiedFormat(child_size, ars.element_fmt);
+			continue;
+		}
+		auto &struct_vec = ListVector::GetEntry(list_vec);
 		struct_vec.ToUnifiedFormat(child_size, ars.struct_fmt);
 		auto &subs = StructVector::GetEntries(struct_vec);
 		ars.sub_fmt.resize(subs.size());
@@ -2490,6 +2525,36 @@ static bool ElementSubfieldStrippable(const JsonoView &view, const JsonoCursor &
 	return JsonoScalarFitsShredType(scalar, type);
 }
 
+// Emit the skeleton scalar array (cursor at ARR_START): each element that the lane lifts (a scalar
+// fitting `element_type`) becomes a VAL_NULL placeholder — it carries no value, the parallel
+// LIST<element_type> shred does — every other element (a non-conforming scalar, a null, an object or
+// array) stays verbatim. The lift gate is JsonoScalarFitsShredType, the same one WriteScalarArrayShred
+// uses, so the placeholder positions match the shred's non-NULL slots exactly. On reconstruct the
+// placeholder is never read: a non-NULL shred slot overrides it, a NULL slot means the element was
+// kept (and a kept element is never a placeholder), so a placeholder and an explicit JSON null never
+// collide.
+static void EmitSkeletonScalarArray(const JsonoView &view, const JsonoCursor &array_cursor, JsonoBuilder &builder,
+                                    const LogicalType &element_type, size_t depth) {
+	auto end_pos = ReadArrayEndPos(view, array_cursor.pos);
+	builder.EmitArrayStart();
+	JsonoCursor cursor = array_cursor;
+	cursor.pos++; // first element; ARR_START consumes no stream entries
+	while (cursor.pos < end_pos) {
+		auto value_tag = SlotTag(view.SlotAt(cursor.pos));
+		if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
+			JsonoCursor probe = cursor;
+			auto scalar = DecodeScalarAt(view, probe);
+			if (JsonoScalarFitsShredType(scalar, element_type)) {
+				builder.EmitNull(); // lifted: placeholder; the shred holds the value
+				SkipValueFast(view, cursor);
+				continue;
+			}
+		}
+		EmitValueVerbatim(view, cursor, builder, depth + 1);
+	}
+	builder.EmitArrayEnd();
+}
+
 // Emit the skeleton array (cursor at ARR_START): each object element minus its strippable
 // subfields, every other element verbatim.
 static void EmitSkeletonArray(const JsonoView &view, const JsonoCursor &array_cursor, JsonoBuilder &builder,
@@ -2574,7 +2639,11 @@ static void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cur
 		}
 		auto value_tag = SlotTag(view.SlotAt(value_cursor.pos));
 		if (terminal_array && value_tag == tag::ARR_START) {
-			EmitSkeletonArray(view, value_cursor, builder, terminal_array->subfields, depth);
+			if (terminal_array->kind == ShredKind::ScalarArray) {
+				EmitSkeletonScalarArray(view, value_cursor, builder, terminal_array->element_type, depth);
+			} else {
+				EmitSkeletonArray(view, value_cursor, builder, terminal_array->subfields, depth);
+			}
 			SkipValueFast(view, value_cursor);
 		} else if ((!deeper_scalar.empty() || !deeper_array.empty()) && value_tag == tag::OBJ_START) {
 			EmitSkeletonObject(view, value_cursor, builder, deeper_scalar, deeper_array, depth + 1);

@@ -1,0 +1,337 @@
+# name: test/sql/jsono_shredded_scalar_array.test
+# description: jsono scalar-array shredding — $.goalsID into a LIST<scalar> shred column, VAL_NULL placeholder per lifted element in the residual skeleton, lossless reconstruct
+# group: [sql]
+
+require jsono
+
+require json
+
+# Peek the raw residual skeleton (body blobs repacked as plain jsono, shreds dropped).
+statement ok
+CREATE MACRO jsono_residual(j) AS struct_pack(
+    "jsono" := struct_pack(
+        body := struct_extract_at(struct_extract_at(j, 1), 1)));
+
+# ---------------------------------------------------------------------------
+# Core: a regular array of scalars shreds into LIST<scalar>; every element
+# round-trips losslessly, so each is lifted (a VAL_NULL placeholder stays in the
+# residual skeleton) and the whole document reconstructs through to_json.
+# ---------------------------------------------------------------------------
+query I
+SELECT to_json(jsono('{"goalsID":[5348936,139733107,3]}',
+                     shredding := {'$.goalsID':'UBIGINT[]'}));
+----
+{"goalsID":[5348936,139733107,3]}
+
+# The shred column is a real typed LIST<UBIGINT>, queryable directly.
+query II
+SELECT (j."jsono"."$.goalsID")[1], (j."jsono"."$.goalsID")[3]
+FROM (SELECT jsono('{"goalsID":[5348936,139733107,3]}',
+                   shredding := {'$.goalsID':'UBIGINT[]'}) AS j);
+----
+5348936	3
+
+# The type is a pure function of the shred set (matches jsono_storage_type).
+query I
+SELECT typeof(jsono('{"goalsID":[1,2,3]}',
+                    shredding := {'$.goalsID':'UBIGINT[]'}))
+     = jsono_storage_type('"$.goalsID" UBIGINT[]');
+----
+true
+
+# ---------------------------------------------------------------------------
+# Per-element lossless gate — a non-conforming element stays verbatim in the
+# residual skeleton (its shred slot NULL), everything round-trips through to_json.
+# ---------------------------------------------------------------------------
+
+# Mixed array: only the conforming UBIGINT elements lift; string/null/bool/negative stay.
+query I
+SELECT to_json(jsono('{"a":[1,"two",3,null,true,-5]}',
+                     shredding := {'$.a':'UBIGINT[]'}));
+----
+{"a":[1,"two",3,null,true,-5]}
+
+# All-string array into a VARCHAR lane.
+query I
+SELECT to_json(jsono('{"a":["x","y","z"]}', shredding := {'$.a':'VARCHAR[]'}));
+----
+{"a":["x","y","z"]}
+
+# VARCHAR lane lifts only real strings; a number stays verbatim (no read-copy).
+query I
+SELECT to_json(jsono('{"a":["x",5,"z"]}', shredding := {'$.a':'VARCHAR[]'}));
+----
+{"a":["x",5,"z"]}
+
+# DOUBLE lane: only genuine doubles lift; an integer stays (its shred kind differs).
+query I
+SELECT to_json(jsono('{"a":[1.5,2.0,3]}', shredding := {'$.a':'DOUBLE[]'}));
+----
+{"a":[1.5,2.0,3]}
+
+# BOOLEAN lane.
+query I
+SELECT to_json(jsono('{"a":[true,false,1]}', shredding := {'$.a':'BOOLEAN[]'}));
+----
+{"a":[true,false,1]}
+
+# BIGINT lane: negatives and large values lift.
+query I
+SELECT to_json(jsono('{"a":[-5,10,9999999999999]}', shredding := {'$.a':'BIGINT[]'}));
+----
+{"a":[-5,10,9999999999999]}
+
+# Empty array (length 0, not absent).
+query I
+SELECT to_json(jsono('{"a":[]}', shredding := {'$.a':'UBIGINT[]'}));
+----
+{"a":[]}
+
+# Absent array path: nothing lifted, value round-trips unchanged.
+query I
+SELECT to_json(jsono('{"x":1}', shredding := {'$.a':'UBIGINT[]'}));
+----
+{"x":1}
+
+# Path present but not an array: stays whole in the residual.
+query I
+SELECT to_json(jsono('{"a":"scalar"}', shredding := {'$.a':'UBIGINT[]'}));
+----
+{"a":"scalar"}
+
+# An explicit JSON null element: a null never fits a typed shred, so it stays as an
+# explicit null in the residual (distinct from a lifted element's placeholder, which
+# the non-NULL shred slot reconstructs over).
+query I
+SELECT to_json(jsono('{"a":[1,null,2]}', shredding := {'$.a':'UBIGINT[]'}));
+----
+{"a":[1,null,2]}
+
+# Nested array path.
+query I
+SELECT to_json(jsono('{"order":{"items":[1,2,3]}}',
+                     shredding := {'$.order.items':'UBIGINT[]'}));
+----
+{"order":{"items":[1,2,3]}}
+
+# Scalar array coexisting with a top-level scalar shred.
+query I
+SELECT to_json(jsono('{"kind":"order","goalsID":[1,2]}',
+                     shredding := {'$.kind':'VARCHAR','$.goalsID':'UBIGINT[]'}));
+----
+{"goalsID":[1,2],"kind":"order"}
+
+# ---------------------------------------------------------------------------
+# Residual skeleton: a kept (non-conforming) element reads from the skeleton; the
+# whole value fails loud when the shred is dropped (body-only residual).
+# ---------------------------------------------------------------------------
+query I
+SELECT jsono_residual(jsono('{"a":[1,"keep",2]}',
+                            shredding := {'$.a':'UBIGINT[]'})) ->> '$.a[1]';
+----
+keep
+
+statement error
+SELECT to_json(jsono_residual(jsono('{"a":[1,2,3]}',
+                                     shredding := {'$.a':'UBIGINT[]'})));
+----
+row was shredded with shred '$.a
+
+# ---------------------------------------------------------------------------
+# Reads that descend INTO a shredded scalar array ($.a[i]) reconstruct (the lifted
+# elements are stripped from the skeleton), and match a plain parse exactly.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE arr_reads AS SELECT
+  jsono('{"a":[10,20,30],"k":"v"}', shredding := {'$.a':'UBIGINT[]'}) AS s,
+  jsono('{"a":[10,20,30],"k":"v"}') AS p;
+
+query IIIIII
+SELECT (s ->> '$.a[0]')          = (p ->> '$.a[0]'),
+       (s ->> '$.a[2]')          = (p ->> '$.a[2]'),
+       (s ->> '$.a')             = (p ->> '$.a'),
+       (s -> '$.a[1]')::VARCHAR  = (p -> '$.a[1]')::VARCHAR,
+       (s ->> '$.k')             = (p ->> '$.k'),
+       jsono_type(s, '$.a[0]')   = jsono_type(p, '$.a[0]')
+FROM arr_reads;
+----
+true	true	true	true	true	true
+
+# An out-of-range index reads NULL.
+query I
+SELECT s ->> '$.a[9]' FROM arr_reads;
+----
+NULL
+
+# ---------------------------------------------------------------------------
+# jsono_entries expands each lifted element into a `<base>[i]` leaf; kept elements
+# come from the residual walk. The union matches a plain parse (compared sorted).
+# ---------------------------------------------------------------------------
+query IT
+SELECT u.key, u.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"a":[10,null,"x",20],"k":"v"}',
+                                    shredding := {'$.a':'UBIGINT[]'}))) AS u
+) ORDER BY u.key;
+----
+$.a[0]	10
+$.a[1]	NULL
+$.a[2]	x
+$.a[3]	20
+$.k	v
+
+# Same multiset as a plain parse.
+query IT
+SELECT u.key, u.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"a":[10,null,"x",20],"k":"v"}'))) AS u
+) ORDER BY u.key;
+----
+$.a[0]	10
+$.a[1]	NULL
+$.a[2]	x
+$.a[3]	20
+$.k	v
+
+# ---------------------------------------------------------------------------
+# jsono_storage_size: the lifted elements' bytes are reported as shred payload
+# (5 UBIGINT × 8 = 40), the residual skeleton carries the placeholders.
+# ---------------------------------------------------------------------------
+query I
+SELECT (jsono_storage_size(jsono('{"a":[1,2,3,4,5]}',
+                                  shredding := {'$.a':'UBIGINT[]'}))).shreds;
+----
+40
+
+# ---------------------------------------------------------------------------
+# jsono_transform over a scalar array reconstructs (the residual navigation cannot
+# see the lifted list column), matching a plain parse.
+# ---------------------------------------------------------------------------
+query I
+SELECT jsono_transform(jsono('{"goalsID":[5,6,7],"kind":"x"}',
+                             shredding := {'$.goalsID':'UBIGINT[]','$.kind':'VARCHAR'}),
+                       {g:{type:['VARCHAR'], path:'$.goalsID[*]'}, k:{type:'VARCHAR', path:'$.kind'}})::VARCHAR
+     = jsono_transform(jsono('{"goalsID":[5,6,7],"kind":"x"}'),
+                       {g:{type:['VARCHAR'], path:'$.goalsID[*]'}, k:{type:'VARCHAR', path:'$.kind'}})::VARCHAR;
+----
+true
+
+# ---------------------------------------------------------------------------
+# Merge / set-op / group_merge preserve the scalar-array shred losslessly.
+# ---------------------------------------------------------------------------
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2]}', shredding := {'$.a':'UBIGINT[]'}),
+                                 jsono('{"b":9}')));
+----
+{"a":[1,2],"b":9}
+
+statement ok
+CREATE TABLE setop AS
+  SELECT jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}) AS j
+  UNION ALL
+  SELECT jsono('{"a":[3,4],"k":"y"}', shredding := {'$.a':'UBIGINT[]'}) AS j;
+
+query I
+SELECT to_json(j) FROM setop ORDER BY to_json(j);
+----
+{"a":[1,2],"k":"x"}
+{"a":[3,4],"k":"y"}
+
+query I
+SELECT to_json(jsono_group_merge_max(j, k)) FROM (
+  SELECT jsono('{"a":[7],"k":"v"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k);
+----
+{"a":[7],"k":"v"}
+
+# ---------------------------------------------------------------------------
+# Casting a shredded-array value to the plain jsono STRUCT is a lossless reconstruct.
+# ---------------------------------------------------------------------------
+query I
+SELECT to_json(jsono('{"a":[1,2,3],"t":"x"}',
+                     shredding := {'$.a':'UBIGINT[]'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+----
+{"a":[1,2,3],"t":"x"}
+
+# Secondary form: shred an already-plain jsono value.
+query I
+SELECT to_json(jsono(jsono('{"a":[1,2,3]}'),
+                     shredding := {'$.a':'UBIGINT[]'}));
+----
+{"a":[1,2,3]}
+
+# ---------------------------------------------------------------------------
+# Multi-row over a table, including a NULL row and a row missing the array.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE rows AS
+SELECT * FROM (VALUES
+    (1, '{"goalsID":[1,2]}'),
+    (2, '{"goalsID":[]}'),
+    (3, '{"other":true}'),
+    (4, NULL)
+) AS v(id, doc);
+
+query II
+SELECT id, to_json(jsono(doc, shredding := {'$.goalsID':'UBIGINT[]'})) AS full
+FROM rows ORDER BY id;
+----
+1	{"goalsID":[1,2]}
+2	{"goalsID":[]}
+3	{"other":true}
+4	NULL
+
+# ---------------------------------------------------------------------------
+# jsono(STRUCT) auto-shred: a top-level LIST<scalar> field lifts into a scalar
+# array shred (bare name), the residual skeleton carried for reconstruct.
+# ---------------------------------------------------------------------------
+query I
+SELECT typeof(jsono({'goalsID': [1,2,3]::UBIGINT[]}))
+     = jsono_storage_type('"goalsID" UBIGINT[]');
+----
+true
+
+# A top-level LIST<UBIGINT> auto-shreds alongside a scalar field, round-trips.
+query I
+SELECT to_json(jsono({'kind': 'x', 'goalsID': [5348936,139733107]::UBIGINT[]}));
+----
+{"goalsID":[5348936,139733107],"kind":"x"}
+
+# The scalar-array shred column is the typed list, queryable directly (bare field name).
+query II
+SELECT (j."jsono"."goalsID")[1], (j."jsono"."goalsID")[2]
+FROM (SELECT jsono({'goalsID': [10,20,30]::UBIGINT[]}) AS j);
+----
+10	20
+
+# A nested LIST<scalar> one struct level deep lifts under its $.parent.items path.
+query I
+SELECT to_json(jsono({'order': {'items': [1,2,3]::UBIGINT[]}}));
+----
+{"order":{"items":[1,2,3]}}
+
+# A LIST<VARCHAR>, LIST<DOUBLE>, LIST<BOOLEAN> all auto-shred and round-trip.
+query I
+SELECT to_json(jsono({'s': ['a','b']::VARCHAR[], 'd': [1.5,2.5]::DOUBLE[], 'b': [true,false]::BOOLEAN[]}));
+----
+{"b":[true,false],"d":[1.5,2.5],"s":["a","b"]}
+
+# An empty list and a list with a NULL element both round-trip.
+query I
+SELECT to_json(jsono({'e': []::UBIGINT[], 'n': [1,NULL,2]::UBIGINT[]}));
+----
+{"e":[],"n":[1,null,2]}
+
+# ---------------------------------------------------------------------------
+# Parquet round-trip: the shred LIST<scalar> column survives storage; the value
+# reconstructs, and a descend read still reconstructs correctly.
+# ---------------------------------------------------------------------------
+require parquet
+
+statement ok
+COPY (SELECT jsono('{"goalsID":[5348936,139733107],"kind":"x"}',
+                   shredding := {'$.goalsID':'UBIGINT[]'}) AS j)
+TO '__TEST_DIR__/scalar_array.parquet' (FORMAT parquet);
+
+query III
+SELECT to_json(j), (j."jsono"."$.goalsID")[1], j ->> '$.goalsID[1]'
+FROM '__TEST_DIR__/scalar_array.parquet';
+----
+{"goalsID":[5348936,139733107],"kind":"x"}	5348936	139733107

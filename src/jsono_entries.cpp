@@ -267,6 +267,10 @@ struct EntriesWalkSink {
 	// stripped value (residual lacks the path) from a read-copy (residual keeps it). NULL when no
 	// VARCHAR shred is present, since only VARCHAR shreds store a read-copy of a non-string scalar.
 	std::unordered_set<std::string> *seen = nullptr;
+	// When set, an array-element path in it is a lifted scalar-array position — the residual carries
+	// only a VAL_NULL placeholder there, the value lives in the shred — so the walk skips it (the
+	// scalar-array shred overlay emits the real value). NULL when no scalar-array shred is present.
+	const std::unordered_set<std::string> *suppress = nullptr;
 
 	void BeginObject() {
 	}
@@ -293,6 +297,9 @@ struct EntriesWalkSink {
 		path.resize(saved);
 	}
 	void Scalar(const JsonoScalar &scalar) {
+		if (suppress && suppress->count(path)) {
+			return; // a lifted scalar-array placeholder; the shred overlay emits the real value
+		}
 		if (seen) {
 			seen->insert(path);
 		}
@@ -368,7 +375,20 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 				has_varchar_shred = has_varchar_shred || ShredPrimitiveStoresReadCopy(sub_kind);
 			}
 			break;
+		case ShredKind::ScalarArray:
+			// A scalar array lifts only conforming elements (a VARCHAR lane strips just real strings, no
+			// read-copy of non-strings), so a lifted element is never also in the residual — no dedup needed.
+			break;
 		}
+	}
+
+	// A scalar array leaves a VAL_NULL placeholder per lifted element in the residual skeleton; the
+	// generic walk would emit it as a `<base>[i]: null` leaf, duplicating the shred overlay's real
+	// value. When any scalar-array shred is present, the lifted positions are collected per row and
+	// the walk suppresses those placeholder leaves (the overlay below emits the real value).
+	bool has_scalar_array = false;
+	for (auto &lane : lanes) {
+		has_scalar_array = has_scalar_array || lane.kind == ShredKind::ScalarArray;
 	}
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
@@ -376,6 +396,8 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 	std::string path;
 	std::string shred_scratch;
 	std::unordered_set<std::string> residual_paths;
+	std::unordered_set<std::string> suppress;
+	std::string suppress_scratch;
 	EntriesSink sink(result);
 	// Zero-copy text leaves point into the input string_heap; keep its buffer alive on the
 	// value child (the reference survives the list child's Reserve/Resize grows).
@@ -393,6 +415,33 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 		if (has_varchar_shred) {
 			residual_paths.clear();
 		}
+		if (has_scalar_array) {
+			// Collect this row's lifted scalar-array positions (`<base>[i]` for each valid element slot),
+			// built with the same key/index path builders the walk uses, so the strings match exactly.
+			suppress.clear();
+			for (idx_t f = 0; f < shreds.size(); f++) {
+				auto &lane = lanes[f];
+				if (lane.kind != ShredKind::ScalarArray) {
+					continue;
+				}
+				auto list_idx = lane.fmt.sel->get_index(row);
+				if (!lane.fmt.validity.RowIsValid(list_idx)) {
+					continue;
+				}
+				auto entry = UnifiedVectorFormat::GetData<list_entry_t>(lane.fmt)[list_idx];
+				auto &element_fmt = lane.sub_fmt[0];
+				auto &base_key =
+				    style == JsonoEntriesKeyStyle::JsonPath ? shreds[f].key_jsonpath : shreds[f].key_dotted;
+				for (idx_t e = 0; e < entry.length; e++) {
+					if (!element_fmt.validity.RowIsValid(element_fmt.sel->get_index(entry.offset + e))) {
+						continue;
+					}
+					suppress_scratch.assign(base_key.begin(), base_key.end());
+					AppendIndexSegment(suppress_scratch, e, style);
+					suppress.insert(suppress_scratch);
+				}
+			}
+		}
 		if (row_state == JsonoRowState::Value) {
 			path.clear();
 			if (style == JsonoEntriesKeyStyle::JsonPath) {
@@ -402,6 +451,9 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 			EntriesWalkSink walk(path, style, sink);
 			if (has_varchar_shred) {
 				walk.seen = &residual_paths;
+			}
+			if (has_scalar_array) {
+				walk.suppress = &suppress;
 			}
 			WalkJsonoValue(view, cursor, walk, 0);
 		} else if (shreds.empty()) {
@@ -454,6 +506,27 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 						sink.AppendText(nonstd::string_view(path.data(), path.size()), false, value);
 						path.resize(saved_key);
 					}
+					path.resize(saved_index);
+				}
+				break;
+			}
+			case ShredKind::ScalarArray: {
+				// Expand each lifted element into a `<base>[i]` leaf (value = the element's text). A NULL
+				// slot is a kept element (non-conforming / null / object / array) that stays in the residual
+				// skeleton the walk already emitted, so the union matches a plain parse. The single element
+				// value lane lives at sub_fmt[0]/sub_kind[0] (see InitShredLanes).
+				auto entry = UnifiedVectorFormat::GetData<list_entry_t>(lane.fmt)[idx];
+				auto &element_fmt = lane.sub_fmt[0];
+				path.assign(base_key.begin(), base_key.end());
+				for (idx_t e = 0; e < entry.length; e++) {
+					auto element_idx = element_fmt.sel->get_index(entry.offset + e);
+					if (!element_fmt.validity.RowIsValid(element_idx)) {
+						continue;
+					}
+					auto saved_index = path.size();
+					AppendIndexSegment(path, e, style);
+					auto value = FormatShredValue(element_fmt, element_idx, lane.sub_kind[0], shred_scratch);
+					sink.AppendText(nonstd::string_view(path.data(), path.size()), false, value);
 					path.resize(saved_index);
 				}
 				break;

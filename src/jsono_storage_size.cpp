@@ -44,10 +44,10 @@ uint64_t ShredValueBytes(const UnifiedVectorFormat &fmt, ShredPrimitive kind, id
 	return 0;
 }
 
-// Payload bytes a LIST<STRUCT> array shred occupies for one row: each element struct contributes its
-// lifted subfields' scalar bytes (a NULL element struct or absent subfield is 0), summed over the
-// row's list span. Mirrors WriteArrayShred (jsono_shred.cpp), which writes one struct row per array
-// element with the lifted subfields as typed scalars.
+// Payload bytes an array shred occupies for one row, summed over the row's list span: a LIST<STRUCT>
+// element contributes its lifted subfields' scalar bytes, a LIST<scalar> element its single lifted
+// value's bytes (a NULL element / absent value is 0). Both array kinds expose their element value
+// lanes through lane.sub_fmt/sub_kind (a scalar array has one), so the per-element sum is uniform.
 uint64_t ArrayShredBytes(const ShredLane &lane, idx_t row) {
 	if (!RowIsValid(lane.fmt, row)) {
 		return 0;
@@ -67,6 +67,7 @@ uint64_t ShredLaneBytes(const ShredLane &lane, idx_t row) {
 	case ShredKind::Scalar:
 		return ShredValueBytes(lane.fmt, lane.scalar_kind, row);
 	case ShredKind::Array:
+	case ShredKind::ScalarArray:
 		return ArrayShredBytes(lane, row);
 	}
 	return 0;

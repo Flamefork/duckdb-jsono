@@ -626,6 +626,60 @@ def test_array_reader_parity(doc: dict[str, Any], schema: str) -> None:
         assert ok == "true", f"array {name} differs shredded vs plain: {text!r} schema {schema!r}"
 
 
+# Scalar-array shredding: a regular array's whole scalar elements lift into a parallel LIST<scalar>
+# column, a VAL_NULL placeholder per lifted element staying in the residual skeleton. Elements are
+# heterogeneous (scalar / null / object / nested array) so the per-element lossless gate is exercised
+# the same way the object-array test exercises subfield gates.
+scalar_array_element = st.one_of(
+    json_scalars,
+    st.dictionaries(st.sampled_from(array_subfield_names), json_scalars, min_size=0, max_size=3),
+    st.lists(st.integers(min_value=0, max_value=5), max_size=2),
+)
+scalar_array_documents = st.fixed_dictionaries({"items": st.lists(scalar_array_element, max_size=6)})
+scalar_array_shred_types = st.sampled_from(["VARCHAR[]", "BIGINT[]", "UBIGINT[]", "DOUBLE[]", "BOOLEAN[]"])
+
+
+def _scalar_descend_reads_parity(shredded: str, plain: str) -> str:
+    # Reads that descend INTO the shredded scalar array ($.items[i], and the whole $.items): the lifted
+    # elements are stripped to placeholders in the skeleton residual, so the optimizer must reconstruct
+    # rather than read the placeholder NULL.
+    reads = [f"$.items[{i}]" for i in (0, 1, 2, 9)]
+    reads.append("$.items")
+    cond = " AND ".join(f"(sj ->> '{r}') IS NOT DISTINCT FROM (pj ->> '{r}')" for r in reads)
+    return f"SELECT ({cond}) FROM (SELECT {shredded} sj, {plain} pj)"
+
+
+SCALAR_ARRAY_READER_PARITY = [
+    ("to_json", _to_json_parity),
+    ("descend_reads", _scalar_descend_reads_parity),
+    ("entries", _entries_parity),
+]
+
+
+@settings(PROPERTY_SETTINGS)
+@example(doc={"items": [1, 2, 3]}, schema="UBIGINT[]")
+@example(doc={"items": []}, schema="UBIGINT[]")
+@example(doc={"items": [1, "two", 3, None, True, -5]}, schema="UBIGINT[]")
+@example(doc={"items": ["x", 5, "z"]}, schema="VARCHAR[]")
+@example(doc={"items": [1.5, 2.0, 3]}, schema="DOUBLE[]")
+@example(doc={"items": [True, False, 1]}, schema="BOOLEAN[]")
+@example(doc={"items": [1, None, 2]}, schema="UBIGINT[]")
+@example(doc={"items": [{"id": 1}, 5, "x", None]}, schema="BIGINT[]")
+@example(doc={"items": [1e16]}, schema="DOUBLE[]")
+@given(doc=scalar_array_documents, schema=scalar_array_shred_types)
+def test_scalar_array_reader_parity(doc: dict[str, Any], schema: str) -> None:
+    # A shredded scalar-array value must read identically to a plain parse across every reader in
+    # SCALAR_ARRAY_READER_PARITY (to_json reconstruct, `->>` descend, jsono_entries leaf multiset).
+    # Fuzzes the full scalar space over heterogeneous elements (the lossless gate keeps non-conforming
+    # scalars / null / object / nested-array elements in the residual skeleton).
+    text = json_dumps(doc)
+    shredded = f"jsono({sql_literal(text)}, shredding := {{'$.items': '{schema}'}})"
+    plain = f"jsono({sql_literal(text)})"
+    for name, build_query in SCALAR_ARRAY_READER_PARITY:
+        ok = SESSION.value(build_query(shredded, plain))
+        assert ok == "true", f"scalar array {name} differs shredded vs plain: {text!r} schema {schema!r}"
+
+
 # Typed scalars for the STRUCT-input auto-shred test: each carries an explicit DuckDB type so the
 # constructor's bind sees the same eligibility it would from a read_json_auto-detected schema.
 typed_struct_scalars = st.one_of(
@@ -716,6 +770,57 @@ def test_struct_array_auto_shred_lossless(elements: list[Any]) -> None:
     }
     plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps(json_doc))}))")
     assert from_struct == plain, f"struct array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
+
+
+# Constructor (native STRUCT) auto-shred of a top-level LIST<scalar> field: the lifted array must
+# reconstruct to the same JSON as parsing the equivalent document. A DuckDB list is homogeneous and
+# typed, so each draw fixes one element type and fuzzes values plus NULL elements.
+# A binary DOUBLE from the struct constructor renders through jsono's own formatter
+# (10000000000000000.0), which legitimately differs from the JSON text a plain parse preserves
+# (1e+16) — orthogonal to shredding (a non-shredded constructor double renders the same way). The
+# auto-shred lossless property compares the lifted value against a text parse, so it fuzzes the types
+# whose text and value coincide; the DOUBLE lane's reconstruct is covered by the deterministic SQL
+# test (clean doubles) and the object-array DOUBLE-subfield property.
+scalar_list_specs = [
+    ("UBIGINT", st.integers(min_value=0, max_value=2**63)),
+    ("BIGINT", st.integers(min_value=-(2**62), max_value=2**62)),
+    ("BOOLEAN", st.booleans()),
+    ("VARCHAR", st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", max_size=6)),
+]
+
+
+@st.composite
+def scalar_list_draw(draw: Any) -> tuple[str, list[Any]]:
+    stype, element_strategy = draw(st.sampled_from(scalar_list_specs))
+    values = draw(st.lists(st.one_of(element_strategy, st.none()), max_size=5))
+    return stype, values
+
+
+def scalar_list_element_sql(value: Any, stype: str) -> str:
+    if value is None:
+        return "NULL"
+    if stype == "BOOLEAN":
+        return "true" if value else "false"
+    if stype == "VARCHAR":
+        return sql_literal(value)
+    return f"{value}::{stype}"
+
+
+@settings(PROPERTY_SETTINGS)
+@example(spec=("UBIGINT", [1, 2, None]))
+@example(spec=("UBIGINT", []))
+@example(spec=("VARCHAR", ["a", None, "b"]))
+@example(spec=("BIGINT", [-5, 10, None]))
+@given(spec=scalar_list_draw())
+def test_scalar_array_auto_shred_lossless(spec: tuple[str, list[Any]]) -> None:
+    # The type-driven auto-shred (jsono over a typed STRUCT with a LIST<scalar> field) lifts the whole
+    # array into a typed LIST<scalar> shred; whatever the values and NULL elements, the logical value
+    # must equal the plain parse of the same document.
+    stype, values = spec
+    list_sql = "[" + ", ".join(scalar_list_element_sql(v, stype) for v in values) + f"]::{stype}[]"
+    from_struct = SESSION.value(f"to_json(jsono({{'goalsID': {list_sql}}}))")
+    plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps({'goalsID': values}))}))")
+    assert from_struct == plain, f"scalar array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
 
 
 @settings(VALIDISH_PROPERTY_SETTINGS)

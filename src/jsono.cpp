@@ -133,7 +133,7 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 			value_complete_index = i;
 			continue;
 		}
-		if (!IsShredValueType(fields[i].second) && !IsShredArrayType(fields[i].second)) {
+		if (!IsShredValueType(fields[i].second) && !IsShredListType(fields[i].second)) {
 			return false;
 		}
 		shreds.push_back(fields[i]);

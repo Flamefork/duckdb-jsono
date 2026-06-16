@@ -3,6 +3,7 @@
 #include "jsono_locate.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_shred.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
 #include "jsono_writer.hpp"
@@ -711,8 +712,24 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 	// from its name.
 	bind_data->spec = spec_value.ToString();
 	auto &input_type = arguments[0]->return_type;
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_transform", false);
+	// An array shred (object or scalar) strips values out of the residual into a list column the
+	// transform's residual navigation cannot see, so a shredded value carrying one is reconstructed
+	// whole (scalar shreds in it fold back through the same reconstruct). A scalar-only shred set keeps
+	// the native residual-first / shred-fallback fast path via AssignShreddedShreds.
+	bool reconstruct_shredded = false;
 	if (IsShreddedJsonoType(input_type)) {
+		JsonoLayoutType layout;
+		TryParseJsonoLayoutType(input_type, layout);
+		for (auto &shred : layout.shreds) {
+			if (IsShredListType(shred.second)) {
+				reconstruct_shredded = true;
+				break;
+			}
+		}
+	}
+	bound_function.arguments[0] =
+	    JsonoResolveJsonoArgument(context, *arguments[0], "jsono_transform", reconstruct_shredded);
+	if (IsShreddedJsonoType(input_type) && !reconstruct_shredded) {
 		AssignShreddedShreds(*bind_data, input_type);
 	}
 	idx_t scalar_fields = 0;

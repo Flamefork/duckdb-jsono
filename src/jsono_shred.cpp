@@ -58,13 +58,16 @@ struct ShredArraySubfield {
 struct ShredField {
 	string path_name; // canonical path; also the shred struct field name
 	vector<PathStep> steps;
-	LogicalType logical_type; // the shred column type (scalar, or LIST<STRUCT> for an array shred)
-	// Scalar shred (is_array == false): one leaf scalar lifted at `steps`. Array shred
-	// (is_array == true): `steps` addresses a regular array; `subfields` are the element leaves
-	// lifted into a parallel LIST<STRUCT> column, the element tail staying in the residual.
-	bool is_array = false;
-	ShredPrimitive primitive;             // valid when !is_array
-	vector<ShredArraySubfield> subfields; // valid when is_array, element-struct order
+	LogicalType logical_type; // the shred column type (scalar, LIST<STRUCT>, or LIST<scalar>)
+	// kind == Scalar: one leaf scalar lifted at `steps` (use `primitive`). kind == Array: `steps`
+	// addresses a regular array; `subfields` are the element leaves lifted into a parallel LIST<STRUCT>
+	// column. kind == ScalarArray: `steps` addresses a regular array; each whole scalar element lifts
+	// into a parallel LIST<element_type> column (use `element_type`/`element_primitive`).
+	ShredKind kind = ShredKind::Scalar;
+	ShredPrimitive primitive;             // valid when kind == Scalar
+	vector<ShredArraySubfield> subfields; // valid when kind == Array, element-struct order
+	LogicalType element_type;             // valid when kind == ScalarArray
+	ShredPrimitive element_primitive;     // valid when kind == ScalarArray
 };
 
 struct ShredBindData : public FunctionData {
@@ -168,7 +171,7 @@ void BindShredFieldType(const string &type_name, ClientContext &context, const s
 	}
 	field.logical_type = type;
 	if (TypeToShredPrimitive(type, field.primitive)) {
-		field.is_array = false;
+		field.kind = ShredKind::Scalar;
 		return;
 	}
 	if (IsShredArrayType(type)) {
@@ -177,7 +180,7 @@ void BindShredFieldType(const string &type_name, ClientContext &context, const s
 			                      "(no array index or wildcard)",
 			                      path);
 		}
-		field.is_array = true;
+		field.kind = ShredKind::Array;
 		auto &element = ListType::GetChildType(type);
 		for (auto &sub : StructType::GetChildTypes(element)) {
 			ShredArraySubfield subfield;
@@ -186,6 +189,17 @@ void BindShredFieldType(const string &type_name, ClientContext &context, const s
 			TypeToShredPrimitive(sub.second, subfield.primitive);
 			field.subfields.push_back(std::move(subfield));
 		}
+		return;
+	}
+	if (IsShredScalarArrayType(type)) {
+		if (!IsObjectKeyPath(field.steps)) {
+			throw BinderException("jsono shred: array shred '%s' must address an array by an object-key path "
+			                      "(no array index or wildcard)",
+			                      path);
+		}
+		field.kind = ShredKind::ScalarArray;
+		field.element_type = ListType::GetChildType(type);
+		TypeToShredPrimitive(field.element_type, field.element_primitive);
 		return;
 	}
 	throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
@@ -248,9 +262,9 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 	bind_data->trie.emplace_back();
 	for (idx_t f = 0; f < bind_data->fields.size(); f++) {
 		auto &field = bind_data->fields[f];
-		if (field.is_array) {
-			// Array shreds extract per element from the parsed value (the two-pass plain shred path);
-			// the one-pass text DOM writer's trie addresses object-key scalar leaves only.
+		if (field.kind != ShredKind::Scalar) {
+			// Array shreds (object or scalar) extract per element from the parsed value (the two-pass
+			// plain shred path); the one-pass text DOM writer's trie addresses object-key scalar leaves only.
 			bind_data->one_pass_text = false;
 			continue;
 		}
@@ -314,14 +328,14 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 		// paths extract from that residual. A plain value takes the plain shred path.
 		bool involves_array = false;
 		for (auto &field : bind_data->fields) {
-			if (field.is_array) {
+			if (field.kind != ShredKind::Scalar) {
 				involves_array = true;
 				break;
 			}
 		}
 		if (!involves_array) {
 			for (auto &shred : src_layout.shreds) {
-				if (IsShredArrayType(shred.second)) {
+				if (IsShredListType(shred.second)) {
 					involves_array = true;
 					break;
 				}
@@ -503,6 +517,86 @@ bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Locat
 	return stripped_any;
 }
 
+// Write one fitting scalar into a flat shred vector at `idx`. The caller has already checked the
+// value fits `primitive` (JsonoScalarFitsShredType), so this strips the value into the typed column
+// unconditionally — unlike WriteShred, a scalar-array element NEVER keeps a VARCHAR read-copy of a
+// non-string: the shred-slot validity disambiguates a lifted element from a kept one, so writing a
+// read-copy would make a non-conforming element look lifted on reconstruct.
+void WriteFittingScalarElement(Vector &out, idx_t idx, const JsonoScalar &scalar, ShredPrimitive primitive,
+                               std::string &scratch) {
+	FlatVector::Validity(out).SetValid(idx);
+	switch (primitive) {
+	case ShredPrimitive::Varchar:
+		scratch.clear();
+		RenderExtractText(scalar, scratch); // a real JSON string renders its content (fits == String)
+		FlatVector::GetData<string_t>(out)[idx] = StringVector::AddString(out, scratch.data(), scratch.size());
+		return;
+	case ShredPrimitive::Bigint:
+		FlatVector::GetData<int64_t>(out)[idx] = scalar.int_value;
+		return;
+	case ShredPrimitive::Ubigint:
+		FlatVector::GetData<uint64_t>(out)[idx] =
+		    scalar.kind == JsonoScalarKind::UInt64 ? scalar.uint_value : uint64_t(scalar.int_value);
+		return;
+	case ShredPrimitive::Double:
+		FlatVector::GetData<double>(out)[idx] = scalar.double_value;
+		return;
+	case ShredPrimitive::Boolean:
+		FlatVector::GetData<bool>(out)[idx] = scalar.bool_value;
+		return;
+	}
+}
+
+// Write the LIST<scalar> shred column for one row's array at `location` and return whether any
+// element was losslessly lifted (so the manifest must list the array path). A missing path, a
+// non-array value, or an absent location writes a NULL list (the value stays whole in the residual).
+// Each array element becomes one list slot: a scalar that fits the lane type is written typed and
+// reported lifted; a non-conforming scalar, a null/object/array element, or a type mismatch writes a
+// NULL slot and stays verbatim in the residual skeleton. The skeleton emit (jsono_merge.cpp) drops
+// exactly the elements lifted here, since both gate on JsonoScalarFitsShredType.
+bool WriteScalarArrayShred(const ShredField &field, const JsonoView &view, const Location &location, Vector &list_vec,
+                           idx_t row, std::string &scratch) {
+	if (!location.found || SlotTag(view.SlotAt(location.cursor.pos)) != tag::ARR_START) {
+		SetListRowNull(list_vec, row);
+		return false;
+	}
+	auto end_pos = ReadArrayEndPos(view, location.cursor.pos);
+	JsonoCursor first = location.cursor;
+	first.pos++; // ARR_START consumes no stream entries, so the stream cursors are the first element's
+	idx_t element_count = 0;
+	for (JsonoCursor walk = first; walk.pos < end_pos;) {
+		SkipValueFast(view, walk);
+		element_count++;
+	}
+	auto start = ListVector::GetListSize(list_vec);
+	EnsureListCapacity(list_vec, start + element_count);
+	auto &child_vec = ListVector::GetEntry(list_vec);
+	child_vec.SetVectorType(VectorType::FLAT_VECTOR);
+	bool stripped_any = false;
+	JsonoCursor elem = first;
+	for (idx_t i = 0; i < element_count; i++) {
+		idx_t child = start + i;
+		auto value_tag = SlotTag(view.SlotAt(elem.pos));
+		bool lifted = false;
+		if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
+			JsonoCursor probe = elem;
+			auto scalar = DecodeScalarAt(view, probe);
+			if (JsonoScalarFitsShredType(scalar, field.element_type)) {
+				WriteFittingScalarElement(child_vec, child, scalar, field.element_primitive, scratch);
+				lifted = true;
+			}
+		}
+		if (!lifted) {
+			// Kept verbatim in the residual skeleton: a NULL slot disambiguates it from a lifted element.
+			FlatVector::SetNull(child_vec, child, true);
+		}
+		stripped_any = stripped_any || lifted;
+		SkipValueFast(view, elem);
+	}
+	FinishListRow(list_vec, row, start, element_count);
+	return stripped_any;
+}
+
 void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &fields, Vector &result,
                       ShredLocalState &lstate) {
 	// The input is plain JSONO, which never carries a manifest of its own: the reader fails
@@ -540,20 +634,26 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
 	}
 
-	// Array shred specs (path + element subfields), built once for the residual skeleton emit. The
-	// skeleton emit strips, per array element, exactly the subfields WriteArrayShred reports
-	// strippable (both gate on JsonoScalarFitsShredType), keeping the array as the position carrier.
+	// Array shred specs (path + lifted-element description), built once for the residual skeleton
+	// emit. The skeleton emit strips, per array element, exactly what the WriteArrayShred /
+	// WriteScalarArrayShred pass reports lifted (both gate on JsonoScalarFitsShredType), keeping the
+	// array as the position carrier.
 	bool has_array = false;
 	vector<JsonoArrayShredSpec> array_specs;
 	for (auto &field : fields) {
-		if (!field.is_array) {
+		if (field.kind == ShredKind::Scalar) {
 			continue;
 		}
 		has_array = true;
 		JsonoArrayShredSpec spec;
 		spec.path = field.steps;
-		for (auto &sub : field.subfields) {
-			spec.subfields.emplace_back(sub.name, sub.logical_type);
+		spec.kind = field.kind;
+		if (field.kind == ShredKind::ScalarArray) {
+			spec.element_type = field.element_type;
+		} else {
+			for (auto &sub : field.subfields) {
+				spec.subfields.emplace_back(sub.name, sub.logical_type);
+			}
 		}
 		array_specs.push_back(std::move(spec));
 	}
@@ -580,10 +680,13 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		for (idx_t f = 0; f < fields.size(); f++) {
 			auto &field = fields[f];
 			auto location = LocatePath(view, field.steps);
-			if (field.is_array) {
-				// Array shreds never set the value-complete marker: a per-element subfield diversion
-				// has no bare-struct_extract fast path to invalidate (the array is reconstructed).
-				if (WriteArrayShred(field, view, location, *shred_children[f], row, lstate.text)) {
+			if (field.kind != ShredKind::Scalar) {
+				// Array shreds never set the value-complete marker: a per-element diversion has no
+				// bare-struct_extract fast path to invalidate (the array is always reconstructed).
+				bool stripped = field.kind == ShredKind::ScalarArray
+				                    ? WriteScalarArrayShred(field, view, location, *shred_children[f], row, lstate.text)
+				                    : WriteArrayShred(field, view, location, *shred_children[f], row, lstate.text);
+				if (stripped) {
 					stripped_fields.push_back(f);
 				}
 				continue;
@@ -1023,6 +1126,9 @@ ShredKind ClassifyShredKind(const LogicalType &type) {
 	if (IsShredArrayType(type)) {
 		return ShredKind::Array;
 	}
+	if (IsShredScalarArrayType(type)) {
+		return ShredKind::ScalarArray;
+	}
 	throw InternalException("jsono: shred column type '%s' is neither a scalar nor an array shred", type.ToString());
 }
 
@@ -1050,6 +1156,17 @@ bool IsShredArrayType(const LogicalType &type) {
 		}
 	}
 	return true;
+}
+
+bool IsShredScalarArrayType(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::LIST) {
+		return false;
+	}
+	return IsShredValueType(ListType::GetChildType(type));
+}
+
+bool IsShredListType(const LogicalType &type) {
+	return IsShredArrayType(type) || IsShredScalarArrayType(type);
 }
 
 bool JsonoScalarFitsShredType(const jsono::JsonoScalar &scalar, const LogicalType &type) {
@@ -1098,9 +1215,9 @@ void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<strin
 		field.steps = ParseShredFieldPath(shred.first);
 		field.logical_type = shred.second;
 		if (TypeToShredPrimitive(shred.second, field.primitive)) {
-			field.is_array = false;
+			field.kind = ShredKind::Scalar;
 		} else if (IsShredArrayType(shred.second)) {
-			field.is_array = true;
+			field.kind = ShredKind::Array;
 			auto &element = ListType::GetChildType(shred.second);
 			for (auto &sub : StructType::GetChildTypes(element)) {
 				ShredArraySubfield subfield;
@@ -1109,6 +1226,10 @@ void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<strin
 				TypeToShredPrimitive(sub.second, subfield.primitive);
 				field.subfields.push_back(std::move(subfield));
 			}
+		} else if (IsShredScalarArrayType(shred.second)) {
+			field.kind = ShredKind::ScalarArray;
+			field.element_type = ListType::GetChildType(shred.second);
+			TypeToShredPrimitive(field.element_type, field.element_primitive);
 		} else {
 			throw InternalException("jsono shred field '%s' has a non-shred type", shred.first);
 		}

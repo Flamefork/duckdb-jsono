@@ -251,13 +251,14 @@ bool PathStepsObjectKeyPrefix(const vector<PathStep> &prefix, const vector<PathS
 	return true;
 }
 
-// True if `read` descends INTO an array shred — the shred's pure-key path is a strict prefix of
-// `read` (e.g. read `$.products[0].category` for the array shred `$.products`), whatever follows
-// (an `[index]` then a subfield). The residual carries only the skeleton array — the lifted element
-// subfields are stripped — so such a read cannot be served from the residual and must reconstruct.
+// True if `read` descends INTO an array shred (object array or scalar array) — the shred's pure-key
+// path is a strict prefix of `read` (e.g. read `$.products[0].category` for the array shred
+// `$.products`, or `$.goalsID[0]` for the scalar array `$.goalsID`), whatever follows. The residual
+// carries only the skeleton array — the lifted element subfields / scalars are stripped — so such a
+// read cannot be served from the residual and must reconstruct.
 bool ReadDescendsIntoArrayShred(const LogicalType &shred_type, const vector<PathStep> &shred_steps,
                                 const vector<PathStep> &read) {
-	if (!IsShredArrayType(shred_type) || shred_steps.size() >= read.size()) {
+	if (!IsShredListType(shred_type) || shred_steps.size() >= read.size()) {
 		return false;
 	}
 	for (idx_t i = 0; i < shred_steps.size(); i++) {
@@ -1707,13 +1708,13 @@ private:
 		}
 		for (auto &shred : CollectShreddedShreds(shredded_cast.child->return_type)) {
 			if (PathStepsEqual(shred.steps, steps)) {
-				if (string_fn && !IsShredArrayType(shred.type)) {
+				if (string_fn && !IsShredListType(shred.type)) {
 					auto alias = expr.GetAlias();
 					return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
 				}
-				// A json-valued extract, or an array shred (whose LIST<STRUCT> column is not the JSON
-				// array text a `->>` expects): reconstruct and extract natively (jsono's renderer),
-				// not core json's `->>`, so numbers/escapes match to_json.
+				// A json-valued extract, or an array shred (whose LIST<STRUCT>/LIST<scalar> column is
+				// not the JSON array text a `->>` expects): reconstruct and extract natively (jsono's
+				// renderer), not core json's `->>`, so numbers/escapes match to_json.
 				return MakeReconstructExtract(expr, shredded_cast, string_fn);
 			}
 			// A read of a subtree holding a stripped shred leaf would miss it in the
@@ -2021,12 +2022,12 @@ private:
 	// overlay is skipped.
 	unique_ptr<Expression> ReconstructShreddedToJson(unique_ptr<Expression> column) {
 		auto shreds = CollectShreddedShreds(column->return_type);
-		// An array shred (LIST<STRUCT>) leaves a skeleton array in the residual; the object-key patch
-		// overlay below is residual-authoritative, so it would keep the skeleton and ignore the shred.
-		// Reconstruct the full plain value via the array-aware reconstruct cast, then serialize that
-		// (the cast propagates a NULL value through to a NULL JSON, so no struct_pack NULL guard).
+		// An array shred (LIST<STRUCT> or LIST<scalar>) leaves a skeleton array in the residual; the
+		// object-key patch overlay below is residual-authoritative, so it would keep the skeleton and
+		// ignore the shred. Reconstruct the full plain value via the array-aware reconstruct cast, then
+		// serialize that (the cast propagates a NULL value through to a NULL JSON, so no struct_pack guard).
 		for (auto &shred : shreds) {
-			if (IsShredArrayType(shred.type)) {
+			if (IsShredListType(shred.type)) {
 				auto alias = column->GetAlias();
 				auto plain = BoundCastExpression::AddCastToType(context, std::move(column), JsonoType());
 				auto json = BoundCastExpression::AddCastToType(context, std::move(plain), LogicalType::JSON());

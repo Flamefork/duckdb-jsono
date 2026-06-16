@@ -1224,10 +1224,11 @@ void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix
 			}
 			continue;
 		}
-		// A regular array of fixed-shape objects (LIST<STRUCT<scalars>>) lifts its element subfields
-		// into a parallel LIST<STRUCT> shred, leaving a skeleton array in the residual. Lifted at the
-		// top level by bare name and one struct level deep under `$.parent.items`, like a scalar leaf.
-		if (IsShredArrayType(child.second)) {
+		// A regular array shred — fixed-shape objects (LIST<STRUCT<scalars>>) lifting their element
+		// subfields, or scalars (LIST<UBIGINT>, LIST<VARCHAR>, …) lifting each whole element — into a
+		// parallel typed list shred, leaving a skeleton array in the residual. Lifted at the top level
+		// by bare name and one struct level deep under `$.parent.items`, like a scalar leaf.
+		if (IsShredListType(child.second)) {
 			if (top_level) {
 				shreds.emplace_back(child.first, child.second);
 			} else {
@@ -1305,10 +1306,10 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 
 		bind_data->one_pass_shred = true;
 		for (auto &shred : bind_data->shreds) {
-			// A nested-path scalar ($-prefixed) or an array shred (LIST<STRUCT>) cannot use the
-			// scalar direct-copy one-pass writer; route through the materialize-then-shred fallback,
-			// which extracts element subfields and builds the skeleton array via JsonoShredFromSpec.
-			if ((!shred.first.empty() && shred.first[0] == '$') || IsShredArrayType(shred.second)) {
+			// A nested-path scalar ($-prefixed) or an array shred (LIST<STRUCT> / LIST<scalar>) cannot
+			// use the scalar direct-copy one-pass writer; route through the materialize-then-shred
+			// fallback, which lifts the array elements and builds the skeleton via JsonoShredFromSpec.
+			if ((!shred.first.empty() && shred.first[0] == '$') || IsShredListType(shred.second)) {
 				bind_data->one_pass_shred = false;
 				break;
 			}

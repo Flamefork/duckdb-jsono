@@ -91,8 +91,10 @@ re-encode it differently — stays in the residual, and its shred is a redundant
 read copy. Pure object-key scalar paths that round-trip through their shred type
 are removed from the residual; array-index paths and non-lossless shred values
 stay in the residual. A whole regular array is a separate case — see
-[Array shreds](#array-shreds-liststruct), which lift element subfields while
-leaving a skeleton array in the residual.
+[Array shreds](#array-shreds-liststruct), which lift element subfields (object
+arrays) or whole scalar elements
+([scalar arrays](#scalar-array-shreds-listtype)) while leaving a skeleton array in
+the residual.
 
 The original value is recovered by overlaying the shreds onto the residual,
 **residual-authoritative**: a path absent from the residual is filled from its
@@ -172,6 +174,54 @@ DuckDB/Parquet column beside `body`, not part of the blob, so no `version` bump
 is needed; an old reader lacking array-shred support rejects the unknown
 `LIST<STRUCT>` sibling at bind or fails loud on the manifest rather than
 silently dropping data.
+
+### Scalar array shreds (`LIST<TYPE>`)
+
+A shred type may be a `LIST<TYPE>` whose element `TYPE` is one of the five scalar
+shred types (`LIST<UBIGINT>`, `LIST<VARCHAR>`, `LIST<DOUBLE>`, `LIST<BIGINT>`,
+`LIST<BOOLEAN>`). Such a *scalar array shred* lifts each whole scalar element of a
+regular array — addressed by an object-key path like `$.goalsID`, not
+`$.goalsID[*]` — into one parallel typed `LIST<TYPE>` column
+(`jsono(value, shredding := {'$.goalsID': 'UBIGINT[]'})`, or the `jsono(STRUCT)`
+auto-shred of a top-level `LIST<scalar>` field). It is the strictly simpler case of
+the object array above: the element is a scalar, not a struct, so there are no
+per-element subfields to overlay — each element is either *lifted* whole or *kept*
+whole.
+
+Like the object array, the array is **not** removed from the residual: it stays as
+a *skeleton array* the same length as the source, carrying length, element order
+and every non-lifted element verbatim. An element is lifted only if it round-trips
+losslessly through the lane type — the same per-scalar
+[lossless gate](#shredded-layout) as an object-key shred, applied to each element —
+so a string in a `UBIGINT[]` lane, an explicit JSON `null`, a number in a
+`VARCHAR[]` lane, an object or a nested array all stay verbatim, element-wise.
+
+Where an object array leaves the element object in place minus its lifted subfields,
+a scalar array has no sub-structure to keep, so a lifted element leaves a **`VAL_NULL`
+placeholder** in the skeleton (one slot, no stream entry — the value's bytes move
+into the typed `LIST` column, which is the storage win). The parallel shred `LIST`
+has exactly one slot per skeleton element (its length equals the skeleton array
+length, authoritative — a different length is a corrupt row and fails loud), and the
+slot's *validity* is what disambiguates the two element states on reconstruction:
+
+- a **non-`NULL` shred slot** is a lifted element — its `VAL_NULL` placeholder in the
+  skeleton is ignored and the typed value is emitted from the shred;
+- a **`NULL` shred slot** is a kept element — the skeleton value (which may itself be
+  an explicit JSON `null`, a non-conforming scalar, an object or an array) is emitted
+  verbatim.
+
+So a lifted element's placeholder `VAL_NULL` and an explicit JSON `null` element are
+never confused: the former always pairs with a non-`NULL` shred slot, the latter
+always with a `NULL` one. A `VARCHAR[]` lane stores no read-copy — it lifts (and so
+marks its slot non-`NULL`) only a real JSON string — keeping that invariant exact.
+
+The manifest lists the array's object-key path with its `LIST<TYPE>` type string when
+at least one element was lifted, exactly as for the other shreds, so a raw cast that
+drops or retypes the scalar array shred is caught the same way (the placeholders are
+missing their values and the residual alone cannot reproduce them). The binary blob
+format is unchanged — `VAL_NULL` is an existing slot tag and the manifest reuses the
+same framing — so no `version` bump is needed; the shred `LIST<TYPE>` is a
+DuckDB/Parquet column beside `body`.
 
 ## Compatibility policy
 
