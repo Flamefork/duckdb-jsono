@@ -2057,18 +2057,35 @@ private:
 	// overlay is skipped.
 	unique_ptr<Expression> ReconstructShreddedToJson(unique_ptr<Expression> column) {
 		auto shreds = CollectShreddedShreds(column->return_type);
-		// An array shred (LIST<STRUCT> or LIST<scalar>) leaves a skeleton array in the residual; the
-		// object-key patch overlay below is residual-authoritative, so it would keep the skeleton and
-		// ignore the shred. Reconstruct the full plain value via the array-aware reconstruct cast, then
-		// serialize that (the cast propagates a NULL value through to a NULL JSON, so no struct_pack guard).
-		for (auto &shred : shreds) {
-			if (IsShredListType(shred.type)) {
-				auto alias = column->GetAlias();
-				auto plain = BoundCastExpression::AddCastToType(context, std::move(column), JsonoType());
-				auto json = BoundCastExpression::AddCastToType(context, std::move(plain), LogicalType::JSON());
-				json->SetAlias(alias);
-				return json;
+		// The struct_pack patch overlay below cannot represent two shred shapes, so fall back to the
+		// array-aware reconstruct cast (which applies each shred as an independent residual-authoritative
+		// overlay and so handles both): (1) an array shred (LIST<STRUCT>/LIST<scalar>) leaves a skeleton
+		// array in the residual the object-key patch would keep verbatim; (2) two object-key paths where
+		// one STRICTLY prefixes another (a scalar `a` and a nested `$.a.a`) — a patch node would be both a
+		// leaf and a group, so building the tree would silently drop the shorter shred. Equal-length
+		// overlapping paths (the duplicate-path spec `a` and `$.a`) are NOT a problem: they collapse to
+		// one patch node, which is the intended dedup. The cast propagates a NULL value through to a NULL
+		// JSON, so no struct_pack guard is needed.
+		bool needs_full_reconstruct = false;
+		for (idx_t i = 0; i < shreds.size() && !needs_full_reconstruct; i++) {
+			if (IsShredListType(shreds[i].type)) {
+				needs_full_reconstruct = true;
+				break;
 			}
+			for (idx_t j = i + 1; j < shreds.size(); j++) {
+				if (shreds[i].steps.size() != shreds[j].steps.size() &&
+				    ShredPathsOverlap(shreds[i].steps, shreds[j].steps)) {
+					needs_full_reconstruct = true;
+					break;
+				}
+			}
+		}
+		if (needs_full_reconstruct) {
+			auto alias = column->GetAlias();
+			auto plain = BoundCastExpression::AddCastToType(context, std::move(column), JsonoType());
+			auto json = BoundCastExpression::AddCastToType(context, std::move(plain), LogicalType::JSON());
+			json->SetAlias(alias);
+			return json;
 		}
 		ShredPatchNode root;
 		for (auto &shred : shreds) {

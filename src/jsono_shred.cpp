@@ -1190,6 +1190,16 @@ bool JsonoScalarFitsShredType(const jsono::JsonoScalar &scalar, const LogicalTyp
 	}
 }
 
+bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b) {
+	idx_t common = std::min(a.size(), b.size());
+	for (idx_t i = 0; i < common; i++) {
+		if (a[i].kind != PathStepKind::Key || b[i].kind != PathStepKind::Key || a[i].key != b[i].key) {
+			return false;
+		}
+	}
+	return true;
+}
+
 std::string JsonoShredManifestEntry(const string &path, const LogicalType &type) {
 	std::string entry;
 	auto append_lv = [&](const string &text) {

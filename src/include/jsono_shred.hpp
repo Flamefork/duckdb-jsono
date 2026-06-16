@@ -94,6 +94,14 @@ struct JsonoArrayShredSpec {
 	LogicalType element_type;                         // kind == ScalarArray
 };
 
+// True if two shred paths overlap structurally: every step they share is the same object key, so
+// one is a prefix of (or equal to) the other (e.g. `a` and `$.a.a`, or `a` and `$.a`). Such a pair
+// is a sparse multi-shape layout (one row populates at most one lane), not an error — but the
+// whole-value to_json overlay cannot pack both into one patch tree (a node would be both a leaf and
+// a group), so that reader falls back to the independent-overlay reconstruct. Index/wildcard steps
+// never match (they cannot form the scalar-vs-nested overlap).
+bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b);
+
 // Serialized shred-manifest entry bytes for one shred (u16 path_len, path, u16 type_len,
 // type name); a row's manifest is a u32 entry count followed by the entries of the paths
 // stripped from that row's residual.

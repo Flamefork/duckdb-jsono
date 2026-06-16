@@ -612,36 +612,33 @@ def struct_literal_sql(value: Any) -> str:
     raise ValueError(f"unsupported struct literal value: {value!r}")
 
 
-# Keys are partitioned so a key is consistently scalar OR consistently a one-level object: scalar
-# keys (a/b/c) always carry scalars (top-level or nested leaves), object keys (p/q) always carry a
-# flat object of scalar keys. This keeps the merged shred set free of prefix-overlapping paths (a
-# scalar `a` AND a nested `$.a.x`), which is a separate pre-existing reshred gap, not H3's domain.
-merge_patch_scalar_key = st.sampled_from(["a", "b", "c"])
-merge_patch_object_key = st.sampled_from(["p", "q"])
+# A key may be a scalar in one patch and a one-level object in another, drawn from one shared pool:
+# this exercises scalar↔object transitions, where the merged shred set acquires prefix-overlapping
+# paths (a scalar `a` AND a nested `$.a.x`) — a valid sparse multi-shape layout. The to_json overlay
+# reconstructs such overlapping paths via the independent-overlay fallback, so the shredded fold must
+# still agree with the plain RFC 7396 reference.
+merge_patch_struct_key = st.sampled_from(["a", "b", "c"])
 merge_patch_struct_scalars = st.one_of(st.booleans(), st.integers(min_value=-100, max_value=100), st.text(max_size=4))
 merge_patch_struct_patch = st.dictionaries(
-    st.one_of(merge_patch_scalar_key, merge_patch_object_key),
+    merge_patch_struct_key,
     st.one_of(
         merge_patch_struct_scalars,
-        st.dictionaries(merge_patch_scalar_key, merge_patch_struct_scalars, min_size=1, max_size=3),
+        st.dictionaries(merge_patch_struct_key, merge_patch_struct_scalars, min_size=1, max_size=3),
     ),
     min_size=1,
     max_size=4,
-).filter(
-    # Enforce the partition: a scalar key never holds an object, an object key always does.
-    lambda patch: all((isinstance(value, dict)) == (key in ("p", "q")) for key, value in patch.items())
 )
 
 
 @settings(PROPERTY_SETTINGS)
-@example(base={"a": 1}, patches=[{"p": {"a": 1, "b": 2}}], spec_keys=["a"])  # disjoint nested add
-@example(base={"a": 1}, patches=[{"p": {"a": 1}}, {"a": 9}], spec_keys=["a"])  # nested + top-level lane
-@example(base={"a": 1}, patches=[{"p": {"a": 1}}, {"p": {"a": 2}}], spec_keys=["a"])  # nested collision
-@example(base={"a": 1}, patches=[{"p": {"a": 1}}, {"q": {"b": 3}}], spec_keys=["a"])  # two nested parents
+@example(base={"a": 1}, patches=[{"a": {"a": 1, "b": 2}}], spec_keys=["a"])  # disjoint nested add
+@example(base={"a": 1}, patches=[{"a": {"a": 1}}, {"a": 9}], spec_keys=["a"])  # nested then top-level lane
+@example(base={"a": 1}, patches=[{"a": {"a": 1}}, {"a": {"a": 2}}], spec_keys=["a"])  # nested collision
+@example(base={"a": None}, patches=[{"a": {"a": False}}, {"a": False}], spec_keys=["a"])  # scalar↔object↔scalar
 @given(
     base=merge_patch_base,
     patches=st.lists(merge_patch_struct_patch, min_size=1, max_size=3),
-    spec_keys=st.lists(merge_patch_scalar_key, min_size=1, max_size=3, unique=True),
+    spec_keys=st.lists(merge_patch_struct_key, min_size=1, max_size=3, unique=True),
 )
 def test_merge_patch_auto_shred_patch_parity(
     base: dict[str, Any], patches: list[dict[str, Any]], spec_keys: list[str]

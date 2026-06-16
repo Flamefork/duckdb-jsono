@@ -1,0 +1,122 @@
+# name: test/sql/jsono_shredded_overlap.test
+# description: shredded jsono with prefix-overlapping shred paths (a scalar `a` AND a nested `$.a.a`)
+# group: [sql]
+
+require jsono
+
+# Reconstruction rides core json's to_json(ANY) / ::JSON.
+require json
+
+require parquet
+
+# A shred set where one path prefixes another is a sparse multi-shape layout, NOT an error: a row
+# whose `a` is a scalar populates the `a` lane, a row whose `a` is an object populates the `$.a.a`
+# lane, and at most one applies per row. The whole-value to_json overlay cannot pack both lanes into
+# one struct_pack patch tree, so it falls back to the independent-overlay reconstruct — which must
+# rebuild the exact original value.
+
+# Scalar at the overlapping key: the `a` lane carries it, `$.a.a` is absent. to_json and ::JSON agree.
+query II
+SELECT to_json(j), j::JSON::VARCHAR
+FROM (SELECT jsono('{"a":false}', shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN'}) AS j);
+----
+{"a":false}	{"a":false}
+
+# Object at the overlapping key: the nested `$.a.a` lane carries the leaf, `a` is absent.
+query I
+SELECT to_json(jsono('{"a":{"a":true}}', shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN'}));
+----
+{"a":{"a":true}}
+
+# Per-path extracts read each lane independently (no patch-tree collision): a scalar row reads the
+# `a` lane and a NULL nested leaf; an object row reads the object text at `a` and the nested leaf.
+query IIII
+SELECT s ->> 'a', s ->> '$.a.a', o ->> 'a', o ->> '$.a.a'
+FROM (
+  SELECT jsono('{"a":false}', shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN'}) AS s,
+         jsono('{"a":{"a":true}}', shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN'}) AS o
+);
+----
+false	NULL	{"a":true}	true
+
+# jsono_type / jsono_keys / jsono_entries over the overlapping type match the plain value.
+query III
+SELECT jsono_type(j), jsono_keys(j), to_json(jsono_entries(j))
+FROM (SELECT jsono('{"a":false,"b":1}', shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN','b':'BIGINT'}) AS j);
+----
+OBJECT	[a, b]	[{"key":"$.a","value":"false"},{"key":"$.b","value":"1"}]
+
+# The type carries BOTH lanes (it is not silently reduced to plain): a value shredded on the
+# overlapping spec is exactly the type jsono_storage_type builds from the same shreds.
+query I
+SELECT typeof(jsono('{"a":false}', shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN','b':'BIGINT'}))
+     = jsono_storage_type('a BOOLEAN, "$.a.a" BOOLEAN, b BIGINT');
+----
+true
+
+# Vector-scale sparse layout: one column holds scalar-`a` rows, object-`a` rows, an absent-`a` row,
+# and a NULL row, all reconstructing to their original value.
+statement ok
+CREATE TABLE overlap AS
+SELECT * FROM (VALUES
+    (1, '{"a":false,"b":1}'),
+    (2, '{"a":{"a":true},"b":2}'),
+    (3, '{"b":3}'),
+    (4, NULL)
+) AS v(id, doc);
+
+query ITTT
+SELECT id,
+       to_json(jsono(doc, shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN','b':'BIGINT'})) AS full,
+       jsono(doc, shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN','b':'BIGINT'}) ->> 'a' AS top_a,
+       jsono(doc, shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN','b':'BIGINT'}) ->> '$.a.a' AS nested_aa
+FROM overlap ORDER BY id;
+----
+1	{"a":false,"b":1}	false	NULL
+2	{"a":{"a":true},"b":2}	{"a":true}	true
+3	{"b":3}	NULL	NULL
+4	NULL	NULL	NULL
+
+# A set-operation UNION of two differently-shredded branches whose paths overlap (a scalar `a` lane
+# from one branch, a nested `$.a.a` lane from the other) merges into one overlapping type and
+# reconstructs each row to its original value — no fail-loud, no dropped value.
+query I
+SELECT to_json(v) FROM (
+  SELECT jsono('{"a":"s"}', shredding := {'a':'VARCHAR'}) AS v
+  UNION ALL SELECT jsono({'a': {'a': false}})
+) ORDER BY 1;
+----
+{"a":"s"}
+{"a":{"a":false}}
+
+# Deeper overlap ($.a vs $.a.b.c): the shorter names a scalar leaf, the longer a deep leaf.
+query II
+SELECT to_json(jsono('{"a":"scalar"}', shredding := {'$.a':'VARCHAR','$.a.b.c':'BIGINT'})),
+       to_json(jsono('{"a":{"b":{"c":9}}}', shredding := {'$.a':'VARCHAR','$.a.b.c':'BIGINT'}));
+----
+{"a":"scalar"}	{"a":{"b":{"c":9}}}
+
+# Non-overlapping siblings under a common parent still shred normally (no spurious fallback): the
+# nested lanes read back through their paths.
+query III
+SELECT j ->> '$.commit.seq', j ->> '$.commit.rev', to_json(j)
+FROM (SELECT jsono('{"commit":{"seq":1,"rev":"r"}}',
+                  shredding := {'$.commit.seq':'BIGINT','$.commit.rev':'VARCHAR'}) AS j);
+----
+1	r	{"commit":{"rev":"r","seq":1}}
+
+# The overlapping type survives Parquet (the `$.a.a` shred field name is preserved) and reconstructs
+# correctly on read — both the scalar-`a` and object-`a` row round-trip.
+statement ok
+COPY (
+  SELECT 1 AS id, jsono('{"a":false,"b":1}', shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN','b':'BIGINT'}) AS v
+  UNION ALL
+  SELECT 2, jsono('{"a":{"a":true},"b":2}', shredding := {'a':'BOOLEAN','$.a.a':'BOOLEAN','b':'BIGINT'})
+) TO '__TEST_DIR__/jsono_overlap.parquet';
+
+query ITT
+SELECT id, to_json(v), v ->> '$.a.a'
+FROM '__TEST_DIR__/jsono_overlap.parquet' ORDER BY id;
+----
+1	{"a":false,"b":1}	NULL
+2	{"a":{"a":true},"b":2}	true

@@ -582,6 +582,45 @@ ORDER BY g;
 1024	{"params":{"a":"v1024"},"tag":"t1024"}
 2049	{"params":{"a":"v2049"},"tag":"t2049"}
 
+# Scalar↔object cross-patch: a field changes from a scalar to a nested object across patches, so the
+# merged shred set carries both `a` (top-level scalar lane) and `$.a.a` (nested lane) — a sparse
+# multi-shape layout. The fast path bails such overlapping lanes to the reshred fallback, which writes
+# both lanes correctly; the to_json overlay reconstructs them (independent-overlay fallback). The
+# shredded fold must equal the plain RFC 7396 reference. See test/sql/jsono_shredded_overlap.test.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":null}'), jsono('{"a":{"a":false}}'), jsono('{"a":false}')));
+----
+{"a":false}
+
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":null}', shredding := {'a':'VARCHAR'}),
+  jsono({'a': {'a': false}}),
+  jsono({'a': false})
+));
+----
+{"a":false}
+
+# The merge keeps the value shredded over both overlapping lanes (it is not reduced to plain).
+query I
+SELECT typeof(jsono_merge_patch(
+  jsono('{"a":null}', shredding := {'a':'VARCHAR'}),
+  jsono({'a': {'a': false}}),
+  jsono({'a': false})
+)) = jsono_storage_type('a BOOLEAN, "$.a.a" BOOLEAN');
+----
+true
+
+# Reverse direction (the field ends as the nested object): same overlapping merged set, shredded
+# equals plain.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":false}', shredding := {'a':'BOOLEAN'}),
+  jsono({'a': {'a': true}})
+)) = to_json(jsono_merge_patch(jsono('{"a":false}'), jsono('{"a":{"a":true}}')));
+----
+true
+
 # --- jsono_group_merge over shredded inputs: accepts shredded, returns shredded (sticky shreds) ---
 
 # Shredded inputs fold the same as plain (latest non-null wins, nulls ignored), and the
