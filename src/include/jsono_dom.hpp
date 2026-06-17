@@ -40,10 +40,9 @@ struct ShapeCacheEntry {
 
 // Direct-mapped shape cache. Slot = hash & (SIZE-1); collisions evict.
 // O(1) lookup with one L1/L2 access — no linear scan, no LRU bookkeeping.
-// On workloads with many distinct schemas (Yandex has 46k top-level keysets
-// across 200k rows) a direct-mapped table sized 2-8× the working schema set
-// gives uniformly high hit rates without the scan-cost ceiling of a
-// linear-probe LRU.
+// On workloads with many distinct schemas, a direct-mapped table sized 2-8× the
+// working schema set gives uniformly high hit rates without the scan-cost ceiling
+// of a linear-probe LRU.
 //
 // SIZE must be a power of two. Default 8192 → 64KB per builder × per-thread.
 // Override via JSONO_SHAPE_CACHE_SIZE env var (rounded up to power of 2).

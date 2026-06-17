@@ -77,6 +77,16 @@ JSONO-only operations:
 - `transform`: `jsono_transform`;
 - `group_merge`: `to_json(jsono_group_merge(...))`;
 - `group_merge_jsono`: `jsono_group_merge`, the JSONO-native path.
+- `group_merge_keyed_max_jsono` / `group_merge_keyed_min_jsono`:
+  `jsono_group_merge_max/min(value, row(k_ts, k_secondary))`, the order-independent
+  keyed JSONO-native path used to model wide keyed group merges.
+- `group_merge_keyed_pair_jsono`: one `jsono_group_merge_min(wide_payload, key)`
+  and one `jsono_group_merge_max(detail_payload, key)` in the same `GROUP BY`,
+  matching a two-keyed-aggregate wide/detail shape.
+
+The `keyed_pair` generator writes explicit Parquet row groups. For parallel
+triage, verify row groups with `parquet_metadata()`; the benchmark summary's
+`chunks` column is DuckDB 2048-row vector chunks, not Parquet row groups.
 
 Scenarios may set a `shredding` spec: the materialized `jsono` input (and the `parse_shred`
 timed call) is then shredded with it. Scenario names carry `shred` so they are easy to filter.
@@ -170,6 +180,7 @@ uv run --frozen python bench/profile_driver.py build/release/extension/jsono/jso
 uv run --frozen python bench/run_benchmarks.py --list
 uv run --frozen python bench/generate_data.py --kind events --size 10k
 uv run --frozen python bench/generate_data.py --kind wide_flat
+uv run --frozen python bench/generate_data.py --kind keyed_pair
 uv run --frozen python bench/compare_results.py --save-baseline
 uv run --frozen python bench/compare_results.py
 uv run --frozen python bench/run_benchmarks.py --profile --filter current/transform/1k/flat_core

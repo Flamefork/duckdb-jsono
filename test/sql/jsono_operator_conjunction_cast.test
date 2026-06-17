@@ -48,7 +48,7 @@ select count(*) from plain where true and (e -> '$.k') is not null;
 ----
 1
 
-# Two parenthesized ->> conjuncts (the original events4 shape).
+# Two parenthesized ->> conjuncts.
 query I
 select count(*) from plain where (e ->> '$.k') = 'v' and (e ->> '$.k') is not null;
 ----
@@ -83,7 +83,7 @@ select count(*) from shred where true and e ->> '$.k' is not null;
 ----
 -> BOOLEAN)
 
-# Array-shred descend path in a conjunction (the events4 case), parenthesized.
+# Array-shred descend path in a conjunction, parenthesized.
 statement ok
 create table arr as
 select jsono('{"event_name":"x","products":[{"name":"A"}]}',

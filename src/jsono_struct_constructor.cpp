@@ -1468,7 +1468,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	// Type-driven auto-shred never diverts: each shred's type is its source field's type, so a
 	// present value always fits the shred and a NULL shred is only an absent field. The value is
 	// therefore always value-complete — which gives jsono(struct, shredding) the COALESCE-free typed
-	// read on read-back, the rick/data ingest path.
+	// read on read-back for struct-ingest workloads.
 	JsonoFillValueCompleteAllTrue(result, count);
 	auto &builder = lstate.builder;
 

@@ -1,5 +1,7 @@
 from config import (
     DATA_DIR,
+    KEYED_PAIR_SIZES,
+    KEYED_PAIR_WIDE_SHREDDING_SPEC,
     EXTRACT_CORE_SPEC,
     FIELD_SAMPLE_JSONO_COMPRESSION,
     FIELD_SAMPLE_JSONO_COMPRESSION_LEVEL,
@@ -270,13 +272,101 @@ SCENARIOS = [
         "group_col": "g1e4",
         "targets": ["jsono"],
     },
-    # Wide SHREDDED base (~107 lanes) + small patches, the rick/data per-event
-    # document-construction shape. The base is shredded outside timing; the timed
-    # merge builds the merged shredded document per row. Variants isolate which
-    # executor path is taken (jsono-only — shredded has no core-json equivalent):
-    #   - production: plain nested patch (params holds a JSONO value) + small shredded
-    #     patch. All top-level shreds -> the fast path copies the ~107 base lanes
-    #     through and folds only the small residuals.
+    {
+        "operation": "group_merge_keyed_max_jsono",
+        "scenario": "wide_flat_keyed_many_groups",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "group_col": "g1e4",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "group_merge_keyed_min_jsono",
+        "scenario": "wide_flat_keyed_many_groups",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "group_col": "g1e4",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "group_merge_keyed_max_jsono",
+        "scenario": "wide_shredded_keyed_many_groups",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "group_col": "g1e4",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "group_merge_keyed_min_jsono",
+        "scenario": "wide_shredded_keyed_many_groups",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "group_col": "g1e4",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "group_merge_keyed_max_jsono",
+        "scenario": "wide_shredded_keyed_few_groups",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "group_col": "g1e1",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "group_merge_keyed_min_jsono",
+        "scenario": "wide_shredded_keyed_few_groups",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "group_col": "g1e1",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "group_merge_keyed_pair_jsono",
+        "scenario": "wide_keyed_pair_medium_group_rows",
+        "size": "1M",
+        "row_count": KEYED_PAIR_SIZES["1M"],
+        "data_file": DATA_DIR / "keyed_pair_1M.parquet",
+        "wide_json_column": "json_wide_payload",
+        "wide_shredding": KEYED_PAIR_WIDE_SHREDDING_SPEC,
+        "detail_json_column": "json_detail_payload",
+        "group_col": "g_medium_group_rows",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "group_merge_keyed_pair_jsono",
+        "scenario": "wide_keyed_pair_few_group_rows",
+        "size": "1M",
+        "row_count": KEYED_PAIR_SIZES["1M"],
+        "data_file": DATA_DIR / "keyed_pair_1M.parquet",
+        "wide_json_column": "json_wide_payload",
+        "wide_shredding": KEYED_PAIR_WIDE_SHREDDING_SPEC,
+        "detail_json_column": "json_small_payload",
+        "group_col": "g_few_group_rows",
+        "targets": ["jsono"],
+    },
+    # Wide SHREDDED base (~107 lanes) + small patches. The base is shredded outside
+    # timing; the timed merge builds the merged shredded document per row. Variants
+    # isolate which executor path is taken (jsono-only — shredded has no core-json
+    # equivalent):
+    #   - mixed_patch: plain nested patch (payload holds a JSONO value) + small
+    #     shredded patch. All top-level shreds -> the fast path copies the ~107
+    #     base lanes through and folds only the small residuals.
     #   - shredded_patch_only: all-shredded inputs, the fast path baseline ceiling.
     #   - plain_patch_only: a single plain nested patch, isolates the plain-input fast
     #     path (the relaxation H1 enables).
@@ -285,7 +375,7 @@ SCENARIOS = [
     #     on the reshred fallback even after H1 — it isolates that separate bottleneck.
     {
         "operation": "merge_patch",
-        "scenario": "wide_shredded_base_production",
+        "scenario": "wide_shredded_base_mixed_patch",
         "size": "100k",
         "row_count": WIDE_FLAT_SIZES["100k"],
         "data_file": DATA_DIR / "wide_flat_100k.parquet",

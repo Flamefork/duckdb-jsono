@@ -1981,12 +1981,10 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 // on the key fall back to a deterministic comparison of the value bytes so the result is fully
 // order-independent; supply a unique (composite) key when ties must resolve a specific way.
 //
-// State carries two parallel JSONO blobs: `values` is the merged document; `keys` mirrors its
-// object structure with every leaf replaced by the winning row's sort-key bytes, stored as a
-// string value (read/written only through the verbatim cursor path — never validated or rendered
-// as JSON, so arbitrary sort-key bytes are fine). Object<->scalar type changes at the same path
-// across rows are resolved wholesale by the larger subtree key; for such structurally-unstable
-// paths the result stays order-independent but may differ from the sequential ORDER BY fold.
+// State is a heap-owned mutable tree. Object nodes keep sorted JSON-key children; leaf nodes keep
+// the winning sort-key bytes plus a standalone JSONO blob for the winning non-object value. An
+// object<->leaf change at the same path fails loud: a commutative per-leaf aggregate cannot
+// reproduce the order-dependent RFC 7396 fold for structurally-inconsistent rows.
 
 struct GroupMergeLWWBindData : public FunctionData {
 	OrderModifiers modifiers;
@@ -2009,71 +2007,58 @@ struct GroupMergeLWWBindData : public FunctionData {
 	}
 };
 
+enum class LWWTreeKind : uint8_t { Object, Leaf };
+
+struct LWWTreeNode;
+
 struct GroupMergeLWWState {
-	OwnedJsonoBlob *values;
-	OwnedJsonoBlob *keys;
+	LWWTreeNode *root;
 	bool has_input;
 };
 
 struct GroupMergeLWWFunction {
 	static void Initialize(GroupMergeLWWState &state) {
-		state.values = nullptr;
-		state.keys = nullptr;
+		state.root = nullptr;
 		state.has_input = false;
 	}
 
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
-		delete state.values;
-		delete state.keys;
-		state.values = nullptr;
-		state.keys = nullptr;
+		delete state.root;
+		state.root = nullptr;
 		state.has_input = false;
 	}
 };
 
-// Read a key-tree leaf's stored sort-key bytes (a VAL_STR_HEAP string value at `cursor`).
-nonstd::string_view KeyLeafBytes(const JsonoView &kview, const JsonoCursor &cursor) {
-	auto len = kview.LengthAt(cursor.length_cursor);
-	return kview.StringAt(cursor.string_cursor, len);
-}
+struct LWWObjectChild {
+	string key;
+	unique_ptr<LWWTreeNode> node;
 
-// The representative key of a key-tree node: its own sort-key if it is a leaf, else the maximum
-// over its subtree's leaves. Only the object branch (an object<->scalar transition) recurses; the
-// common leaf-vs-leaf conflict reads one string directly with no allocation.
-nonstd::string_view MaxKeyInSubtree(const JsonoView &kview, const JsonoCursor &cursor) {
-	auto t = SlotTag(kview.SlotAt(cursor.pos));
-	if (t != tag::OBJ_START) {
-		if (t != tag::VAL_STR_HEAP) {
-			throw InternalException("jsono_group_merge: malformed key tree leaf");
-		}
-		return KeyLeafBytes(kview, cursor);
+	LWWObjectChild(string key, unique_ptr<LWWTreeNode> node) : key(std::move(key)), node(std::move(node)) {
 	}
-	auto layout = ReadObjectLayout(kview, cursor.pos);
-	std::vector<MergeChild> kids;
-	CollectObjectChildren(kview, layout, cursor, kids);
-	nonstd::string_view best;
-	bool have = false;
-	for (auto &kid : kids) {
-		auto cand = MaxKeyInSubtree(kview, kid.cursor);
-		if (!have || CompareJsonoKeys(cand, best) > 0) {
-			best = cand;
-			have = true;
-		}
-	}
-	if (!have) {
-		throw InternalException("jsono_group_merge: empty key-tree object");
-	}
-	return best;
-}
 
-template <class T>
-int CompareVecBytes(const std::vector<T> &a, const std::vector<T> &b) {
-	size_t na = a.size() * sizeof(T);
-	size_t nb = b.size() * sizeof(T);
-	size_t n = std::min(na, nb);
+	LWWObjectChild(LWWObjectChild &&) = default;
+	LWWObjectChild &operator=(LWWObjectChild &&) = default;
+	LWWObjectChild(const LWWObjectChild &) = delete;
+	LWWObjectChild &operator=(const LWWObjectChild &) = delete;
+};
+
+struct LWWTreeNode {
+	LWWTreeKind kind = LWWTreeKind::Object;
+	vector<LWWObjectChild> children;
+	string sort_key;
+	OwnedJsonoBlob value;
+};
+
+struct LWWTreeScratch {
+	JsonoBuilder builder;
+	OwnedJsonoBlob candidate;
+};
+
+int CompareRawBytes(const char *a, size_t na, const char *b, size_t nb) {
+	auto n = std::min(na, nb);
 	if (n > 0) {
-		int c = std::memcmp(a.data(), b.data(), n);
+		int c = std::memcmp(a, b, n);
 		if (c != 0) {
 			return c;
 		}
@@ -2081,39 +2066,125 @@ int CompareVecBytes(const std::vector<T> &a, const std::vector<T> &b) {
 	return na < nb ? -1 : (na > nb ? 1 : 0);
 }
 
-// Deterministic total order over two JSONO values, used only to break an exact key tie so the
-// fold stays order-independent. Serializes each value standalone (heaps start at 0, so equal
-// values produce byte-identical streams) and compares the streams in a fixed order.
-int CompareValueTie(const JsonoView &va, const JsonoCursor &ca, const JsonoView &vb, const JsonoCursor &cb) {
-	static thread_local JsonoBuilder ta;
-	static thread_local JsonoBuilder tb;
-	ta.Reset();
-	tb.Reset();
-	JsonoCursor x = ca;
-	EmitValueVerbatim(va, x, ta, 0);
-	JsonoCursor y = cb;
-	EmitValueVerbatim(vb, y, tb, 0);
-	if (int c = CompareVecBytes(ta.slots, tb.slots)) {
+int CompareRawBytes(const string &a, const string &b) {
+	return CompareRawBytes(a.data(), a.size(), b.data(), b.size());
+}
+
+int CompareRawBytes(const string &a, nonstd::string_view b) {
+	return CompareRawBytes(a.data(), a.size(), b.data(), b.size());
+}
+
+void AssignBytes(string &out, nonstd::string_view bytes) {
+	out.resize(bytes.size());
+	if (bytes.size() > 0) {
+		std::memcpy(&out[0], bytes.data(), bytes.size());
+	}
+}
+
+void WriteScalarLeafHeader(OwnedJsonoBlob &out, uint64_t slot) {
+	out.slots.resize(JSONO_HEADER_SIZE + sizeof(uint64_t));
+	JsonoHeader header;
+	header.magic = MAGIC;
+	header.version = VERSION;
+	header.flags = flags::SORTED_KEYS;
+	header.reserved = 0;
+	std::memcpy(&out.slots[0], &header, JSONO_HEADER_SIZE);
+	std::memcpy(&out.slots[JSONO_HEADER_SIZE], &slot, sizeof(uint64_t));
+	out.key_heap.clear();
+	out.string_heap.clear();
+	out.lengths.clear();
+	out.nums.clear();
+	out.skips.resize(sizeof(ContainerMetadataHeader));
+	ContainerMetadataHeader meta;
+	meta.span_count = 0;
+	meta.checkpoint_index_count = 0;
+	meta.checkpoint_count = 0;
+	std::memcpy(&out.skips[0], &meta, sizeof(meta));
+}
+
+void StoreScalarLeafBlob(const JsonoView &view, JsonoCursor &cursor, OwnedJsonoBlob &out) {
+	auto slot = view.SlotAt(cursor.pos);
+	auto slot_tag = SlotTag(slot);
+	WriteScalarLeafHeader(out, slot);
+	switch (slot_tag) {
+	case tag::VAL_STR_HEAP: {
+		auto len = view.LengthAt(cursor.length_cursor);
+		auto s = view.StringAt(cursor.string_cursor, len);
+		out.string_heap.assign(s.data(), s.size());
+		out.lengths.assign(reinterpret_cast<const char *>(&len), sizeof(uint32_t));
+		cursor.string_cursor += len;
+		cursor.length_cursor++;
+		cursor.pos++;
+		return;
+	}
+	case tag::VAL_EXT: {
+		auto subtype = ExtSubtype(slot);
+		if (subtype == ext_subtype::NUMBER) {
+			auto len = view.LengthAt(cursor.length_cursor);
+			auto s = view.StringAt(cursor.string_cursor, len);
+			out.string_heap.assign(s.data(), s.size());
+			out.lengths.assign(reinterpret_cast<const char *>(&len), sizeof(uint32_t));
+			cursor.string_cursor += len;
+			cursor.length_cursor++;
+			cursor.pos++;
+			return;
+		}
+		if (subtype >= ext_subtype::COUNT) {
+			throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
+		}
+		auto num = view.NumAt(cursor.num_cursor);
+		out.nums.assign(reinterpret_cast<const char *>(&num), sizeof(uint64_t));
+		cursor.num_cursor++;
+		cursor.pos++;
+		return;
+	}
+	case tag::VAL_INT60:
+	case tag::VAL_DEC60: {
+		auto num = view.NumAt(cursor.num_cursor);
+		out.nums.assign(reinterpret_cast<const char *>(&num), sizeof(uint64_t));
+		cursor.num_cursor++;
+		cursor.pos++;
+		return;
+	}
+	case tag::VAL_TRUE:
+	case tag::VAL_FALSE:
+	case tag::VAL_NULL:
+		cursor.pos++;
+		return;
+	default:
+		throw InvalidInputException("malformed JSONO: non-value slot in value position");
+	}
+}
+
+// Deterministic total order over two standalone JSONO leaf blobs, used only to break an exact key
+// tie so the fold stays order-independent. This matches the old builder-vector order: slots
+// without JSONO header, then string_heap, nums, key_heap, lengths.
+int CompareBlobValueTie(const OwnedJsonoBlob &a, const OwnedJsonoBlob &b) {
+	if (a.slots.size() < JSONO_HEADER_SIZE || b.slots.size() < JSONO_HEADER_SIZE) {
+		throw InternalException("jsono_group_merge: malformed leaf blob");
+	}
+	if (int c = CompareRawBytes(a.slots.data() + JSONO_HEADER_SIZE, a.slots.size() - JSONO_HEADER_SIZE,
+	                            b.slots.data() + JSONO_HEADER_SIZE, b.slots.size() - JSONO_HEADER_SIZE)) {
 		return c;
 	}
-	if (int c = CompareVecBytes(ta.string_heap, tb.string_heap)) {
+	if (int c = CompareRawBytes(a.string_heap, b.string_heap)) {
 		return c;
 	}
-	if (int c = CompareVecBytes(ta.nums, tb.nums)) {
+	if (int c = CompareRawBytes(a.nums, b.nums)) {
 		return c;
 	}
-	if (int c = CompareVecBytes(ta.key_heap, tb.key_heap)) {
+	if (int c = CompareRawBytes(a.key_heap, b.key_heap)) {
 		return c;
 	}
-	return CompareVecBytes(ta.lengths, tb.lengths);
+	return CompareRawBytes(a.lengths, b.lengths);
 }
 
 // Per-leaf last-write-wins is well-defined only when every path has a consistent kind across rows
 // (always an object, or always a non-object leaf). When a path is a non-empty object in one row and
 // a scalar/array in another, the sequential RFC 7396 fold's result depends on row order, so a
 // commutative per-leaf rule cannot reproduce it — failing loud beats a silently order-dependent
-// answer. The accumulator never stores empty/stripped objects, so an OBJ_START here is always a real
-// structural object.
+// answer. Empty object members are stripped before touching a child, so a nested OBJ_START conflict
+// is a real structural object (the document root can still be an empty object input).
 [[noreturn]] void ThrowMixedKindConflict() {
 	throw InvalidInputException(
 	    "jsono_group_merge_max/min: a path is an object in one row and a scalar/array in another; "
@@ -2121,258 +2192,296 @@ int CompareValueTie(const JsonoView &va, const JsonoCursor &ca, const JsonoView 
 	    "Use jsono_group_merge(value ORDER BY key) instead for paths that change kind across rows.");
 }
 
-// >0 if the A subtree's key wins the conflict, <0 if B wins, 0 on an exact key tie.
-int CompareConflict(const JsonoView &va, const JsonoCursor &ca, const JsonoView &ka, const JsonoCursor &cka,
-                    const JsonoView &vb, const JsonoCursor &cb, const JsonoView &kb, const JsonoCursor &ckb) {
-	int c = CompareJsonoKeys(MaxKeyInSubtree(ka, cka), MaxKeyInSubtree(kb, ckb));
-	if (c != 0) {
-		return c;
+size_t FindLWWChildIndex(const vector<LWWObjectChild> &children, nonstd::string_view key) {
+	size_t lo = 0;
+	size_t hi = children.size();
+	while (lo < hi) {
+		auto mid = lo + (hi - lo) / 2;
+		auto &stored = children[mid].key;
+		if (CompareJsonoKeys(nonstd::string_view(stored.data(), stored.size()), key) < 0) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
 	}
-	return CompareValueTie(va, ca, vb, cb);
+	return lo;
 }
 
-void MergeLWW(const JsonoView &va, const JsonoCursor &ca, const JsonoView &ka, const JsonoCursor &cka,
-              const JsonoView &vb, const JsonoCursor &cb, const JsonoView &kb, const JsonoCursor &ckb,
-              JsonoBuilder &out_v, JsonoBuilder &out_k, size_t depth);
-
-// Merge two object nodes (with their mirrored key nodes) into out_v/out_k. Both sides are
-// non-null, non-empty objects (the accumulator never stores nulls/empties, and incoming rows are
-// null-stripped before merge), so this is a pure sorted-key two-pointer with no null bookkeeping.
-void MergeLWWObjects(const JsonoView &va, const JsonoCursor &ca, const JsonoView &ka, const JsonoCursor &cka,
-                     const JsonoView &vb, const JsonoCursor &cb, const JsonoView &kb, const JsonoCursor &ckb,
-                     JsonoBuilder &out_v, JsonoBuilder &out_k, size_t depth) {
-	if (depth > JSONO_MAX_NESTING_DEPTH) {
-		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
-		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
-	}
-	// The key children align with the value children by index (same keys, same order), so the
-	// two-pointer compares value keys and indexes the key children with the same rank.
-	std::vector<MergeChild> cva, cka_ch, cvb, ckb_ch;
-	CollectObjectChildren(va, ReadObjectLayout(va, ca.pos), ca, cva);
-	CollectObjectChildren(ka, ReadObjectLayout(ka, cka.pos), cka, cka_ch);
-	CollectObjectChildren(vb, ReadObjectLayout(vb, cb.pos), cb, cvb);
-	CollectObjectChildren(kb, ReadObjectLayout(kb, ckb.pos), ckb, ckb_ch);
-
-	struct PlanEntry {
-		nonstd::string_view key;
-		MergeSrc src;
-		size_t ra;
-		size_t rb;
-	};
-	std::vector<PlanEntry> plan;
-	plan.reserve(cva.size() + cvb.size());
-	size_t ia = 0;
-	size_t ib = 0;
-	while (ia < cva.size() || ib < cvb.size()) {
-		int cmp;
-		if (ib >= cvb.size()) {
-			cmp = -1;
-		} else if (ia >= cva.size()) {
-			cmp = 1;
-		} else {
-			cmp = CompareJsonoKeys(cva[ia].key, cvb[ib].key);
-		}
-		if (cmp < 0) {
-			plan.push_back(PlanEntry {cva[ia].key, MergeSrc::A, ia, 0});
-			ia++;
-		} else if (cmp > 0) {
-			plan.push_back(PlanEntry {cvb[ib].key, MergeSrc::B, 0, ib});
-			ib++;
-		} else {
-			if (cva[ia].tag == tag::OBJ_START && cvb[ib].tag == tag::OBJ_START) {
-				plan.push_back(PlanEntry {cva[ia].key, MergeSrc::Recurse, ia, ib});
-			} else {
-				if (cva[ia].tag == tag::OBJ_START || cvb[ib].tag == tag::OBJ_START) {
-					ThrowMixedKindConflict();
-				}
-				int c = CompareConflict(va, cva[ia].cursor, ka, cka_ch[ia].cursor, vb, cvb[ib].cursor, kb,
-				                        ckb_ch[ib].cursor);
-				plan.push_back(PlanEntry {cva[ia].key, c >= 0 ? MergeSrc::A : MergeSrc::B, ia, ib});
-			}
-			ia++;
-			ib++;
-		}
-	}
-
-	out_v.EmitObjectStart(plan.size());
-	for (auto &p : plan) {
-		out_v.EmitKeySlot(p.key);
-	}
-	out_k.EmitObjectStart(plan.size());
-	for (auto &p : plan) {
-		out_k.EmitKeySlot(p.key);
-	}
-	for (auto &p : plan) {
-		out_v.EmitObjectChildStart();
-		out_k.EmitObjectChildStart();
-		if (p.src == MergeSrc::Recurse) {
-			MergeLWW(va, cva[p.ra].cursor, ka, cka_ch[p.ra].cursor, vb, cvb[p.rb].cursor, kb, ckb_ch[p.rb].cursor,
-			         out_v, out_k, depth + 1);
-		} else if (p.src == MergeSrc::A) {
-			JsonoCursor vc = cva[p.ra].cursor;
-			EmitValueVerbatim(va, vc, out_v, depth + 1);
-			JsonoCursor kc = cka_ch[p.ra].cursor;
-			EmitValueVerbatim(ka, kc, out_k, depth + 1);
-		} else {
-			JsonoCursor vc = cvb[p.rb].cursor;
-			EmitValueVerbatim(vb, vc, out_v, depth + 1);
-			JsonoCursor kc = ckb_ch[p.rb].cursor;
-			EmitValueVerbatim(kb, kc, out_k, depth + 1);
-		}
-	}
-	out_v.EmitObjectEnd();
-	out_k.EmitObjectEnd();
+void ResetLWWNodeToObject(LWWTreeNode &node) {
+	node.kind = LWWTreeKind::Object;
+	node.children.clear();
+	node.sort_key.clear();
+	node.value = OwnedJsonoBlob();
 }
 
-void MergeLWW(const JsonoView &va, const JsonoCursor &ca, const JsonoView &ka, const JsonoCursor &cka,
-              const JsonoView &vb, const JsonoCursor &cb, const JsonoView &kb, const JsonoCursor &ckb,
-              JsonoBuilder &out_v, JsonoBuilder &out_k, size_t depth) {
-	bool a_obj = SlotTag(va.SlotAt(ca.pos)) == tag::OBJ_START;
-	bool b_obj = SlotTag(vb.SlotAt(cb.pos)) == tag::OBJ_START;
-	if (a_obj && b_obj) {
-		MergeLWWObjects(va, ca, ka, cka, vb, cb, kb, ckb, out_v, out_k, depth);
+void StoreLWWLeafFromIncoming(LWWTreeNode &node, const JsonoView &view, JsonoCursor &cursor, nonstd::string_view K,
+                              LWWTreeScratch &scratch, size_t depth) {
+	node.kind = LWWTreeKind::Leaf;
+	node.children.clear();
+	AssignBytes(node.sort_key, K);
+	if (SlotTag(view.SlotAt(cursor.pos)) != tag::ARR_START) {
+		StoreScalarLeafBlob(view, cursor, node.value);
 		return;
 	}
-	if (a_obj || b_obj) {
-		ThrowMixedKindConflict();
-	}
-	// Both sides are non-object leaves at this path: the higher key wins the whole node.
-	int c = CompareConflict(va, ca, ka, cka, vb, cb, kb, ckb);
-	if (c >= 0) {
-		JsonoCursor vc = ca;
-		EmitValueVerbatim(va, vc, out_v, depth);
-		JsonoCursor kc = cka;
-		EmitValueVerbatim(ka, kc, out_k, depth);
-	} else {
-		JsonoCursor vc = cb;
-		EmitValueVerbatim(vb, vc, out_v, depth);
-		JsonoCursor kc = ckb;
-		EmitValueVerbatim(kb, kc, out_k, depth);
-	}
+	scratch.builder.Reset();
+	EmitValueVerbatim(view, cursor, scratch.builder, depth);
+	SerializeBuilderToBlob(scratch.builder, node.value);
 }
 
-void BuildIncomingValue(const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K, JsonoBuilder &out_v,
-                        JsonoBuilder &out_k, size_t depth);
+void SerializeIncomingLWWLeaf(const JsonoView &view, JsonoCursor &cursor, OwnedJsonoBlob &out, LWWTreeScratch &scratch,
+                              size_t depth) {
+	if (SlotTag(view.SlotAt(cursor.pos)) != tag::ARR_START) {
+		StoreScalarLeafBlob(view, cursor, out);
+		return;
+	}
+	scratch.builder.Reset();
+	EmitValueVerbatim(view, cursor, scratch.builder, depth);
+	SerializeBuilderToBlob(scratch.builder, out);
+}
 
-// Emit one incoming object into out_v (null members stripped, IGNORE NULLS) and the mirrored
-// key tree into out_k (every surviving leaf gets the row's sort key K). Models EmitObjectStrip's
-// survival mask but with the parallel key emission and recursion.
-void BuildIncomingObject(const JsonoView &V, const JsonoCursor &obj_cursor, nonstd::string_view K, JsonoBuilder &out_v,
-                         JsonoBuilder &out_k, size_t depth) {
+void BuildIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
+                          LWWTreeScratch &scratch, size_t depth);
+
+void BuildIncomingLWWObject(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
+                            LWWTreeScratch &scratch, size_t depth) {
 	if (depth > JSONO_MAX_NESTING_DEPTH) {
 		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
 		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
 	}
-	auto layout = ReadObjectLayout(V, obj_cursor.pos);
-	JsonoCursor value_start = obj_cursor;
-	value_start.pos = layout.value_start;
-	static constexpr size_t MASK_STACK = 128;
-	char keep[MASK_STACK];
-	bool cached = layout.key_count <= MASK_STACK;
-	size_t count = 0;
-	{
-		JsonoCursor vc = value_start;
-		for (size_t i = 0; i < layout.key_count; i++) {
-			bool survives = MemberSurvivesStrip(V, vc.pos, MergeMode::IgnoreNulls);
-			if (cached) {
-				keep[i] = survives ? 1 : 0;
-			}
-			count += survives ? 1 : 0;
-			SkipValueFast(V, vc);
+	ResetLWWNodeToObject(node);
+	auto layout = ReadObjectLayout(V, cursor.pos);
+	JsonoCursor vc = cursor;
+	vc.pos = layout.value_start;
+	for (size_t i = 0; i < layout.key_count; i++) {
+		auto key_slot = V.SlotAt(layout.key_start + i);
+		if (SlotTag(key_slot) != tag::KEY) {
+			throw InvalidInputException("malformed JSONO: object key slot expected");
 		}
-	}
-	out_v.EmitObjectStart(count);
-	out_k.EmitObjectStart(count);
-	{
-		JsonoCursor vc = value_start;
-		for (size_t i = 0; i < layout.key_count; i++) {
-			bool survives = cached ? (keep[i] != 0) : MemberSurvivesStrip(V, vc.pos, MergeMode::IgnoreNulls);
-			if (survives) {
-				auto key_slot = V.SlotAt(layout.key_start + i);
-				if (SlotTag(key_slot) != tag::KEY) {
-					throw InvalidInputException("malformed JSONO: object key slot expected");
-				}
-				auto key = V.KeyAt(SlotPayload(key_slot));
-				out_v.EmitKeySlot(key);
-				out_k.EmitKeySlot(key);
-			}
+		if (!MemberSurvivesStrip(V, vc.pos, MergeMode::IgnoreNulls)) {
 			SkipValueFast(V, vc);
+			continue;
 		}
+		auto key = V.KeyAt(SlotPayload(key_slot));
+		string key_copy;
+		AssignBytes(key_copy, key);
+		auto child = make_uniq<LWWTreeNode>();
+		BuildIncomingLWWNode(*child, V, vc, K, scratch, depth + 1);
+		node.children.emplace_back(std::move(key_copy), std::move(child));
 	}
-	{
-		JsonoCursor vc = value_start;
+	if (vc.pos >= V.Slots() || SlotTag(V.SlotAt(vc.pos)) != tag::OBJ_END) {
+		throw InvalidInputException("malformed JSONO: object value span mismatch");
+	}
+	vc.pos++;
+	cursor = vc;
+}
+
+void BuildIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
+                          LWWTreeScratch &scratch, size_t depth) {
+	auto slot_tag = SlotTag(V.SlotAt(cursor.pos));
+	if (slot_tag == tag::OBJ_START) {
+		BuildIncomingLWWObject(node, V, cursor, K, scratch, depth);
+		return;
+	}
+	// Arrays are a single leaf (replaced wholesale), exactly like jsono_group_merge. Scalars,
+	// including a top-level JSON null, are leaves too.
+	StoreLWWLeafFromIncoming(node, V, cursor, K, scratch, depth);
+}
+
+void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
+                          LWWTreeScratch &scratch, size_t depth) {
+	auto slot_tag = SlotTag(V.SlotAt(cursor.pos));
+	if (slot_tag == tag::OBJ_START) {
+		if (node.kind != LWWTreeKind::Object) {
+			ThrowMixedKindConflict();
+		}
+		if (depth > JSONO_MAX_NESTING_DEPTH) {
+			throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
+			                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+		}
+		auto layout = ReadObjectLayout(V, cursor.pos);
+		JsonoCursor vc = cursor;
+		vc.pos = layout.value_start;
 		for (size_t i = 0; i < layout.key_count; i++) {
-			bool survives = cached ? (keep[i] != 0) : MemberSurvivesStrip(V, vc.pos, MergeMode::IgnoreNulls);
-			if (!survives) {
+			auto key_slot = V.SlotAt(layout.key_start + i);
+			if (SlotTag(key_slot) != tag::KEY) {
+				throw InvalidInputException("malformed JSONO: object key slot expected");
+			}
+			auto key = V.KeyAt(SlotPayload(key_slot));
+			if (!MemberSurvivesStrip(V, vc.pos, MergeMode::IgnoreNulls)) {
 				SkipValueFast(V, vc);
 				continue;
 			}
-			out_v.EmitObjectChildStart();
-			out_k.EmitObjectChildStart();
-			BuildIncomingValue(V, vc, K, out_v, out_k, depth + 1);
+			auto child_idx = FindLWWChildIndex(node.children, key);
+			bool found = child_idx < node.children.size() &&
+			             CompareJsonoKeys(nonstd::string_view(node.children[child_idx].key.data(),
+			                                                  node.children[child_idx].key.size()),
+			                              key) == 0;
+			if (found) {
+				MergeIncomingLWWNode(*node.children[child_idx].node, V, vc, K, scratch, depth + 1);
+			} else {
+				string key_copy;
+				AssignBytes(key_copy, key);
+				auto child = make_uniq<LWWTreeNode>();
+				BuildIncomingLWWNode(*child, V, vc, K, scratch, depth + 1);
+				node.children.insert(node.children.begin() + child_idx,
+				                     LWWObjectChild(std::move(key_copy), std::move(child)));
+			}
 		}
+		if (vc.pos >= V.Slots() || SlotTag(V.SlotAt(vc.pos)) != tag::OBJ_END) {
+			throw InvalidInputException("malformed JSONO: object value span mismatch");
+		}
+		vc.pos++;
+		cursor = vc;
+		return;
 	}
-	out_v.EmitObjectEnd();
-	out_k.EmitObjectEnd();
-}
-
-void BuildIncomingValue(const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K, JsonoBuilder &out_v,
-                        JsonoBuilder &out_k, size_t depth) {
-	auto slot_tag = SlotTag(V.SlotAt(cursor.pos));
-	if (slot_tag == tag::OBJ_START) {
-		BuildIncomingObject(V, cursor, K, out_v, out_k, depth);
+	if (node.kind != LWWTreeKind::Leaf) {
+		ThrowMixedKindConflict();
+	}
+	int key_cmp = CompareRawBytes(node.sort_key, K);
+	if (key_cmp > 0) {
 		SkipValueFast(V, cursor);
 		return;
 	}
-	if (slot_tag == tag::ARR_START) {
-		// Arrays are a single leaf (replaced wholesale), exactly like jsono_group_merge.
-		EmitValueVerbatim(V, cursor, out_v, depth);
-		out_k.EmitString(K);
+	if (key_cmp < 0) {
+		StoreLWWLeafFromIncoming(node, V, cursor, K, scratch, depth);
 		return;
 	}
-	// Any scalar, including a top-level JSON null (a non-object incoming replaces wholesale).
-	EmitScalarVerbatim(V, cursor, out_v);
-	out_k.EmitString(K);
+	SerializeIncomingLWWLeaf(V, cursor, scratch.candidate, scratch, depth);
+	if (CompareBlobValueTie(node.value, scratch.candidate) < 0) {
+		node.value = scratch.candidate;
+	}
 }
 
-// Serialize the incoming row into the value/key builders, then either seed an empty group or
-// merge into the accumulator. Mirrors FoldIntoGroupState but maintains the parallel key tree.
-void FoldRowLWW(GroupMergeLWWState &state, const JsonoView &V, nonstd::string_view K) {
-	static thread_local JsonoBuilder inc_v;
-	static thread_local JsonoBuilder inc_k;
-	inc_v.Reset();
-	inc_k.Reset();
-	JsonoCursor cursor;
-	BuildIncomingValue(V, cursor, K, inc_v, inc_k, 0);
+unique_ptr<LWWTreeNode> CloneLWWTreeNode(const LWWTreeNode &source) {
+	auto result = make_uniq<LWWTreeNode>();
+	result->kind = source.kind;
+	result->sort_key = source.sort_key;
+	result->value = source.value;
+	result->children.reserve(source.children.size());
+	for (auto &child : source.children) {
+		result->children.emplace_back(child.key, CloneLWWTreeNode(*child.node));
+	}
+	return result;
+}
 
+void CopyLWWTreeNode(LWWTreeNode &target, const LWWTreeNode &source) {
+	target.kind = source.kind;
+	target.children.clear();
+	target.sort_key = source.sort_key;
+	target.value = source.value;
+	target.children.reserve(source.children.size());
+	for (auto &child : source.children) {
+		target.children.emplace_back(child.key, CloneLWWTreeNode(*child.node));
+	}
+}
+
+void MoveLWWTreeNode(LWWTreeNode &target, LWWTreeNode &source) {
+	target.kind = source.kind;
+	target.children = std::move(source.children);
+	target.sort_key = std::move(source.sort_key);
+	target.value = std::move(source.value);
+	source.children.clear();
+	source.sort_key.clear();
+	source.value = OwnedJsonoBlob();
+}
+
+void MergeLWWTreeIntoTree(LWWTreeNode &target, const LWWTreeNode &source) {
+	if (target.kind == LWWTreeKind::Object && source.kind == LWWTreeKind::Object) {
+		for (auto &source_child : source.children) {
+			auto key = nonstd::string_view(source_child.key.data(), source_child.key.size());
+			auto child_idx = FindLWWChildIndex(target.children, key);
+			bool found = child_idx < target.children.size() &&
+			             CompareJsonoKeys(nonstd::string_view(target.children[child_idx].key.data(),
+			                                                  target.children[child_idx].key.size()),
+			                              key) == 0;
+			if (found) {
+				MergeLWWTreeIntoTree(*target.children[child_idx].node, *source_child.node);
+			} else {
+				target.children.insert(target.children.begin() + child_idx,
+				                       LWWObjectChild(source_child.key, CloneLWWTreeNode(*source_child.node)));
+			}
+		}
+		return;
+	}
+	if (target.kind == LWWTreeKind::Object || source.kind == LWWTreeKind::Object) {
+		ThrowMixedKindConflict();
+	}
+	int key_cmp = CompareRawBytes(target.sort_key, source.sort_key);
+	if (key_cmp < 0 || (key_cmp == 0 && CompareBlobValueTie(target.value, source.value) < 0)) {
+		CopyLWWTreeNode(target, source);
+	}
+}
+
+void MergeLWWTreeIntoTreeDestructive(LWWTreeNode &target, LWWTreeNode &source) {
+	if (target.kind == LWWTreeKind::Object && source.kind == LWWTreeKind::Object) {
+		for (auto &source_child : source.children) {
+			if (!source_child.node) {
+				continue;
+			}
+			auto key = nonstd::string_view(source_child.key.data(), source_child.key.size());
+			auto child_idx = FindLWWChildIndex(target.children, key);
+			bool found = child_idx < target.children.size() &&
+			             CompareJsonoKeys(nonstd::string_view(target.children[child_idx].key.data(),
+			                                                  target.children[child_idx].key.size()),
+			                              key) == 0;
+			if (found) {
+				MergeLWWTreeIntoTreeDestructive(*target.children[child_idx].node, *source_child.node);
+			} else {
+				target.children.insert(target.children.begin() + child_idx, std::move(source_child));
+			}
+		}
+		source.children.clear();
+		return;
+	}
+	if (target.kind == LWWTreeKind::Object || source.kind == LWWTreeKind::Object) {
+		ThrowMixedKindConflict();
+	}
+	int key_cmp = CompareRawBytes(target.sort_key, source.sort_key);
+	if (key_cmp < 0 || (key_cmp == 0 && CompareBlobValueTie(target.value, source.value) < 0)) {
+		MoveLWWTreeNode(target, source);
+	}
+}
+
+void EmitLWWTreeNode(const LWWTreeNode &node, JsonoBuilder &builder, size_t depth) {
+	if (depth > JSONO_MAX_NESTING_DEPTH) {
+		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
+		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+	}
+	if (node.kind == LWWTreeKind::Object) {
+		builder.EmitObjectStart(node.children.size());
+		for (auto &child : node.children) {
+			builder.EmitKeySlot(nonstd::string_view(child.key.data(), child.key.size()));
+		}
+		for (auto &child : node.children) {
+			builder.EmitObjectChildStart();
+			EmitLWWTreeNode(*child.node, builder, depth + 1);
+		}
+		builder.EmitObjectEnd();
+		return;
+	}
+	JsonoView value_view = ViewOfBlob(node.value);
+	if (!value_view.ParseHeader()) {
+		throw InternalException("jsono_group_merge: malformed leaf blob");
+	}
+	JsonoCursor cursor;
+	EmitValueVerbatim(value_view, cursor, builder, depth);
+}
+
+// Fold the incoming row into the mutable per-group tree. Object rows update only surviving
+// IGNORE NULLS leaves; arrays/scalars are standalone leaves with a copied sort key.
+void FoldRowLWW(GroupMergeLWWState &state, const JsonoView &V, nonstd::string_view K) {
+	static thread_local LWWTreeScratch scratch;
+	JsonoCursor cursor;
 	if (!state.has_input) {
-		state.values = new OwnedJsonoBlob();
-		state.keys = new OwnedJsonoBlob();
-		SerializeBuilderToBlob(inc_v, *state.values);
-		SerializeBuilderToBlob(inc_k, *state.keys);
+		state.root = new LWWTreeNode();
+		BuildIncomingLWWNode(*state.root, V, cursor, K, scratch, 0);
 		state.has_input = true;
 		return;
 	}
-
-	static thread_local OwnedJsonoBlob inc_v_blob;
-	static thread_local OwnedJsonoBlob inc_k_blob;
-	SerializeBuilderToBlob(inc_v, inc_v_blob);
-	SerializeBuilderToBlob(inc_k, inc_k_blob);
-
-	static thread_local JsonoBuilder out_v;
-	static thread_local JsonoBuilder out_k;
-	out_v.Reset();
-	out_k.Reset();
-	JsonoView acc_v = ViewOfBlob(*state.values);
-	JsonoView acc_k = ViewOfBlob(*state.keys);
-	JsonoView iv = ViewOfBlob(inc_v_blob);
-	JsonoView ik = ViewOfBlob(inc_k_blob);
-	if (!acc_v.ParseHeader() || !acc_k.ParseHeader() || !iv.ParseHeader() || !ik.ParseHeader()) {
-		throw InternalException("jsono_group_merge: malformed accumulator blob");
+	if (!state.root) {
+		throw InternalException("jsono_group_merge: missing keyed aggregate root");
 	}
-	MergeLWW(acc_v, JsonoCursor(), acc_k, JsonoCursor(), iv, JsonoCursor(), ik, JsonoCursor(), out_v, out_k, 0);
-	SerializeBuilderToBlob(out_v, *state.values);
-	SerializeBuilderToBlob(out_k, *state.keys);
+	MergeIncomingLWWNode(*state.root, V, cursor, K, scratch, 0);
 }
 
 unique_ptr<FunctionData> JsonoGroupMergeLWWBind(ClientContext &context, AggregateFunction &function,
@@ -2475,58 +2584,64 @@ void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_da
 }
 
 void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
-	(void)aggr_input_data;
 	UnifiedVectorFormat source_fmt;
 	source.ToUnifiedFormat(count, source_fmt);
 	auto source_data = UnifiedVectorFormat::GetData<GroupMergeLWWState *>(source_fmt);
 	auto target_data = FlatVector::GetData<GroupMergeLWWState *>(target);
+	auto destructive = aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE;
 
-	static thread_local JsonoBuilder out_v;
-	static thread_local JsonoBuilder out_k;
 	for (idx_t row = 0; row < count; row++) {
 		auto &src = *source_data[RowIndex(source_fmt, row)];
-		if (!src.has_input || !src.values || !src.keys) {
+		if (!src.has_input || !src.root) {
 			continue;
 		}
 		auto &tgt = *target_data[row];
 		if (!tgt.has_input) {
-			tgt.values = new OwnedJsonoBlob(*src.values);
-			tgt.keys = new OwnedJsonoBlob(*src.keys);
+			if (destructive) {
+				tgt.root = src.root;
+				src.root = nullptr;
+				src.has_input = false;
+			} else {
+				tgt.root = CloneLWWTreeNode(*src.root).release();
+			}
 			tgt.has_input = true;
 			continue;
 		}
-		out_v.Reset();
-		out_k.Reset();
-		JsonoView tv = ViewOfBlob(*tgt.values);
-		JsonoView tk = ViewOfBlob(*tgt.keys);
-		JsonoView sv = ViewOfBlob(*src.values);
-		JsonoView sk = ViewOfBlob(*src.keys);
-		if (!tv.ParseHeader() || !tk.ParseHeader() || !sv.ParseHeader() || !sk.ParseHeader()) {
-			throw InternalException("jsono_group_merge: malformed accumulator blob");
+		if (!tgt.root) {
+			throw InternalException("jsono_group_merge: missing keyed aggregate root");
 		}
-		MergeLWW(tv, JsonoCursor(), tk, JsonoCursor(), sv, JsonoCursor(), sk, JsonoCursor(), out_v, out_k, 0);
-		SerializeBuilderToBlob(out_v, *tgt.values);
-		SerializeBuilderToBlob(out_k, *tgt.keys);
+		if (destructive) {
+			MergeLWWTreeIntoTreeDestructive(*tgt.root, *src.root);
+			delete src.root;
+			src.root = nullptr;
+			src.has_input = false;
+		} else {
+			MergeLWWTreeIntoTree(*tgt.root, *src.root);
+		}
 	}
 }
 
-// Write each group's merged `values` blob (or an empty object for an empty group) into `out`.
+// Serialize each group's tree (or an empty object for an empty group) into `out`.
 void FinalizeLWWPlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMergeLWWState *const *state_data,
                             idx_t count, idx_t base) {
 	JsonoBodyWriter writer;
 	writer.Init(out);
-	JsonoBuilder empty_builder;
+	JsonoBuilder builder;
 	for (idx_t i = 0; i < count; i++) {
 		auto rid = i + base;
 		auto &state = *state_data[RowIndex(state_fmt, i)];
-		if (!state.has_input || !state.values) {
-			empty_builder.Reset();
-			empty_builder.EmitObjectStart(0);
-			empty_builder.EmitObjectEnd();
-			writer.WriteRow(rid, empty_builder);
+		builder.Reset();
+		if (!state.has_input) {
+			builder.EmitObjectStart(0);
+			builder.EmitObjectEnd();
+			writer.WriteRow(rid, builder);
 			continue;
 		}
-		WriteOwnedBlobRow(writer, rid, *state.values);
+		if (!state.root) {
+			throw InternalException("jsono_group_merge: missing keyed aggregate root");
+		}
+		EmitLWWTreeNode(*state.root, builder, 0);
+		writer.WriteRow(rid, builder);
 	}
 }
 

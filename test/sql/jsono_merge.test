@@ -414,7 +414,7 @@ SELECT to_json(jsono_merge_patch(jsono({'name': 'x', 'meta': {'src': 'web'}}), j
 # fallback whenever a plain input could make it wrong. ---
 
 # Disjoint plain patch (an object-valued key, kept plain): the base lanes copy through, the
-# plain key folds into the residual. The rick/data per-event document-build shape.
+# plain key folds into the residual.
 query II
 SELECT to_json(m), typeof(m) = jsono_storage_type('event_name VARCHAR, goals VARCHAR, url VARCHAR')
 FROM (

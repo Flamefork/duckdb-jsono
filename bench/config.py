@@ -95,6 +95,15 @@ WIDE_FLAT_SIZES = {
     "100k": 100_000,
 }
 
+# Events4 keyed-aggregate proxy. Kept outside `--kind all` generation because it
+# is deliberately larger than the routine synthetic datasets.
+KEYED_PAIR_SIZES = {
+    "1M": 1_000_000,
+}
+KEYED_PAIR_ROW_GROUP_SIZE = 32_768
+KEYED_PAIR_PAGE_GROUPS = 86_207
+KEYED_PAIR_USER_GROUPS = 263_000
+
 # Schema of the wide-flat dataset (generate_data.py reads these to emit rows, the
 # shredded merge scenarios read them to build a shred spec that matches the keys
 # exactly). group prefix -> [(key suffix, value kind)], flattened to
@@ -107,7 +116,7 @@ WIDE_FLAT_GROUPS = {
         ("session_id", "digits"),
         ("hit_id", "digits"),
         ("counter_id", "digits"),
-        ("watch_id", "digits"),
+        ("secondary_id", "digits"),
         ("visit_id", "digits"),
     ],
     "browser": [
@@ -223,8 +232,8 @@ WIDE_FLAT_FIELDS = [
 
 # Shred spec covering every always-present scalar top-level key (~107 lanes). int
 # values shred as BIGINT, every other kind (digits/token/sparse_token/flag/url) is
-# a JSON string -> VARCHAR. event_name is the fixed archetype key. This mirrors the
-# rick/data group-merged base: a wide value carrying ~90 typed lanes.
+# a JSON string -> VARCHAR. event_name is the fixed archetype key; the resulting
+# value is a wide shredded group-merge base with many typed lanes.
 WIDE_FLAT_SHREDDING_SPEC = {
     "event_name": "VARCHAR",
     **{
@@ -232,12 +241,18 @@ WIDE_FLAT_SHREDDING_SPEC = {
         for name, kind in WIDE_FLAT_FIELDS
     },
 }
+KEYED_PAIR_WIDE_SHREDDING_SPEC = {
+    **WIDE_FLAT_SHREDDING_SPEC,
+    "URL": "VARCHAR",
+    "primaryID": "VARCHAR",
+    "secondaryID": "VARCHAR",
+}
 
-# Patches mirroring the rick/data per-event document construction. A patch entry is tagged
-# with how it is built, because the construction decides the shredded type the merge sees:
+# Merge-patch inputs are tagged with how they are built, because the construction
+# decides the shredded type the merge sees:
 #   {"plain": value}    -> jsono('<json text>'): a PLAIN jsono value (no shreds). This is the
-#                          `jsono({'params': watch_params})` shape where params holds a JSONO
-#                          value, so it is not auto-shredded — the plain argument H1 fast-paths.
+#                          `jsono({'payload': nested_payload})` shape where payload holds a JSONO
+#                          value, so it is not auto-shredded — the plain argument fast-paths.
 #   {"shredded": value} -> jsono(<struct literal>): jsono({...}) auto-shreds scalar top-level
 #                          fields, mirroring jsono({'event_name':.., 'goals':..}).
 #   {"auto_shred": value} -> jsono(<struct literal>) over a value with NESTED scalars, which
@@ -245,17 +260,17 @@ WIDE_FLAT_SHREDDING_SPEC = {
 #                          path (it is not a whole top-level lane), so this stays on the reshred
 #                          fallback even after H1 — it isolates that separate bottleneck.
 WIDE_FLAT_NESTED_PATCH = {
-    "plain": {"params": {"watch_goal_a": "1042", "watch_goal_b": "5530"}}
+    "plain": {"payload": {"detail_goal_a": "1042", "detail_goal_b": "5530"}}
 }
 WIDE_FLAT_SMALL_PATCH = {
     "shredded": {"event_name": "page_view_merged", "goals": "g1,g2,g3"}
 }
 WIDE_FLAT_NESTED_SHRED_PATCH = {
-    "auto_shred": {"params": {"watch_goal_a": "1042", "watch_goal_b": "5530"}}
+    "auto_shred": {"payload": {"detail_goal_a": "1042", "detail_goal_b": "5530"}}
 }
 
 # Shred set for shredded scenarios over the field_sample page_view shape:
-# always-present scalar keys, matching the rick/data deployment plan.
+# always-present scalar keys, used by projection and filter-pushdown scenarios.
 FIELD_SAMPLE_SHREDDING_SPEC = {
     "clientID": "VARCHAR",
     "event_name": "VARCHAR",
@@ -282,7 +297,7 @@ FIELD_SAMPLE_PROJECT_PATHS = [
 # (O-2); without the fuse the shredded variant pays three residual reads + three
 # manifest checks per row.
 FIELD_SAMPLE_FILTER_PREDICATES = [
-    {"path": "$.browser", "values": ["chrome", "yandex_browser", "safari_mobile"]},
+    {"path": "$.browser", "values": ["chrome", "alt_browser", "safari_mobile"]},
     {"path": "$.operatingSystem", "values": ["windows10", "ios18", "android"]},
     {"path": "$.regionCity", "values": ["Moscow", "Saint Petersburg", "Kiev"]},
 ]

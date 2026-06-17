@@ -222,6 +222,75 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
         )
         self.assertNotIn("shredding", query.timed_sql)
 
+    def test_jsono_group_merge_keyed_query_materializes_input_and_keys(self) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "group_merge_keyed_max_jsono",
+                "scenario": "wide_shredded_keyed_many_groups",
+                "json_column": "json_wide_flat",
+                "shredding": {"event_name": "VARCHAR"},
+                "group_col": "g1e4",
+                "targets": ["jsono"],
+            },
+            Path("wide_flat_100k.parquet"),
+        )
+
+        self.assertIn(
+            "jsono(json_wide_flat::VARCHAR, shredding := {'event_name': 'VARCHAR'}) AS t",
+            query.prepare_sql[0],
+        )
+        self.assertIn("g1e4 AS g", query.prepare_sql[0])
+        self.assertIn("row_num AS k_ts", query.prepare_sql[0])
+        self.assertIn(
+            "(row_num % 1000000)::UBIGINT AS k_secondary", query.prepare_sql[0]
+        )
+        self.assertIn(
+            "SELECT jsono_group_merge_max(t, row(k_ts, k_secondary)) AS r",
+            query.timed_sql,
+        )
+        self.assertIn("GROUP BY g", query.timed_sql)
+        self.assertNotIn("jsono(", query.timed_sql)
+
+    def test_jsono_group_merge_keyed_pair_query_materializes_inputs_and_keys(
+        self,
+    ) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "group_merge_keyed_pair_jsono",
+                "scenario": "wide_keyed_pair_medium_group_rows",
+                "wide_json_column": "json_wide_payload",
+                "wide_shredding": {"event_name": "VARCHAR", "secondaryID": "VARCHAR"},
+                "detail_json_column": "json_detail_payload",
+                "group_col": "g_medium_group_rows",
+                "targets": ["jsono"],
+            },
+            Path("keyed_pair_1M.parquet"),
+        )
+
+        self.assertIn(
+            "jsono(json_wide_payload::VARCHAR, shredding := {'event_name': 'VARCHAR', 'secondaryID': 'VARCHAR'}) AS wide_payload",
+            query.prepare_sql[0],
+        )
+        self.assertIn(
+            "jsono(json_detail_payload::VARCHAR) AS detail_payload",
+            query.prepare_sql[0],
+        )
+        self.assertIn("g_medium_group_rows AS g", query.prepare_sql[0])
+        self.assertIn("row_num AS k_ts", query.prepare_sql[0])
+        self.assertIn(
+            "(row_num % 1000000)::UBIGINT AS k_secondary", query.prepare_sql[0]
+        )
+        self.assertIn(
+            "jsono_group_merge_min(wide_payload, row(k_ts, k_secondary)) AS wide_payload",
+            query.timed_sql,
+        )
+        self.assertIn(
+            "jsono_group_merge_max(detail_payload, row(k_ts, k_secondary)) AS detail_payload",
+            query.timed_sql,
+        )
+        self.assertIn("GROUP BY g", query.timed_sql)
+        self.assertNotIn("jsono(", query.timed_sql)
+
     def test_jsono_project_paths_query_is_filterless_multi_extract(self) -> None:
         query = run_benchmarks.build_jsono_query(
             {

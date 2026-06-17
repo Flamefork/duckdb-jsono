@@ -246,12 +246,51 @@ def jsono_prepare_jsono(scenario_config: dict, data_path: Path) -> str:
 
 
 def jsono_prepare_jsono_with_group(scenario_config: dict, data_path: Path) -> str:
-    json_column = scenario_config["json_column"]
     group_col = scenario_config["group_col"]
     return f"""
         CREATE OR REPLACE TEMP TABLE _bench_in AS
-        SELECT jsono({json_column}::VARCHAR) AS t, {group_col}
+        SELECT {jsono_value_sql(scenario_config)} AS t, {group_col}
         FROM {table_sql(data_path)}
+    """
+
+
+def jsono_prepare_jsono_with_group_and_key(
+    scenario_config: dict, data_path: Path
+) -> str:
+    group_col = scenario_config["group_col"]
+    return f"""
+        CREATE OR REPLACE TEMP TABLE _bench_in AS
+        WITH source AS (
+            SELECT *, row_number() OVER ()::UBIGINT AS row_num
+            FROM {table_sql(data_path)}
+        )
+        SELECT
+            {jsono_value_sql(scenario_config)} AS t,
+            {group_col} AS g,
+            row_num AS k_ts,
+            (row_num % 1000000)::UBIGINT AS k_secondary
+        FROM source
+    """
+
+
+def jsono_prepare_jsono_pair_with_group_and_key(
+    scenario_config: dict, data_path: Path
+) -> str:
+    wide_shredding = sql_typed_literal(scenario_config["wide_shredding"])
+    group_col = scenario_config["group_col"]
+    return f"""
+        CREATE OR REPLACE TEMP TABLE _bench_in AS
+        WITH source AS (
+            SELECT *, row_number() OVER ()::UBIGINT AS row_num
+            FROM {table_sql(data_path)}
+        )
+        SELECT
+            jsono({scenario_config["wide_json_column"]}::VARCHAR, shredding := {wide_shredding}) AS wide_payload,
+            jsono({scenario_config["detail_json_column"]}::VARCHAR) AS detail_payload,
+            {group_col} AS g,
+            row_num AS k_ts,
+            (row_num % 1000000)::UBIGINT AS k_secondary
+        FROM source
     """
 
 
@@ -544,6 +583,40 @@ def build_jsono_group_merge_jsono_query(
     )
 
 
+def build_jsono_group_merge_keyed_query(
+    scenario_config: dict, data_path: Path, function_name: str
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(
+            jsono_prepare_jsono_with_group_and_key(scenario_config, data_path),
+        ),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {function_name}(t, row(k_ts, k_secondary)) AS r
+            FROM _bench_in
+            GROUP BY g
+        """,
+    )
+
+
+def build_jsono_group_merge_keyed_pair_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(
+            jsono_prepare_jsono_pair_with_group_and_key(scenario_config, data_path),
+        ),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT
+                jsono_group_merge_min(wide_payload, row(k_ts, k_secondary)) AS wide_payload,
+                jsono_group_merge_max(detail_payload, row(k_ts, k_secondary)) AS detail_payload
+            FROM _bench_in
+            GROUP BY g
+        """,
+    )
+
+
 def build_jsono_optimizer_project_query(
     scenario_config: dict, data_path: Path
 ) -> BenchmarkQuery:
@@ -787,6 +860,16 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_group_merge_query(scenario_config, data_path)
         case "group_merge_jsono":
             return build_jsono_group_merge_jsono_query(scenario_config, data_path)
+        case "group_merge_keyed_max_jsono":
+            return build_jsono_group_merge_keyed_query(
+                scenario_config, data_path, "jsono_group_merge_max"
+            )
+        case "group_merge_keyed_min_jsono":
+            return build_jsono_group_merge_keyed_query(
+                scenario_config, data_path, "jsono_group_merge_min"
+            )
+        case "group_merge_keyed_pair_jsono":
+            return build_jsono_group_merge_keyed_pair_query(scenario_config, data_path)
         case "optimizer_project":
             return build_jsono_optimizer_project_query(scenario_config, data_path)
         case "project_paths":

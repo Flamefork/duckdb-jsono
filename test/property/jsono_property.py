@@ -545,8 +545,8 @@ def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
 
 
 # merge_patch over a SHREDDED base with PLAIN patch arguments must fold identically to the same
-# PLAIN base with the same patches. A plain patch on the fast path is the rick/data per-event shape;
-# this fuzzes every way it can interact with a lane: disjoint append, a value colliding into the
+# PLAIN base with the same patches. This fuzzes every way a plain patch can interact with a lane:
+# disjoint append, a value colliding into the
 # residual, an RFC 7396 null that deletes a lane (no trace in the folded residual), and a non-object
 # patch that replaces the whole document. The plain-base fold is the RFC 7396 reference.
 merge_patch_keys = st.sampled_from(["a", "b", "c", "d", "e"])
@@ -595,8 +595,8 @@ def test_merge_patch_shredded_plain_parity(base: dict[str, Any], patches: list[A
     )
 
 
-# A jsono({...}) patch with a NESTED object auto-shreds its scalars into '$.path' lanes — the
-# rick/data jsono({'params': {...}}) shape. Merging it onto a shredded base puts nested shreds in the
+# A jsono({...}) patch with a NESTED object auto-shreds its scalars into '$.path' lanes.
+# Merging it onto a shredded base puts nested shreds in the
 # merged set, which the fast path copies through as lanes overlaid at their paths. The same merge
 # expressed with PLAIN text patches over a plain base is the RFC 7396 reference; the two must agree
 # (disjoint nested add, nested value collision, a scalar replacing the nested parent, a deeper nest).

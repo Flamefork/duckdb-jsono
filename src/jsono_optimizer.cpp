@@ -1979,7 +1979,7 @@ private:
 		coalesce->children.push_back(std::move(shred_value));
 		coalesce->children.push_back(std::move(fallback));
 		coalesce->SetAlias(alias);
-		return coalesce;
+		return std::move(coalesce);
 	}
 
 	// Read a string-extracted shred. A VARCHAR shred holds the `->>` text for every row,
@@ -2026,7 +2026,7 @@ private:
 		coalesce->children.push_back(std::move(shred_text));
 		coalesce->children.push_back(std::move(fallback));
 		coalesce->SetAlias(alias);
-		return coalesce;
+		return std::move(coalesce);
 	}
 
 	// Build the shred patch as a nested struct_pack tree mirroring each shred's path: a leaf

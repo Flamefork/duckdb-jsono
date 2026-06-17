@@ -294,7 +294,7 @@ STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, ski
 # Type-driven auto-shred is always value-complete: a shred's type IS its field's type, so a present
 # value always fits and a NULL is only an absent field, never a residual diversion. A typed shred
 # with absent (NULL) rows is therefore read COALESCE-free — the value-complete fast path that gives
-# jsono(struct, shredding) the zone-map pushdown on read-back (the rick/data ingest path).
+# jsono(struct, shredding) the zone-map pushdown on read-back.
 statement ok
 CREATE TABLE sc_value_complete AS
 SELECT jsono({'x': CASE WHEN i % 3 = 0 THEN NULL ELSE i END :: BIGINT, 'k': 'a'}) AS j

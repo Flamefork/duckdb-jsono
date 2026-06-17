@@ -24,6 +24,10 @@ import duckdb
 
 from config import (
     DATA_DIR,
+    KEYED_PAIR_PAGE_GROUPS,
+    KEYED_PAIR_ROW_GROUP_SIZE,
+    KEYED_PAIR_SIZES,
+    KEYED_PAIR_USER_GROUPS,
     NUMBERS_SIZES,
     SIZES,
     URL_DEFAULT_SIZES,
@@ -41,7 +45,7 @@ UTM_SOURCES = [
     "google",
     "facebook",
     "instagram",
-    "yandex",
+    "local_search",
     "vk",
     "tiktok",
     "email",
@@ -134,7 +138,7 @@ PAGE_TITLES = [
 REFERRERS = [
     "https://www.google.com/search?q=shoes",
     "https://www.google.com/",
-    "https://yandex.ru/",
+    "https://search.example/",
     "https://m.facebook.com/",
     "https://t.me/somechannel",
     "https://news.ycombinator.com/",
@@ -142,7 +146,7 @@ REFERRERS = [
 ]
 
 DEVICE_TYPES = ["mobile", "desktop", "tablet"]
-BROWSERS = ["Chrome", "Safari", "Firefox", "Edge", "Yandex", "Opera"]
+BROWSERS = ["Chrome", "Safari", "Firefox", "Edge", "AltBrowser", "Opera"]
 OSES = ["iOS", "Android", "Windows", "macOS", "Linux"]
 SCREENS = [
     "390x844",
@@ -298,7 +302,7 @@ def grp_ga(rng: random.Random) -> dict:
 def grp_pixels(rng: random.Random) -> dict:
     return {
         "fbp": f"fb.1.{rng.randint(1_000_000_000, 9_999_999_999)}.{rng.randint(100, 999)}",
-        "yandex_uid": str(rng.randint(1_000_000_000, 9_999_999_999)),
+        "external_uid": str(rng.randint(1_000_000_000, 9_999_999_999)),
         "ym_uid": str(rng.randint(1_000_000_000, 9_999_999_999)),
         "_ga": f"GA1.2.{rng.randint(100_000_000, 999_999_999)}.{rng.randint(1_000_000_000, 9_999_999_999)}",
     }
@@ -795,6 +799,146 @@ def generate_wide_flat_data(size_name: str, num_rows: int, seed: int) -> None:
     print(f"  Saved to {output_path}")
 
 
+def sql_string(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def keyed_pair_value_sql(kind: str) -> str:
+    match kind:
+        case "int":
+            return "(i % 4097)::BIGINT"
+        case "digits":
+            return "(1000000000 + ((i * 17) % 9000000000))::VARCHAR"
+        case "token":
+            return "'tok_' || (i % 97)::VARCHAR"
+        case "sparse_token":
+            return "CASE WHEN i % 4 = 0 THEN 'tok_' || (i % 97)::VARCHAR ELSE '' END"
+        case "flag":
+            return "CASE WHEN i % 2 = 0 THEN '1' ELSE '0' END"
+        case "url":
+            return "'https://example.com/page/' || (i % 1000)::VARCHAR"
+        case _:
+            raise ValueError(f"unknown keyed_pair value kind: {kind}")
+
+
+def json_object_sql(fields: list[tuple[str, str]]) -> str:
+    arguments = []
+    for key, expression in fields:
+        arguments.append(sql_string(key))
+        arguments.append(expression)
+    return "json_object(" + ", ".join(arguments) + ")::JSON"
+
+
+def group_rows_sql(group_column: str, segments: list[tuple[int, int]]) -> str:
+    start_group = 0
+    start_row = 0
+    selects = []
+    for group_count, group_size in segments:
+        selects.append(
+            f"""
+            SELECT
+                row_num: {start_row}::UBIGINT + group_offset * {group_size} + row_offset,
+                {group_column}: {start_group}::UBIGINT + group_offset
+            FROM range({group_count}) group_offsets(group_offset)
+            CROSS JOIN range({group_size}) row_offsets(row_offset)
+            """
+        )
+        start_group += group_count
+        start_row += group_count * group_size
+    return "\nUNION ALL\n".join(selects)
+
+
+def generate_keyed_pair_data(size_name: str, num_rows: int, seed: int) -> None:
+    print(f"Generating keyed_pair {size_name} ({num_rows:,} rows) with seed={seed}...")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = DATA_DIR / f"keyed_pair_{size_name}.parquet"
+
+    conn = duckdb.connect()
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    root_fields = [
+        ("event_name", "'page_view'"),
+        ("URL", "'https://example.com/page/' || (i % 1000)::VARCHAR"),
+        (
+            "primaryID",
+            "(row_num % {groups} + 1)::VARCHAR".format(groups=KEYED_PAIR_PAGE_GROUPS),
+        ),
+        ("secondaryID", "(row_num % 1000000 + 1)::VARCHAR"),
+        *[(key, keyed_pair_value_sql(kind)) for key, kind in WIDE_FLAT_FIELDS],
+    ]
+    detail_fields = [
+        ("browser", "'browser_' || (i % 7)::VARCHAR"),
+        ("device", "'device_' || (i % 3)::VARCHAR"),
+        ("screen", "'screen_' || (i % 8)::VARCHAR"),
+        ("language", "'lang_' || (i % 6)::VARCHAR"),
+        ("referer", "'https://ref.example/' || (i % 100)::VARCHAR"),
+        ("scroll_depth", "(i % 101)::BIGINT"),
+        ("duration", "(1 + (i % 600))::BIGINT"),
+        ("is_bounce", "i % 2 = 0"),
+    ]
+    user_fields = [
+        ("client_type", "'type_' || (i % 3)::VARCHAR"),
+        ("segment", "'segment_' || (i % 4)::VARCHAR"),
+        ("country", "'country_' || (i % 12)::VARCHAR"),
+        ("visits", "(1 + (i % 25))::BIGINT"),
+        ("lead_score", "(i % 1001)::BIGINT"),
+    ]
+    page_segments = [
+        (44_000, 9),
+        (33_000, 12),
+        (9_000, 22),
+        (206, 48),
+        (1, 112),
+    ]
+    user_segments = [
+        (100_000, 3),
+        (130_000, 4),
+        (30_000, 5),
+        (2_900, 9),
+        (100, 39),
+    ]
+    conn.execute(
+        f"""
+        COPY (
+            WITH
+            page_rows AS (
+                {group_rows_sql("page_group", page_segments)}
+            ),
+            user_rows AS (
+                {group_rows_sql("user_group", user_segments)}
+            )
+            SELECT
+                json_wide_payload: {json_object_sql(root_fields)},
+                json_detail_payload: {json_object_sql(detail_fields)},
+                json_small_payload: {json_object_sql(user_fields)},
+                g_medium_group_rows: 'pv_' || page_group::VARCHAR,
+                g_few_group_rows: 'up_' || user_group::VARCHAR,
+            FROM page_rows
+            JOIN user_rows USING (row_num)
+            CROSS JOIN LATERAL (
+                SELECT (row_num + {seed})::UBIGINT AS i
+            )
+        )
+        TO '{output_path}' (
+            FORMAT PARQUET,
+            ROW_GROUP_SIZE {KEYED_PAIR_ROW_GROUP_SIZE},
+            KV_METADATA {{
+                seed: '{seed}',
+                size: '{size_name}',
+                rows: '{num_rows}',
+                generated_at: '{generated_at}',
+                row_group_size: '{KEYED_PAIR_ROW_GROUP_SIZE}',
+                schema_version: 'keyed_pair_v1'
+            }}
+        )
+        """
+    )
+    conn.close()
+
+    print(f"  Saved to {output_path}")
+
+
 def clean_path(path: str) -> str:
     return path.split("?", 1)[0]
 
@@ -951,7 +1095,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--kind",
-        choices=["all", "events", "urls", "numbers", "wide_flat"],
+        choices=["all", "events", "urls", "numbers", "wide_flat", "keyed_pair"],
         default="all",
         help="Dataset kind to generate (default: all)",
     )
@@ -969,6 +1113,8 @@ def main() -> None:
             generate_numbers_data(args.size, NUMBERS_SIZES[args.size], args.seed)
         if args.kind in ("all", "wide_flat") and args.size in WIDE_FLAT_SIZES:
             generate_wide_flat_data(args.size, WIDE_FLAT_SIZES[args.size], args.seed)
+        if args.kind == "keyed_pair" and args.size in KEYED_PAIR_SIZES:
+            generate_keyed_pair_data(args.size, KEYED_PAIR_SIZES[args.size], args.seed)
     else:
         if args.kind in ("all", "events"):
             for size_name, num_rows in SIZES.items():
@@ -982,6 +1128,9 @@ def main() -> None:
         if args.kind in ("all", "wide_flat"):
             for size_name, num_rows in WIDE_FLAT_SIZES.items():
                 generate_wide_flat_data(size_name, num_rows, args.seed)
+        if args.kind == "keyed_pair":
+            for size_name, num_rows in KEYED_PAIR_SIZES.items():
+                generate_keyed_pair_data(size_name, num_rows, args.seed)
 
 
 if __name__ == "__main__":

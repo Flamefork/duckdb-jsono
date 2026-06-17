@@ -15,10 +15,10 @@ require json
 # residual and tripped the shred-manifest guard. Both values live in their lanes, so this must just
 # return them.
 query II
-SELECT (rp->>'pageViewID')::ubigint, (rp->>'watchID')::ubigint
+SELECT (rp->>'primaryID')::ubigint, (rp->>'secondaryID')::ubigint
 FROM (VALUES
-  (jsono('{"watchID":100,"pageViewID":50}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'})),
-  (jsono('{"watchID":101,"pageViewID":60}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'}))
+  (jsono('{"secondaryID":100,"primaryID":50}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'})),
+  (jsono('{"secondaryID":101,"primaryID":60}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'}))
 ) t(rp)
 ORDER BY 1;
 ----
@@ -27,9 +27,9 @@ ORDER BY 1;
 
 # Text (uncast) extracts take the same shred-read fold + fallback path.
 query II
-SELECT rp->>'pageViewID', rp->>'watchID'
+SELECT rp->>'primaryID', rp->>'secondaryID'
 FROM (VALUES
-  (jsono('{"watchID":100,"pageViewID":50}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'}))
+  (jsono('{"secondaryID":100,"primaryID":50}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'}))
 ) t(rp);
 ----
 50	100
@@ -37,22 +37,22 @@ FROM (VALUES
 # Mixed: one shredded lane + one residual path in the same projection. The shredded path must read
 # its lane; only the genuine residual path may go through a residual read.
 query II
-SELECT (rp->>'pageViewID')::ubigint, rp->>'dateTime'
+SELECT (rp->>'primaryID')::ubigint, rp->>'dateTime'
 FROM (VALUES
-  (jsono('{"pageViewID":50,"dateTime":"x"}', shredding := {'$.pageViewID':'UBIGINT'}))
+  (jsono('{"primaryID":50,"dateTime":"x"}', shredding := {'$.primaryID':'UBIGINT'}))
 ) t(rp);
 ----
 50	x
 
-# The events4 shape that surfaced it: a keyed group_merge whose order key and GROUP BY each extract
-# a different shred lane of the aggregated shredded column.
+# A keyed group_merge whose order key and GROUP BY each extract a different shred lane of the
+# aggregated shredded column.
 query I
-SELECT (jsono_group_merge_min(rp, (rp->>'watchID')::ubigint) ->> 'pageViewID')::ubigint
+SELECT (jsono_group_merge_min(rp, (rp->>'secondaryID')::ubigint) ->> 'primaryID')::ubigint
 FROM (VALUES
-  (jsono('{"watchID":100,"pageViewID":50}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'}), 10),
-  (jsono('{"watchID":101,"pageViewID":60}', shredding := {'$.watchID':'UBIGINT','$.pageViewID':'UBIGINT'}), 20)
+  (jsono('{"secondaryID":100,"primaryID":50}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'}), 10),
+  (jsono('{"secondaryID":101,"primaryID":60}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'}), 20)
 ) t(rp, dt)
-GROUP BY (rp->>'pageViewID')::ubigint
+GROUP BY (rp->>'primaryID')::ubigint
 ORDER BY 1;
 ----
 50
