@@ -385,6 +385,7 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 		throw InvalidInputException("jsono: key heap exceeds storage limits");
 	}
 
+	auto start_slot_count = s.sz.slot_count;
 	s.sz.slot_count += 2 + emit_count;
 	if (emit_count > OBJECT_CHECKPOINT_STRIDE) {
 		auto stride = emit_count >= LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT ? LARGE_OBJECT_CHECKPOINT_STRIDE
@@ -393,21 +394,16 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 		s.sz.checkpoint_count += (emit_count - 1) / stride;
 	}
 
-	s.plans.push_back(DomObjectPlan {sorted_hash, kv_offset, idx_offset, uint32_t(emit_count)});
+	auto plan_index = s.plans.size();
+	s.plans.push_back(DomObjectPlan {sorted_hash, kv_offset, idx_offset, uint32_t(emit_count), false});
 
-	// ContainerStoresSpan + EnsureParentObjectSpan folded into one predicate:
-	// an object stores a span when it is checkpointed or any emitted child is
-	// a container. Only emitted (post-dedup) children recurse, matching the
-	// builder, so dropped duplicates contribute neither sizes nor spans.
-	bool spanned = emit_count > OBJECT_CHECKPOINT_STRIDE;
+	bool has_container_child = false;
 	if (trie_children.empty()) {
 		for (size_t i = 0; i < emit_count; i++) {
 			// Absolute indexing: recursion appends to kvs/indices and may reallocate.
 			auto *value = s.kvs[kv_offset + s.indices[idx_offset + i]].second;
 			auto value_type = yyjson_get_type(value);
-			if (value_type == YYJSON_TYPE_OBJ || value_type == YYJSON_TYPE_ARR) {
-				spanned = true;
-			}
+			has_container_child |= value_type == YYJSON_TYPE_OBJ || value_type == YYJSON_TYPE_ARR;
 			SizeDomElement(value, s, depth + 1);
 		}
 	} else {
@@ -415,9 +411,7 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 		for (size_t i = 0; i < emit_count; i++) {
 			auto *value = s.kvs[kv_offset + s.indices[idx_offset + i]].second;
 			auto value_type = yyjson_get_type(value);
-			if (value_type == YYJSON_TYPE_OBJ || value_type == YYJSON_TYPE_ARR) {
-				spanned = true;
-			}
+			has_container_child |= value_type == YYJSON_TYPE_OBJ || value_type == YYJSON_TYPE_ARR;
 			if (next_child < trie_children.size() && trie_children[next_child].first == i) {
 				// Collection above only descends into object values.
 				SizeDomObject(value, s, depth + 1, shred, trie_children[next_child].second);
@@ -427,6 +421,10 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 			}
 		}
 	}
+	auto slot_span = s.sz.slot_count - start_slot_count;
+	bool spanned =
+	    emit_count > OBJECT_CHECKPOINT_STRIDE || (has_container_child && slot_span > OBJECT_CHECKPOINT_STRIDE);
+	s.plans[plan_index].spanned = spanned;
 	if (spanned) {
 		s.sz.span_count++;
 	}
@@ -434,7 +432,9 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 
 void SizeDomArray(yyjson_val *arr, DomDirectState &s, size_t depth) {
 	SizeDomContainerChecks(s, depth);
-	s.sz.span_count++; // arrays always store a span
+	if (yyjson_arr_size(arr) > 0) {
+		s.sz.span_count++;
+	}
 	s.sz.slot_count += 2;
 	yyjson_arr_iter iter = yyjson_arr_iter_with(arr);
 	yyjson_val *elem;
@@ -552,28 +552,20 @@ struct DirectDest {
 struct DirectFrame {
 	uint64_t id;
 	size_t span_index;
-	bool is_object;
 };
 
-// EnsureParentObjectSpan equivalent: a parent object's span is allocated at
-// its first container child's start, which keeps span_ids sorted.
-void DirectEnsureParentObjectSpan(DirectFrame *parent, DirectDest &d) {
-	if (parent && parent->is_object && parent->span_index == DIRECT_NO_SPAN) {
-		parent->span_index = d.AllocSpan(uint32_t(parent->id));
-	}
-}
+void WriteDomElementDirect(yyjson_val *element, DomDirectState &s, DirectDest &d);
 
-void WriteDomElementDirect(yyjson_val *element, DomDirectState &s, DirectDest &d, DirectFrame *parent);
-
-void WriteDomObjectDirect(DomDirectState &s, DirectDest &d, DirectFrame *parent) {
+void WriteDomObjectDirect(DomDirectState &s, DirectDest &d) {
 	const auto plan = s.plans[d.plan_pos++];
-	DirectEnsureParentObjectSpan(parent, d);
-	DirectFrame frame {d.container_count++, DIRECT_NO_SPAN, true};
+	DirectFrame frame {d.container_count++, DIRECT_NO_SPAN};
 
 	auto checkpoint_offset = NO_OBJECT_CHECKPOINTS;
 	uint32_t checkpoint_stride = 0;
-	if (plan.emit_count > OBJECT_CHECKPOINT_STRIDE) {
+	if (plan.spanned) {
 		frame.span_index = d.AllocSpan(uint32_t(frame.id));
+	}
+	if (plan.emit_count > OBJECT_CHECKPOINT_STRIDE) {
 		checkpoint_stride = plan.emit_count >= LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT ? LARGE_OBJECT_CHECKPOINT_STRIDE
 		                                                                               : OBJECT_CHECKPOINT_STRIDE;
 		checkpoint_offset = uint32_t(d.checkpoint_pos);
@@ -607,7 +599,7 @@ void WriteDomObjectDirect(DomDirectState &s, DirectDest &d, DirectFrame *parent)
 			    ObjectCursorCheckpoint {uint32_t(d.slot_pos - value_start), uint32_t(d.string_pos - start_string),
 			                            uint32_t(d.length_pos - start_length), uint32_t(d.num_pos - start_num)});
 		}
-		WriteDomElementDirect(kvs[perm[i]].second, s, d, &frame);
+		WriteDomElementDirect(kvs[perm[i]].second, s, d);
 	}
 	d.PushSlot(MakeSlot(tag::OBJ_END, 0));
 
@@ -619,10 +611,11 @@ void WriteDomObjectDirect(DomDirectState &s, DirectDest &d, DirectFrame *parent)
 	}
 }
 
-void WriteDomArrayDirect(yyjson_val *arr, DomDirectState &s, DirectDest &d, DirectFrame *parent) {
-	DirectEnsureParentObjectSpan(parent, d);
-	DirectFrame frame {d.container_count++, DIRECT_NO_SPAN, false};
-	frame.span_index = d.AllocSpan(uint32_t(frame.id));
+void WriteDomArrayDirect(yyjson_val *arr, DomDirectState &s, DirectDest &d) {
+	DirectFrame frame {d.container_count++, DIRECT_NO_SPAN};
+	if (yyjson_arr_size(arr) > 0) {
+		frame.span_index = d.AllocSpan(uint32_t(frame.id));
+	}
 
 	auto start_slot = d.slot_pos;
 	auto start_string = d.string_pos;
@@ -633,23 +626,25 @@ void WriteDomArrayDirect(yyjson_val *arr, DomDirectState &s, DirectDest &d, Dire
 	yyjson_arr_iter iter = yyjson_arr_iter_with(arr);
 	yyjson_val *elem;
 	while ((elem = yyjson_arr_iter_next(&iter))) {
-		WriteDomElementDirect(elem, s, d, &frame);
+		WriteDomElementDirect(elem, s, d);
 	}
 	d.PushSlot(MakeSlot(tag::ARR_END, 0));
 
-	d.StoreSpan(frame.span_index,
-	            ContainerSpan {uint32_t(d.slot_pos - start_slot), uint32_t(d.string_pos - start_string), 0,
-	                           uint32_t(d.length_pos - start_length), uint32_t(d.num_pos - start_num)});
+	if (frame.span_index != DIRECT_NO_SPAN) {
+		d.StoreSpan(frame.span_index,
+		            ContainerSpan {uint32_t(d.slot_pos - start_slot), uint32_t(d.string_pos - start_string), 0,
+		                           uint32_t(d.length_pos - start_length), uint32_t(d.num_pos - start_num)});
+	}
 }
 
-void WriteDomElementDirect(yyjson_val *element, DomDirectState &s, DirectDest &d, DirectFrame *parent) {
+void WriteDomElementDirect(yyjson_val *element, DomDirectState &s, DirectDest &d) {
 	switch (yyjson_get_type(element)) {
 	case YYJSON_TYPE_OBJ:
 		// Object keys/values come from the recorded plan, not the DOM handle.
-		WriteDomObjectDirect(s, d, parent);
+		WriteDomObjectDirect(s, d);
 		return;
 	case YYJSON_TYPE_ARR:
-		WriteDomArrayDirect(element, s, d, parent);
+		WriteDomArrayDirect(element, s, d);
 		return;
 	case YYJSON_TYPE_STR: {
 		auto len = yyjson_get_len(element);
@@ -767,7 +762,7 @@ void EmitDomRowDirect(yyjson_val *root, DomDirectState &state, JsonoBodyWriter &
 	d.checkpoint_index = d.spans + sz.span_count * sizeof(ContainerSpan);
 	d.checkpoints = d.checkpoint_index + sz.checkpoint_index_count * sizeof(ObjectCheckpointIndex);
 
-	WriteDomElementDirect(root, state, d, nullptr);
+	WriteDomElementDirect(root, state, d);
 
 	// Pass-1 sizing and pass-2 emission must agree exactly; a mismatch means
 	// some buffer was written out of bounds — fail loud before publishing.

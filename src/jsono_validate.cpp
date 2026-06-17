@@ -132,17 +132,22 @@ void ValidateScalar(const JsonoView &view, JsonoCursor &cursor) {
 	}
 }
 
+enum class ContainerSpanRequirement : uint8_t { Forbidden, Optional, Required };
+
 // Validate one stored container span against the cursor deltas the walk actually
-// produced. Spans must exist exactly for arrays, objects with child_count >
-// OBJECT_CHECKPOINT_STRIDE, and objects whose immediate children include a container;
-// a spanned object additionally stores the shape_hash of its sorted key sequence.
-void ValidateContainerSpan(const JsonoView &view, uint64_t container_id, bool span_eligible, uint64_t expected_hash,
-                           const JsonoCursor &start, const JsonoCursor &end, size_t &validated_span_count) {
+// produced. Spans are required for non-empty arrays and large objects; legacy small
+// objects with container children and empty arrays may still carry optional spans.
+// A spanned object additionally stores the shape_hash of its sorted key sequence.
+void ValidateContainerSpan(const JsonoView &view, uint64_t container_id, ContainerSpanRequirement requirement,
+                           uint64_t expected_hash, const JsonoCursor &start, const JsonoCursor &end,
+                           size_t &validated_span_count) {
 	ContainerSpan span;
 	bool has_span = view.TryContainerSpan(container_id, span);
-	if (has_span != span_eligible) {
-		throw InvalidInputException(has_span ? "malformed JSONO: unexpected container span"
-		                                     : "malformed JSONO: container span missing");
+	if (has_span && requirement == ContainerSpanRequirement::Forbidden) {
+		throw InvalidInputException("malformed JSONO: unexpected container span");
+	}
+	if (!has_span && requirement == ContainerSpanRequirement::Required) {
+		throw InvalidInputException("malformed JSONO: container span missing");
 	}
 	if (!has_span) {
 		return;
@@ -208,8 +213,10 @@ bool ValidateValue(const JsonoView &view, JsonoCursor &cursor, size_t depth,
 			throw InvalidInputException("malformed JSONO: object value span mismatch");
 		}
 		cursor.pos++;
-		ValidateContainerSpan(view, container_id, layout.key_count > OBJECT_CHECKPOINT_STRIDE || has_container_child,
-		                      shape_hash, start, cursor, validated_span_count);
+		auto span_requirement = layout.key_count > OBJECT_CHECKPOINT_STRIDE ? ContainerSpanRequirement::Required
+		                        : has_container_child                       ? ContainerSpanRequirement::Optional
+		                                                                    : ContainerSpanRequirement::Forbidden;
+		ValidateContainerSpan(view, container_id, span_requirement, shape_hash, start, cursor, validated_span_count);
 		return true;
 	}
 	case tag::ARR_START: {
@@ -231,7 +238,9 @@ bool ValidateValue(const JsonoView &view, JsonoCursor &cursor, size_t depth,
 			throw InvalidInputException("malformed JSONO: array value span mismatch");
 		}
 		cursor.pos = end_pos + 1;
-		ValidateContainerSpan(view, container_id, true, 0, start, cursor, validated_span_count);
+		auto span_requirement =
+		    cursor.pos == start.pos + 2 ? ContainerSpanRequirement::Optional : ContainerSpanRequirement::Required;
+		ValidateContainerSpan(view, container_id, span_requirement, 0, start, cursor, validated_span_count);
 		return true;
 	}
 	default:
@@ -246,8 +255,8 @@ void ValidateMetadata(const JsonoView &view, const std::vector<uint32_t> &contai
 	if (ExpectedSkipsSize(metadata) != view.SkipsSize()) {
 		// The only legal tail after the checkpoint sections is a shred manifest; parsing it
 		// validates the framing (and throws on trailing garbage).
-		std::vector<jsono::ShredManifestEntry> manifest;
-		view.ReadShredManifest(manifest);
+		auto tail = view.ManifestTail();
+		ValidateShredManifestBytes(tail.data(), tail.size());
 	}
 	// The walk validated every span-eligible container against a stored span, so an
 	// extra stored span is exactly a count mismatch. The sparse id index must be

@@ -28,24 +28,33 @@ FROM (SELECT jsono('{"s":"hi","empty":"","i":7,"neg":-42,"big":57646075230342348
 ----
 4	5
 
-# A small flat object (<= 16 keys, scalar children only) stores no ContainerSpan: its skips
-# blob is the bare 12-byte metadata header. An array always stores one (12 + 4 id + 24 span).
-query II
+# A small object (<= 16 keys) and an empty array store no ContainerSpan: their skips blob is
+# the bare 12-byte metadata header. A non-empty array stores one (12 + 4 id + 24 span).
+query III
 SELECT
   octet_length(jsono('{"a":1,"b":"x"}')."jsono".body.skips),
+  octet_length(jsono('[]')."jsono".body.skips),
   octet_length(jsono('[1,2]')."jsono".body.skips);
 ----
-12	40
+12	12	40
 
-# A small object whose immediate children include a container stores a span — skipping it
-# stays an O(1) jump instead of a subtree walk. The nested flat object itself stays
-# span-less (one span: 12 + 4 + 24); a nested array adds its own (two spans: 12 + 2x28).
+# A small object whose immediate children include a tiny container stays spanless: skipping it
+# is a bounded subtree walk. A nested non-empty array stores its own span.
 query II
 SELECT
   octet_length(jsono('{"a":1,"o":{"x":1}}')."jsono".body.skips),
   octet_length(jsono('{"a":1,"l":[1,2]}')."jsono".body.skips);
 ----
-40	68
+12	40
+
+# A small object with a large nested subtree stores an optional span, because late-key
+# navigation would otherwise replay the whole subtree on every row.
+query II
+SELECT
+  octet_length(jsono('{"root":{"a":1,"l":[1,2,3,4,5,6,7,8,9,10]},"z":1}')."jsono".body.skips),
+  jsono_validate(jsono('{"root":{"a":1,"l":[1,2,3,4,5,6,7,8,9,10]},"z":1}'));
+----
+96	true
 
 # The struct constructor's one_list fast path agrees with the criterion, validated against
 # a full walk. The NULL-typed scalar field is not shreddable, so the first two values stay

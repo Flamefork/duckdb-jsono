@@ -241,6 +241,22 @@ SELECT to_json(jsono_group_merge_max(j, k)) FROM (
 ----
 {"a":[7],"k":"v"}
 
+query I
+SELECT to_json(jsono_group_merge_max(j, k)) FROM (
+  SELECT jsono('{"a":[1],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k
+  UNION ALL
+  SELECT jsono('{"a":[2,3],"k":"y"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k);
+----
+{"a":[2,3],"k":"y"}
+
+query I
+SELECT to_json(jsono_group_merge_max(j, k)) FROM (
+  SELECT jsono('{"a":[10,20],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k
+  UNION ALL
+  SELECT jsono('{"a":[10],"k":"y"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k);
+----
+{"a":[10,20],"k":"y"}
+
 # ---------------------------------------------------------------------------
 # Casting a shredded-array value to the plain jsono STRUCT is a lossless reconstruct.
 # ---------------------------------------------------------------------------

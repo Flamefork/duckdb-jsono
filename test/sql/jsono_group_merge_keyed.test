@@ -46,6 +46,17 @@ FROM p;
 ----
 {"arr":[9],"o":{"d":{"e":7,"f":2}}}	true
 
+# Literal keys containing dots are distinct from nested paths with the same textual spelling.
+query II
+WITH p(j, ts) AS (VALUES
+  (jsono('{"a.b":1}'), 1),
+  (jsono('{"a":{"b":2}}'), 2))
+SELECT to_json(jsono_group_merge_max(j, ts)),
+       to_json(jsono_group_merge_max(j, ts)) = to_json(jsono_group_merge(j ORDER BY ts))
+FROM p;
+----
+{"a":{"b":2},"a.b":1}	true
+
 # _min picks the smallest-key value per leaf (earliest-wins).
 query II
 WITH p(j, ts) AS (VALUES
@@ -152,6 +163,42 @@ FROM (
 ----
 {"event_name":"search","x":1}	search	true
 
+# Direct keyed finalize writes a layout-indexed shred manifest; it must validate and still guard raw narrowing.
+query I
+SELECT jsono_validate(m)
+FROM (
+  SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
+    (jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}), 1)
+  ) t(j, ts)
+);
+----
+true
+
+statement ok
+CREATE TABLE indexed_keyed_narrow AS SELECT jsono('{}', shredding := {'a':'VARCHAR'}) AS j WHERE false;
+
+statement ok
+CREATE TABLE indexed_keyed_wide AS
+SELECT m FROM (
+  SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
+    (jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}), 1)
+  ) t(j, ts)
+);
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO indexed_keyed_narrow SELECT m FROM indexed_keyed_wide;
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT to_json(j) FROM indexed_keyed_narrow;
+----
+narrowed by a raw struct cast
+
 # Nested-path shred ($.a.b) sticks through the keyed fold.
 query III
 SELECT to_json(m), m ->> '$.a.b', (jsono_storage_size(m)).shreds
@@ -163,6 +210,34 @@ FROM (
 );
 ----
 {"a":{"b":2}}	2	8
+
+# A nested scalar shred is emitted from the direct LWW lane and stripped from the residual body.
+query II
+SELECT to_json(m),
+       to_json(struct_pack("jsono" := struct_pack(body := struct_pack(
+         slots := m."jsono".body.slots,
+         key_heap := m."jsono".body.key_heap,
+         string_heap := m."jsono".body.string_heap,
+         skips := __jsono_internal_strip_manifest(m."jsono".body.skips),
+         lengths := m."jsono".body.lengths,
+         nums := m."jsono".body.nums))))
+FROM (
+  SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
+    (jsono('{"a":{"b":"old","c":"keep"},"x":1}', shredding := {'$.a.b':'VARCHAR'}), 1),
+    (jsono('{"a":{"b":"new"},"z":2}', shredding := {'$.a.b':'VARCHAR'}), 2)
+  ) t(j, ts)
+);
+----
+{"a":{"b":"new","c":"keep"},"x":1,"z":2}	{"a":{"c":"keep"},"x":1,"z":2}
+
+# Stripping a nested shred must not hide a scalar/object conflict at its parent.
+statement error
+SELECT to_json(jsono_group_merge_max(j, ts)) FROM (VALUES
+  (jsono('{"a":{"b":"x"}}', shredding := {'$.a.b':'VARCHAR'}), 2),
+  (jsono('{"a":5}', shredding := {'$.a.b':'VARCHAR'}), 1)
+) t(j, ts);
+----
+structurally-inconsistent
 
 # GROUP BY over a shredded input: each group reshreds to its own value.
 query III

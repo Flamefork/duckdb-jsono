@@ -641,6 +641,8 @@ bool EmitConstructorScalarValue(const JsonoStructVectorData &data, idx_t row, Do
 // The direct emitters' cursor snapshot at container start, paired with the sparse span
 // slot the container reserved (JsonoBuilder::NO_SPAN for a small object).
 struct DirectContainerStart {
+	uint64_t id;
+	uint64_t tag;
 	size_t span_index;
 	size_t start_slot;
 	size_t start_string;
@@ -648,26 +650,25 @@ struct DirectContainerStart {
 	size_t start_num;
 };
 
-// `has_container_child` forces the span for an object the caller statically knows holds a
-// container child (the lazy EnsureParentObjectSpan only sees children opened through the
-// builder, and the direct emitters do not register themselves in open_containers).
 DirectContainerStart BeginConstructorDirectContainer(DomJsonoBuilder &builder, uint64_t container_tag,
-                                                     uint32_t child_count, bool has_container_child) {
+                                                     uint32_t child_count) {
 	if (child_count > CONTAINER_CHILD_COUNT_MASK) {
 		throw InvalidInputException("jsono: object has too many keys for storage");
 	}
 	if (builder.container_count > std::numeric_limits<uint32_t>::max() || builder.container_count > CONTAINER_ID_MAX) {
 		throw InvalidInputException("jsono: too many containers for storage");
 	}
-	// A direct container nested inside a general-path object is that object's container
-	// child; the enclosing one_list root (if any) is direct itself and already spanned.
-	builder.EnsureParentObjectSpan();
 	auto id = builder.container_count++;
 	auto span_index = JsonoBuilder::NO_SPAN;
-	if (JsonoBuilder::ContainerStoresSpan(container_tag, child_count) || has_container_child) {
+	if (JsonoBuilder::ContainerStoresSpan(container_tag, child_count)) {
 		builder.PushContainerSpanPlaceholder(id, span_index);
 	}
-	DirectContainerStart start {span_index, builder.slots.size(), builder.string_heap.size(), builder.lengths.size(),
+	DirectContainerStart start {id,
+	                            container_tag,
+	                            span_index,
+	                            builder.slots.size(),
+	                            builder.string_heap.size(),
+	                            builder.lengths.size(),
 	                            builder.nums.size()};
 	builder.slots.push_back(MakeSlot(container_tag, MakeContainerPayload(id, child_count)));
 	return start;
@@ -686,6 +687,14 @@ void FinishConstructorDirectContainer(DomJsonoBuilder &builder, const DirectCont
 	auto string_byte_span = builder.string_heap.size() - start.start_string;
 	auto length_count = builder.lengths.size() - start.start_length;
 	auto num_count = builder.nums.size() - start.start_num;
+	if (start.tag == tag::ARR_START && slot_span == 2) {
+		if (start.span_index + 1 != builder.skips.size() || builder.span_ids[start.span_index] != start.id) {
+			throw InternalException("jsono writer: empty array span is not the last sparse span");
+		}
+		builder.span_ids.pop_back();
+		builder.skips.pop_back();
+		return;
+	}
 	if (slot_span > std::numeric_limits<uint32_t>::max() || string_byte_span > std::numeric_limits<uint32_t>::max() ||
 	    length_count > std::numeric_limits<uint32_t>::max() || num_count > std::numeric_limits<uint32_t>::max()) {
 		throw InvalidInputException("jsono: container span exceeds storage limits");
@@ -794,7 +803,7 @@ void EmitConstructorFlatScalarObject(const JsonoStructVectorData &data, idx_t ro
 
 void EmitConstructorDirectFlatScalarObject(const JsonoStructVectorData &data, idx_t row, DomJsonoBuilder &builder) {
 	auto &plan = *data.plan;
-	auto start = BeginConstructorDirectContainer(builder, tag::OBJ_START, uint32_t(plan.field_perm.size()), false);
+	auto start = BeginConstructorDirectContainer(builder, tag::OBJ_START, uint32_t(plan.field_perm.size()));
 	EmitConstructorObjectKeys(plan, builder);
 	for (auto field_idx : plan.field_perm) {
 		if (!EmitConstructorScalarValue(data.children[field_idx], row, builder)) {
@@ -814,7 +823,7 @@ void EmitConstructorDirectListOfFlatScalarObjects(const JsonoStructVectorData &d
 	}
 	auto entry = data.list_entries[idx];
 	auto &child = data.children[0];
-	auto start = BeginConstructorDirectContainer(builder, tag::ARR_START, 0, false);
+	auto start = BeginConstructorDirectContainer(builder, tag::ARR_START, 0);
 	auto child_all_valid = child.fmt.validity.AllValid();
 	for (idx_t child_i = entry.offset; child_i < entry.offset + entry.length; child_i++) {
 		if (!child_all_valid && ConstructorValueRowIsNull(child, child_i)) {
@@ -829,18 +838,7 @@ void EmitConstructorDirectListOfFlatScalarObjects(const JsonoStructVectorData &d
 
 void EmitConstructorOneListFlatScalarObject(const JsonoStructVectorData &data, idx_t row, DomJsonoBuilder &builder) {
 	auto &plan = *data.plan;
-	// The one list child is this object's only possible container child; per row it is a
-	// container child only when the list itself is non-NULL (a NULL list emits VAL_NULL).
-	bool has_container_child = false;
-	for (auto field_idx : plan.field_perm) {
-		auto &child = data.children[field_idx];
-		if (child.plan->strategy == StructValueStrategy::List &&
-		    child.fmt.validity.RowIsValid(RowIndex(child.fmt, row))) {
-			has_container_child = true;
-		}
-	}
-	auto start =
-	    BeginConstructorDirectContainer(builder, tag::OBJ_START, uint32_t(plan.field_perm.size()), has_container_child);
+	auto start = BeginConstructorDirectContainer(builder, tag::OBJ_START, uint32_t(plan.field_perm.size()));
 	EmitConstructorObjectKeys(plan, builder);
 	for (auto field_idx : plan.field_perm) {
 		auto &child = data.children[field_idx];

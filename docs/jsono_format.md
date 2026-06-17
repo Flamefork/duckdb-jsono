@@ -114,10 +114,56 @@ u32 entry_count
 per entry: u16 path_len, path bytes, u16 type_len, type bytes
 ```
 
-Entries are sorted by path (the shred writer emits fields in canonical order)
-and list only the paths actually stripped from this row (a value kept in the
-residual by the lossless gate is not listed). A plain value writes no manifest —
-its `skips` blob ends at the checkpoints, which reads as zero entries.
+Writers may use a compact type-code variant for common scalar and scalar-array
+shred types:
+
+```
+u32 marker = 0xffffffff
+u32 entry_count
+per entry: u16 path_len, path bytes, u8 type_code
+           [if type_code = 0: u16 type_len, type bytes]
+```
+
+The compact form is semantically identical: the path remains stored exactly, and
+the type code expands to the same canonical type string a full manifest would
+carry (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`, and their `[]`
+scalar-array forms). Type code `0` keeps the full type string for complex shred
+types.
+
+Writers that already know the consumer carries the exact same canonical shred
+layout may use an indexed variant:
+
+```
+u32 marker = 0xfffffffe
+u64 layout_hash
+u32 entry_count
+per entry: u16 shred_index
+```
+
+`layout_hash` is computed from the full canonical `(path, type)` shred list of
+the writing type. A reader expands `shred_index` through its own shred list only
+when the hash matches exactly; otherwise the row is treated as narrowed by a raw
+struct cast and fails loud. This keeps the indexed form exact: it never guesses
+that an index in a different layout means the same path.
+
+For dense rows, writers may use the same exact layout contract with a bitset:
+
+```
+u32 marker = 0xfffffffd
+u64 layout_hash
+u32 byte_count
+byte[byte_count] stripped_shred_bitset
+```
+
+`byte_count` must equal `ceil(shred_count / 8)` for the matched layout. Bit `i`
+means canonical shred `i` was stripped from this row's residual. The layout hash
+rule is identical to the indexed variant; a reader never interprets bit positions
+under a different shred layout.
+
+Entries are sorted by canonical shred order (path order) and list only the paths
+actually stripped from this row (a value kept in the residual by the lossless
+gate is not listed). A plain value writes no manifest — its `skips` blob ends at
+the checkpoints, which reads as zero entries.
 
 The manifest is what makes a raw by-name struct cast safe to detect: if a cast
 drops a shred (the target type carries fewer shreds) or converts one to a
@@ -234,10 +280,9 @@ Current `JSONO` files use `version = 4`:
   [Shred manifest](#shred-manifest));
 - version 4 moved the variable slot payloads into the `lengths`/`nums` streams
   (slots are pure tags), made `ContainerSpan`/`ObjectCursorCheckpoint` carry
-  per-stream counts/deltas, and made span storage *sparse*: only arrays,
-  objects with `child_count > OBJECT_CHECKPOINT_STRIDE`, and objects whose
-  immediate children include a container store a span, addressed through a
-  sorted sparse container-id index.
+  per-stream counts/deltas, and made span storage *sparse*: non-empty arrays
+  and objects with `child_count > OBJECT_CHECKPOINT_STRIDE` store a span,
+  addressed through a sorted sparse container-id index.
 
 This extension is still experimental, so compatibility is intentionally strict:
 an incompatible change to slot tags, payload semantics, heap layout, navigation
@@ -448,23 +493,23 @@ that their combined size fits within the blob.
 
 ### ContainerSpan — sparse, skip-cost driven
 
-Spans are stored **only** for containers whose skip cannot be done cheaply by a
-walk:
+Spans are required for containers whose skip cannot be done cheaply from the
+slot stream alone:
 
-- every **array** — no inline child count, so a walk would not know where to
-  stop without paying attention to nesting;
+- every **non-empty array** — no inline child count, so a walk would not know
+  where to stop without replaying nested structure; an empty array is the
+  adjacent `ARR_START, ARR_END` pair and needs no span;
 - every **object with `child_count > OBJECT_CHECKPOINT_STRIDE`** (= 16) —
-  exactly the objects that also get cursor checkpoints;
-- every **object whose immediate children include a container** (object or
-  array) — without a span, skipping it would walk the whole child subtree
-  instead of jumping.
+  exactly the objects that also get cursor checkpoints.
 
-Small **flat** objects (`child_count <= OBJECT_CHECKPOINT_STRIDE`, scalar
-children only) store nothing; a reader skips one by walking its `child_count`
-value slots — all scalars, so the walk touches only the slot words already in
-cache. On shape-stable data this removes the dominant per-container metadata
-cost: most real leaf objects are small and flat, while every skip that crosses
-a subtree stays O(1).
+Small objects (`child_count <= OBJECT_CHECKPOINT_STRIDE`) may carry an optional
+span when their subtree is no longer cheap to replay. The DOM writer stores one
+when the object has a container child and its total `slot_span` exceeds
+`OBJECT_CHECKPOINT_STRIDE`; tiny skeleton objects stay spanless. This keeps the
+dominant per-container metadata cost out of leaf/skeleton objects, while late-key
+navigation can still jump past compact-key, large-subtree values in O(1). Readers
+accept and validate optional spans for small objects with container children and
+for empty arrays.
 
 The sorted `container_id` array before the spans is the sparse index; a reader
 resolves it in `JsonoView::TryContainerSpan`. The ids are strictly ascending,

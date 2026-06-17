@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "duckdb/common/exception.hpp"
@@ -198,9 +200,9 @@ constexpr uint32_t MAGIC = 0x4F4E534A; // 'JSNO' little-endian
 // the former VAL_EXT trailing data slots) to the `nums` stream (u64 LE, walk
 // order), making slot words shape-constant across rows. ContainerSpan gains
 // length_count/num_count, ObjectCursorCheckpoint gains length_delta/num_delta, and
-// spans are stored only where a skip needs them — arrays, objects with child_count >
-// OBJECT_CHECKPOINT_STRIDE, and objects whose immediate children include a
-// container — addressed through a sorted sparse container-id index.
+// spans are stored only where a skip needs them — non-empty arrays and objects
+// with child_count > OBJECT_CHECKPOINT_STRIDE — addressed through a sorted sparse
+// container-id index.
 constexpr uint8_t VERSION = 0x04;
 
 namespace flags {
@@ -379,11 +381,10 @@ struct ContainerMetadataHeader {
 
 // ContainerSpan carries the subtree's slot span, string_heap byte span, lengths/
 // nums entry counts, and (for objects) a shape_hash: the fingerprint of the
-// object's sorted key sequence. Spans are stored only for arrays, objects with
-// child_count > OBJECT_CHECKPOINT_STRIDE, and objects whose immediate children
-// include a container; a sorted sparse container-id index precedes the span
-// records (see docs/jsono_format.md). Arrays store shape_hash = 0 (never read —
-// the rank cache only runs on objects).
+// object's sorted key sequence. Spans are stored only for non-empty arrays and
+// objects with child_count > OBJECT_CHECKPOINT_STRIDE; a sorted sparse
+// container-id index precedes the span records (see docs/jsono_format.md). Arrays
+// store shape_hash = 0 (never read — the rank cache only runs on objects).
 struct ContainerSpan {
 	uint32_t slot_span;
 	uint32_t string_byte_span;
@@ -431,6 +432,57 @@ struct ShredManifestEntry {
 	nonstd::string_view type;
 };
 
+constexpr uint32_t SHRED_MANIFEST_COMPACT_TYPE_MARKER = 0xFFFFFFFFU;
+constexpr uint32_t SHRED_MANIFEST_INDEX_MARKER = 0xFFFFFFFEU;
+constexpr uint32_t SHRED_MANIFEST_BITSET_MARKER = 0xFFFFFFFDU;
+constexpr uint8_t SHRED_MANIFEST_TYPE_EXTENDED = 0;
+constexpr uint8_t SHRED_MANIFEST_TYPE_VARCHAR = 1;
+constexpr uint8_t SHRED_MANIFEST_TYPE_BIGINT = 2;
+constexpr uint8_t SHRED_MANIFEST_TYPE_UBIGINT = 3;
+constexpr uint8_t SHRED_MANIFEST_TYPE_DOUBLE = 4;
+constexpr uint8_t SHRED_MANIFEST_TYPE_BOOLEAN = 5;
+constexpr uint8_t SHRED_MANIFEST_TYPE_VARCHAR_LIST = 6;
+constexpr uint8_t SHRED_MANIFEST_TYPE_BIGINT_LIST = 7;
+constexpr uint8_t SHRED_MANIFEST_TYPE_UBIGINT_LIST = 8;
+constexpr uint8_t SHRED_MANIFEST_TYPE_DOUBLE_LIST = 9;
+constexpr uint8_t SHRED_MANIFEST_TYPE_BOOLEAN_LIST = 10;
+
+inline nonstd::string_view ShredManifestCompactTypeName(uint8_t code) {
+	switch (code) {
+	case SHRED_MANIFEST_TYPE_VARCHAR:
+		return nonstd::string_view("VARCHAR", 7);
+	case SHRED_MANIFEST_TYPE_BIGINT:
+		return nonstd::string_view("BIGINT", 6);
+	case SHRED_MANIFEST_TYPE_UBIGINT:
+		return nonstd::string_view("UBIGINT", 7);
+	case SHRED_MANIFEST_TYPE_DOUBLE:
+		return nonstd::string_view("DOUBLE", 6);
+	case SHRED_MANIFEST_TYPE_BOOLEAN:
+		return nonstd::string_view("BOOLEAN", 7);
+	case SHRED_MANIFEST_TYPE_VARCHAR_LIST:
+		return nonstd::string_view("VARCHAR[]", 9);
+	case SHRED_MANIFEST_TYPE_BIGINT_LIST:
+		return nonstd::string_view("BIGINT[]", 8);
+	case SHRED_MANIFEST_TYPE_UBIGINT_LIST:
+		return nonstd::string_view("UBIGINT[]", 9);
+	case SHRED_MANIFEST_TYPE_DOUBLE_LIST:
+		return nonstd::string_view("DOUBLE[]", 8);
+	case SHRED_MANIFEST_TYPE_BOOLEAN_LIST:
+		return nonstd::string_view("BOOLEAN[]", 9);
+	default:
+		throw InvalidInputException("malformed JSONO: unknown compact shred manifest type code");
+	}
+}
+
+inline uint64_t HashShredManifestSignatures(const std::vector<std::pair<std::string, std::string>> &signatures) {
+	uint64_t h = HashMix64(HASH_SEED ^ uint64_t(signatures.size()), HASH_PRIME);
+	for (auto &signature : signatures) {
+		h = HashKey(h, nonstd::string_view(signature.first.data(), signature.first.size()));
+		h = HashKey(h, nonstd::string_view(signature.second.data(), signature.second.size()));
+	}
+	return h;
+}
+
 // The shred manifest is the tail of the skips blob, after the checkpoint sections:
 //   u32 entry_count, then per entry: u16 path_len, path bytes, u16 type_len, type bytes.
 // Entries are sorted by path (the shred writer emits fields in canonical order). A plain value
@@ -466,7 +518,8 @@ inline size_t JsonoSkipsManifestOffset(const uint8_t *skips, size_t skips_size) 
 // Parse a shred manifest from its raw tail bytes into `entries` (string_views into `data`).
 // Returns the entry count; an empty tail is a value without a manifest. Throws on framing
 // corruption (declared entries longer than the tail, or trailing bytes).
-inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector<ShredManifestEntry> &entries) {
+inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector<ShredManifestEntry> &entries,
+                                      const std::vector<std::pair<std::string, std::string>> *signatures = nullptr) {
 	entries.clear();
 	if (size == 0) {
 		return 0;
@@ -481,6 +534,72 @@ inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector
 	};
 	uint32_t entry_count;
 	read_bytes(&entry_count, sizeof(entry_count));
+	if (entry_count == SHRED_MANIFEST_INDEX_MARKER) {
+		uint64_t layout_hash;
+		read_bytes(&layout_hash, sizeof(layout_hash));
+		read_bytes(&entry_count, sizeof(entry_count));
+		if (!signatures || layout_hash != HashShredManifestSignatures(*signatures)) {
+			throw InvalidInputException(
+			    "JSONO: row carries an indexed shred manifest for a different shred layout; the value was narrowed "
+			    "by a raw struct cast and cannot be read losslessly. Reshred through jsono(value, shredding := "
+			    "{...}) (the extension optimizer does this automatically)");
+		}
+		entries.reserve(entry_count);
+		for (uint32_t i = 0; i < entry_count; i++) {
+			uint16_t index;
+			read_bytes(&index, sizeof(index));
+			if (index >= signatures->size()) {
+				throw InvalidInputException("malformed JSONO: shred manifest index is out of bounds");
+			}
+			auto &signature = (*signatures)[index];
+			entries.push_back(
+			    ShredManifestEntry {nonstd::string_view(signature.first.data(), signature.first.size()),
+			                        nonstd::string_view(signature.second.data(), signature.second.size())});
+		}
+		if (cursor != size) {
+			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
+		}
+		return entries.size();
+	}
+	if (entry_count == SHRED_MANIFEST_BITSET_MARKER) {
+		uint64_t layout_hash;
+		read_bytes(&layout_hash, sizeof(layout_hash));
+		uint32_t byte_count;
+		read_bytes(&byte_count, sizeof(byte_count));
+		if (byte_count > size - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		if (!signatures || layout_hash != HashShredManifestSignatures(*signatures)) {
+			throw InvalidInputException(
+			    "JSONO: row carries an indexed shred manifest for a different shred layout; the value was narrowed "
+			    "by a raw struct cast and cannot be read losslessly. Reshred through jsono(value, shredding := "
+			    "{...}) (the extension optimizer does this automatically)");
+		}
+		auto expected_byte_count = (signatures->size() + 7) / 8;
+		if (byte_count != expected_byte_count) {
+			throw InvalidInputException("malformed JSONO: shred manifest bitset length does not match shred layout");
+		}
+		for (idx_t i = 0; i < signatures->size(); i++) {
+			auto mask = uint8_t(1U << (i & 7U));
+			if ((uint8_t(data[cursor + i / 8]) & mask) == 0) {
+				continue;
+			}
+			auto &signature = (*signatures)[i];
+			entries.push_back(
+			    ShredManifestEntry {nonstd::string_view(signature.first.data(), signature.first.size()),
+			                        nonstd::string_view(signature.second.data(), signature.second.size())});
+		}
+		cursor += byte_count;
+		if (cursor != size) {
+			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
+		}
+		return entries.size();
+	}
+	bool compact_types = false;
+	if (entry_count == SHRED_MANIFEST_COMPACT_TYPE_MARKER) {
+		compact_types = true;
+		read_bytes(&entry_count, sizeof(entry_count));
+	}
 	entries.reserve(entry_count);
 	for (uint32_t i = 0; i < entry_count; i++) {
 		uint16_t path_len;
@@ -490,6 +609,14 @@ inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector
 		}
 		auto path = nonstd::string_view(data + cursor, path_len);
 		cursor += path_len;
+		if (compact_types) {
+			uint8_t type_code;
+			read_bytes(&type_code, sizeof(type_code));
+			if (type_code != SHRED_MANIFEST_TYPE_EXTENDED) {
+				entries.push_back(ShredManifestEntry {path, ShredManifestCompactTypeName(type_code)});
+				continue;
+			}
+		}
 		uint16_t type_len;
 		read_bytes(&type_len, sizeof(type_len));
 		if (type_len > size - cursor) {
@@ -503,6 +630,79 @@ inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector
 		throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
 	}
 	return entries.size();
+}
+
+inline void ValidateShredManifestBytes(const char *data, size_t size) {
+	if (size == 0) {
+		return;
+	}
+	size_t cursor = 0;
+	auto read_bytes = [&](void *dst, size_t bytes) {
+		if (bytes > size - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		std::memcpy(dst, data + cursor, bytes);
+		cursor += bytes;
+	};
+	uint32_t entry_count;
+	read_bytes(&entry_count, sizeof(entry_count));
+	if (entry_count == SHRED_MANIFEST_INDEX_MARKER) {
+		uint64_t layout_hash;
+		read_bytes(&layout_hash, sizeof(layout_hash));
+		read_bytes(&entry_count, sizeof(entry_count));
+		if (entry_count > (size - cursor) / sizeof(uint16_t)) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		cursor += entry_count * sizeof(uint16_t);
+		if (cursor != size) {
+			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
+		}
+		return;
+	}
+	if (entry_count == SHRED_MANIFEST_BITSET_MARKER) {
+		uint64_t layout_hash;
+		read_bytes(&layout_hash, sizeof(layout_hash));
+		uint32_t byte_count;
+		read_bytes(&byte_count, sizeof(byte_count));
+		if (byte_count > size - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		cursor += byte_count;
+		if (cursor != size) {
+			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
+		}
+		return;
+	}
+	bool compact_types = false;
+	if (entry_count == SHRED_MANIFEST_COMPACT_TYPE_MARKER) {
+		compact_types = true;
+		read_bytes(&entry_count, sizeof(entry_count));
+	}
+	for (uint32_t i = 0; i < entry_count; i++) {
+		uint16_t path_len;
+		read_bytes(&path_len, sizeof(path_len));
+		if (path_len > size - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		cursor += path_len;
+		if (compact_types) {
+			uint8_t type_code;
+			read_bytes(&type_code, sizeof(type_code));
+			if (type_code != SHRED_MANIFEST_TYPE_EXTENDED) {
+				(void)ShredManifestCompactTypeName(type_code);
+				continue;
+			}
+		}
+		uint16_t type_len;
+		read_bytes(&type_len, sizeof(type_len));
+		if (type_len > size - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		cursor += type_len;
+	}
+	if (cursor != size) {
+		throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
+	}
 }
 
 // Fingerprint an object's stored KEY slots (sorted order, length-prefixed) into a
@@ -670,9 +870,10 @@ public:
 
 	// Parse the shred manifest from the skips tail into `entries`. Returns the entry count
 	// (zero for a plain value, whose skips blob ends at the checkpoints).
-	size_t ReadShredManifest(std::vector<ShredManifestEntry> &entries) const {
+	size_t ReadShredManifest(std::vector<ShredManifestEntry> &entries,
+	                         const std::vector<std::pair<std::string, std::string>> *signatures = nullptr) const {
 		auto tail = ManifestTail();
-		return ParseShredManifestBytes(tail.data(), tail.size(), entries);
+		return ParseShredManifestBytes(tail.data(), tail.size(), entries, signatures);
 	}
 
 	// Raw bytes of the shred-manifest tail (empty for a value without one). The verification
@@ -734,7 +935,7 @@ public:
 	}
 
 	// Sparse span lookup over the sorted container-id index. False when the container
-	// stores no span (a small flat object — skipped by a linear walk instead).
+	// stores no span (a small object or an empty array — skipped by a linear walk).
 	// The ids are strictly ascending, so ids[i] >= i: the entry for `container_id`, if
 	// stored, sits at index <= container_id. Near-root containers (the ids key lookups
 	// hit hottest — the row root is always id 0) are therefore found by a short downward
@@ -788,7 +989,7 @@ public:
 		return true;
 	}
 
-	// Span lookup for containers the writer always spans (arrays, objects with
+	// Span lookup for containers that must be spanned (non-empty arrays, objects with
 	// child_count > OBJECT_CHECKPOINT_STRIDE): a missing span is corruption.
 	JSONO_ALWAYS_INLINE ContainerSpan ContainerSpanAt(uint64_t container_id) const {
 		ContainerSpan span;

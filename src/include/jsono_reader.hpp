@@ -270,10 +270,10 @@ inline void AdvanceCursorBySpan(const JsonoView &view, const ContainerSpan &span
 }
 
 // `probe_small_object_span`: key-lookup callers (extract / optimizer match+project) pass true so a
-// small object that does store a span (one with a container child) yields its shape_hash — that is
-// what lets their per-object rank cache trust a cached key rank by an int compare instead of
-// re-reading the key heap. Walk-everything callers (serializers, merge, transform) keep the default:
-// they never consult shape_hash, so the sparse-index binary search would be pure waste.
+// legacy small object that does store a span yields its shape_hash — that is what lets their
+// per-object rank cache trust a cached key rank by an int compare instead of re-reading the key heap.
+// Walk-everything callers (serializers, merge, transform) keep the default: they never consult
+// shape_hash, so the sparse-index binary search would be pure waste.
 inline ObjectLayout ReadObjectLayout(const JsonoView &view, size_t pos, bool probe_small_object_span = false) {
 	auto slot = view.SlotAt(pos);
 	auto payload = SlotPayload(slot);
@@ -324,12 +324,26 @@ inline ObjectLayout ReadObjectLayout(const JsonoView &view, size_t pos, bool pro
 }
 
 inline size_t ReadArrayEndPos(const JsonoView &view, size_t pos) {
-	auto span = CheckedContainerSpan(view, pos, tag::ARR_START);
-	auto end_pos = pos + size_t(span.slot_span) - 1;
-	if (SlotTag(view.SlotAt(end_pos)) != tag::ARR_END) {
-		throw InvalidInputException("malformed JSONO: array span does not end with ARR_END");
+	auto slot = view.SlotAt(pos);
+	auto payload = SlotPayload(slot);
+	if (SlotTag(slot) != tag::ARR_START) {
+		throw InvalidInputException("malformed JSONO: unexpected container tag");
 	}
-	return end_pos;
+	ContainerSpan span;
+	if (view.TryContainerSpan(ContainerId(payload), span)) {
+		if (span.slot_span < 2 || size_t(span.slot_span) > view.Slots() - pos) {
+			throw InvalidInputException("malformed JSONO: container slot span out of bounds");
+		}
+		auto end_pos = pos + size_t(span.slot_span) - 1;
+		if (SlotTag(view.SlotAt(end_pos)) != tag::ARR_END) {
+			throw InvalidInputException("malformed JSONO: array span does not end with ARR_END");
+		}
+		return end_pos;
+	}
+	if (pos + 1 < view.Slots() && SlotTag(view.SlotAt(pos + 1)) == tag::ARR_END) {
+		return pos + 1;
+	}
+	throw InvalidInputException("malformed JSONO: container span missing");
 }
 
 void SkipValueFast(const JsonoView &view, JsonoCursor &cursor, size_t depth);
@@ -384,9 +398,8 @@ JSONO_ALWAYS_INLINE bool TrySkipScalarFromSlot(const JsonoView &view, uint64_t s
 // Skip the value whose first slot is `slot`, already read at `cursor.pos` (a valid slot
 // index). Lets callers that have just read the slot — e.g. to inspect its tag —
 // skip without paying a second SlotAt for the common scalar cases. Spanned containers
-// (arrays, large objects, objects with a container child) jump via their ContainerSpan;
-// a small flat object (no span) is walked linearly — its children are all scalars, so
-// the recursion only fires on crafted blobs, guarded by `depth`.
+// (non-empty arrays and large objects) jump via their ContainerSpan; small objects and
+// empty arrays without spans are walked linearly, guarded by `depth`.
 JSONO_ALWAYS_INLINE void SkipValueFastFromSlot(const JsonoView &view, uint64_t slot, JsonoCursor &cursor,
                                                size_t depth = 0) {
 	if (TrySkipScalarFromSlot(view, slot, cursor)) {
@@ -442,12 +455,22 @@ inline void SkipContainerFromSlot(const JsonoView &view, uint64_t slot, JsonoCur
 		return;
 	}
 	case tag::ARR_START: {
-		auto span = CheckedContainerSpan(view, cursor.pos, tag::ARR_START);
-		if (SlotTag(view.SlotAt(cursor.pos + size_t(span.slot_span) - 1)) != tag::ARR_END) {
-			throw InvalidInputException("malformed JSONO: array span does not end with ARR_END");
+		ContainerSpan span;
+		if (view.TryContainerSpan(ContainerId(payload), span)) {
+			if (span.slot_span < 2 || size_t(span.slot_span) > view.Slots() - cursor.pos) {
+				throw InvalidInputException("malformed JSONO: container slot span out of bounds");
+			}
+			if (SlotTag(view.SlotAt(cursor.pos + size_t(span.slot_span) - 1)) != tag::ARR_END) {
+				throw InvalidInputException("malformed JSONO: array span does not end with ARR_END");
+			}
+			AdvanceCursorBySpan(view, span, cursor);
+			return;
 		}
-		AdvanceCursorBySpan(view, span, cursor);
-		return;
+		if (cursor.pos + 1 < view.Slots() && SlotTag(view.SlotAt(cursor.pos + 1)) == tag::ARR_END) {
+			cursor.pos += 2;
+			return;
+		}
+		throw InvalidInputException("malformed JSONO: container span missing");
 	}
 	case tag::KEY:
 	case tag::OBJ_END:

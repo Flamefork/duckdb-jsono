@@ -796,6 +796,14 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 
 	JsonoVectorData input;
 	InitJsonoVectorData(input_vec, count, input);
+	vector<std::pair<std::string, std::string>> input_signatures;
+	JsonoLayoutType input_layout;
+	if (TryParseJsonoLayoutType(input_vec.GetType(), input_layout)) {
+		input_signatures.reserve(input_layout.shreds.size());
+		for (auto &shred : input_layout.shreds) {
+			input_signatures.emplace_back(shred.first, shred.second.ToString());
+		}
+	}
 	std::string manifest;
 	vector<idx_t> stripped_fields;
 	JsonoView view;
@@ -815,7 +823,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			if (ReadJsonoRowStrict(input, row, src_blob)) {
 				JsonoView src_view = MakeJsonoView(src_blob);
 				if (src_view.ParseHeader()) {
-					src_view.ReadShredManifest(src_manifest);
+					src_view.ReadShredManifest(src_manifest, &input_signatures);
 				}
 			}
 			old_manifest = &src_manifest;

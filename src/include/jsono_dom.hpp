@@ -186,6 +186,7 @@ struct DomObjectPlan {
 	size_t kv_offset;
 	size_t idx_offset;
 	uint32_t emit_count;
+	bool spanned;
 };
 
 struct DomDirectState {

@@ -221,13 +221,13 @@ SELECT
 ----
 true	true	true	true
 
-# The writer emits a metadata header (12 B) plus a sparse id (4 B) and a 24-byte span ONLY
-# for spanned containers: here the array stores one and the root object stores one too —
-# its immediate children include a container, so its skip must jump, not walk.
+# The writer emits a metadata header (12 B) plus a sparse id (4 B) and a 24-byte span only
+# for spanned containers: here the non-empty array stores one, while the small root object
+# is skipped by a bounded walk.
 query I
 SELECT octet_length(jsono('{"a":"x","b":["yy"]}')."jsono".body.skips);
 ----
-68
+40
 
 # A 17-key object is spanned (id 4 B + span 24 B) and gets a checkpoint index entry (12 B)
 # with one 16-byte cursor checkpoint.

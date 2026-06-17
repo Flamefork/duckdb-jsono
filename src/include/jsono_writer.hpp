@@ -32,9 +32,8 @@ struct JsonoBuilder {
 	std::vector<char> string_heap;
 	std::vector<uint32_t> lengths;
 	std::vector<uint64_t> nums;
-	// Sparse span storage: spans exist only for arrays, objects with
-	// child_count > OBJECT_CHECKPOINT_STRIDE, and objects whose immediate children
-	// include a container. `span_ids` holds their container ids; it is sorted by
+	// Sparse span storage: spans exist only for non-empty arrays and objects with
+	// child_count > OBJECT_CHECKPOINT_STRIDE. `span_ids` holds their container ids; it is sorted by
 	// construction (ids are assigned in container-start order, and a span is pushed
 	// either at the container's own start or at its first container child's start —
 	// at which point its subtree has produced no spans yet). `skips` is the parallel
@@ -160,14 +159,11 @@ struct JsonoBuilder {
 		slots.push_back(MakeSlot(tag::VAL_NULL, 0));
 	}
 
-	// Whether a container stores a ContainerSpan regardless of its children: every array
-	// (no inline child count, so a skip cannot walk it without one) and every object
-	// large enough to get cursor checkpoints. An object whose immediate children include
-	// a container also stores a span — skipping it would otherwise walk the whole child
-	// subtree — but that is only known once a container child opens, so it is allocated
-	// lazily (EnsureParentObjectSpan) or eagerly by direct emitters whose child shapes
-	// are static. Small flat objects (scalars only) store nothing: their skip is a cheap
-	// walk over their own slots.
+	// Whether a container starts with a ContainerSpan placeholder: arrays first reserve
+	// one because their final size is only known at close; empty arrays drop it again in
+	// FinishContainer. Large objects keep a span for subtree skip and cursor checkpoints.
+	// Small objects store no span, even with container children: their key count is bounded,
+	// so skipping them by walking their immediate children is cheap.
 	static bool ContainerStoresSpan(uint64_t container_tag, uint32_t child_count) {
 		return container_tag == tag::ARR_START ||
 		       (container_tag == tag::OBJ_START && child_count > OBJECT_CHECKPOINT_STRIDE);
@@ -177,20 +173,6 @@ struct JsonoBuilder {
 		span_index = skips.size();
 		span_ids.push_back(uint32_t(id));
 		skips.push_back(ContainerSpan {0, 0, 0, 0, 0});
-	}
-
-	// Called when a container child opens: its parent object's skip is now a subtree
-	// walk, so the parent stores a span too. At the first container child's start the
-	// parent's subtree has produced no spans yet (an earlier spanned descendant would
-	// have allocated the parent already), so appending keeps `span_ids` sorted.
-	void EnsureParentObjectSpan() {
-		if (open_containers.empty()) {
-			return;
-		}
-		auto &parent = open_containers.back();
-		if (parent.tag == tag::OBJ_START && parent.span_index == NO_SPAN) {
-			PushContainerSpanPlaceholder(parent.id, parent.span_index);
-		}
 	}
 
 	void EmitContainerStart(uint64_t container_tag, uint32_t child_count) {
@@ -204,7 +186,6 @@ struct JsonoBuilder {
 		if (container_count > std::numeric_limits<uint32_t>::max() || container_count > CONTAINER_ID_MAX) {
 			throw InvalidInputException("jsono: too many containers for storage");
 		}
-		EnsureParentObjectSpan();
 		auto id = container_count++;
 		auto span_index = NO_SPAN;
 		if (ContainerStoresSpan(container_tag, child_count)) {
@@ -274,6 +255,14 @@ struct JsonoBuilder {
 		auto string_byte_span = string_heap.size() - open.start_string;
 		auto length_count = lengths.size() - open.start_length;
 		auto num_count = nums.size() - open.start_num;
+		if (open.tag == tag::ARR_START && slot_span == 2) {
+			if (open.span_index + 1 != skips.size() || span_ids[open.span_index] != open.id) {
+				throw InternalException("jsono writer: empty array span is not the last sparse span");
+			}
+			span_ids.pop_back();
+			skips.pop_back();
+			return;
+		}
 		if (slot_span > std::numeric_limits<uint32_t>::max() ||
 		    string_byte_span > std::numeric_limits<uint32_t>::max() ||
 		    length_count > std::numeric_limits<uint32_t>::max() || num_count > std::numeric_limits<uint32_t>::max()) {

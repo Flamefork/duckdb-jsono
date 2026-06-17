@@ -22,6 +22,7 @@
 #include "string_view.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -796,6 +797,7 @@ struct ReconShred {
 	idx_t child;
 	LogicalType type;
 	vector<PathStep> steps; // object-key path; size 1 is a top-level key
+	string manifest_path;
 };
 
 void EmitReconShredScalar(JsonoBuilder &builder, const ReconShred &shred, const UnifiedVectorFormat &fmt, idx_t idx) {
@@ -2011,21 +2013,76 @@ enum class LWWTreeKind : uint8_t { Object, Leaf };
 
 struct LWWTreeNode;
 
+struct LWWScalarValue {
+	uint64_t slot = 0;
+	uint64_t num = 0;
+	uint32_t length = 0;
+};
+
+constexpr uint32_t LWW_INVALID_SORT_KEY_ID = std::numeric_limits<uint32_t>::max();
+
+struct LWWScalarLane {
+	bool has_value = false;
+	uint32_t sort_key_id = LWW_INVALID_SORT_KEY_ID;
+	LWWScalarValue value;
+};
+
+struct LWWListElement {
+	LWWScalarValue value;
+	string text;
+};
+
+struct LWWListValue {
+	vector<LWWListElement> elements;
+	OwnedJsonoBlob skeleton;
+};
+
+struct LWWListLane {
+	bool has_value = false;
+	uint32_t sort_key_id = LWW_INVALID_SORT_KEY_ID;
+	LWWListValue value;
+};
+
 struct GroupMergeLWWState {
 	LWWTreeNode *root;
+	LWWScalarLane *scalar_lanes;
+	idx_t scalar_lane_count;
+	string *scalar_texts;
+	idx_t scalar_text_lane_count;
+	LWWListLane *list_lanes;
+	idx_t list_lane_count;
+	vector<string> *lane_sort_keys;
 	bool has_input;
 };
 
 struct GroupMergeLWWFunction {
 	static void Initialize(GroupMergeLWWState &state) {
 		state.root = nullptr;
+		state.scalar_lanes = nullptr;
+		state.scalar_lane_count = 0;
+		state.scalar_texts = nullptr;
+		state.scalar_text_lane_count = 0;
+		state.list_lanes = nullptr;
+		state.list_lane_count = 0;
+		state.lane_sort_keys = nullptr;
 		state.has_input = false;
 	}
 
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
 		delete state.root;
+		delete[] state.scalar_lanes;
+		delete[] state.scalar_texts;
+		delete[] state.list_lanes;
+		delete state.lane_sort_keys;
 		state.root = nullptr;
+		state.scalar_lanes = nullptr;
+		state.scalar_lane_count = 0;
+		state.scalar_texts = nullptr;
+		state.scalar_text_lane_count = 0;
+		state.list_lanes = nullptr;
+		state.list_lane_count = 0;
+		state.lane_sort_keys = nullptr;
 		state.has_input = false;
 	}
 };
@@ -2074,11 +2131,46 @@ int CompareRawBytes(const string &a, nonstd::string_view b) {
 	return CompareRawBytes(a.data(), a.size(), b.data(), b.size());
 }
 
+int CompareRawBytes(nonstd::string_view a, const string &b) {
+	return CompareRawBytes(a.data(), a.size(), b.data(), b.size());
+}
+
+int CompareRawBytes(nonstd::string_view a, nonstd::string_view b) {
+	return CompareRawBytes(a.data(), a.size(), b.data(), b.size());
+}
+
 void AssignBytes(string &out, nonstd::string_view bytes) {
 	out.resize(bytes.size());
 	if (bytes.size() > 0) {
 		std::memcpy(&out[0], bytes.data(), bytes.size());
 	}
+}
+
+// Sort-key ids are references to stored bytes, not canonical dictionary ids; all equality/order checks
+// compare bytes, so non-adjacent duplicate keys are correct and avoid quadratic global dedupe.
+uint32_t StoreLWWLaneSortKey(GroupMergeLWWState &state, nonstd::string_view K) {
+	if (!state.lane_sort_keys) {
+		state.lane_sort_keys = new vector<string>();
+	}
+	auto &keys = *state.lane_sort_keys;
+	if (!keys.empty() && CompareRawBytes(keys.back(), K) == 0) {
+		return uint32_t(keys.size() - 1);
+	}
+	if (keys.size() >= LWW_INVALID_SORT_KEY_ID) {
+		throw InternalException("jsono_group_merge: too many distinct lane sort keys in one aggregate state");
+	}
+	string copy;
+	AssignBytes(copy, K);
+	keys.push_back(std::move(copy));
+	return uint32_t(keys.size() - 1);
+}
+
+nonstd::string_view LWWLaneSortKey(const GroupMergeLWWState &state, uint32_t sort_key_id) {
+	if (!state.lane_sort_keys || sort_key_id >= state.lane_sort_keys->size()) {
+		throw InternalException("jsono_group_merge: invalid lane sort-key reference");
+	}
+	auto &key = (*state.lane_sort_keys)[sort_key_id];
+	return nonstd::string_view(key.data(), key.size());
 }
 
 void WriteScalarLeafHeader(OwnedJsonoBlob &out, uint64_t slot) {
@@ -2179,6 +2271,151 @@ int CompareBlobValueTie(const OwnedJsonoBlob &a, const OwnedJsonoBlob &b) {
 	return CompareRawBytes(a.lengths, b.lengths);
 }
 
+bool LWWScalarValueHasNum(const LWWScalarValue &value) {
+	auto slot_tag = SlotTag(value.slot);
+	if (slot_tag == tag::VAL_INT60 || slot_tag == tag::VAL_DEC60) {
+		return true;
+	}
+	if (slot_tag != tag::VAL_EXT) {
+		return false;
+	}
+	auto subtype = ExtSubtype(value.slot);
+	return subtype == ext_subtype::INT64 || subtype == ext_subtype::UINT64 || subtype == ext_subtype::DOUBLE;
+}
+
+bool LWWScalarValueHasLength(const LWWScalarValue &value) {
+	auto slot_tag = SlotTag(value.slot);
+	if (slot_tag == tag::VAL_STR_HEAP) {
+		return true;
+	}
+	return slot_tag == tag::VAL_EXT && ExtSubtype(value.slot) == ext_subtype::NUMBER;
+}
+
+int CompareLWWScalarNumBytes(const LWWScalarValue &a, const LWWScalarValue &b) {
+	auto a_size = LWWScalarValueHasNum(a) ? sizeof(a.num) : size_t(0);
+	auto b_size = LWWScalarValueHasNum(b) ? sizeof(b.num) : size_t(0);
+	return CompareRawBytes(a_size == 0 ? nullptr : reinterpret_cast<const char *>(&a.num), a_size,
+	                       b_size == 0 ? nullptr : reinterpret_cast<const char *>(&b.num), b_size);
+}
+
+int CompareLWWScalarLengthBytes(const LWWScalarValue &a, const LWWScalarValue &b) {
+	auto a_size = LWWScalarValueHasLength(a) ? sizeof(a.length) : size_t(0);
+	auto b_size = LWWScalarValueHasLength(b) ? sizeof(b.length) : size_t(0);
+	return CompareRawBytes(a_size == 0 ? nullptr : reinterpret_cast<const char *>(&a.length), a_size,
+	                       b_size == 0 ? nullptr : reinterpret_cast<const char *>(&b.length), b_size);
+}
+
+int CompareLWWScalarValueTie(const LWWScalarValue &a, nonstd::string_view a_text, const LWWScalarValue &b,
+                             nonstd::string_view b_text) {
+	if (int c = CompareRawBytes(reinterpret_cast<const char *>(&a.slot), sizeof(a.slot),
+	                            reinterpret_cast<const char *>(&b.slot), sizeof(b.slot))) {
+		return c;
+	}
+	if (int c = CompareRawBytes(a_text.data(), a_text.size(), b_text.data(), b_text.size())) {
+		return c;
+	}
+	if (int c = CompareLWWScalarNumBytes(a, b)) {
+		return c;
+	}
+	return CompareLWWScalarLengthBytes(a, b);
+}
+
+int CompareLWWScalarValueTie(const LWWScalarValue &a, nonstd::string_view a_text, const OwnedJsonoBlob &b) {
+	if (b.slots.size() < JSONO_HEADER_SIZE) {
+		throw InternalException("jsono_group_merge: malformed leaf blob");
+	}
+	if (int c = CompareRawBytes(reinterpret_cast<const char *>(&a.slot), sizeof(a.slot),
+	                            b.slots.data() + JSONO_HEADER_SIZE, b.slots.size() - JSONO_HEADER_SIZE)) {
+		return c;
+	}
+	if (int c = CompareRawBytes(a_text.data(), a_text.size(), b.string_heap.data(), b.string_heap.size())) {
+		return c;
+	}
+	auto num_size = LWWScalarValueHasNum(a) ? sizeof(a.num) : size_t(0);
+	if (int c = CompareRawBytes(num_size == 0 ? nullptr : reinterpret_cast<const char *>(&a.num), num_size,
+	                            b.nums.data(), b.nums.size())) {
+		return c;
+	}
+	if (int c = CompareRawBytes(nullptr, 0, b.key_heap.data(), b.key_heap.size())) {
+		return c;
+	}
+	auto length_size = LWWScalarValueHasLength(a) ? sizeof(a.length) : size_t(0);
+	return CompareRawBytes(length_size == 0 ? nullptr : reinterpret_cast<const char *>(&a.length), length_size,
+	                       b.lengths.data(), b.lengths.size());
+}
+
+void SerializeLWWScalarValueToBlob(const LWWScalarValue &value, nonstd::string_view text, OwnedJsonoBlob &out) {
+	WriteScalarLeafHeader(out, value.slot);
+	if (LWWScalarValueHasLength(value)) {
+		out.string_heap.assign(text.data(), text.size());
+		out.lengths.assign(reinterpret_cast<const char *>(&value.length), sizeof(uint32_t));
+	}
+	if (LWWScalarValueHasNum(value)) {
+		out.nums.assign(reinterpret_cast<const char *>(&value.num), sizeof(uint64_t));
+	}
+}
+
+void EmitLWWScalarValue(const LWWScalarValue &value, nonstd::string_view text, const LogicalType &type,
+                        JsonoBuilder &builder) {
+	ShredPrimitive primitive;
+	if (!TypeToShredPrimitive(type, primitive)) {
+		throw InternalException("jsono_group_merge direct list lane: non-scalar element type '%s'", type.ToString());
+	}
+	switch (primitive) {
+	case ShredPrimitive::Varchar:
+		builder.EmitString(text);
+		return;
+	case ShredPrimitive::Bigint: {
+		int64_t v;
+		std::memcpy(&v, &value.num, sizeof(v));
+		builder.EmitInt(v);
+		return;
+	}
+	case ShredPrimitive::Ubigint:
+		builder.EmitUInt(value.num);
+		return;
+	case ShredPrimitive::Double: {
+		double v;
+		std::memcpy(&v, &value.num, sizeof(v));
+		builder.EmitDouble(v);
+		return;
+	}
+	case ShredPrimitive::Boolean:
+		builder.EmitBool(SlotTag(value.slot) == tag::VAL_TRUE);
+		return;
+	}
+}
+
+void SerializeLWWListValueToBlob(const LWWListValue &value, const LogicalType &type, OwnedJsonoBlob &out,
+                                 JsonoBuilder &builder) {
+	builder.Reset();
+	builder.EmitArrayStart();
+	auto &element_type = ListType::GetChildType(type);
+	for (auto &element : value.elements) {
+		EmitLWWScalarValue(element.value, nonstd::string_view(element.text.data(), element.text.size()), element_type,
+		                   builder);
+	}
+	builder.EmitArrayEnd();
+	SerializeBuilderToBlob(builder, out);
+}
+
+int CompareLWWListValueTie(const LWWListValue &a, const LWWListValue &b, const LogicalType &type) {
+	static thread_local JsonoBuilder builder_a;
+	static thread_local JsonoBuilder builder_b;
+	static thread_local OwnedJsonoBlob blob_a;
+	static thread_local OwnedJsonoBlob blob_b;
+	SerializeLWWListValueToBlob(a, type, blob_a, builder_a);
+	SerializeLWWListValueToBlob(b, type, blob_b, builder_b);
+	return CompareBlobValueTie(blob_a, blob_b);
+}
+
+int CompareLWWListValueTie(const LWWListValue &a, const LogicalType &type, const OwnedJsonoBlob &b) {
+	static thread_local JsonoBuilder builder;
+	static thread_local OwnedJsonoBlob blob;
+	SerializeLWWListValueToBlob(a, type, blob, builder);
+	return CompareBlobValueTie(blob, b);
+}
+
 // Per-leaf last-write-wins is well-defined only when every path has a consistent kind across rows
 // (always an object, or always a non-object leaf). When a path is a non-empty object in one row and
 // a scalar/array in another, the sequential RFC 7396 fold's result depends on row order, so a
@@ -2214,6 +2451,18 @@ void ResetLWWNodeToObject(LWWTreeNode &node) {
 	node.value = OwnedJsonoBlob();
 }
 
+bool LWWRootKeySkipped(const vector<nonstd::string_view> *root_skip_keys, size_t depth, nonstd::string_view key) {
+	if (!root_skip_keys || depth != 0) {
+		return false;
+	}
+	for (auto skip_key : *root_skip_keys) {
+		if (skip_key == key) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void StoreLWWLeafFromIncoming(LWWTreeNode &node, const JsonoView &view, JsonoCursor &cursor, nonstd::string_view K,
                               LWWTreeScratch &scratch, size_t depth) {
 	node.kind = LWWTreeKind::Leaf;
@@ -2240,10 +2489,12 @@ void SerializeIncomingLWWLeaf(const JsonoView &view, JsonoCursor &cursor, OwnedJ
 }
 
 void BuildIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
-                          LWWTreeScratch &scratch, size_t depth);
+                          LWWTreeScratch &scratch, size_t depth,
+                          const vector<nonstd::string_view> *root_skip_keys = nullptr);
 
 void BuildIncomingLWWObject(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
-                            LWWTreeScratch &scratch, size_t depth) {
+                            LWWTreeScratch &scratch, size_t depth,
+                            const vector<nonstd::string_view> *root_skip_keys = nullptr) {
 	if (depth > JSONO_MAX_NESTING_DEPTH) {
 		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
 		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
@@ -2262,10 +2513,14 @@ void BuildIncomingLWWObject(LWWTreeNode &node, const JsonoView &V, JsonoCursor &
 			continue;
 		}
 		auto key = V.KeyAt(SlotPayload(key_slot));
+		if (LWWRootKeySkipped(root_skip_keys, depth, key)) {
+			SkipValueFast(V, vc);
+			continue;
+		}
 		string key_copy;
 		AssignBytes(key_copy, key);
 		auto child = make_uniq<LWWTreeNode>();
-		BuildIncomingLWWNode(*child, V, vc, K, scratch, depth + 1);
+		BuildIncomingLWWNode(*child, V, vc, K, scratch, depth + 1, root_skip_keys);
 		node.children.emplace_back(std::move(key_copy), std::move(child));
 	}
 	if (vc.pos >= V.Slots() || SlotTag(V.SlotAt(vc.pos)) != tag::OBJ_END) {
@@ -2276,10 +2531,10 @@ void BuildIncomingLWWObject(LWWTreeNode &node, const JsonoView &V, JsonoCursor &
 }
 
 void BuildIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
-                          LWWTreeScratch &scratch, size_t depth) {
+                          LWWTreeScratch &scratch, size_t depth, const vector<nonstd::string_view> *root_skip_keys) {
 	auto slot_tag = SlotTag(V.SlotAt(cursor.pos));
 	if (slot_tag == tag::OBJ_START) {
-		BuildIncomingLWWObject(node, V, cursor, K, scratch, depth);
+		BuildIncomingLWWObject(node, V, cursor, K, scratch, depth, root_skip_keys);
 		return;
 	}
 	// Arrays are a single leaf (replaced wholesale), exactly like jsono_group_merge. Scalars,
@@ -2288,7 +2543,8 @@ void BuildIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cu
 }
 
 void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
-                          LWWTreeScratch &scratch, size_t depth) {
+                          LWWTreeScratch &scratch, size_t depth,
+                          const vector<nonstd::string_view> *root_skip_keys = nullptr) {
 	auto slot_tag = SlotTag(V.SlotAt(cursor.pos));
 	if (slot_tag == tag::OBJ_START) {
 		if (node.kind != LWWTreeKind::Object) {
@@ -2301,6 +2557,7 @@ void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cu
 		auto layout = ReadObjectLayout(V, cursor.pos);
 		JsonoCursor vc = cursor;
 		vc.pos = layout.value_start;
+		idx_t child_pos = 0;
 		for (size_t i = 0; i < layout.key_count; i++) {
 			auto key_slot = V.SlotAt(layout.key_start + i);
 			if (SlotTag(key_slot) != tag::KEY) {
@@ -2311,20 +2568,32 @@ void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cu
 				SkipValueFast(V, vc);
 				continue;
 			}
-			auto child_idx = FindLWWChildIndex(node.children, key);
+			if (LWWRootKeySkipped(root_skip_keys, depth, key)) {
+				SkipValueFast(V, vc);
+				continue;
+			}
+			while (child_pos < node.children.size() &&
+			       CompareJsonoKeys(
+			           nonstd::string_view(node.children[child_pos].key.data(), node.children[child_pos].key.size()),
+			           key) < 0) {
+				child_pos++;
+			}
+			auto child_idx = child_pos;
 			bool found = child_idx < node.children.size() &&
 			             CompareJsonoKeys(nonstd::string_view(node.children[child_idx].key.data(),
 			                                                  node.children[child_idx].key.size()),
 			                              key) == 0;
 			if (found) {
-				MergeIncomingLWWNode(*node.children[child_idx].node, V, vc, K, scratch, depth + 1);
+				MergeIncomingLWWNode(*node.children[child_idx].node, V, vc, K, scratch, depth + 1, root_skip_keys);
+				child_pos = child_idx + 1;
 			} else {
 				string key_copy;
 				AssignBytes(key_copy, key);
 				auto child = make_uniq<LWWTreeNode>();
-				BuildIncomingLWWNode(*child, V, vc, K, scratch, depth + 1);
+				BuildIncomingLWWNode(*child, V, vc, K, scratch, depth + 1, root_skip_keys);
 				node.children.insert(node.children.begin() + child_idx,
 				                     LWWObjectChild(std::move(key_copy), std::move(child)));
+				child_pos = child_idx + 1;
 			}
 		}
 		if (vc.pos >= V.Slots() || SlotTag(V.SlotAt(vc.pos)) != tag::OBJ_END) {
@@ -2383,6 +2652,190 @@ void MoveLWWTreeNode(LWWTreeNode &target, LWWTreeNode &source) {
 	source.children.clear();
 	source.sort_key.clear();
 	source.value = OwnedJsonoBlob();
+}
+
+void EnsureLWWScalarLanes(GroupMergeLWWState &state, idx_t count, idx_t text_count);
+void EnsureLWWListLanes(GroupMergeLWWState &state, idx_t count);
+
+nonstd::string_view LWWScalarTextView(const string *text) {
+	if (!text) {
+		return nonstd::string_view();
+	}
+	return nonstd::string_view(text->data(), text->size());
+}
+
+string *LWWScalarLaneText(GroupMergeLWWState &state, const vector<idx_t> &text_indices, idx_t lane_idx) {
+	auto text_idx = text_indices[lane_idx];
+	return text_idx == DConstants::INVALID_INDEX ? nullptr : &state.scalar_texts[text_idx];
+}
+
+const string *LWWScalarLaneText(const GroupMergeLWWState &state, const vector<idx_t> &text_indices, idx_t lane_idx) {
+	auto text_idx = text_indices[lane_idx];
+	return text_idx == DConstants::INVALID_INDEX ? nullptr : &state.scalar_texts[text_idx];
+}
+
+void CopyLWWScalarLane(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
+                       const GroupMergeLWWState &source_state, const LWWScalarLane &source, const string *source_text) {
+	target.has_value = source.has_value;
+	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
+	target.value = source.value;
+	if (target_text) {
+		*target_text = *source_text;
+	}
+}
+
+void MoveLWWScalarLane(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
+                       const GroupMergeLWWState &source_state, LWWScalarLane &source, string *source_text) {
+	target.has_value = source.has_value;
+	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
+	target.value = source.value;
+	if (target_text) {
+		*target_text = std::move(*source_text);
+		source_text->clear();
+	}
+	source.has_value = false;
+	source.sort_key_id = LWW_INVALID_SORT_KEY_ID;
+	source.value = LWWScalarValue();
+}
+
+void MergeLWWScalarLaneState(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
+                             const GroupMergeLWWState &source_state, const LWWScalarLane &source,
+                             const string *source_text) {
+	if (!source.has_value) {
+		return;
+	}
+	if (!target.has_value) {
+		CopyLWWScalarLane(target_state, target, target_text, source_state, source, source_text);
+		return;
+	}
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target.sort_key_id),
+	                              LWWLaneSortKey(source_state, source.sort_key_id));
+	if (key_cmp < 0 || (key_cmp == 0 && CompareLWWScalarValueTie(target.value, LWWScalarTextView(target_text),
+	                                                             source.value, LWWScalarTextView(source_text)) < 0)) {
+		CopyLWWScalarLane(target_state, target, target_text, source_state, source, source_text);
+	}
+}
+
+void MergeLWWScalarLaneStateDestructive(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
+                                        const GroupMergeLWWState &source_state, LWWScalarLane &source,
+                                        string *source_text) {
+	if (!source.has_value) {
+		return;
+	}
+	if (!target.has_value) {
+		MoveLWWScalarLane(target_state, target, target_text, source_state, source, source_text);
+		return;
+	}
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target.sort_key_id),
+	                              LWWLaneSortKey(source_state, source.sort_key_id));
+	if (key_cmp < 0 || (key_cmp == 0 && CompareLWWScalarValueTie(target.value, LWWScalarTextView(target_text),
+	                                                             source.value, LWWScalarTextView(source_text)) < 0)) {
+		MoveLWWScalarLane(target_state, target, target_text, source_state, source, source_text);
+	}
+}
+
+void MergeLWWScalarLanes(GroupMergeLWWState &target, const GroupMergeLWWState &source,
+                         const vector<idx_t> &text_indices) {
+	if (!source.scalar_lanes) {
+		return;
+	}
+	EnsureLWWScalarLanes(target, source.scalar_lane_count, source.scalar_text_lane_count);
+	for (idx_t i = 0; i < source.scalar_lane_count; i++) {
+		MergeLWWScalarLaneState(target, target.scalar_lanes[i], LWWScalarLaneText(target, text_indices, i), source,
+		                        source.scalar_lanes[i], LWWScalarLaneText(source, text_indices, i));
+	}
+}
+
+void MergeLWWScalarLanesDestructive(GroupMergeLWWState &target, GroupMergeLWWState &source,
+                                    const vector<idx_t> &text_indices) {
+	if (!source.scalar_lanes) {
+		return;
+	}
+	EnsureLWWScalarLanes(target, source.scalar_lane_count, source.scalar_text_lane_count);
+	for (idx_t i = 0; i < source.scalar_lane_count; i++) {
+		MergeLWWScalarLaneStateDestructive(target, target.scalar_lanes[i], LWWScalarLaneText(target, text_indices, i),
+		                                   source, source.scalar_lanes[i], LWWScalarLaneText(source, text_indices, i));
+	}
+	delete[] source.scalar_lanes;
+	delete[] source.scalar_texts;
+	source.scalar_lanes = nullptr;
+	source.scalar_lane_count = 0;
+	source.scalar_texts = nullptr;
+	source.scalar_text_lane_count = 0;
+}
+
+void CopyLWWListLane(GroupMergeLWWState &target_state, LWWListLane &target, const GroupMergeLWWState &source_state,
+                     const LWWListLane &source) {
+	target.has_value = source.has_value;
+	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
+	target.value = source.value;
+}
+
+void MoveLWWListLane(GroupMergeLWWState &target_state, LWWListLane &target, const GroupMergeLWWState &source_state,
+                     LWWListLane &source) {
+	target.has_value = source.has_value;
+	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
+	target.value = std::move(source.value);
+	source.has_value = false;
+	source.sort_key_id = LWW_INVALID_SORT_KEY_ID;
+	source.value = LWWListValue();
+}
+
+void MergeLWWListLaneState(GroupMergeLWWState &target_state, LWWListLane &target,
+                           const GroupMergeLWWState &source_state, const LWWListLane &source, const LogicalType &type) {
+	if (!source.has_value) {
+		return;
+	}
+	if (!target.has_value) {
+		CopyLWWListLane(target_state, target, source_state, source);
+		return;
+	}
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target.sort_key_id),
+	                              LWWLaneSortKey(source_state, source.sort_key_id));
+	if (key_cmp < 0 || (key_cmp == 0 && CompareLWWListValueTie(target.value, source.value, type) < 0)) {
+		CopyLWWListLane(target_state, target, source_state, source);
+	}
+}
+
+void MergeLWWListLaneStateDestructive(GroupMergeLWWState &target_state, LWWListLane &target,
+                                      const GroupMergeLWWState &source_state, LWWListLane &source,
+                                      const LogicalType &type) {
+	if (!source.has_value) {
+		return;
+	}
+	if (!target.has_value) {
+		MoveLWWListLane(target_state, target, source_state, source);
+		return;
+	}
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target.sort_key_id),
+	                              LWWLaneSortKey(source_state, source.sort_key_id));
+	if (key_cmp < 0 || (key_cmp == 0 && CompareLWWListValueTie(target.value, source.value, type) < 0)) {
+		MoveLWWListLane(target_state, target, source_state, source);
+	}
+}
+
+void MergeLWWListLanes(GroupMergeLWWState &target, const GroupMergeLWWState &source, const vector<ReconShred> &shreds) {
+	if (!source.list_lanes) {
+		return;
+	}
+	EnsureLWWListLanes(target, source.list_lane_count);
+	for (idx_t i = 0; i < source.list_lane_count; i++) {
+		MergeLWWListLaneState(target, target.list_lanes[i], source, source.list_lanes[i], shreds[i].type);
+	}
+}
+
+void MergeLWWListLanesDestructive(GroupMergeLWWState &target, GroupMergeLWWState &source,
+                                  const vector<ReconShred> &shreds) {
+	if (!source.list_lanes) {
+		return;
+	}
+	EnsureLWWListLanes(target, source.list_lane_count);
+	for (idx_t i = 0; i < source.list_lane_count; i++) {
+		MergeLWWListLaneStateDestructive(target, target.list_lanes[i], source, source.list_lanes[i], shreds[i].type);
+	}
+	delete[] source.list_lanes;
+	source.list_lanes = nullptr;
+	source.list_lane_count = 0;
 }
 
 void MergeLWWTreeIntoTree(LWWTreeNode &target, const LWWTreeNode &source) {
@@ -2469,19 +2922,1050 @@ void EmitLWWTreeNode(const LWWTreeNode &node, JsonoBuilder &builder, size_t dept
 
 // Fold the incoming row into the mutable per-group tree. Object rows update only surviving
 // IGNORE NULLS leaves; arrays/scalars are standalone leaves with a copied sort key.
-void FoldRowLWW(GroupMergeLWWState &state, const JsonoView &V, nonstd::string_view K) {
+void FoldRowLWW(GroupMergeLWWState &state, const JsonoView &V, nonstd::string_view K,
+                const vector<nonstd::string_view> *root_skip_keys = nullptr) {
 	static thread_local LWWTreeScratch scratch;
 	JsonoCursor cursor;
 	if (!state.has_input) {
 		state.root = new LWWTreeNode();
-		BuildIncomingLWWNode(*state.root, V, cursor, K, scratch, 0);
+		BuildIncomingLWWNode(*state.root, V, cursor, K, scratch, 0, root_skip_keys);
 		state.has_input = true;
 		return;
 	}
 	if (!state.root) {
 		throw InternalException("jsono_group_merge: missing keyed aggregate root");
 	}
-	MergeIncomingLWWNode(*state.root, V, cursor, K, scratch, 0);
+	MergeIncomingLWWNode(*state.root, V, cursor, K, scratch, 0, root_skip_keys);
+}
+
+vector<idx_t> LWWScalarTextLaneIndices(const vector<ReconShred> &shreds) {
+	vector<idx_t> result;
+	result.reserve(shreds.size());
+	idx_t text_count = 0;
+	for (auto &shred : shreds) {
+		ShredPrimitive primitive;
+		if (!TypeToShredPrimitive(shred.type, primitive)) {
+			throw InternalException("jsono_group_merge direct lanes: non-scalar shred type '%s'",
+			                        shred.type.ToString());
+		}
+		if (primitive == ShredPrimitive::Varchar) {
+			result.push_back(text_count++);
+		} else {
+			result.push_back(DConstants::INVALID_INDEX);
+		}
+	}
+	return result;
+}
+
+idx_t LWWScalarTextLaneCount(const vector<idx_t> &text_indices) {
+	idx_t count = 0;
+	for (auto text_idx : text_indices) {
+		if (text_idx != DConstants::INVALID_INDEX) {
+			count++;
+		}
+	}
+	return count;
+}
+
+void EnsureLWWScalarLanes(GroupMergeLWWState &state, idx_t count, idx_t text_count) {
+	if (count == 0) {
+		return;
+	}
+	if (state.scalar_lanes) {
+		if (state.scalar_lane_count != count || state.scalar_text_lane_count != text_count) {
+			throw InternalException("jsono_group_merge: scalar lane count changed inside one aggregate state");
+		}
+		return;
+	}
+	if (state.scalar_lane_count != 0 || state.scalar_text_lane_count != 0) {
+		throw InternalException("jsono_group_merge: scalar lane count set without lane storage");
+	}
+	state.scalar_lanes = new LWWScalarLane[count];
+	state.scalar_lane_count = count;
+	if (text_count > 0) {
+		state.scalar_texts = new string[text_count];
+		state.scalar_text_lane_count = text_count;
+	}
+}
+
+void EnsureLWWListLanes(GroupMergeLWWState &state, idx_t count) {
+	if (count == 0) {
+		return;
+	}
+	if (state.list_lanes) {
+		if (state.list_lane_count != count) {
+			throw InternalException("jsono_group_merge: list lane count changed inside one aggregate state");
+		}
+		return;
+	}
+	if (state.list_lane_count != 0) {
+		throw InternalException("jsono_group_merge: list lane count set without lane storage");
+	}
+	state.list_lanes = new LWWListLane[count];
+	state.list_lane_count = count;
+}
+
+void StorePrimitiveLaneValue(const LogicalType &type, const UnifiedVectorFormat &fmt, idx_t idx, LWWScalarValue &out,
+                             string *text_out) {
+	ShredPrimitive kind;
+	if (!TypeToShredPrimitive(type, kind)) {
+		throw InternalException("jsono_group_merge direct shredded update: non-scalar shred type '%s'",
+		                        type.ToString());
+	}
+	out = LWWScalarValue();
+	switch (kind) {
+	case ShredPrimitive::Varchar: {
+		auto value = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
+		auto len = value.GetSize();
+		if (len > std::numeric_limits<uint32_t>::max()) {
+			throw InvalidInputException("jsono: string value exceeds storage limits");
+		}
+		out.slot = MakeSlot(tag::VAL_STR_HEAP, 0);
+		out.length = uint32_t(len);
+		text_out->assign(value.GetData(), value.GetSize());
+		return;
+	}
+	case ShredPrimitive::Bigint: {
+		auto value = UnifiedVectorFormat::GetData<int64_t>(fmt)[idx];
+		out.slot = FitsInt60(value) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64);
+		out.num = uint64_t(value);
+		return;
+	}
+	case ShredPrimitive::Ubigint: {
+		auto value = UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx];
+		if (value <= uint64_t(std::numeric_limits<int64_t>::max())) {
+			auto signed_value = int64_t(value);
+			out.slot = FitsInt60(signed_value) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64);
+		} else {
+			out.slot = MakeExtSlot(ext_subtype::UINT64);
+		}
+		out.num = value;
+		return;
+	}
+	case ShredPrimitive::Double: {
+		auto value = UnifiedVectorFormat::GetData<double>(fmt)[idx];
+		if (!std::isfinite(value)) {
+			throw InvalidInputException("jsono: cannot store non-finite double value (NaN/Infinity)");
+		}
+		out.slot = MakeExtSlot(ext_subtype::DOUBLE);
+		std::memcpy(&out.num, &value, sizeof(out.num));
+		return;
+	}
+	case ShredPrimitive::Boolean:
+		out.slot = MakeSlot(UnifiedVectorFormat::GetData<bool>(fmt)[idx] ? tag::VAL_TRUE : tag::VAL_FALSE, 0);
+		return;
+	}
+}
+
+void StoreScalarShredLaneValue(const ReconShred &shred, const UnifiedVectorFormat &fmt, idx_t idx, LWWScalarValue &out,
+                               string &text_out) {
+	text_out.clear();
+	StorePrimitiveLaneValue(shred.type, fmt, idx, out, &text_out);
+}
+
+uint32_t ResolveLWWRowSortKey(GroupMergeLWWState &state, nonstd::string_view K, uint32_t &sort_key_id) {
+	if (sort_key_id == LWW_INVALID_SORT_KEY_ID) {
+		sort_key_id = StoreLWWLaneSortKey(state, K);
+	}
+	return sort_key_id;
+}
+
+void StoreLWWScalarLane(LWWScalarLane &lane, string *lane_text, const LWWScalarValue &value, nonstd::string_view text,
+                        uint32_t sort_key_id) {
+	lane.has_value = true;
+	lane.sort_key_id = sort_key_id;
+	lane.value = value;
+	if (lane_text) {
+		lane_text->assign(text.data(), text.size());
+	}
+}
+
+void MergeLWWScalarLane(GroupMergeLWWState &state, LWWScalarLane &lane, string *lane_text,
+                        const LWWScalarValue &candidate, nonstd::string_view candidate_text, nonstd::string_view K,
+                        uint32_t &sort_key_id) {
+	if (!lane.has_value) {
+		StoreLWWScalarLane(lane, lane_text, candidate, candidate_text, ResolveLWWRowSortKey(state, K, sort_key_id));
+		return;
+	}
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), K);
+	if (key_cmp > 0) {
+		return;
+	}
+	if (key_cmp < 0 ||
+	    CompareLWWScalarValueTie(lane.value, LWWScalarTextView(lane_text), candidate, candidate_text) < 0) {
+		StoreLWWScalarLane(lane, lane_text, candidate, candidate_text, ResolveLWWRowSortKey(state, K, sort_key_id));
+	}
+}
+
+bool LocateTopLevelLWWValue(const JsonoView &view, nonstd::string_view key, JsonoCursor &out) {
+	if (view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+		return false;
+	}
+	auto layout = ReadObjectLayout(view, 0);
+	JsonoCursor cursor;
+	cursor.pos = layout.value_start;
+	for (idx_t i = 0; i < layout.key_count; i++) {
+		auto key_slot = view.SlotAt(layout.key_start + i);
+		if (SlotTag(key_slot) != tag::KEY) {
+			throw InvalidInputException("malformed JSONO: object key slot expected");
+		}
+		auto current = view.KeyAt(SlotPayload(key_slot));
+		if (current == key) {
+			out = cursor;
+			return true;
+		}
+		SkipValueFast(view, cursor);
+	}
+	return false;
+}
+
+bool StoreCompleteListShredLaneValue(const ReconShred &shred, const JsonoView &base_view,
+                                     const UnifiedVectorFormat &list_fmt, const UnifiedVectorFormat &element_fmt,
+                                     idx_t row, LWWTreeScratch &scratch, LWWListValue &out) {
+	if (!RowIsValid(list_fmt, row)) {
+		return false;
+	}
+	JsonoCursor skeleton_cursor;
+	auto key = nonstd::string_view(shred.steps[0].key.data(), shred.steps[0].key.size());
+	if (!LocateTopLevelLWWValue(base_view, key, skeleton_cursor)) {
+		throw InternalException("jsono_group_merge direct list update: missing array skeleton");
+	}
+	auto &element_type = ListType::GetChildType(shred.type);
+	auto list_entry = UnifiedVectorFormat::GetData<list_entry_t>(list_fmt)[RowIndex(list_fmt, row)];
+	for (idx_t i = 0; i < list_entry.length; i++) {
+		if (!RowIsValid(element_fmt, list_entry.offset + i)) {
+			return false;
+		}
+	}
+	out.elements.clear();
+	out.elements.resize(list_entry.length);
+	for (idx_t i = 0; i < list_entry.length; i++) {
+		StorePrimitiveLaneValue(element_type, element_fmt, RowIndex(element_fmt, list_entry.offset + i),
+		                        out.elements[i].value, &out.elements[i].text);
+	}
+	SerializeIncomingLWWLeaf(base_view, skeleton_cursor, out.skeleton, scratch, 1);
+	return true;
+}
+
+void StoreLWWListLane(LWWListLane &lane, const LWWListValue &value, uint32_t sort_key_id) {
+	lane.has_value = true;
+	lane.sort_key_id = sort_key_id;
+	lane.value = value;
+}
+
+void MergeLWWListLane(GroupMergeLWWState &state, LWWListLane &lane, const LWWListValue &candidate,
+                      const LogicalType &type, nonstd::string_view K, uint32_t &sort_key_id) {
+	if (!lane.has_value) {
+		StoreLWWListLane(lane, candidate, ResolveLWWRowSortKey(state, K, sort_key_id));
+		return;
+	}
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), K);
+	if (key_cmp > 0) {
+		return;
+	}
+	if (key_cmp < 0 || CompareLWWListValueTie(lane.value, candidate, type) < 0) {
+		StoreLWWListLane(lane, candidate, ResolveLWWRowSortKey(state, K, sort_key_id));
+	}
+}
+
+bool PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> &bind_shreds,
+                                   vector<ReconShred> &scalar_shreds, vector<ReconShred> &list_shreds,
+                                   vector<idx_t> &overlay_shreds) {
+	for (idx_t i = 0; i < bind_shreds.size(); i++) {
+		auto &name = bind_shreds[i].first;
+		vector<PathStep> steps;
+		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
+			steps = ParseJsonoPath(name, "jsono_group_merge direct shredded update");
+		} else {
+			steps.push_back(PathStep {PathStepKind::Key, name, 0});
+		}
+		for (auto &step : steps) {
+			if (step.kind != PathStepKind::Key) {
+				return false;
+			}
+		}
+		auto &type = bind_shreds[i].second;
+		if (IsShredListType(type)) {
+			if (IsShredScalarArrayType(type) && steps.size() == 1) {
+				ReconShred shred {i, type, std::move(steps)};
+				shred.manifest_path = name;
+				list_shreds.push_back(std::move(shred));
+				continue;
+			}
+			overlay_shreds.push_back(i);
+			continue;
+		}
+		ReconShred shred {i, type, std::move(steps)};
+		shred.manifest_path = name;
+		scalar_shreds.push_back(std::move(shred));
+	}
+	return true;
+}
+
+void FoldManifestedScalarShredsLWW(GroupMergeLWWState &state, const vector<ReconShred> &shreds,
+                                   const vector<idx_t> &text_indices, idx_t text_count,
+                                   vector<UnifiedVectorFormat> &shred_fmt,
+                                   const std::vector<ShredManifestEntry> &manifest, idx_t row, nonstd::string_view K) {
+	if (shreds.empty()) {
+		return;
+	}
+	EnsureLWWScalarLanes(state, shreds.size(), text_count);
+	uint32_t sort_key_id = LWW_INVALID_SORT_KEY_ID;
+	LWWScalarValue candidate;
+	string candidate_text;
+	idx_t shred_idx = 0;
+	for (auto &entry : manifest) {
+		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
+		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+			shred_idx++;
+		}
+		if (shred_idx >= shreds.size()) {
+			break;
+		}
+		auto &shred = shreds[shred_idx];
+		if (entry.path != nonstd::string_view(shred.manifest_path.data(), shred.manifest_path.size())) {
+			continue;
+		}
+		if (!RowIsValid(shred_fmt[shred_idx], row)) {
+			continue;
+		}
+		StoreScalarShredLaneValue(shred, shred_fmt[shred_idx], RowIndex(shred_fmt[shred_idx], row), candidate,
+		                          candidate_text);
+		MergeLWWScalarLane(state, state.scalar_lanes[shred_idx], LWWScalarLaneText(state, text_indices, shred_idx),
+		                   candidate, nonstd::string_view(candidate_text.data(), candidate_text.size()), K,
+		                   sort_key_id);
+	}
+}
+
+bool CanSkipManifestedScalarShredsLWW(const GroupMergeLWWState &state, const vector<ReconShred> &shreds,
+                                      vector<UnifiedVectorFormat> &shred_fmt,
+                                      const std::vector<ShredManifestEntry> &manifest, idx_t row,
+                                      nonstd::string_view K) {
+	if (!state.scalar_lanes) {
+		return false;
+	}
+	if (state.scalar_lane_count != shreds.size()) {
+		throw InternalException("jsono_group_merge: scalar lane count changed inside one aggregate state");
+	}
+	bool saw_scalar = false;
+	idx_t shred_idx = 0;
+	for (auto &entry : manifest) {
+		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
+		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+			shred_idx++;
+		}
+		if (shred_idx >= shreds.size()) {
+			break;
+		}
+		auto &shred = shreds[shred_idx];
+		if (entry.path != nonstd::string_view(shred.manifest_path.data(), shred.manifest_path.size())) {
+			continue;
+		}
+		saw_scalar = true;
+		if (!RowIsValid(shred_fmt[shred_idx], row)) {
+			return false;
+		}
+		auto &lane = state.scalar_lanes[shred_idx];
+		if (!lane.has_value || CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), K) <= 0) {
+			return false;
+		}
+	}
+	return saw_scalar;
+}
+
+bool DirectListShredManifestRowComplete(const vector<ReconShred> &shreds, vector<UnifiedVectorFormat> &list_fmt,
+                                        vector<UnifiedVectorFormat> &element_fmt,
+                                        const std::vector<ShredManifestEntry> &manifest, idx_t row) {
+	idx_t shred_idx = 0;
+	for (auto &entry : manifest) {
+		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
+		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+			shred_idx++;
+		}
+		if (shred_idx >= shreds.size()) {
+			break;
+		}
+		auto &shred = shreds[shred_idx];
+		if (entry.path != nonstd::string_view(shred.manifest_path.data(), shred.manifest_path.size())) {
+			continue;
+		}
+		if (!RowIsValid(list_fmt[shred_idx], row)) {
+			return false;
+		}
+		auto list_entry =
+		    UnifiedVectorFormat::GetData<list_entry_t>(list_fmt[shred_idx])[RowIndex(list_fmt[shred_idx], row)];
+		for (idx_t i = 0; i < list_entry.length; i++) {
+			if (!RowIsValid(element_fmt[shred_idx], list_entry.offset + i)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+bool CanUseDirectListShreds(Vector &input, idx_t count, const vector<ReconShred> &shreds,
+                            vector<UnifiedVectorFormat> &list_fmt, vector<UnifiedVectorFormat> &element_fmt) {
+	if (shreds.empty()) {
+		return true;
+	}
+	JsonoRowReader reader;
+	reader.Init(input, count);
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob;
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			continue;
+		}
+		if (!DirectListShredManifestRowComplete(shreds, list_fmt, element_fmt, reader.RowManifest(view), row)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void FoldManifestedListShredsLWW(GroupMergeLWWState &state, const vector<ReconShred> &shreds,
+                                 vector<UnifiedVectorFormat> &list_fmt, vector<UnifiedVectorFormat> &element_fmt,
+                                 const std::vector<ShredManifestEntry> &manifest, const JsonoView &base_view, idx_t row,
+                                 nonstd::string_view K, vector<nonstd::string_view> &skip_root_keys) {
+	if (shreds.empty()) {
+		return;
+	}
+	static thread_local LWWTreeScratch scratch;
+	EnsureLWWListLanes(state, shreds.size());
+	uint32_t sort_key_id = LWW_INVALID_SORT_KEY_ID;
+	LWWListValue candidate;
+	idx_t shred_idx = 0;
+	for (auto &entry : manifest) {
+		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
+		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+			shred_idx++;
+		}
+		if (shred_idx >= shreds.size()) {
+			break;
+		}
+		auto &shred = shreds[shred_idx];
+		if (entry.path != nonstd::string_view(shred.manifest_path.data(), shred.manifest_path.size())) {
+			continue;
+		}
+		if (!StoreCompleteListShredLaneValue(shred, base_view, list_fmt[shred_idx], element_fmt[shred_idx], row,
+		                                     scratch, candidate)) {
+			throw InternalException("jsono_group_merge direct list update: manifested list shred is incomplete");
+		}
+		MergeLWWListLane(state, state.list_lanes[shred_idx], candidate, shred.type, K, sort_key_id);
+		skip_root_keys.push_back(nonstd::string_view(shred.steps[0].key.data(), shred.steps[0].key.size()));
+	}
+}
+
+bool JsonoGroupMergeLWWSimpleUpdateDirectShredded(Vector inputs[], const GroupMergeLWWBindData &bind_data,
+                                                  data_ptr_t state_ptr, idx_t count, UnifiedVectorFormat &sk_fmt,
+                                                  const string_t *sk_data) {
+	if (!IsShreddedJsonoType(inputs[0].GetType()) || bind_data.shreds.empty()) {
+		return false;
+	}
+	vector<ReconShred> scalar_shreds;
+	vector<ReconShred> list_shreds;
+	vector<idx_t> overlay_shreds;
+	if (!PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, overlay_shreds)) {
+		return false;
+	}
+	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
+	auto scalar_text_count = LWWScalarTextLaneCount(scalar_text_indices);
+	if (!list_shreds.empty() && !overlay_shreds.empty()) {
+		return false;
+	}
+	Vector overlay(JsonoType(), count);
+	Vector *base = &inputs[0];
+	if (!overlay_shreds.empty()) {
+		JsonoOverlayShredsToPlain(inputs[0], count, overlay_shreds, overlay);
+		base = &overlay;
+	}
+	JsonoRowReader base_reader;
+	base_reader.Init(*base, count);
+	JsonoRowReader manifest_reader;
+	if (base != &inputs[0]) {
+		manifest_reader.Init(inputs[0], count);
+	}
+	vector<UnifiedVectorFormat> shred_fmt(scalar_shreds.size());
+	for (idx_t k = 0; k < scalar_shreds.size(); k++) {
+		JsonoShredVector(inputs[0], scalar_shreds[k].child).ToUnifiedFormat(count, shred_fmt[k]);
+	}
+	vector<UnifiedVectorFormat> list_fmt(list_shreds.size());
+	vector<UnifiedVectorFormat> element_fmt(list_shreds.size());
+	for (idx_t k = 0; k < list_shreds.size(); k++) {
+		auto &list_vec = JsonoShredVector(inputs[0], list_shreds[k].child);
+		list_vec.ToUnifiedFormat(count, list_fmt[k]);
+		ListVector::GetEntry(list_vec).ToUnifiedFormat(ListVector::GetListSize(list_vec), element_fmt[k]);
+	}
+	if (!CanUseDirectListShreds(inputs[0], count, list_shreds, list_fmt, element_fmt)) {
+		return false;
+	}
+
+	auto &state = *reinterpret_cast<GroupMergeLWWState *>(state_ptr);
+	JsonoView base_view;
+	JsonoView manifest_view;
+	vector<nonstd::string_view> skip_root_keys;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow base_blob;
+		if (base_reader.Read(row, base_blob, base_view) != JsonoRowState::Value) {
+			continue;
+		}
+		const std::vector<ShredManifestEntry> *manifest = nullptr;
+		if (base == &inputs[0]) {
+			manifest = &base_reader.RowManifest(base_view);
+		} else {
+			JsonoBlobRow manifest_blob;
+			if (manifest_reader.Read(row, manifest_blob, manifest_view) != JsonoRowState::Value) {
+				continue;
+			}
+			manifest = &manifest_reader.RowManifest(manifest_view);
+		}
+		auto &k = sk_data[sk_fmt.sel->get_index(row)];
+		auto K = nonstd::string_view(k.GetData(), k.GetSize());
+		skip_root_keys.clear();
+		FoldManifestedListShredsLWW(state, list_shreds, list_fmt, element_fmt, *manifest, base_view, row, K,
+		                            skip_root_keys);
+		FoldRowLWW(state, base_view, K, &skip_root_keys);
+		if (!CanSkipManifestedScalarShredsLWW(state, scalar_shreds, shred_fmt, *manifest, row, K)) {
+			FoldManifestedScalarShredsLWW(state, scalar_shreds, scalar_text_indices, scalar_text_count, shred_fmt,
+			                              *manifest, row, K);
+		}
+	}
+	return true;
+}
+
+bool JsonoGroupMergeLWWUpdateDirectShredded(Vector inputs[], const GroupMergeLWWBindData &bind_data, idx_t count,
+                                            UnifiedVectorFormat &sk_fmt, const string_t *sk_data,
+                                            UnifiedVectorFormat &state_fmt, GroupMergeLWWState *const *state_data) {
+	if (!IsShreddedJsonoType(inputs[0].GetType()) || bind_data.shreds.empty()) {
+		return false;
+	}
+	vector<ReconShred> scalar_shreds;
+	vector<ReconShred> list_shreds;
+	vector<idx_t> overlay_shreds;
+	if (!PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, overlay_shreds)) {
+		return false;
+	}
+	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
+	auto scalar_text_count = LWWScalarTextLaneCount(scalar_text_indices);
+	if (!list_shreds.empty() && !overlay_shreds.empty()) {
+		return false;
+	}
+	Vector overlay(JsonoType(), count);
+	Vector *base = &inputs[0];
+	if (!overlay_shreds.empty()) {
+		JsonoOverlayShredsToPlain(inputs[0], count, overlay_shreds, overlay);
+		base = &overlay;
+	}
+	JsonoRowReader base_reader;
+	base_reader.Init(*base, count);
+	JsonoRowReader manifest_reader;
+	if (base != &inputs[0]) {
+		manifest_reader.Init(inputs[0], count);
+	}
+	vector<UnifiedVectorFormat> shred_fmt(scalar_shreds.size());
+	for (idx_t k = 0; k < scalar_shreds.size(); k++) {
+		JsonoShredVector(inputs[0], scalar_shreds[k].child).ToUnifiedFormat(count, shred_fmt[k]);
+	}
+	vector<UnifiedVectorFormat> list_fmt(list_shreds.size());
+	vector<UnifiedVectorFormat> element_fmt(list_shreds.size());
+	for (idx_t k = 0; k < list_shreds.size(); k++) {
+		auto &list_vec = JsonoShredVector(inputs[0], list_shreds[k].child);
+		list_vec.ToUnifiedFormat(count, list_fmt[k]);
+		ListVector::GetEntry(list_vec).ToUnifiedFormat(ListVector::GetListSize(list_vec), element_fmt[k]);
+	}
+	if (!CanUseDirectListShreds(inputs[0], count, list_shreds, list_fmt, element_fmt)) {
+		return false;
+	}
+
+	JsonoView base_view;
+	JsonoView manifest_view;
+	vector<nonstd::string_view> skip_root_keys;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow base_blob;
+		if (base_reader.Read(row, base_blob, base_view) != JsonoRowState::Value) {
+			continue;
+		}
+		const std::vector<ShredManifestEntry> *manifest = nullptr;
+		if (base == &inputs[0]) {
+			manifest = &base_reader.RowManifest(base_view);
+		} else {
+			JsonoBlobRow manifest_blob;
+			if (manifest_reader.Read(row, manifest_blob, manifest_view) != JsonoRowState::Value) {
+				continue;
+			}
+			manifest = &manifest_reader.RowManifest(manifest_view);
+		}
+		auto &k = sk_data[sk_fmt.sel->get_index(row)];
+		auto K = nonstd::string_view(k.GetData(), k.GetSize());
+		auto &state = *state_data[RowIndex(state_fmt, row)];
+		skip_root_keys.clear();
+		FoldManifestedListShredsLWW(state, list_shreds, list_fmt, element_fmt, *manifest, base_view, row, K,
+		                            skip_root_keys);
+		FoldRowLWW(state, base_view, K, &skip_root_keys);
+		if (!CanSkipManifestedScalarShredsLWW(state, scalar_shreds, shred_fmt, *manifest, row, K)) {
+			FoldManifestedScalarShredsLWW(state, scalar_shreds, scalar_text_indices, scalar_text_count, shred_fmt,
+			                              *manifest, row, K);
+		}
+	}
+	return true;
+}
+
+bool LWWPathTerminatesOnKey(const vector<const vector<PathStep> *> &paths, size_t depth, nonstd::string_view key) {
+	for (auto *path : paths) {
+		auto &step = (*path)[depth];
+		if (depth + 1 == path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void LWWContinuingPathsForKey(const vector<const vector<PathStep> *> &paths, size_t depth, nonstd::string_view key,
+                              vector<const vector<PathStep> *> &out) {
+	out.clear();
+	for (auto *path : paths) {
+		auto &step = (*path)[depth];
+		if (depth + 1 < path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
+			out.push_back(path);
+		}
+	}
+}
+
+void EmitLWWTreeNodeStrippingPaths(const LWWTreeNode &node, const vector<const vector<PathStep> *> &strip_paths,
+                                   JsonoBuilder &builder, size_t depth) {
+	if (strip_paths.empty() || node.kind != LWWTreeKind::Object) {
+		EmitLWWTreeNode(node, builder, depth);
+		return;
+	}
+	idx_t child_count = 0;
+	for (auto &child : node.children) {
+		auto key = nonstd::string_view(child.key.data(), child.key.size());
+		child_count += LWWPathTerminatesOnKey(strip_paths, depth, key) ? 0 : 1;
+	}
+	builder.EmitObjectStart(child_count);
+	for (auto &child : node.children) {
+		auto key = nonstd::string_view(child.key.data(), child.key.size());
+		if (!LWWPathTerminatesOnKey(strip_paths, depth, key)) {
+			builder.EmitKeySlot(key);
+		}
+	}
+	vector<const vector<PathStep> *> deeper;
+	for (auto &child : node.children) {
+		auto key = nonstd::string_view(child.key.data(), child.key.size());
+		if (LWWPathTerminatesOnKey(strip_paths, depth, key)) {
+			continue;
+		}
+		builder.EmitObjectChildStart();
+		LWWContinuingPathsForKey(strip_paths, depth, key, deeper);
+		EmitLWWTreeNodeStrippingPaths(*child.node, deeper, builder, depth + 1);
+	}
+	builder.EmitObjectEnd();
+}
+
+struct LWWRootEmitEntry {
+	bool is_list_override;
+	idx_t index;
+	nonstd::string_view key;
+};
+
+void EmitLWWListSkeleton(const LWWListLane &lane, JsonoBuilder &builder, size_t depth) {
+	JsonoView value_view = ViewOfBlob(lane.value.skeleton);
+	if (!value_view.ParseHeader()) {
+		throw InternalException("jsono_group_merge: malformed list skeleton blob");
+	}
+	JsonoCursor cursor;
+	EmitValueVerbatim(value_view, cursor, builder, depth);
+}
+
+void EmitLWWTreeNodeWithListOverrides(const LWWTreeNode &node, JsonoBuilder &builder,
+                                      const vector<const vector<PathStep> *> &scalar_strip_paths,
+                                      const vector<idx_t> &skip_children, const vector<idx_t> &list_override_indices,
+                                      const vector<ReconShred> &list_shreds, const LWWListLane *list_lanes,
+                                      size_t depth) {
+	if (list_override_indices.empty()) {
+		EmitLWWTreeNodeStrippingPaths(node, scalar_strip_paths, builder, depth);
+		return;
+	}
+	if (node.kind != LWWTreeKind::Object || depth != 0 || !list_lanes) {
+		throw InternalException("jsono_group_merge: list skeleton override requires a root object");
+	}
+	vector<LWWRootEmitEntry> entries;
+	entries.reserve(node.children.size() - skip_children.size() + list_override_indices.size());
+	idx_t skip_pos = 0;
+	for (idx_t i = 0; i < node.children.size(); i++) {
+		if (skip_pos < skip_children.size() && skip_children[skip_pos] == i) {
+			skip_pos++;
+			continue;
+		}
+		auto key = nonstd::string_view(node.children[i].key.data(), node.children[i].key.size());
+		if (!LWWPathTerminatesOnKey(scalar_strip_paths, depth, key)) {
+			entries.push_back(LWWRootEmitEntry {false, i, key});
+		}
+	}
+	for (auto list_idx : list_override_indices) {
+		auto &key = list_shreds[list_idx].steps[0].key;
+		entries.push_back(LWWRootEmitEntry {true, list_idx, nonstd::string_view(key.data(), key.size())});
+	}
+	std::sort(entries.begin(), entries.end(),
+	          [](const LWWRootEmitEntry &a, const LWWRootEmitEntry &b) { return CompareJsonoKeys(a.key, b.key) < 0; });
+	for (idx_t i = 1; i < entries.size(); i++) {
+		if (CompareJsonoKeys(entries[i - 1].key, entries[i].key) == 0) {
+			throw InternalException("jsono_group_merge: duplicate root key while emitting list skeleton override");
+		}
+	}
+	builder.EmitObjectStart(entries.size());
+	for (auto &entry : entries) {
+		builder.EmitKeySlot(entry.key);
+	}
+	for (auto &entry : entries) {
+		builder.EmitObjectChildStart();
+		if (entry.is_list_override) {
+			EmitLWWListSkeleton(list_lanes[entry.index], builder, depth + 1);
+		} else {
+			vector<const vector<PathStep> *> deeper;
+			LWWContinuingPathsForKey(scalar_strip_paths, depth, entry.key, deeper);
+			EmitLWWTreeNodeStrippingPaths(*node.children[entry.index].node, deeper, builder, depth + 1);
+		}
+	}
+	builder.EmitObjectEnd();
+}
+
+int CompareLWWScalarLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWScalarLane &lane, const string *lane_text,
+                                   const LWWTreeNode &node) {
+	if (node.kind != LWWTreeKind::Leaf) {
+		ThrowMixedKindConflict();
+	}
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), node.sort_key);
+	if (key_cmp != 0) {
+		return key_cmp;
+	}
+	return CompareLWWScalarValueTie(lane.value, LWWScalarTextView(lane_text), node.value);
+}
+
+int CompareLWWListLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWListLane &lane, const ReconShred &shred,
+                                 const LWWTreeNode &node) {
+	if (node.kind != LWWTreeKind::Leaf) {
+		ThrowMixedKindConflict();
+	}
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), node.sort_key);
+	if (key_cmp != 0) {
+		return key_cmp;
+	}
+	return CompareLWWListValueTie(lane.value, shred.type, node.value);
+}
+
+void WriteLWWScalarLaneValue(const LWWScalarValue &value, nonstd::string_view text, const LogicalType &type,
+                             Vector &out, idx_t rid) {
+	ShredPrimitive primitive;
+	if (!TypeToShredPrimitive(type, primitive)) {
+		throw InternalException("jsono_group_merge direct finalize: non-scalar type '%s'", type.ToString());
+	}
+	FlatVector::Validity(out).SetValid(rid);
+	switch (primitive) {
+	case ShredPrimitive::Varchar:
+		FlatVector::GetData<string_t>(out)[rid] = StringVector::AddString(out, text.data(), text.size());
+		return;
+	case ShredPrimitive::Bigint: {
+		int64_t v;
+		std::memcpy(&v, &value.num, sizeof(v));
+		FlatVector::GetData<int64_t>(out)[rid] = v;
+		return;
+	}
+	case ShredPrimitive::Ubigint:
+		FlatVector::GetData<uint64_t>(out)[rid] = value.num;
+		return;
+	case ShredPrimitive::Double: {
+		double v;
+		std::memcpy(&v, &value.num, sizeof(v));
+		FlatVector::GetData<double>(out)[rid] = v;
+		return;
+	}
+	case ShredPrimitive::Boolean:
+		FlatVector::GetData<bool>(out)[rid] = SlotTag(value.slot) == tag::VAL_TRUE;
+		return;
+	}
+}
+
+void WriteLWWScalarLaneValue(const LWWScalarLane &lane, const string *lane_text, const ReconShred &shred, Vector &out,
+                             idx_t rid) {
+	WriteLWWScalarLaneValue(lane.value, LWWScalarTextView(lane_text), shred.type, out, rid);
+}
+
+void WriteLWWListLaneValue(const LWWListLane &lane, const ReconShred &shred, Vector &out, idx_t rid) {
+	FlatVector::Validity(out).SetValid(rid);
+	auto start = ListVector::GetListSize(out);
+	EnsureListCapacity(out, start + lane.value.elements.size());
+	auto &child = ListVector::GetEntry(out);
+	child.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &element_type = ListType::GetChildType(shred.type);
+	for (idx_t i = 0; i < lane.value.elements.size(); i++) {
+		auto &element = lane.value.elements[i];
+		WriteLWWScalarLaneValue(element.value, nonstd::string_view(element.text.data(), element.text.size()),
+		                        element_type, child, start + i);
+	}
+	FinishListRow(out, rid, start, lane.value.elements.size());
+}
+
+bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, Vector &out, idx_t rid,
+                              bool &diverted) {
+	diverted = false;
+	if (node.kind != LWWTreeKind::Leaf) {
+		return false;
+	}
+	JsonoView value_view = ViewOfBlob(node.value);
+	if (!value_view.ParseHeader() || value_view.Slots() == 0) {
+		return false;
+	}
+	auto slot_tag = SlotTag(value_view.SlotAt(0));
+	if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
+		return false;
+	}
+	JsonoCursor cursor;
+	auto scalar = DecodeScalarAt(value_view, cursor);
+	ShredPrimitive primitive;
+	if (!TypeToShredPrimitive(shred.type, primitive)) {
+		throw InternalException("jsono_group_merge direct finalize: non-scalar shred type '%s'", shred.type.ToString());
+	}
+	if (primitive == ShredPrimitive::Varchar) {
+		if (scalar.kind != JsonoScalarKind::String) {
+			return false;
+		}
+		FlatVector::Validity(out).SetValid(rid);
+		FlatVector::GetData<string_t>(out)[rid] = StringVector::AddString(out, scalar.text.data(), scalar.text.size());
+		return true;
+	}
+	if (!JsonoScalarFitsShredType(scalar, shred.type)) {
+		diverted = true;
+		return false;
+	}
+	FlatVector::Validity(out).SetValid(rid);
+	switch (primitive) {
+	case ShredPrimitive::Bigint:
+		FlatVector::GetData<int64_t>(out)[rid] = scalar.int_value;
+		return true;
+	case ShredPrimitive::Ubigint:
+		FlatVector::GetData<uint64_t>(out)[rid] =
+		    scalar.kind == JsonoScalarKind::UInt64 ? scalar.uint_value : uint64_t(scalar.int_value);
+		return true;
+	case ShredPrimitive::Double:
+		FlatVector::GetData<double>(out)[rid] = scalar.double_value;
+		return true;
+	case ShredPrimitive::Boolean:
+		FlatVector::GetData<bool>(out)[rid] = scalar.bool_value;
+		return true;
+	case ShredPrimitive::Varchar:
+		break;
+	}
+	return false;
+}
+
+enum class LWWPathLookupKind : uint8_t { Missing, Found, PrefixLeaf };
+
+struct LWWPathLookup {
+	LWWPathLookup() {
+	}
+	LWWPathLookup(LWWPathLookupKind kind_p, LWWTreeNode *node_p) : kind(kind_p), node(node_p) {
+	}
+	LWWPathLookupKind kind = LWWPathLookupKind::Missing;
+	LWWTreeNode *node = nullptr;
+};
+
+LWWPathLookup FindLWWPathNode(LWWTreeNode &root, const vector<PathStep> &steps) {
+	LWWTreeNode *node = &root;
+	for (idx_t depth = 0; depth < steps.size(); depth++) {
+		if (node->kind != LWWTreeKind::Object) {
+			return {LWWPathLookupKind::PrefixLeaf, node};
+		}
+		auto key = nonstd::string_view(steps[depth].key.data(), steps[depth].key.size());
+		auto child_idx = FindLWWChildIndex(node->children, key);
+		bool found = child_idx < node->children.size() &&
+		             CompareJsonoKeys(nonstd::string_view(node->children[child_idx].key.data(),
+		                                                  node->children[child_idx].key.size()),
+		                              key) == 0;
+		if (!found) {
+			return {};
+		}
+		node = node->children[child_idx].node.get();
+	}
+	return {LWWPathLookupKind::Found, node};
+}
+
+void AppendLWWIndexedShredManifest(std::string &manifest, uint64_t layout_hash, idx_t shred_count,
+                                   const vector<idx_t> &shred_indices) {
+	auto bitset_byte_count = (shred_count + 7) / 8;
+	auto index_byte_count = shred_indices.size() * sizeof(uint16_t);
+	if (bitset_byte_count < index_byte_count) {
+		if (bitset_byte_count > std::numeric_limits<uint32_t>::max()) {
+			throw InvalidInputException("jsono shred: too many shreds for bitset manifest");
+		}
+		uint32_t bitset_marker = SHRED_MANIFEST_BITSET_MARKER;
+		uint32_t stored_byte_count = uint32_t(bitset_byte_count);
+		manifest.append(reinterpret_cast<const char *>(&bitset_marker), sizeof(bitset_marker));
+		manifest.append(reinterpret_cast<const char *>(&layout_hash), sizeof(layout_hash));
+		manifest.append(reinterpret_cast<const char *>(&stored_byte_count), sizeof(stored_byte_count));
+		auto bitset_start = manifest.size();
+		manifest.resize(bitset_start + bitset_byte_count, '\0');
+		for (auto index : shred_indices) {
+			if (index >= shred_count) {
+				throw InternalException("jsono shred: manifest index is out of bounds");
+			}
+			manifest[bitset_start + index / 8] =
+			    char(uint8_t(manifest[bitset_start + index / 8]) | uint8_t(1U << (index & 7U)));
+		}
+		return;
+	}
+	uint32_t index_marker = SHRED_MANIFEST_INDEX_MARKER;
+	uint32_t entry_count = uint32_t(shred_indices.size());
+	manifest.append(reinterpret_cast<const char *>(&index_marker), sizeof(index_marker));
+	manifest.append(reinterpret_cast<const char *>(&layout_hash), sizeof(layout_hash));
+	manifest.append(reinterpret_cast<const char *>(&entry_count), sizeof(entry_count));
+	for (auto index : shred_indices) {
+		if (index > std::numeric_limits<uint16_t>::max()) {
+			throw InvalidInputException("jsono shred: too many shreds for indexed manifest");
+		}
+		uint16_t stored = uint16_t(index);
+		manifest.append(reinterpret_cast<const char *>(&stored), sizeof(stored));
+	}
+}
+
+bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorFormat &state_fmt,
+                                              GroupMergeLWWState *const *state_data,
+                                              const GroupMergeLWWBindData &bind_data, idx_t count, idx_t offset) {
+	vector<ReconShred> scalar_shreds;
+	vector<ReconShred> list_shreds;
+	vector<idx_t> ignored_list_shreds;
+	if (!PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, ignored_list_shreds)) {
+		return false;
+	}
+	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
+	if (!list_shreds.empty() && !ignored_list_shreds.empty()) {
+		return false;
+	}
+
+	JsonoBodyWriter writer;
+	writer.Init(result);
+	vector<Vector *> shred_out(bind_data.shreds.size());
+	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
+		shred_out[f] = &JsonoShredVector(result, f);
+		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
+	}
+	Vector *vc_out = &JsonoVcVector(result);
+	vc_out->SetVectorType(VectorType::FLAT_VECTOR);
+
+	vector<std::pair<std::string, std::string>> manifest_signatures;
+	manifest_signatures.reserve(bind_data.shreds.size());
+	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
+		manifest_signatures.emplace_back(bind_data.shreds[f].first, bind_data.shreds[f].second.ToString());
+	}
+	auto manifest_layout_hash = HashShredManifestSignatures(manifest_signatures);
+
+	JsonoBuilder builder;
+	vector<const vector<PathStep> *> scalar_strip_paths;
+	vector<idx_t> stripped_child_indices;
+	vector<idx_t> stripped_shred_indices;
+	vector<idx_t> list_override_indices;
+	std::string manifest;
+	for (idx_t i = 0; i < count; i++) {
+		auto rid = i + offset;
+		for (auto *shred : shred_out) {
+			FlatVector::SetNull(*shred, rid, true);
+		}
+		FlatVector::Validity(*vc_out).SetValid(rid);
+		FlatVector::GetData<bool>(*vc_out)[rid] = true;
+
+		auto &state = *state_data[RowIndex(state_fmt, i)];
+		builder.Reset();
+		scalar_strip_paths.clear();
+		stripped_child_indices.clear();
+		stripped_shred_indices.clear();
+		list_override_indices.clear();
+		bool value_complete = true;
+		if (!state.has_input) {
+			builder.EmitObjectStart(0);
+			builder.EmitObjectEnd();
+			writer.WriteRow(rid, builder);
+			continue;
+		}
+		if (!state.root) {
+			throw InternalException("jsono_group_merge: missing keyed aggregate root");
+		}
+		if (state.scalar_lanes && state.scalar_lane_count != scalar_shreds.size()) {
+			throw InternalException("jsono_group_merge: scalar lane count changed inside one aggregate state");
+		}
+		if (state.list_lanes && state.list_lane_count != list_shreds.size()) {
+			throw InternalException("jsono_group_merge: list lane count changed inside one aggregate state");
+		}
+		if ((state.scalar_lanes || state.list_lanes) && state.root->kind != LWWTreeKind::Object) {
+			ThrowMixedKindConflict();
+		}
+		if (state.root->kind == LWWTreeKind::Object) {
+			for (idx_t s = 0; s < scalar_shreds.size(); s++) {
+				auto &shred = scalar_shreds[s];
+				auto lookup = FindLWWPathNode(*state.root, shred.steps);
+				auto *lane = state.scalar_lanes && state.scalar_lanes[s].has_value ? &state.scalar_lanes[s] : nullptr;
+				auto *lane_text = lane ? LWWScalarLaneText(state, scalar_text_indices, s) : nullptr;
+				if (lane && lookup.kind == LWWPathLookupKind::PrefixLeaf) {
+					ThrowMixedKindConflict();
+				}
+				bool found = lookup.kind == LWWPathLookupKind::Found;
+				if (lane && (!found || CompareLWWScalarLaneToTreeLeaf(state, *lane, lane_text, *lookup.node) >= 0)) {
+					WriteLWWScalarLaneValue(*lane, lane_text, shred, *shred_out[shred.child], rid);
+					if (found) {
+						scalar_strip_paths.push_back(&shred.steps);
+					}
+					stripped_shred_indices.push_back(shred.child);
+					continue;
+				}
+				if (!found) {
+					continue;
+				}
+				bool diverted = false;
+				if (WriteLWWScalarShredValue(*lookup.node, shred, *shred_out[shred.child], rid, diverted)) {
+					scalar_strip_paths.push_back(&shred.steps);
+					stripped_shred_indices.push_back(shred.child);
+				}
+				value_complete = value_complete && !diverted;
+			}
+			for (idx_t s = 0; s < list_shreds.size(); s++) {
+				auto &shred = list_shreds[s];
+				auto key = nonstd::string_view(shred.steps[0].key.data(), shred.steps[0].key.size());
+				auto child_idx = FindLWWChildIndex(state.root->children, key);
+				bool found = child_idx < state.root->children.size() &&
+				             CompareJsonoKeys(nonstd::string_view(state.root->children[child_idx].key.data(),
+				                                                  state.root->children[child_idx].key.size()),
+				                              key) == 0;
+				auto *lane = state.list_lanes && state.list_lanes[s].has_value ? &state.list_lanes[s] : nullptr;
+				if (!lane) {
+					continue;
+				}
+				if (!found ||
+				    CompareLWWListLaneToTreeLeaf(state, *lane, shred, *state.root->children[child_idx].node) >= 0) {
+					if (found) {
+						stripped_child_indices.push_back(child_idx);
+					}
+					WriteLWWListLaneValue(*lane, shred, *shred_out[shred.child], rid);
+					stripped_shred_indices.push_back(shred.child);
+					list_override_indices.push_back(s);
+				}
+			}
+		}
+		if (!value_complete) {
+			FlatVector::SetNull(*vc_out, rid, true);
+		}
+		std::sort(stripped_child_indices.begin(), stripped_child_indices.end());
+		EmitLWWTreeNodeWithListOverrides(*state.root, builder, scalar_strip_paths, stripped_child_indices,
+		                                 list_override_indices, list_shreds, state.list_lanes, 0);
+		const std::string *manifest_ptr = nullptr;
+		if (!stripped_shred_indices.empty()) {
+			std::sort(stripped_shred_indices.begin(), stripped_shred_indices.end());
+			manifest.clear();
+			AppendLWWIndexedShredManifest(manifest, manifest_layout_hash, bind_data.shreds.size(),
+			                              stripped_shred_indices);
+			manifest_ptr = &manifest;
+		}
+		writer.WriteRow(rid, builder, manifest_ptr);
+	}
+	return true;
 }
 
 unique_ptr<FunctionData> JsonoGroupMergeLWWBind(ClientContext &context, AggregateFunction &function,
@@ -2535,15 +4019,18 @@ void JsonoGroupMergeLWWSimpleUpdate(Vector inputs[], AggregateInputData &aggr_in
                                     data_ptr_t state_ptr, idx_t count) {
 	(void)input_count;
 	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeLWWBindData>();
-	Vector reconstructed(JsonoType(), count);
-	JsonoRowReader reader;
-	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
 	Vector sort_keys(LogicalType::BLOB, count);
 	LWWMakeSortKeys(inputs[1], count, bind_data, sort_keys);
 	UnifiedVectorFormat sk_fmt;
 	sort_keys.ToUnifiedFormat(count, sk_fmt);
 	auto sk_data = UnifiedVectorFormat::GetData<string_t>(sk_fmt);
+	if (JsonoGroupMergeLWWSimpleUpdateDirectShredded(inputs, bind_data, state_ptr, count, sk_fmt, sk_data)) {
+		return;
+	}
 
+	Vector reconstructed(JsonoType(), count);
+	JsonoRowReader reader;
+	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
 	auto &state = *reinterpret_cast<GroupMergeLWWState *>(state_ptr);
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
@@ -2552,7 +4039,8 @@ void JsonoGroupMergeLWWSimpleUpdate(Vector inputs[], AggregateInputData &aggr_in
 			continue;
 		}
 		auto &k = sk_data[sk_fmt.sel->get_index(row)];
-		FoldRowLWW(state, view, nonstd::string_view(k.GetData(), k.GetSize()));
+		auto K = nonstd::string_view(k.GetData(), k.GetSize());
+		FoldRowLWW(state, view, K);
 	}
 }
 
@@ -2560,9 +4048,6 @@ void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_da
                               idx_t count) {
 	(void)input_count;
 	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeLWWBindData>();
-	Vector reconstructed(JsonoType(), count);
-	JsonoRowReader reader;
-	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
 	Vector sort_keys(LogicalType::BLOB, count);
 	LWWMakeSortKeys(inputs[1], count, bind_data, sort_keys);
 	UnifiedVectorFormat sk_fmt;
@@ -2571,7 +4056,13 @@ void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_da
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<GroupMergeLWWState *>(state_fmt);
+	if (JsonoGroupMergeLWWUpdateDirectShredded(inputs, bind_data, count, sk_fmt, sk_data, state_fmt, state_data)) {
+		return;
+	}
 
+	Vector reconstructed(JsonoType(), count);
+	JsonoRowReader reader;
+	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
@@ -2579,11 +4070,22 @@ void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_da
 			continue;
 		}
 		auto &k = sk_data[sk_fmt.sel->get_index(row)];
-		FoldRowLWW(*state_data[RowIndex(state_fmt, row)], view, nonstd::string_view(k.GetData(), k.GetSize()));
+		auto &state = *state_data[RowIndex(state_fmt, row)];
+		auto K = nonstd::string_view(k.GetData(), k.GetSize());
+		FoldRowLWW(state, view, K);
 	}
 }
 
 void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
+	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeLWWBindData>();
+	vector<ReconShred> scalar_shreds;
+	vector<ReconShred> list_shreds;
+	vector<idx_t> ignored_list_shreds;
+	if (!PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, ignored_list_shreds)) {
+		list_shreds.clear();
+	}
+	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
+
 	UnifiedVectorFormat source_fmt;
 	source.ToUnifiedFormat(count, source_fmt);
 	auto source_data = UnifiedVectorFormat::GetData<GroupMergeLWWState *>(source_fmt);
@@ -2592,17 +4094,36 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 
 	for (idx_t row = 0; row < count; row++) {
 		auto &src = *source_data[RowIndex(source_fmt, row)];
-		if (!src.has_input || !src.root) {
+		if (!src.has_input) {
 			continue;
+		}
+		if (!src.root) {
+			throw InternalException("jsono_group_merge: missing keyed aggregate root");
 		}
 		auto &tgt = *target_data[row];
 		if (!tgt.has_input) {
 			if (destructive) {
 				tgt.root = src.root;
+				tgt.scalar_lanes = src.scalar_lanes;
+				tgt.scalar_lane_count = src.scalar_lane_count;
+				tgt.scalar_texts = src.scalar_texts;
+				tgt.scalar_text_lane_count = src.scalar_text_lane_count;
+				tgt.list_lanes = src.list_lanes;
+				tgt.list_lane_count = src.list_lane_count;
+				tgt.lane_sort_keys = src.lane_sort_keys;
 				src.root = nullptr;
+				src.scalar_lanes = nullptr;
+				src.scalar_lane_count = 0;
+				src.scalar_texts = nullptr;
+				src.scalar_text_lane_count = 0;
+				src.list_lanes = nullptr;
+				src.list_lane_count = 0;
+				src.lane_sort_keys = nullptr;
 				src.has_input = false;
 			} else {
 				tgt.root = CloneLWWTreeNode(*src.root).release();
+				MergeLWWScalarLanes(tgt, src, scalar_text_indices);
+				MergeLWWListLanes(tgt, src, list_shreds);
 			}
 			tgt.has_input = true;
 			continue;
@@ -2612,11 +4133,15 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 		}
 		if (destructive) {
 			MergeLWWTreeIntoTreeDestructive(*tgt.root, *src.root);
+			MergeLWWScalarLanesDestructive(tgt, src, scalar_text_indices);
+			MergeLWWListLanesDestructive(tgt, src, list_shreds);
 			delete src.root;
 			src.root = nullptr;
 			src.has_input = false;
 		} else {
 			MergeLWWTreeIntoTree(*tgt.root, *src.root);
+			MergeLWWScalarLanes(tgt, src, scalar_text_indices);
+			MergeLWWListLanes(tgt, src, list_shreds);
 		}
 	}
 }
@@ -2654,6 +4179,9 @@ void JsonoGroupMergeLWWFinalize(Vector &states, AggregateInputData &aggr_input_d
 	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeLWWBindData>();
 	if (bind_data.shreds.empty()) {
 		FinalizeLWWPlainGroups(result, state_fmt, state_data, count, offset);
+		return;
+	}
+	if (JsonoGroupMergeLWWFinalizeDirectShredded(result, state_fmt, state_data, bind_data, count, offset)) {
 		return;
 	}
 	Vector plain(JsonoType(), count);
