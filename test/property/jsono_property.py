@@ -169,7 +169,16 @@ class JsonoSession:
 
 
 def sql_literal(text: str) -> str:
-    return "'" + text.replace("'", "''") + "'"
+    # A SQL expression evaluating to exactly `text`. The persistent CLI reads stdin as
+    # newline-delimited C-strings (local_getline), so a raw NUL byte on the wire terminates the
+    # line early and the statement is never seen as complete — the pipe round-trip then deadlocks
+    # (a bare newline is harmless: the shell reassembles the statement across lines). A NUL reaches
+    # here only from raw st.text() values that skip json_dumps' u0000 escaping (struct literals);
+    # splice it back in with chr(0) so the wire carries no raw NUL while the value is preserved.
+    if "\x00" not in text:
+        return "'" + text.replace("'", "''") + "'"
+    runs = ["'" + run.replace("'", "''") + "'" for run in text.split("\x00")]
+    return "(" + " || chr(0) || ".join(runs) + ")"
 
 
 def jsono_blob_hex_expr(text: str) -> str:
