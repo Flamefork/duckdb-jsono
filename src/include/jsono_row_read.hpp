@@ -3,6 +3,7 @@
 #include "jsono.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_render.hpp"
 
 #include "duckdb/common/types/vector.hpp"
 
@@ -284,6 +285,67 @@ private:
 	std::vector<ShredManifestEntry> manifest_scratch_;
 	std::vector<std::pair<std::string, std::string>> point_read_signatures_;
 	vector<PathStep> steps_scratch_;
+};
+
+// Locate-then-render: classify the value at `located_cursor` (container / inline scalar / rendered
+// scalar / JSON null) and drive a SINK with the resulting `->>` text. The manifest guard
+// (CheckContainerRead) fires for a container exactly as a direct read would. The readers that share
+// this — the optimizer's filter matcher and projection writer, and jsono_extract_string — differ only
+// in the terminal action, captured by the sink: OnInlineText sees heap-backed text (a String/
+// NumberText value, zero-copyable straight out of string_heap), OnRenderedText sees transient
+// `scratch` bytes (a serialized container or a rendered numeric/bool, must be copied), OnNull is the
+// SQL-NULL outcome (JSON null, or — for the matcher — a non-match).
+template <class SINK>
+JSONO_ALWAYS_INLINE void EmitLocatedText(JsonoRowReader &reader, const JsonoView &view, const vector<PathStep> &steps,
+                                         const JsonoCursor &located_cursor, std::string &scratch, SINK &sink) {
+	auto slot_tag = SlotTag(view.SlotAt(located_cursor.pos));
+	if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
+		// Serializing the whole container would silently include/drop a manifest leaf inside it.
+		reader.CheckContainerRead(view, steps);
+		scratch.clear();
+		auto cursor = located_cursor;
+		AppendJsonValueText(view, cursor, scratch, 0);
+		sink.OnRenderedText(nonstd::string_view(scratch.data(), scratch.size()));
+		return;
+	}
+	auto cursor = located_cursor;
+	auto scalar = DecodeScalarAt(view, cursor);
+	if (scalar.kind == JsonoScalarKind::Null) {
+		sink.OnNull();
+		return;
+	}
+	if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
+		sink.OnInlineText(scalar.text);
+		return;
+	}
+	scratch.clear();
+	if (RenderExtractText(scalar, scratch)) {
+		sink.OnNull();
+		return;
+	}
+	sink.OnRenderedText(nonstd::string_view(scratch.data(), scratch.size()));
+}
+
+// EmitLocatedText sink that writes `->>` text into a FLAT string result vector (the optimizer's
+// projection writer and jsono_extract_string share it). A valid row references zero-copy heap text or
+// copies the rendered bytes; a null outcome sets the row NULL. The caller must AddHeapReference the
+// input string_heap so the zero-copy values stay alive.
+struct JsonoExtractStringSink {
+	Vector &result;
+	string_t *result_data;
+	idx_t row;
+
+	void OnInlineText(nonstd::string_view text) {
+		FlatVector::Validity(result).SetValid(row);
+		result_data[row] = ZeroCopyHeapText(text);
+	}
+	void OnRenderedText(nonstd::string_view text) {
+		FlatVector::Validity(result).SetValid(row);
+		result_data[row] = StringVector::AddString(result, text.data(), text.size());
+	}
+	void OnNull() {
+		FlatVector::SetNull(result, row, true);
+	}
 };
 
 } // namespace jsono

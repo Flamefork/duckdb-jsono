@@ -594,32 +594,28 @@ bool ContainsExpectedValue(const vector<string> &values, nonstd::string_view can
 	return false;
 }
 
+// EmitLocatedText sink for the filter matcher: a located value matches when its `->>` text equals one
+// of the predicate's expected values; a JSON null (or an unlocatable miss) never matches.
+struct JsonoMatchSink {
+	const vector<string> &values;
+	bool matched;
+
+	void OnInlineText(nonstd::string_view text) {
+		matched = ContainsExpectedValue(values, text);
+	}
+	void OnRenderedText(nonstd::string_view text) {
+		matched = ContainsExpectedValue(values, text);
+	}
+	void OnNull() {
+		matched = false;
+	}
+};
+
 bool LocatedValueMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoMatchPredicate &predicate,
                          const JsonoView &view, const JsonoMatchLocation &location) {
-	auto &values = predicate.values;
-	auto slot_tag = SlotTag(view.SlotAt(location.cursor.pos));
-	if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
-		// The compare serializes the whole found container; a manifest leaf inside it would
-		// silently change the text.
-		reader.CheckContainerRead(view, predicate.steps);
-		lstate.scratch.clear();
-		auto cursor = location.cursor;
-		AppendJsonValueText(view, cursor, lstate.scratch, 0);
-		return ContainsExpectedValue(values, nonstd::string_view(lstate.scratch.data(), lstate.scratch.size()));
-	}
-	auto cursor = location.cursor;
-	auto scalar = DecodeScalarAt(view, cursor);
-	if (scalar.kind == JsonoScalarKind::Null) {
-		return false;
-	}
-	if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
-		return ContainsExpectedValue(values, scalar.text);
-	}
-	lstate.scratch.clear();
-	if (RenderExtractText(scalar, lstate.scratch)) {
-		return false;
-	}
-	return ContainsExpectedValue(values, nonstd::string_view(lstate.scratch.data(), lstate.scratch.size()));
+	JsonoMatchSink sink {predicate.values, false};
+	EmitLocatedText(reader, view, predicate.steps, location.cursor, lstate.scratch, sink);
+	return sink.matched;
 }
 
 bool PredicateMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoMatchPredicate &predicate,
@@ -635,34 +631,8 @@ bool PredicateMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const
 
 void WriteLocatedExtractString(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoProjectField &field,
                                Vector &result, idx_t row, const JsonoView &view, const JsonoMatchLocation &location) {
-	auto result_data = FlatVector::GetData<string_t>(result);
-	auto slot_tag = SlotTag(view.SlotAt(location.cursor.pos));
-	if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
-		// `->>` serializes a found container; a manifest leaf inside it would silently drop
-		// from the text.
-		reader.CheckContainerRead(view, field.steps);
-		lstate.scratch.clear();
-		auto cursor = location.cursor;
-		AppendJsonValueText(view, cursor, lstate.scratch, 0);
-		FlatVector::Validity(result).SetValid(row);
-		result_data[row] = StringVector::AddString(result, lstate.scratch.data(), lstate.scratch.size());
-		return;
-	}
-
-	auto cursor = location.cursor;
-	auto scalar = DecodeScalarAt(view, cursor);
-	if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
-		FlatVector::Validity(result).SetValid(row);
-		result_data[row] = ZeroCopyHeapText(scalar.text);
-		return;
-	}
-	lstate.scratch.clear();
-	if (RenderExtractText(scalar, lstate.scratch)) {
-		FlatVector::SetNull(result, row, true);
-		return;
-	}
-	FlatVector::Validity(result).SetValid(row);
-	result_data[row] = StringVector::AddString(result, lstate.scratch.data(), lstate.scratch.size());
+	JsonoExtractStringSink sink {result, FlatVector::GetData<string_t>(result), row};
+	EmitLocatedText(reader, view, field.steps, location.cursor, lstate.scratch, sink);
 }
 
 enum class JsonoExtremaKind : uint8_t { Min, Max };

@@ -521,23 +521,8 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
-		auto cursor = location.cursor;
-		auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
-		scratch.clear();
-		if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
-			reader.CheckContainerRead(view, bind_data.steps);
-			AppendJsonValueText(view, cursor, scratch, 0);
-			result_data[row] = StringVector::AddString(result, scratch.data(), scratch.size());
-			continue;
-		}
-		auto scalar = DecodeScalarAt(view, cursor);
-		if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
-			result_data[row] = ZeroCopyHeapText(scalar.text);
-		} else if (RenderExtractText(scalar, scratch)) {
-			FlatVector::SetNull(result, row, true);
-		} else {
-			result_data[row] = StringVector::AddString(result, scratch.data(), scratch.size());
-		}
+		JsonoExtractStringSink sink {result, result_data, row};
+		EmitLocatedText(reader, view, bind_data.steps, location.cursor, scratch, sink);
 	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
