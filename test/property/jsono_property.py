@@ -3,6 +3,7 @@ from json import dumps as json_dumps
 from json import loads as json_loads
 from os import environ
 from pathlib import Path
+from select import select
 from subprocess import PIPE
 from subprocess import Popen
 from sys import stderr
@@ -32,6 +33,14 @@ SENTINEL_TOKEN = "JSONO_PROPERTY_SENTINEL_9f3a"
 SENTINEL_LINE = f'[{{"jsono_sentinel":"{SENTINEL_TOKEN}"}}]'
 
 MAX_EXAMPLES = int(environ.get("JSONO_PROPERTY_MAX_EXAMPLES", "300"))
+
+# Ceiling on how long one statement may go without producing output. A property query runs in
+# milliseconds, so this only fires on a genuine stall: a CLI that treats the sent SQL as an
+# incomplete statement (it blocks reading stdin for a continuation it never gets while we block
+# reading stdout) deadlocks the pipe round-trip forever. The timeout converts that into a bounded
+# JsonoCrash with the stuck statement and stderr tail, which restarts the process — the same
+# recovery path as an outright process death.
+DRAIN_TIMEOUT_SECONDS = float(environ.get("JSONO_PROPERTY_DRAIN_TIMEOUT", "30"))
 
 
 class JsonoCrash(Exception):
@@ -91,11 +100,20 @@ class JsonoSession:
         self.proc.stdin.write(line.encode("utf-8") + b"\n")
         self.proc.stdin.flush()
 
-    def _drain(self) -> list[str]:
+    def _drain(self, context: str = "") -> list[str]:
         assert self.proc is not None and self.proc.stdout is not None
         self._send(f"SELECT '{SENTINEL_TOKEN}' AS jsono_sentinel;")
         lines: list[str] = []
         while True:
+            ready, _, _ = select([self.proc.stdout], [], [], DRAIN_TIMEOUT_SECONDS)
+            if not ready:
+                tail = self._stderr_tail()
+                detail = f"\n--- CLI stderr tail ---\n{tail}" if tail.strip() else ""
+                stmt = f"\n--- stuck statement ---\n{context}" if context else ""
+                raise JsonoCrash(
+                    f"CLI produced no output for {DRAIN_TIMEOUT_SECONDS:.0f}s "
+                    f"(hang or incomplete statement){stmt}{detail}"
+                )
             raw = self.proc.stdout.readline()
             if raw == b"":
                 tail = self._stderr_tail()
@@ -122,8 +140,9 @@ class JsonoSession:
         if self.proc is None or self.proc.poll() is not None:
             self.restart()
         try:
-            self._send(f"SELECT CAST(({expr}) AS VARCHAR) AS v;")
-            rows = self._drain()
+            stmt = f"SELECT CAST(({expr}) AS VARCHAR) AS v;"
+            self._send(stmt)
+            rows = self._drain(stmt)
         except JsonoCrash:
             self.restart()
             raise
@@ -143,7 +162,7 @@ class JsonoSession:
             self.restart()
         try:
             self._send(sql)
-            self._drain()
+            self._drain(sql)
         except JsonoCrash:
             self.restart()
             raise
