@@ -3413,9 +3413,13 @@ void FoldManifestedListShredsLWW(GroupMergeLWWState &state, const vector<ReconSh
 	}
 }
 
-bool JsonoGroupMergeLWWSimpleUpdateDirectShredded(Vector inputs[], const GroupMergeLWWBindData &bind_data,
-                                                  data_ptr_t state_ptr, idx_t count, UnifiedVectorFormat &sk_fmt,
-                                                  const string_t *sk_data) {
+// The grouped (per-row state) and ungrouped (single state) direct-shredded updates differ only in
+// where the row's accumulator comes from, so `state_for(row)` is the only varying piece: the
+// SimpleUpdate wrapper returns the one state for every row, the grouped Update indexes state_data.
+template <class StateFor>
+bool JsonoGroupMergeLWWUpdateDirectShreddedImpl(Vector inputs[], const GroupMergeLWWBindData &bind_data, idx_t count,
+                                                UnifiedVectorFormat &sk_fmt, const string_t *sk_data,
+                                                StateFor state_for) {
 	if (!IsShreddedJsonoType(inputs[0].GetType()) || bind_data.shreds.empty()) {
 		return false;
 	}
@@ -3457,7 +3461,6 @@ bool JsonoGroupMergeLWWSimpleUpdateDirectShredded(Vector inputs[], const GroupMe
 		return false;
 	}
 
-	auto &state = *reinterpret_cast<GroupMergeLWWState *>(state_ptr);
 	JsonoView base_view;
 	JsonoView manifest_view;
 	vector<nonstd::string_view> skip_root_keys;
@@ -3478,6 +3481,7 @@ bool JsonoGroupMergeLWWSimpleUpdateDirectShredded(Vector inputs[], const GroupMe
 		}
 		auto &k = sk_data[sk_fmt.sel->get_index(row)];
 		auto K = nonstd::string_view(k.GetData(), k.GetSize());
+		auto &state = state_for(row);
 		skip_root_keys.clear();
 		FoldManifestedListShredsLWW(state, list_shreds, list_fmt, element_fmt, *manifest, base_view, row, K,
 		                            skip_root_keys);
@@ -3490,81 +3494,20 @@ bool JsonoGroupMergeLWWSimpleUpdateDirectShredded(Vector inputs[], const GroupMe
 	return true;
 }
 
+bool JsonoGroupMergeLWWSimpleUpdateDirectShredded(Vector inputs[], const GroupMergeLWWBindData &bind_data,
+                                                  data_ptr_t state_ptr, idx_t count, UnifiedVectorFormat &sk_fmt,
+                                                  const string_t *sk_data) {
+	auto &state = *reinterpret_cast<GroupMergeLWWState *>(state_ptr);
+	return JsonoGroupMergeLWWUpdateDirectShreddedImpl(inputs, bind_data, count, sk_fmt, sk_data,
+	                                                  [&](idx_t) -> GroupMergeLWWState & { return state; });
+}
+
 bool JsonoGroupMergeLWWUpdateDirectShredded(Vector inputs[], const GroupMergeLWWBindData &bind_data, idx_t count,
                                             UnifiedVectorFormat &sk_fmt, const string_t *sk_data,
                                             UnifiedVectorFormat &state_fmt, GroupMergeLWWState *const *state_data) {
-	if (!IsShreddedJsonoType(inputs[0].GetType()) || bind_data.shreds.empty()) {
-		return false;
-	}
-	vector<ReconShred> scalar_shreds;
-	vector<ReconShred> list_shreds;
-	vector<idx_t> overlay_shreds;
-	if (!PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, overlay_shreds)) {
-		return false;
-	}
-	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
-	auto scalar_text_count = LWWScalarTextLaneCount(scalar_text_indices);
-	if (!list_shreds.empty() && !overlay_shreds.empty()) {
-		return false;
-	}
-	Vector overlay(JsonoType(), count);
-	Vector *base = &inputs[0];
-	if (!overlay_shreds.empty()) {
-		JsonoOverlayShredsToPlain(inputs[0], count, overlay_shreds, overlay);
-		base = &overlay;
-	}
-	JsonoRowReader base_reader;
-	base_reader.Init(*base, count);
-	JsonoRowReader manifest_reader;
-	if (base != &inputs[0]) {
-		manifest_reader.Init(inputs[0], count);
-	}
-	vector<UnifiedVectorFormat> shred_fmt(scalar_shreds.size());
-	for (idx_t k = 0; k < scalar_shreds.size(); k++) {
-		JsonoShredVector(inputs[0], scalar_shreds[k].child).ToUnifiedFormat(count, shred_fmt[k]);
-	}
-	vector<UnifiedVectorFormat> list_fmt(list_shreds.size());
-	vector<UnifiedVectorFormat> element_fmt(list_shreds.size());
-	for (idx_t k = 0; k < list_shreds.size(); k++) {
-		auto &list_vec = JsonoShredVector(inputs[0], list_shreds[k].child);
-		list_vec.ToUnifiedFormat(count, list_fmt[k]);
-		ListVector::GetEntry(list_vec).ToUnifiedFormat(ListVector::GetListSize(list_vec), element_fmt[k]);
-	}
-	if (!CanUseDirectListShreds(inputs[0], count, list_shreds, list_fmt, element_fmt)) {
-		return false;
-	}
-
-	JsonoView base_view;
-	JsonoView manifest_view;
-	vector<nonstd::string_view> skip_root_keys;
-	for (idx_t row = 0; row < count; row++) {
-		JsonoBlobRow base_blob;
-		if (base_reader.Read(row, base_blob, base_view) != JsonoRowState::Value) {
-			continue;
-		}
-		const std::vector<ShredManifestEntry> *manifest = nullptr;
-		if (base == &inputs[0]) {
-			manifest = &base_reader.RowManifest(base_view);
-		} else {
-			JsonoBlobRow manifest_blob;
-			if (manifest_reader.Read(row, manifest_blob, manifest_view) != JsonoRowState::Value) {
-				continue;
-			}
-			manifest = &manifest_reader.RowManifest(manifest_view);
-		}
-		auto &k = sk_data[sk_fmt.sel->get_index(row)];
-		auto K = nonstd::string_view(k.GetData(), k.GetSize());
-		auto &state = *state_data[RowIndex(state_fmt, row)];
-		skip_root_keys.clear();
-		FoldManifestedListShredsLWW(state, list_shreds, list_fmt, element_fmt, *manifest, base_view, row, K,
-		                            skip_root_keys);
-		FoldRowLWW(state, base_view, K, &skip_root_keys);
-		if (!CanSkipManifestedScalarShredsLWW(state, scalar_shreds, shred_fmt, *manifest, row, K)) {
-			FoldManifestedScalarShredsLWW(state, scalar_shreds, scalar_text_indices, scalar_text_count, shred_fmt,
-			                              *manifest, row, K);
-		}
-	}
-	return true;
+	return JsonoGroupMergeLWWUpdateDirectShreddedImpl(
+	    inputs, bind_data, count, sk_fmt, sk_data,
+	    [&](idx_t row) -> GroupMergeLWWState & { return *state_data[RowIndex(state_fmt, row)]; });
 }
 
 bool LWWPathTerminatesOnKey(const vector<const vector<PathStep> *> &paths, size_t depth, nonstd::string_view key) {
@@ -4066,6 +4009,27 @@ void LWWMakeSortKeys(Vector &order_key, idx_t count, const GroupMergeLWWBindData
 	CreateSortKeyHelpers::CreateSortKey(order_key, count, bind_data.modifiers, sort_keys);
 }
 
+// Fallback for inputs the direct-shredded path declined (plain JSONO, or shreds it can't fold
+// directly): reconstruct each row to plain and fold it. Same `state_for(row)` indirection as the
+// direct path, so the ungrouped and grouped updates share this loop.
+template <class StateFor>
+void JsonoGroupMergeLWWReconstructFold(Vector inputs[], idx_t count, UnifiedVectorFormat &sk_fmt,
+                                       const string_t *sk_data, StateFor state_for) {
+	Vector reconstructed(JsonoType(), count);
+	JsonoRowReader reader;
+	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob;
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			continue;
+		}
+		auto &k = sk_data[sk_fmt.sel->get_index(row)];
+		auto K = nonstd::string_view(k.GetData(), k.GetSize());
+		FoldRowLWW(state_for(row), view, K);
+	}
+}
+
 void JsonoGroupMergeLWWSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
                                     data_ptr_t state_ptr, idx_t count) {
 	(void)input_count;
@@ -4078,21 +4042,9 @@ void JsonoGroupMergeLWWSimpleUpdate(Vector inputs[], AggregateInputData &aggr_in
 	if (JsonoGroupMergeLWWSimpleUpdateDirectShredded(inputs, bind_data, state_ptr, count, sk_fmt, sk_data)) {
 		return;
 	}
-
-	Vector reconstructed(JsonoType(), count);
-	JsonoRowReader reader;
-	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
 	auto &state = *reinterpret_cast<GroupMergeLWWState *>(state_ptr);
-	JsonoView view;
-	for (idx_t row = 0; row < count; row++) {
-		JsonoBlobRow blob;
-		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
-			continue;
-		}
-		auto &k = sk_data[sk_fmt.sel->get_index(row)];
-		auto K = nonstd::string_view(k.GetData(), k.GetSize());
-		FoldRowLWW(state, view, K);
-	}
+	JsonoGroupMergeLWWReconstructFold(inputs, count, sk_fmt, sk_data,
+	                                  [&](idx_t) -> GroupMergeLWWState & { return state; });
 }
 
 void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &states,
@@ -4110,21 +4062,9 @@ void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_da
 	if (JsonoGroupMergeLWWUpdateDirectShredded(inputs, bind_data, count, sk_fmt, sk_data, state_fmt, state_data)) {
 		return;
 	}
-
-	Vector reconstructed(JsonoType(), count);
-	JsonoRowReader reader;
-	reader.Init(*GroupMergeReadInput(inputs[0], count, reconstructed), count);
-	JsonoView view;
-	for (idx_t row = 0; row < count; row++) {
-		JsonoBlobRow blob;
-		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
-			continue;
-		}
-		auto &k = sk_data[sk_fmt.sel->get_index(row)];
-		auto &state = *state_data[RowIndex(state_fmt, row)];
-		auto K = nonstd::string_view(k.GetData(), k.GetSize());
-		FoldRowLWW(state, view, K);
-	}
+	JsonoGroupMergeLWWReconstructFold(inputs, count, sk_fmt, sk_data, [&](idx_t row) -> GroupMergeLWWState & {
+		return *state_data[RowIndex(state_fmt, row)];
+	});
 }
 
 void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
