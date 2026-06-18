@@ -2649,25 +2649,23 @@ unique_ptr<LWWTreeNode> CloneLWWTreeNode(const LWWTreeNode &source) {
 	return result;
 }
 
-void CopyLWWTreeNode(LWWTreeNode &target, const LWWTreeNode &source) {
-	target.kind = source.kind;
-	target.children.clear();
-	target.sort_key = source.sort_key;
-	target.value = source.value;
-	target.children.reserve(source.children.size());
-	for (auto &child : source.children) {
-		target.children.emplace_back(child.key, CloneLWWTreeNode(*child.node));
+// The keyed combine transfers a source group's state into the target either by deep copy (a shared
+// source merged into several targets) or by move (the source is consumed). `destructive` is the
+// aggregate's combine_type, constant for the whole Combine call, so every copy/move twin below is
+// one body branching on it: the non-destructive combine path also holds a mutable source, so the
+// copy branch simply reads it without resetting.
+void TransferLWWTreeNode(LWWTreeNode &target, LWWTreeNode &source, bool destructive) {
+	if (destructive) {
+		target.kind = source.kind;
+		target.children = std::move(source.children);
+		target.sort_key = std::move(source.sort_key);
+		target.value = std::move(source.value);
+		source.children.clear();
+		source.sort_key.clear();
+		source.value = OwnedJsonoBlob();
+	} else {
+		target = std::move(*CloneLWWTreeNode(source));
 	}
-}
-
-void MoveLWWTreeNode(LWWTreeNode &target, LWWTreeNode &source) {
-	target.kind = source.kind;
-	target.children = std::move(source.children);
-	target.sort_key = std::move(source.sort_key);
-	target.value = std::move(source.value);
-	source.children.clear();
-	source.sort_key.clear();
-	source.value = OwnedJsonoBlob();
 }
 
 void EnsureLWWScalarLanes(GroupMergeLWWState &state, idx_t count, idx_t text_count);
@@ -2983,37 +2981,10 @@ void MergeLWWListLanesDestructive(GroupMergeLWWState &target, GroupMergeLWWState
 	source.list_lane_count = 0;
 }
 
-void MergeLWWTreeIntoTree(LWWTreeNode &target, const LWWTreeNode &source) {
+void MergeLWWTreeInto(LWWTreeNode &target, LWWTreeNode &source, bool destructive) {
 	if (target.kind == LWWTreeKind::Object && source.kind == LWWTreeKind::Object) {
 		for (auto &source_child : source.children) {
-			auto key = nonstd::string_view(source_child.key.data(), source_child.key.size());
-			auto child_idx = FindLWWChildIndex(target.children, key);
-			bool found = child_idx < target.children.size() &&
-			             CompareJsonoKeys(nonstd::string_view(target.children[child_idx].key.data(),
-			                                                  target.children[child_idx].key.size()),
-			                              key) == 0;
-			if (found) {
-				MergeLWWTreeIntoTree(*target.children[child_idx].node, *source_child.node);
-			} else {
-				target.children.insert(target.children.begin() + child_idx,
-				                       LWWObjectChild(source_child.key, CloneLWWTreeNode(*source_child.node)));
-			}
-		}
-		return;
-	}
-	if (target.kind == LWWTreeKind::Object || source.kind == LWWTreeKind::Object) {
-		ThrowMixedKindConflict();
-	}
-	int key_cmp = CompareRawBytes(target.sort_key, source.sort_key);
-	if (key_cmp < 0 || (key_cmp == 0 && CompareBlobValueTie(target.value, source.value) < 0)) {
-		CopyLWWTreeNode(target, source);
-	}
-}
-
-void MergeLWWTreeIntoTreeDestructive(LWWTreeNode &target, LWWTreeNode &source) {
-	if (target.kind == LWWTreeKind::Object && source.kind == LWWTreeKind::Object) {
-		for (auto &source_child : source.children) {
-			if (!source_child.node) {
+			if (destructive && !source_child.node) {
 				continue;
 			}
 			auto key = nonstd::string_view(source_child.key.data(), source_child.key.size());
@@ -3023,12 +2994,17 @@ void MergeLWWTreeIntoTreeDestructive(LWWTreeNode &target, LWWTreeNode &source) {
 			                                                  target.children[child_idx].key.size()),
 			                              key) == 0;
 			if (found) {
-				MergeLWWTreeIntoTreeDestructive(*target.children[child_idx].node, *source_child.node);
-			} else {
+				MergeLWWTreeInto(*target.children[child_idx].node, *source_child.node, destructive);
+			} else if (destructive) {
 				target.children.insert(target.children.begin() + child_idx, std::move(source_child));
+			} else {
+				target.children.insert(target.children.begin() + child_idx,
+				                       LWWObjectChild(source_child.key, CloneLWWTreeNode(*source_child.node)));
 			}
 		}
-		source.children.clear();
+		if (destructive) {
+			source.children.clear();
+		}
 		return;
 	}
 	if (target.kind == LWWTreeKind::Object || source.kind == LWWTreeKind::Object) {
@@ -3036,7 +3012,7 @@ void MergeLWWTreeIntoTreeDestructive(LWWTreeNode &target, LWWTreeNode &source) {
 	}
 	int key_cmp = CompareRawBytes(target.sort_key, source.sort_key);
 	if (key_cmp < 0 || (key_cmp == 0 && CompareBlobValueTie(target.value, source.value) < 0)) {
-		MoveLWWTreeNode(target, source);
+		TransferLWWTreeNode(target, source, destructive);
 	}
 }
 
@@ -4312,14 +4288,14 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 			throw InternalException("jsono_group_merge: missing keyed aggregate root");
 		}
 		if (destructive) {
-			MergeLWWTreeIntoTreeDestructive(*tgt.root, *src.root);
+			MergeLWWTreeInto(*tgt.root, *src.root, true);
 			MergeLWWScalarLanesDestructive(tgt, src, scalar_shreds, scalar_text_indices);
 			MergeLWWListLanesDestructive(tgt, src, list_shreds);
 			delete src.root;
 			src.root = nullptr;
 			src.has_input = false;
 		} else {
-			MergeLWWTreeIntoTree(*tgt.root, *src.root);
+			MergeLWWTreeInto(*tgt.root, *src.root, false);
 			MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices);
 			MergeLWWListLanes(tgt, src, list_shreds);
 		}
