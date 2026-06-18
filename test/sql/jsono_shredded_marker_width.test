@@ -1,0 +1,94 @@
+# name: test/sql/jsono_shredded_marker_width.test
+# description: The reserved value-complete marker $jsono$vc is identified by name with any integer width, not strictly UBIGINT — a shredded jsono value round-tripped through a generic value->SQL->value path (e.g. DuckLake inlined-data INSERT serializes the marker as a bare integer literal that re-parses as BIGINT/HUGEINT) must still cast back to the canonical UBIGINT-marker type losslessly. A strict-UBIGINT rule misread the degraded marker as a typed shred, shifting the shred->vector mapping and crashing in reconstruct (Expected INT64, found VARCHAR).
+# group: [sql]
+
+require jsono
+
+require json
+
+# A canonical shredded value carries the marker as UBIGINT.
+query I
+SELECT typeof(jsono({'event_name':'pv','goals':'buy'}).jsono."$jsono$vc");
+----
+UBIGINT
+
+# Degrade the marker to BIGINT exactly as DuckLake's value->SQL->value inlining does (the UBIGINT hash
+# serializes to a bare integer literal that re-parses signed), then cast the struct back to the
+# canonical UBIGINT-marker type. Before the fix this crashed in reconstruct; now it round-trips.
+query I
+WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
+SELECT to_json(
+  struct_pack(jsono := struct_pack(
+    body := c.jsono.body,
+    "$jsono$vc" := c.jsono."$jsono$vc"::BIGINT,
+    event_name := c.jsono.event_name,
+    goals := c.jsono.goals
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR, goals VARCHAR))
+)
+FROM v;
+----
+{"event_name":"pv","goals":"buy"}
+
+# The reconstructed value is exactly the canonical shredded type (marker back to UBIGINT, same shreds):
+# the cast took the lossless plain struct-cast path, NOT a reshred, because the marker was recognized.
+query I
+WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
+SELECT typeof(
+  struct_pack(jsono := struct_pack(
+    body := c.jsono.body,
+    "$jsono$vc" := c.jsono."$jsono$vc"::BIGINT,
+    event_name := c.jsono.event_name,
+    goals := c.jsono.goals
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR, goals VARCHAR))
+) = jsono_storage_type('event_name VARCHAR, goals VARCHAR')
+FROM v;
+----
+true
+
+# A 64-bit hash above INT64_MAX re-parses as HUGEINT, not UBIGINT — the name match must cover that too.
+query I
+WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
+SELECT to_json(
+  struct_pack(jsono := struct_pack(
+    body := c.jsono.body,
+    "$jsono$vc" := c.jsono."$jsono$vc"::HUGEINT,
+    event_name := c.jsono.event_name,
+    goals := c.jsono.goals
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR, goals VARCHAR))
+)
+FROM v;
+----
+{"event_name":"pv","goals":"buy"}
+
+# Extracts over the round-tripped value agree with to_json (the bug made the typed-shred read diverge):
+# the reserved marker never leaks into the residual as a $jsono$vc data key.
+query II
+WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c),
+rt AS (
+  SELECT struct_pack(jsono := struct_pack(
+    body := c.jsono.body,
+    "$jsono$vc" := c.jsono."$jsono$vc"::BIGINT,
+    event_name := c.jsono.event_name,
+    goals := c.jsono.goals
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR, goals VARCHAR)) AS r
+  FROM v
+)
+SELECT jsono_extract_string(r, '$.event_name'), jsono_extract_string(r, '$."$jsono$vc"') FROM rt;
+----
+pv	NULL
+
+# A degraded-marker source reshredded to a NARROWER shred set (goals drops to the residual) reconstructs
+# the full value: the marker is recognized, so the reconstruct + reshred path reads every lane correctly.
+query I
+WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
+SELECT to_json(
+  struct_pack(jsono := struct_pack(
+    body := c.jsono.body,
+    "$jsono$vc" := c.jsono."$jsono$vc"::BIGINT,
+    event_name := c.jsono.event_name,
+    goals := c.jsono.goals
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR))
+)
+FROM v;
+----
+{"event_name":"pv","goals":"buy"}

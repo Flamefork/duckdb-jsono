@@ -118,17 +118,24 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 		out.shreds.clear();
 		return true;
 	}
-	// A field named JSONO_VALUE_COMPLETE (UBIGINT) is the value-complete marker, not a shred, and it
-	// is identified by name at ANY position: a set-operation merged type interleaves it among the
+	// A field named JSONO_VALUE_COMPLETE (any integer width) is the value-complete marker, not a shred,
+	// and it is identified by name at ANY position: a set-operation merged type interleaves it among the
 	// shreds (CombineStructTypes iterates the left branch's fields — body, marker, shreds — then
 	// appends the right branch's unique shreds after the marker), so a positional rule would misread
-	// it as a shred. Every other sibling of `body` must be a shred value type; anything else means
-	// this is not a JSONO struct (a user struct that merely carries a body-shaped field stays theirs).
+	// it as a shred. The width is matched as IsIntegral, not strictly UBIGINT: a value round-tripped
+	// through a generic value->SQL->value path (DuckLake inlined-data INSERT, which serializes the
+	// marker as a bare integer literal that re-parses as BIGINT/HUGEINT) keeps the reserved name but
+	// loses the exact UBIGINT width — and the name is reserved (no shred path can collide, see
+	// JsonoValueCompleteName / the shred-spec guard), so the name alone identifies the marker. A
+	// strict-UBIGINT rule would misclassify such a marker as a typed shred, shifting the shred->vector
+	// mapping and corrupting reconstruct. Every other sibling of `body` must be a shred value type;
+	// anything else means this is not a JSONO struct (a user struct that merely carries a body-shaped
+	// field stays theirs).
 	child_list_t<LogicalType> shreds;
 	bool has_value_complete = false;
 	idx_t value_complete_index = 0;
 	for (idx_t i = 1; i < fields.size(); i++) {
-		if (fields[i].first == JSONO_VALUE_COMPLETE && fields[i].second.id() == LogicalTypeId::UBIGINT) {
+		if (fields[i].first == JSONO_VALUE_COMPLETE && fields[i].second.IsIntegral()) {
 			has_value_complete = true;
 			value_complete_index = i;
 			continue;

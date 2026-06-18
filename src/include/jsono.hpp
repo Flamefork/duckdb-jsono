@@ -80,15 +80,18 @@ LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds);
 // The top-level field name of every layout (plain and shredded): "jsono".
 string JsonoLayoutName();
 
-// The reserved name of the value-complete marker field every shredded layout carries. The field is
-// UBIGINT: on a value-complete row it stores the canonical layout hash (JsonoLayoutHashOf) of the
-// shred set the row was written under; it is NULL exactly on rows that diverted a present scalar of a
-// shred path into the residual (case B). A scan whose marker stats prove no NULL AND a single min==max
+// The reserved name of the value-complete marker field every shredded layout carries. Canonically the
+// field is UBIGINT: on a value-complete row it stores the canonical layout hash (JsonoLayoutHashOf) of
+// the shred set the row was written under; it is NULL exactly on rows that diverted a present scalar of
+// a shred path into the residual (case B). A scan whose marker stats prove no NULL AND a single min==max
 // hash equal to the read type's layout hash has no diversion and was written under exactly the read
 // shred set, so the optimizer may read its typed shreds as a bare struct_extract (zone-map pushdown)
 // even when the shred itself has NULLs from absent paths. A multi-file read unioning narrower shred
 // sets carries a different hash per file (min!=max), which keeps the residual COALESCE fallback. Not a
-// shred: reserved so no shred path can collide. Carries no value semantics for reconstruction.
+// shred: reserved so no shred path can collide. Carries no value semantics for reconstruction — so the
+// layout parser identifies it by name with any integer width (IsIntegral), tolerating a value that was
+// round-tripped through a generic value->SQL->value path (e.g. DuckLake inlined-data INSERT) where the
+// bare-integer marker literal re-parses as BIGINT/HUGEINT instead of UBIGINT.
 string JsonoValueCompleteName();
 
 // Canonical layout hash of a shredded jsono type: HashShredManifestSignatures over its shreds in type
