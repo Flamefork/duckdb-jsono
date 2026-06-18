@@ -95,7 +95,7 @@ string JsonoLayoutName();
 string JsonoValueCompleteName();
 
 // Canonical layout hash of a shredded jsono type: HashShredManifestSignatures over its shreds in type
-// order (same hash the indexed shred manifest keys on). Returns 0 for a plain / non-shredded type.
+// order. Returns 0 for a plain / non-shredded type.
 // Writers stamp this into the value-complete marker; the optimizer recomputes it from the read type
 // to verify per-scan shred-set coverage before trusting value-completeness.
 uint64_t JsonoLayoutHashOf(const LogicalType &type);
@@ -492,9 +492,9 @@ inline uint64_t HashShredManifestSignatures(const std::vector<std::pair<std::str
 }
 
 // The shred manifest is the tail of the skips blob, after the checkpoint sections. It is either a
-// full path/type entry list, a compact type-code entry list, or an indexed/bitset list keyed by the
-// canonical shred layout hash (see docs/jsono_format.md). Entries follow canonical shred order. A
-// plain value writes no manifest (the skips blob ends at the checkpoints), which reads as zero entries.
+// full path/type entry list or a compact type-code entry list (see docs/jsono_format.md). Entries
+// follow canonical shred order. A plain value writes no manifest (the skips blob ends at the
+// checkpoints), which reads as zero entries.
 // The manifest is the write-time record of which paths are NOT in the residual: a reader holding
 // fewer (or differently typed) shreds than the manifest lists cannot reproduce the value — that row
 // was narrowed by a raw struct cast — and must fail loud instead of silently dropping the value.
@@ -526,8 +526,7 @@ inline size_t JsonoSkipsManifestOffset(const uint8_t *skips, size_t skips_size) 
 // Parse a shred manifest from its raw tail bytes into `entries` (string_views into `data`).
 // Returns the entry count; an empty tail is a value without a manifest. Throws on framing
 // corruption (declared entries longer than the tail, or trailing bytes).
-inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector<ShredManifestEntry> &entries,
-                                      const std::vector<std::pair<std::string, std::string>> *signatures = nullptr) {
+inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector<ShredManifestEntry> &entries) {
 	entries.clear();
 	if (size == 0) {
 		return 0;
@@ -579,6 +578,12 @@ inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector
 	return entries.size();
 }
 
+// Validate the framing of a shred-manifest tail without materializing its entries. Accepts exactly
+// the same byte sequences as ParseShredManifestBytes, but allocates nothing: the parser reserves
+// `entry_count` entries up front, so a corrupt tail with a bogus huge count would throw std::bad_alloc
+// before the framing read can reject it. jsono_validate (ValidateJsonoBlob) catches only
+// InvalidInputException, so it relies on this allocation-free path to report corruption as `false`
+// rather than letting an uncaught bad_alloc escape. Do not fold this into ParseShredManifestBytes.
 inline void ValidateShredManifestBytes(const char *data, size_t size) {
 	if (size == 0) {
 		return;
@@ -790,10 +795,9 @@ public:
 
 	// Parse the shred manifest from the skips tail into `entries`. Returns the entry count
 	// (zero for a plain value, whose skips blob ends at the checkpoints).
-	size_t ReadShredManifest(std::vector<ShredManifestEntry> &entries,
-	                         const std::vector<std::pair<std::string, std::string>> *signatures = nullptr) const {
+	size_t ReadShredManifest(std::vector<ShredManifestEntry> &entries) const {
 		auto tail = ManifestTail();
-		return ParseShredManifestBytes(tail.data(), tail.size(), entries, signatures);
+		return ParseShredManifestBytes(tail.data(), tail.size(), entries);
 	}
 
 	// Raw bytes of the shred-manifest tail (empty for a value without one). The verification

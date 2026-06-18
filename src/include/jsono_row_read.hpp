@@ -72,7 +72,7 @@ private:
 	void VerifyManifested(nonstd::string_view tail) {
 		verified_ = false;
 		tail_.assign(tail.data(), tail.size());
-		ParseShredManifestBytes(tail_.data(), tail_.size(), entries_, &signatures_);
+		ParseShredManifestBytes(tail_.data(), tail_.size(), entries_);
 		VerifyShredManifestEntries(entries_, signatures_);
 		verified_ = true;
 	}
@@ -95,13 +95,11 @@ private:
 // whole found container — a manifest leaf strictly inside it means the result would be missing
 // that leaf. An honest shredded read never reaches either case (the optimizer reads shreds
 // directly and reconstructs subtree reads that overlap a shred), so a hit here is always a row
-// narrowed by a raw struct cast. Indexed/bitset manifests require the original shred layout to
-// decode their paths; without it, the parser fails loud before this filter can prove non-coverage.
+// narrowed by a raw struct cast.
 inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathStep> &read_steps, bool found_container,
                                       std::vector<ShredManifestEntry> &manifest_scratch,
-                                      vector<PathStep> &steps_scratch,
-                                      const std::vector<std::pair<std::string, std::string>> *signatures = nullptr) {
-	view.ReadShredManifest(manifest_scratch, signatures);
+                                      vector<PathStep> &steps_scratch) {
+	view.ReadShredManifest(manifest_scratch);
 	for (auto &entry : manifest_scratch) {
 		auto path = string(entry.path);
 		steps_scratch.clear();
@@ -170,7 +168,6 @@ public:
 	// the row's streams (bulk walkers touch them densely anyway).
 	void InitPointRead(Vector &input, idx_t count) {
 		InitJsonoVectorData(input, count, data_);
-		InitSignaturesFromType(input.GetType(), point_read_signatures_);
 		verify_on_read_ = false;
 		prefetch_ = true;
 	}
@@ -227,18 +224,6 @@ public:
 	}
 
 private:
-	static void InitSignaturesFromType(const LogicalType &type,
-	                                   std::vector<std::pair<std::string, std::string>> &signatures) {
-		signatures.clear();
-		JsonoLayoutType layout;
-		if (TryParseJsonoLayoutType(type, layout)) {
-			signatures.reserve(layout.shreds.size());
-			for (auto &shred : layout.shreds) {
-				signatures.emplace_back(shred.first, shred.second.ToString());
-			}
-		}
-	}
-
 	struct CoverMemo {
 		const vector<PathStep> *steps = nullptr;
 		std::string tail;
@@ -269,8 +254,7 @@ private:
 			return;
 		}
 		memo.ok = false;
-		ThrowIfManifestCoversPath(view, steps, found_container, manifest_scratch_, steps_scratch_,
-		                          &point_read_signatures_);
+		ThrowIfManifestCoversPath(view, steps, found_container, manifest_scratch_, steps_scratch_);
 		memo.steps = &steps;
 		memo.tail.assign(tail.data(), tail.size());
 		memo.ok = true;
@@ -283,7 +267,6 @@ private:
 	CoverMemo miss_memo_;
 	CoverMemo container_memo_;
 	std::vector<ShredManifestEntry> manifest_scratch_;
-	std::vector<std::pair<std::string, std::string>> point_read_signatures_;
 	vector<PathStep> steps_scratch_;
 };
 
