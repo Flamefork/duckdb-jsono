@@ -443,8 +443,6 @@ struct ShredManifestEntry {
 };
 
 constexpr uint32_t SHRED_MANIFEST_COMPACT_TYPE_MARKER = 0xFFFFFFFFU;
-constexpr uint32_t SHRED_MANIFEST_INDEX_MARKER = 0xFFFFFFFEU;
-constexpr uint32_t SHRED_MANIFEST_BITSET_MARKER = 0xFFFFFFFDU;
 constexpr uint8_t SHRED_MANIFEST_TYPE_EXTENDED = 0;
 constexpr uint8_t SHRED_MANIFEST_TYPE_VARCHAR = 1;
 constexpr uint8_t SHRED_MANIFEST_TYPE_BIGINT = 2;
@@ -544,67 +542,6 @@ inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector
 	};
 	uint32_t entry_count;
 	read_bytes(&entry_count, sizeof(entry_count));
-	if (entry_count == SHRED_MANIFEST_INDEX_MARKER) {
-		uint64_t layout_hash;
-		read_bytes(&layout_hash, sizeof(layout_hash));
-		read_bytes(&entry_count, sizeof(entry_count));
-		if (!signatures || layout_hash != HashShredManifestSignatures(*signatures)) {
-			throw InvalidInputException(
-			    "JSONO: row carries an indexed shred manifest for a different shred layout; the value was narrowed "
-			    "by a raw struct cast and cannot be read losslessly. Reshred through jsono(value, shredding := "
-			    "{...}) (the extension optimizer does this automatically)");
-		}
-		entries.reserve(entry_count);
-		for (uint32_t i = 0; i < entry_count; i++) {
-			uint16_t index;
-			read_bytes(&index, sizeof(index));
-			if (index >= signatures->size()) {
-				throw InvalidInputException("malformed JSONO: shred manifest index is out of bounds");
-			}
-			auto &signature = (*signatures)[index];
-			entries.push_back(
-			    ShredManifestEntry {nonstd::string_view(signature.first.data(), signature.first.size()),
-			                        nonstd::string_view(signature.second.data(), signature.second.size())});
-		}
-		if (cursor != size) {
-			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
-		}
-		return entries.size();
-	}
-	if (entry_count == SHRED_MANIFEST_BITSET_MARKER) {
-		uint64_t layout_hash;
-		read_bytes(&layout_hash, sizeof(layout_hash));
-		uint32_t byte_count;
-		read_bytes(&byte_count, sizeof(byte_count));
-		if (byte_count > size - cursor) {
-			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
-		}
-		if (!signatures || layout_hash != HashShredManifestSignatures(*signatures)) {
-			throw InvalidInputException(
-			    "JSONO: row carries an indexed shred manifest for a different shred layout; the value was narrowed "
-			    "by a raw struct cast and cannot be read losslessly. Reshred through jsono(value, shredding := "
-			    "{...}) (the extension optimizer does this automatically)");
-		}
-		auto expected_byte_count = (signatures->size() + 7) / 8;
-		if (byte_count != expected_byte_count) {
-			throw InvalidInputException("malformed JSONO: shred manifest bitset length does not match shred layout");
-		}
-		for (idx_t i = 0; i < signatures->size(); i++) {
-			auto mask = uint8_t(1U << (i & 7U));
-			if ((uint8_t(data[cursor + i / 8]) & mask) == 0) {
-				continue;
-			}
-			auto &signature = (*signatures)[i];
-			entries.push_back(
-			    ShredManifestEntry {nonstd::string_view(signature.first.data(), signature.first.size()),
-			                        nonstd::string_view(signature.second.data(), signature.second.size())});
-		}
-		cursor += byte_count;
-		if (cursor != size) {
-			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
-		}
-		return entries.size();
-	}
 	bool compact_types = false;
 	if (entry_count == SHRED_MANIFEST_COMPACT_TYPE_MARKER) {
 		compact_types = true;
@@ -656,33 +593,6 @@ inline void ValidateShredManifestBytes(const char *data, size_t size) {
 	};
 	uint32_t entry_count;
 	read_bytes(&entry_count, sizeof(entry_count));
-	if (entry_count == SHRED_MANIFEST_INDEX_MARKER) {
-		uint64_t layout_hash;
-		read_bytes(&layout_hash, sizeof(layout_hash));
-		read_bytes(&entry_count, sizeof(entry_count));
-		if (entry_count > (size - cursor) / sizeof(uint16_t)) {
-			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
-		}
-		cursor += entry_count * sizeof(uint16_t);
-		if (cursor != size) {
-			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
-		}
-		return;
-	}
-	if (entry_count == SHRED_MANIFEST_BITSET_MARKER) {
-		uint64_t layout_hash;
-		read_bytes(&layout_hash, sizeof(layout_hash));
-		uint32_t byte_count;
-		read_bytes(&byte_count, sizeof(byte_count));
-		if (byte_count > size - cursor) {
-			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
-		}
-		cursor += byte_count;
-		if (cursor != size) {
-			throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
-		}
-		return;
-	}
 	bool compact_types = false;
 	if (entry_count == SHRED_MANIFEST_COMPACT_TYPE_MARKER) {
 		compact_types = true;

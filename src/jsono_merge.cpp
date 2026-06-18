@@ -4034,6 +4034,10 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		manifest_signatures.emplace_back(bind_data.shreds[f].first, bind_data.shreds[f].second.ToString());
 	}
 	auto manifest_layout_hash = HashShredManifestSignatures(manifest_signatures);
+	vector<JsonoShredManifestEntryBytes> manifest_entries(bind_data.shreds.size());
+	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
+		manifest_entries[f] = JsonoShredManifestEntry(bind_data.shreds[f].first, bind_data.shreds[f].second);
+	}
 
 	JsonoBuilder builder;
 	vector<const vector<PathStep> *> scalar_strip_paths;
@@ -4136,8 +4140,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		if (!stripped_shred_indices.empty()) {
 			std::sort(stripped_shred_indices.begin(), stripped_shred_indices.end());
 			manifest.clear();
-			JsonoAppendIndexedShredManifest(manifest, manifest_layout_hash, bind_data.shreds.size(),
-			                                stripped_shred_indices);
+			JsonoAppendShredManifest(manifest, manifest_entries, stripped_shred_indices);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(rid, builder, manifest_ptr);

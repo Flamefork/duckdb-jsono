@@ -1290,53 +1290,6 @@ void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredMani
 	    });
 }
 
-uint64_t JsonoShredManifestLayoutHash(const vector<std::pair<string, LogicalType>> &shreds) {
-	vector<std::pair<std::string, std::string>> signatures;
-	signatures.reserve(shreds.size());
-	for (auto &shred : shreds) {
-		signatures.emplace_back(shred.first, shred.second.ToString());
-	}
-	return jsono::HashShredManifestSignatures(signatures);
-}
-
-void JsonoAppendIndexedShredManifest(std::string &manifest, uint64_t layout_hash, idx_t shred_count,
-                                     const vector<idx_t> &shred_indices) {
-	auto bitset_byte_count = (shred_count + 7) / 8;
-	auto index_byte_count = shred_indices.size() * sizeof(uint16_t);
-	if (bitset_byte_count < index_byte_count) {
-		if (bitset_byte_count > std::numeric_limits<uint32_t>::max()) {
-			throw InvalidInputException("jsono shred: too many shreds for bitset manifest");
-		}
-		uint32_t bitset_marker = jsono::SHRED_MANIFEST_BITSET_MARKER;
-		uint32_t stored_byte_count = uint32_t(bitset_byte_count);
-		manifest.append(reinterpret_cast<const char *>(&bitset_marker), sizeof(bitset_marker));
-		manifest.append(reinterpret_cast<const char *>(&layout_hash), sizeof(layout_hash));
-		manifest.append(reinterpret_cast<const char *>(&stored_byte_count), sizeof(stored_byte_count));
-		auto bitset_start = manifest.size();
-		manifest.resize(bitset_start + bitset_byte_count, '\0');
-		for (auto index : shred_indices) {
-			if (index >= shred_count) {
-				throw InternalException("jsono shred: manifest index is out of bounds");
-			}
-			manifest[bitset_start + index / 8] =
-			    char(uint8_t(manifest[bitset_start + index / 8]) | uint8_t(1U << (index & 7U)));
-		}
-		return;
-	}
-	uint32_t index_marker = jsono::SHRED_MANIFEST_INDEX_MARKER;
-	uint32_t entry_count = uint32_t(shred_indices.size());
-	manifest.append(reinterpret_cast<const char *>(&index_marker), sizeof(index_marker));
-	manifest.append(reinterpret_cast<const char *>(&layout_hash), sizeof(layout_hash));
-	manifest.append(reinterpret_cast<const char *>(&entry_count), sizeof(entry_count));
-	for (auto index : shred_indices) {
-		if (index > std::numeric_limits<uint16_t>::max()) {
-			throw InvalidInputException("jsono shred: too many shreds for indexed manifest");
-		}
-		uint16_t stored = uint16_t(index);
-		manifest.append(reinterpret_cast<const char *>(&stored), sizeof(stored));
-	}
-}
-
 void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<string, LogicalType>> &shreds,
                         Vector &result) {
 	vector<ShredField> fields;

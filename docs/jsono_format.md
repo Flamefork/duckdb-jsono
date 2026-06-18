@@ -130,35 +130,12 @@ carry (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`, and their `[]`
 scalar-array forms). Type code `0` keeps the full type string for complex shred
 types.
 
-Writers that already know the consumer carries the exact same canonical shred
-layout may use an indexed variant:
-
-```
-u32 marker = 0xfffffffe
-u64 layout_hash
-u32 entry_count
-per entry: u16 shred_index
-```
-
-`layout_hash` is computed from the full canonical `(path, type)` shred list of
-the writing type. A reader expands `shred_index` through its own shred list only
-when the hash matches exactly; otherwise the row is treated as narrowed by a raw
-struct cast and fails loud. This keeps the indexed form exact: it never guesses
-that an index in a different layout means the same path.
-
-For dense rows, writers may use the same exact layout contract with a bitset:
-
-```
-u32 marker = 0xfffffffd
-u64 layout_hash
-u32 byte_count
-byte[byte_count] stripped_shred_bitset
-```
-
-`byte_count` must equal `ceil(shred_count / 8)` for the matched layout. Bit `i`
-means canonical shred `i` was stripped from this row's residual. The layout hash
-rule is identical to the indexed variant; a reader never interprets bit positions
-under a different shred layout.
+Both forms are self-describing — each entry carries its path and type inline — so
+a reader needs no external shred list to decode them. (Earlier revisions also
+defined layout-hash-keyed `indexed` and `bitset` tails that referenced the
+reader's own shred list; they were removed because they never beat the compact
+form on disk — their per-row bit-packing trades zstd-friendly repetition for high
+entropy, so Parquet + zstd compress the compact form smaller.)
 
 Entries are sorted by canonical shred order (path order) and list only the paths
 actually stripped from this row (a value kept in the residual by the lossless

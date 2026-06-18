@@ -114,11 +114,6 @@ void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredMani
 void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries,
                               const vector<idx_t> &entry_indices);
 
-uint64_t JsonoShredManifestLayoutHash(const vector<std::pair<string, LogicalType>> &shreds);
-
-void JsonoAppendIndexedShredManifest(std::string &manifest, uint64_t layout_hash, idx_t shred_count,
-                                     const vector<idx_t> &shred_indices);
-
 // Shred a plain JSONO `input` vector into the shredded `result` STRUCT (the four-BLOB
 // residual prefix followed by one shred column per `shreds` entry, in order). Each shred is
 // a top-level key named by `shreds[i].first` with type `shreds[i].second`; its value is
