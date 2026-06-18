@@ -118,7 +118,7 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 		out.shreds.clear();
 		return true;
 	}
-	// A field named JSONO_VALUE_COMPLETE (BOOLEAN) is the value-complete marker, not a shred, and it
+	// A field named JSONO_VALUE_COMPLETE (UBIGINT) is the value-complete marker, not a shred, and it
 	// is identified by name at ANY position: a set-operation merged type interleaves it among the
 	// shreds (CombineStructTypes iterates the left branch's fields — body, marker, shreds — then
 	// appends the right branch's unique shreds after the marker), so a positional rule would misread
@@ -128,7 +128,7 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 	bool has_value_complete = false;
 	idx_t value_complete_index = 0;
 	for (idx_t i = 1; i < fields.size(); i++) {
-		if (fields[i].first == JSONO_VALUE_COMPLETE && fields[i].second.id() == LogicalTypeId::BOOLEAN) {
+		if (fields[i].first == JSONO_VALUE_COMPLETE && fields[i].second.id() == LogicalTypeId::UBIGINT) {
 			has_value_complete = true;
 			value_complete_index = i;
 			continue;
@@ -222,17 +222,35 @@ string JsonoValueCompleteName() {
 	return JSONO_VALUE_COMPLETE;
 }
 
+uint64_t JsonoLayoutHashOf(const LogicalType &type) {
+	JsonoLayoutType layout;
+	if (!TryParseJsonoLayoutType(type, layout) || layout.kind != JsonoLayoutKind::Shredded) {
+		return 0;
+	}
+	vector<std::pair<std::string, std::string>> signatures;
+	signatures.reserve(layout.shreds.size());
+	for (auto &shred : layout.shreds) {
+		signatures.emplace_back(shred.first, shred.second.ToString());
+	}
+	return jsono::HashShredManifestSignatures(signatures);
+}
+
 LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds) {
 	child_list_t<LogicalType> layout_children;
 	layout_children.emplace_back("body", JsonoBodyStructType());
-	// Every shredded layout carries the value-complete marker, uniformly (a VARCHAR-only shred set
-	// too, where it is always non-NULL). It sits right after `body`, BEFORE the shreds, on purpose:
-	// DuckDB's set-operation type reconciliation (CombineStructTypes) iterates the left branch's
-	// fields then appends the right branch's unique ones, so a marker placed after `body` stays at a
-	// fixed position with the shreds contiguous after it in every branch and their merge — whereas a
-	// trailing marker would be interleaved (body, shreds_left, marker, shreds_right), reordering the
-	// merged type away from the canonical one and breaking the positional struct cast between them.
-	layout_children.emplace_back(JSONO_VALUE_COMPLETE, LogicalType::BOOLEAN);
+	// Every shredded layout carries the value-complete marker, uniformly. Its value is the canonical
+	// layout hash (JsonoLayoutHashOf) of the shred set the row was written under when the row is
+	// value-complete, NULL otherwise — so the optimizer can confirm via the marker's min/max zone-map
+	// that every scanned row was written under EXACTLY the read type's shred set before dropping the
+	// residual COALESCE fallback. A multi-file read that unions narrower shred sets leaves the marker
+	// carrying a different hash per file, which keeps the fallback (see CollectShredTotality). It sits
+	// right after `body`, BEFORE the shreds, on purpose: DuckDB's set-operation type reconciliation
+	// (CombineStructTypes) iterates the left branch's fields then appends the right branch's unique
+	// ones, so a marker placed after `body` stays at a fixed position with the shreds contiguous after
+	// it in every branch and their merge — whereas a trailing marker would be interleaved (body,
+	// shreds_left, marker, shreds_right), reordering the merged type away from the canonical one and
+	// breaking the positional struct cast between them.
+	layout_children.emplace_back(JSONO_VALUE_COMPLETE, LogicalType::UBIGINT);
 	for (auto &shred : shreds) {
 		layout_children.push_back(shred);
 	}

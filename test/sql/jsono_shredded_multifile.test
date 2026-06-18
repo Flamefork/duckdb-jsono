@@ -1,0 +1,101 @@
+# name: test/sql/jsono_shredded_multifile.test
+# description: Multi-file read combining jsono Parquet files with DIFFERENT shred sets (union_by_name / glob / DuckLake-style schema evolution) reads every path correctly — a value-complete marker covers only its own file's shred set, so a widened read keeps the residual COALESCE fallback instead of a silent NULL.
+# group: [sql]
+
+# The reader NULL-fills each file's missing shred lanes while the value stays in that file's residual,
+# so a shred read must fall back to the residual for those rows. Regression for the value-complete
+# coverage fix: each file's marker carries its own shred-set layout hash, so a widened multi-file read
+# sees per-file hash mismatches and keeps the COALESCE fallback (a bare struct_extract would read NULL
+# for a path that lives in another file's residual). to_json reconstructs correctly either way; the bug
+# made ->> / jsono_extract_string disagree with it.
+
+require jsono
+
+require json
+
+require parquet
+
+# Two files with DISJOINT VARCHAR shred sets: file A shreds $.a, file B shreds $.b. In each file the
+# other path lives in the residual (it was never a shred there), so its lane is NULL-filled on the
+# union read — yet its value must still read back.
+statement ok
+COPY (SELECT jsono('{"a":"A1","b":"B1","c":"C1"}', shredding := {'a':'VARCHAR'}) AS e)
+TO '__TEST_DIR__/mf_a.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono('{"a":"X1","b":"Y1","c":"Z1"}', shredding := {'b':'VARCHAR'}) AS e)
+TO '__TEST_DIR__/mf_b.parquet' (FORMAT parquet);
+
+# Every path reads correctly regardless of which file shredded it: the shredded path reads its lane,
+# the residual path falls back to the residual (a silent NULL before the fix).
+query IIII
+SELECT to_json(e)::VARCHAR AS j, e ->> 'a' AS a, e ->> 'b' AS b, e ->> 'c' AS c
+FROM read_parquet(['__TEST_DIR__/mf_a.parquet', '__TEST_DIR__/mf_b.parquet'], union_by_name=true)
+ORDER BY j;
+----
+{"a":"A1","b":"B1","c":"C1"}	A1	B1	C1
+{"a":"X1","b":"Y1","c":"Z1"}	X1	Y1	Z1
+
+# to_json (reconstruct) and ->> must AGREE on every value: the bug returned NULL from ->> for a path in
+# the residual while to_json reconstructed it, a self-contradiction within one value.
+query II
+SELECT (to_json(e) ->> 'b') AS reconstruct_b, (e ->> 'b') AS extract_b
+FROM read_parquet(['__TEST_DIR__/mf_a.parquet', '__TEST_DIR__/mf_b.parquet'], union_by_name=true)
+ORDER BY reconstruct_b;
+----
+B1	B1
+Y1	Y1
+
+# jsono_extract_string reads the same way as ->>.
+query II
+SELECT jsono_extract_string(e, 'a') AS a, jsono_extract_string(e, 'b') AS b
+FROM read_parquet(['__TEST_DIR__/mf_a.parquet', '__TEST_DIR__/mf_b.parquet'], union_by_name=true)
+ORDER BY a NULLS FIRST;
+----
+A1	B1
+X1	Y1
+
+# Same heterogeneity reached through a glob (still requires union_by_name to merge the schemas).
+query II
+SELECT e ->> 'a' AS a, e ->> 'b' AS b
+FROM read_parquet('__TEST_DIR__/mf_*.parquet', union_by_name=true)
+ORDER BY a;
+----
+A1	B1
+X1	Y1
+
+# Disjoint TYPED (BIGINT) shred sets: file A shreds $.n, file B shreds $.m. The other typed value sits
+# in the residual with a NULL lane; CAST(->> AS BIGINT) must recover it (the typed COALESCE fallback).
+statement ok
+COPY (SELECT jsono('{"n":11,"m":21}', shredding := {'$.n':'BIGINT'}) AS e)
+TO '__TEST_DIR__/mt_a.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono('{"n":12,"m":22}', shredding := {'$.m':'BIGINT'}) AS e)
+TO '__TEST_DIR__/mt_b.parquet' (FORMAT parquet);
+
+query III
+SELECT to_json(e)::VARCHAR AS j, CAST(e ->> '$.n' AS BIGINT) AS n, CAST(e ->> '$.m' AS BIGINT) AS m
+FROM read_parquet(['__TEST_DIR__/mt_a.parquet', '__TEST_DIR__/mt_b.parquet'], union_by_name=true)
+ORDER BY j;
+----
+{"m":21,"n":11}	11	21
+{"m":22,"n":12}	12	22
+
+# Control: a HOMOGENEOUS multi-file read (both files the same shred set) is unaffected — every row's
+# value-complete marker carries the same hash, and the residual path reads correctly throughout.
+statement ok
+COPY (SELECT jsono('{"a":"H1","b":"G1"}', shredding := {'a':'VARCHAR'}) AS e)
+TO '__TEST_DIR__/mh_1.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono('{"a":"H2","b":"G2"}', shredding := {'a':'VARCHAR'}) AS e)
+TO '__TEST_DIR__/mh_2.parquet' (FORMAT parquet);
+
+query III
+SELECT to_json(e)::VARCHAR AS j, e ->> 'a' AS a, e ->> 'b' AS b
+FROM read_parquet(['__TEST_DIR__/mh_1.parquet', '__TEST_DIR__/mh_2.parquet'], union_by_name=true)
+ORDER BY j;
+----
+{"a":"H1","b":"G1"}	H1	G1
+{"a":"H2","b":"G2"}	H2	G2

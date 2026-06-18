@@ -414,22 +414,24 @@ inline Vector &JsonoVcVector(Vector &result) {
 	return *StructVector::GetEntries(layout)[1];
 }
 
-// Mark the whole result value-complete (marker non-NULL on every row): for a producer that by
-// construction never diverts a present scalar into the residual — e.g. type-driven auto-shred, where
-// each shred's type IS its source field's type, so a present value always fits and a NULL is only an
-// absent field, never a residual diversion. The marker is part of the struct, so this also keeps such
-// a value structurally equal (under `=`) to one the text/struct path built with the same data.
-inline void JsonoFillValueCompleteAllTrue(Vector &result, idx_t count) {
+// Mark the whole result value-complete (marker = the layout hash of the result's shred set on every
+// row): for a producer that by construction never diverts a present scalar into the residual — e.g.
+// type-driven auto-shred, where each shred's type IS its source field's type, so a present value
+// always fits and a NULL is only an absent field, never a residual diversion. The marker is part of
+// the struct, so this also keeps such a value structurally equal (under `=`) to one the text/struct
+// path built with the same data and the same shred set.
+inline void JsonoFillValueComplete(Vector &result, idx_t count) {
 	auto &layout_type = StructType::GetChildTypes(result.GetType())[0].second;
 	auto &fields = StructType::GetChildTypes(layout_type);
 	if (fields.size() < 2 || fields[1].first != JsonoValueCompleteName()) {
 		return;
 	}
+	auto layout_hash = JsonoLayoutHashOf(result.GetType());
 	auto &vc = JsonoVcVector(result);
 	vc.SetVectorType(VectorType::FLAT_VECTOR);
-	auto data = FlatVector::GetData<bool>(vc);
+	auto data = FlatVector::GetData<uint64_t>(vc);
 	for (idx_t row = 0; row < count; row++) {
-		data[row] = true;
+		data[row] = layout_hash;
 	}
 }
 

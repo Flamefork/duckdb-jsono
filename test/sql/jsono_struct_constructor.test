@@ -208,14 +208,14 @@ true	{"$.x":"v","y":1}
 query I
 SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" BOOLEAN, "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR))
 
 # The walk stops after one level: a scalar two or more levels deep stays in the residual (a deep
 # schema would otherwise lift many cold leaves). Only $.b.c is shredded; $.b.d.e is not.
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep'}}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" BOOLEAN, "$.b.c" VARCHAR, a BIGINT))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, "$.b.c" VARCHAR, a BIGINT))
 
 # Losslessness holds for the un-shredded deep leaf too: $.b.d.e round-trips through the residual.
 query I
@@ -289,7 +289,7 @@ nested	flat
 query I
 SELECT typeof(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" BOOLEAN, "$.commit.operation" VARCHAR))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, "$.commit.operation" VARCHAR))
 
 # Type-driven auto-shred is always value-complete: a shred's type IS its field's type, so a present
 # value always fits and a NULL is only an absent field, never a residual diversion. A typed shred

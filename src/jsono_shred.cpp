@@ -611,6 +611,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 	// (case B), non-NULL otherwise. WriteShred reports the diversion below.
 	Vector *vc_out = &JsonoVcVector(result);
 	vc_out->SetVectorType(VectorType::FLAT_VECTOR);
+	auto layout_hash = JsonoLayoutHashOf(result.GetType());
 	vector<Vector *> shred_children;
 	shred_children.reserve(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
@@ -702,7 +703,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		if (diverted_row) {
 			FlatVector::SetNull(*vc_out, row, true);
 		} else {
-			FlatVector::GetData<bool>(*vc_out)[row] = true;
+			FlatVector::GetData<uint64_t>(*vc_out)[row] = layout_hash;
 		}
 
 		lstate.builder.Reset();
@@ -754,6 +755,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 	// stays in the residual for one of this target's typed shreds (case B), non-NULL otherwise.
 	Vector *vc_out = &JsonoVcVector(result);
 	vc_out->SetVectorType(VectorType::FLAT_VECTOR);
+	auto layout_hash = JsonoLayoutHashOf(result.GetType());
 	vector<Vector *> shred_out(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		shred_out[f] = &JsonoShredVector(result, f);
@@ -864,7 +866,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		if (diverted_row) {
 			FlatVector::SetNull(*vc_out, row, true);
 		} else {
-			FlatVector::GetData<bool>(*vc_out)[row] = true;
+			FlatVector::GetData<uint64_t>(*vc_out)[row] = layout_hash;
 		}
 
 		if (lstate.strip_paths.empty()) {
@@ -958,6 +960,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	// VARCHAR-only shred set it stays uniformly non-NULL (a VARCHAR shred never diverts).
 	Vector *vc_out = &JsonoVcVector(result);
 	vc_out->SetVectorType(VectorType::FLAT_VECTOR);
+	auto layout_hash = JsonoLayoutHashOf(result.GetType());
 
 	vector<JsonoShredManifestEntryBytes> manifest_entries(fields.size());
 	jsono_dom::DomShredContext ctx;
@@ -1050,7 +1053,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 				if (diverted) {
 					FlatVector::SetNull(*vc_out, row, true);
 				} else {
-					FlatVector::GetData<bool>(*vc_out)[row] = true;
+					FlatVector::GetData<uint64_t>(*vc_out)[row] = layout_hash;
 				}
 			}
 		} catch (...) {

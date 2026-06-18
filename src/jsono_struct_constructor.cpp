@@ -1465,7 +1465,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	// present value always fits the shred and a NULL shred is only an absent field. The value is
 	// therefore always value-complete — which gives jsono(struct, shredding) the COALESCE-free typed
 	// read on read-back for struct-ingest workloads.
-	JsonoFillValueCompleteAllTrue(result, count);
+	JsonoFillValueComplete(result, count);
 	auto &builder = lstate.builder;
 
 	// All-stripped rows with an empty residual share constant blobs (header + {} + manifest).

@@ -40,6 +40,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/struct_stats.hpp"
 
 #include "string_view.hpp"
@@ -1588,17 +1589,28 @@ void CollectShredTotality(ClientContext &context, const LogicalOperator &op, Shr
 						per_shred[shred.child_index] = false;
 					}
 				}
-				// Value-complete: the marker field carries no NULL, so no row diverted a present
-				// scalar into the residual. Every typed shred's NULLs are then absent paths, where a
-				// bare struct_extract reads the correct NULL — so all shreds are safe to read
-				// COALESCE-free, even those that still carry (absent) NULLs. (A base-table column is
-				// canonical, so the marker is the last layout child; value_complete_index carries its
-				// exact position regardless.)
+				// Value-complete: the marker carries no NULL AND a single min==max layout hash equal to
+				// the read type's, so every scanned row diverted nothing into the residual AND was
+				// written under EXACTLY the read shred set. Each typed shred's NULLs are then absent
+				// paths, where a bare struct_extract reads the correct NULL, so all shreds are safe to
+				// read COALESCE-free even those that still carry (absent) NULLs. A multi-file read that
+				// unions narrower shred sets (union_by_name, DuckLake schema evolution) leaves the marker
+				// carrying a different hash per file (min!=max, or min==max!=read hash): the file's
+				// value-completeness covered only its own narrower set, not the widened read type, so a
+				// shred NULL-filled by the reader means value-in-residual, not absent — this check fails
+				// and the residual COALESCE fallback stays. (A base-table column is canonical, so the
+				// marker is the last layout child; value_complete_index carries its exact position
+				// regardless.)
 				idx_t vc_index = layout_info.value_complete_index;
-				if (has_value_complete && vc_index < layout_children &&
-				    !StructStats::GetChildStats(layout_stats, vc_index).CanHaveNull()) {
-					for (auto &shred : shreds) {
-						per_shred[shred.child_index] = false;
+				if (has_value_complete && vc_index < layout_children) {
+					auto &vc_stats = StructStats::GetChildStats(layout_stats, vc_index);
+					auto expected_hash = JsonoLayoutHashOf(returned_types[table_index]);
+					if (!vc_stats.CanHaveNull() && NumericStats::HasMinMax(vc_stats) &&
+					    NumericStats::Min(vc_stats).GetValue<uint64_t>() == expected_hash &&
+					    NumericStats::Max(vc_stats).GetValue<uint64_t>() == expected_hash) {
+						for (auto &shred : shreds) {
+							per_shred[shred.child_index] = false;
+						}
 					}
 				}
 			}
@@ -1992,8 +2004,29 @@ private:
 		auto shred_value = ShredExtract(*column, shred.child_index);
 		FunctionBinder function_binder(context);
 		if (shred.type.id() == LogicalTypeId::VARCHAR) {
-			shred_value->SetAlias(alias);
-			return shred_value;
+			// A VARCHAR shred holds the `->>` text whenever the lane carries the value. A total shred
+			// reads bare; a non-total one falls back to a residual text extract for its NULL-lane rows.
+			// Crucially this is NOT unconditional: a multi-file read that unioned a narrower shred set
+			// (union_by_name / DuckLake schema evolution) NULL-fills this lane for the files that lacked
+			// it while the value stays in their residual — the value-complete coverage check in
+			// ShredIsTotal sees the per-file hash mismatch and keeps the fallback, so the residual value
+			// is read instead of a silent NULL.
+			if (ShredIsTotal(*column, shred.child_index)) {
+				shred_value->SetAlias(alias);
+				return shred_value;
+			}
+			auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
+			auto residual = ResidualReinterpret(*column, /*soft=*/true);
+			vector<unique_ptr<Expression>> ext_children;
+			ext_children.push_back(std::move(residual));
+			ext_children.push_back(std::move(path));
+			auto fallback =
+			    function_binder.BindScalarFunction(JsonoExtractStringFunction(path_type), std::move(ext_children));
+			auto coalesce = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, LogicalType::VARCHAR);
+			coalesce->children.push_back(std::move(shred_value));
+			coalesce->children.push_back(std::move(fallback));
+			coalesce->SetAlias(alias);
+			return std::move(coalesce);
 		}
 		unique_ptr<Expression> shred_text;
 		if (shred.type.id() == LogicalTypeId::DOUBLE) {

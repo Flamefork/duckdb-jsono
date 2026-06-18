@@ -229,7 +229,7 @@ statement error
 SELECT struct_pack(
         "jsono" := struct_pack(
             body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
-            "$jsono$vc" := true,
+            "$jsono$vc" := NULL::UBIGINT,
             a := 'v'))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
 ----
 body is NULL

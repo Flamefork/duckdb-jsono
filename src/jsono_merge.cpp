@@ -1632,7 +1632,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// participate in the value-complete typed-scalar shortcut. A diverted scalar (case B)
 			// would sit in that residual at the scalar shred's key and trip the gate to the fallback,
 			// so every NULL scalar shred here is an absent path (case A), never a diversion.
-			JsonoFillValueCompleteAllTrue(result, count);
+			JsonoFillValueComplete(result, count);
 			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
 			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
 			for (idx_t b = 0; b < BODY_BLOB_COUNT; b++) {
@@ -4047,7 +4047,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 			FlatVector::SetNull(*shred, rid, true);
 		}
 		FlatVector::Validity(*vc_out).SetValid(rid);
-		FlatVector::GetData<bool>(*vc_out)[rid] = true;
+		FlatVector::GetData<uint64_t>(*vc_out)[rid] = manifest_layout_hash;
 
 		auto &state = *state_data[RowIndex(state_fmt, i)];
 		builder.Reset();
