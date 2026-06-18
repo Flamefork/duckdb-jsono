@@ -94,7 +94,8 @@ private:
 // whole found container — a manifest leaf strictly inside it means the result would be missing
 // that leaf. An honest shredded read never reaches either case (the optimizer reads shreds
 // directly and reconstructs subtree reads that overlap a shred), so a hit here is always a row
-// narrowed by a raw struct cast.
+// narrowed by a raw struct cast. Indexed/bitset manifests require the original shred layout to
+// decode their paths; without it, the parser fails loud before this filter can prove non-coverage.
 inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathStep> &read_steps, bool found_container,
                                       std::vector<ShredManifestEntry> &manifest_scratch,
                                       vector<PathStep> &steps_scratch,

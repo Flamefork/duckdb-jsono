@@ -1,6 +1,7 @@
 #pragma once
 
 #include "jsono.hpp"
+#include "jsono_shred.hpp"
 #include "jsono_writer.hpp"
 
 #include "yyjson.hpp"
@@ -276,11 +277,12 @@ struct DomShredTrieNode {
 
 struct DomShredContext {
 	const std::vector<DomShredTrieNode> *nodes = nullptr;
-	std::vector<DomShredKind> kinds;                            // per shred field
-	const std::vector<std::string> *manifest_entries = nullptr; // per shred field, serialized
+	std::vector<DomShredKind> kinds; // per shred field
+	const vector<JsonoShredManifestEntryBytes> *manifest_entries = nullptr;
 	// Per-row outputs: captures parallel to the shred fields, manifest = the row's serialized
 	// shred-manifest tail (empty when nothing was stripped).
 	std::vector<DomShredCapture> captures;
+	vector<idx_t> stripped_fields;
 	std::string manifest;
 };
 

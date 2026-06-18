@@ -688,19 +688,14 @@ void EmitDomRowDirect(yyjson_val *root, DomDirectState &state, JsonoBodyWriter &
 			SizeDomElement(root, state, 0);
 		}
 		shred->manifest.clear();
-		uint32_t stripped_count = 0;
-		for (auto &cap : shred->captures) {
-			if (cap.stripped) {
-				stripped_count++;
+		shred->stripped_fields.clear();
+		for (idx_t f = 0; f < shred->captures.size(); f++) {
+			if (shred->captures[f].stripped) {
+				shred->stripped_fields.push_back(f);
 			}
 		}
-		if (stripped_count > 0) {
-			shred->manifest.append(reinterpret_cast<const char *>(&stripped_count), sizeof(stripped_count));
-			for (idx_t f = 0; f < shred->captures.size(); f++) {
-				if (shred->captures[f].stripped) {
-					shred->manifest.append((*shred->manifest_entries)[f]);
-				}
-			}
+		if (!shred->stripped_fields.empty()) {
+			JsonoAppendShredManifest(shred->manifest, *shred->manifest_entries, shred->stripped_fields);
 		}
 	} else {
 		SizeDomElement(root, state, 0);

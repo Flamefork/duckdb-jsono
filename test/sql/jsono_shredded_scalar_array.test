@@ -223,6 +223,36 @@ SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2]}', shredding := {'$.a':'UBIGI
 ----
 {"a":[1,2],"b":9}
 
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}),
+                                 jsono('{"a":null}')));
+----
+{"k":"x"}
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}),
+                                 jsono('{"a":5}')));
+----
+{"a":5,"k":"x"}
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}),
+                                 jsono('{"a":[3]}')));
+----
+{"a":[3],"k":"x"}
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1]}', shredding := {'$.a':'UBIGINT[]'}),
+                                 jsono('{"a":5,"z":9}', shredding := {'$.z':'UBIGINT'})));
+----
+{"a":5,"z":9}
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1]}', shredding := {'$.a':'UBIGINT[]'}),
+                                 jsono('{"a":[2,3]}', shredding := {'$.a':'UBIGINT[]'})));
+----
+{"a":[2,3]}
+
 statement ok
 CREATE TABLE setop AS
   SELECT jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}) AS j
@@ -234,6 +264,18 @@ SELECT to_json(j) FROM setop ORDER BY to_json(j);
 ----
 {"a":[1,2],"k":"x"}
 {"a":[3,4],"k":"y"}
+
+statement ok
+CREATE TABLE setop_widen AS
+  SELECT jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}) AS j
+  UNION ALL
+  SELECT jsono('{"a":[3,4],"k":"y","z":9}', shredding := {'$.a':'UBIGINT[]','$.z':'BIGINT'}) AS j;
+
+query I
+SELECT to_json(j) FROM setop_widen ORDER BY to_json(j);
+----
+{"a":[1,2],"k":"x"}
+{"a":[3,4],"k":"y","z":9}
 
 query I
 SELECT to_json(jsono_group_merge_max(j, k)) FROM (

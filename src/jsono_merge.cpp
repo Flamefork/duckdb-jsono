@@ -1369,6 +1369,23 @@ bool ResidualConflictsWithShredPath(const JsonoView &view, const vector<PathStep
 	return true; // full path resolved to a present value
 }
 
+// A scalar-array shred deliberately leaves an array skeleton at the shred path in the residual.
+// That terminal array is not a conflict: the copied LIST lane overlays it element-for-element on
+// reconstruct. Anything else present at that path is a real replacement/collision and must fall
+// back to the full reshred path.
+bool ResidualConflictsWithScalarArrayShredPath(const JsonoView &view, const vector<PathStep> &steps) {
+	JsonoCursor cursor;
+	for (idx_t s = 0; s < steps.size(); s++) {
+		if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_START) {
+			return true;
+		}
+		if (!LocatePathStep(nullptr, s, view, steps[s], cursor)) {
+			return false;
+		}
+	}
+	return cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::ARR_START;
+}
+
 // True if two object-key shred paths overlap structurally: they agree on the full length of the
 // shorter one, so one is a prefix of (or equal to) the other (e.g. `a` and `$.a.a`, or `a` and
 // `$.a`). Such a pair cannot be two independent lanes — one names a scalar leaf, the other lives
@@ -1463,9 +1480,10 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	// per-row reconstruct+reshred. Both shredded AND plain inputs ride it: a plain input folds
 	// its whole value into the residual and declares no lanes (FastCopyShred skips it). Every
 	// shred is an object-key lane (top-level `K` or nested `$.p.q`) the read overlay re-inserts
-	// at its path; an ARRAY shred is not a whole-lane copy (its elements interleave the residual
-	// skeleton) so it falls back. The per-row gate diverts to the fallback whenever an input could
-	// make the lane copy-through wrong (a non-object replace, a key/path naming a lane).
+	// at its path; a scalar-array shred copies through with its residual skeleton. LIST<STRUCT>
+	// array shreds still fall back because each element merges multiple subfield lanes over a
+	// per-element tail. The per-row gate diverts to the fallback whenever an input could make the
+	// lane copy-through wrong (a non-object replace, a key/path naming a lane).
 	bool fast_viable = true;
 	vector<idx_t> plain_inputs;
 	for (idx_t i = 0; i < ncols; i++) {
@@ -1475,16 +1493,21 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		}
 	}
 	// Parse each shred's object-key path once (top-level shreds are a single Key step). An array
-	// shred, or any non-Key step (only reachable through an array path), disqualifies the fast path.
+	// shred with element objects, or any non-Key step (only reachable through an array path),
+	// disqualifies the fast path.
 	vector<vector<PathStep>> shred_paths(bind_data.shreds.size());
+	vector<ShredKind> shred_kinds(bind_data.shreds.size());
+	bool has_jsonpath_shred = false;
 	bool has_nested_shred = false;
 	for (idx_t k = 0; k < bind_data.shreds.size() && fast_viable; k++) {
 		auto &shred = bind_data.shreds[k];
-		if (IsShredArrayType(shred.type) || IsShredScalarArrayType(shred.type)) {
+		shred_kinds[k] = ClassifyShredKind(shred.type);
+		if (shred_kinds[k] == ShredKind::Array) {
 			fast_viable = false;
 			break;
 		}
 		if (shred.name.size() >= 2 && shred.name[0] == '$' && shred.name[1] == '.') {
+			has_jsonpath_shred = true;
 			shred_paths[k] = ParseJsonoPath(shred.name, "jsono merge fast path");
 			for (auto &step : shred_paths[k]) {
 				if (step.kind != PathStepKind::Key) {
@@ -1547,8 +1570,10 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				// non-object residual is handled by the plain-input gate above, preserving the
 				// all-shredded behaviour). A nested shred additionally conflicts if a node along
 				// its path is a present non-object (its lane cannot overlay into a scalar).
-				bool hit = shred_paths[k].size() == 1 ? ResidualHasTopLevelKey(v, bind_data.shreds[k].name)
-				                                      : ResidualConflictsWithShredPath(v, shred_paths[k]);
+				bool hit = shred_kinds[k] == ShredKind::ScalarArray
+				               ? ResidualConflictsWithScalarArrayShredPath(v, shred_paths[k])
+				               : (shred_paths[k].size() == 1 ? ResidualHasTopLevelKey(v, bind_data.shreds[k].name)
+				                                             : ResidualConflictsWithShredPath(v, shred_paths[k]));
 				if (hit) {
 					conflict = true;
 					break;
@@ -1578,9 +1603,11 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 					conflict = true;
 					break;
 				}
-				if (has_nested_shred) {
+				if (has_jsonpath_shred) {
 					for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
-						if (shred_paths[k].size() > 1 && ResidualConflictsWithShredPath(pview, shred_paths[k])) {
+						auto &name = bind_data.shreds[k].name;
+						if (name.size() >= 2 && name[0] == '$' && name[1] == '.' &&
+						    ResidualConflictsWithShredPath(pview, shred_paths[k])) {
 							conflict = true;
 							break;
 						}
@@ -1600,10 +1627,11 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// except `skips`, which is re-emitted per row below with the output's shred manifest.
 			JsonoBodyWriter writer;
 			writer.Init(result);
-			// The fast path is reached only when no shred key appears in the folded residual (the
-			// no-conflict gate above). A diverted scalar (case B) would sit in that residual at the
-			// shred's key and trip the gate to the fallback — so every NULL shred here is an absent
-			// path (case A), never a diversion: the result is value-complete by construction.
+			// The fast path is reached only when scalar shred keys do not appear in the folded
+			// residual. Scalar-array keys may appear as their normal skeleton arrays, but they do not
+			// participate in the value-complete typed-scalar shortcut. A diverted scalar (case B)
+			// would sit in that residual at the scalar shred's key and trip the gate to the fallback,
+			// so every NULL scalar shred here is an absent path (case A), never a diversion.
 			JsonoFillValueCompleteAllTrue(result, count);
 			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
 			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
@@ -1628,21 +1656,11 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// that carries a value has no copy in the residual (the no-conflict gate above) —
 			// exactly what the manifest must record, or a later raw narrowing cast would lose it
 			// silently. Re-emit each row's skips with the manifest of its non-NULL shreds.
-			vector<std::string> manifest_entries(bind_data.shreds.size());
+			vector<JsonoShredManifestEntryBytes> manifest_entries(bind_data.shreds.size());
 			vector<UnifiedVectorFormat> shred_fmt(bind_data.shreds.size());
 			for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
 				auto &shred = bind_data.shreds[k];
-				auto &entry = manifest_entries[k];
-				auto append_lv = [&](const string &text) {
-					if (text.size() > std::numeric_limits<uint16_t>::max()) {
-						throw InvalidInputException("jsono merge: path or type name exceeds manifest limits");
-					}
-					uint16_t len = uint16_t(text.size());
-					entry.append(reinterpret_cast<const char *>(&len), sizeof(len));
-					entry.append(text);
-				};
-				append_lv(shred.name);
-				append_lv(shred.type.ToString());
+				manifest_entries[k] = JsonoShredManifestEntry(shred.name, shred.type);
 				JsonoShredVector(result, shred.result_child_index).ToUnifiedFormat(count, shred_fmt[k]);
 			}
 			auto fr_skips = FlatVector::GetData<string_t>(*fr_blobs[BODY_SKIPS]);
@@ -1650,6 +1668,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			auto &r_skips = writer.Skips();
 			auto skips_out = writer.data[BODY_SKIPS];
 			std::string skips_buf;
+			vector<idx_t> stripped_fields;
 			for (idx_t row = 0; row < count; row++) {
 				if (!result_validity.RowIsValid(row) || !fr_skips_validity.RowIsValid(row)) {
 					FlatVector::SetNull(r_skips, row, true);
@@ -1657,17 +1676,14 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				}
 				skips_buf.clear();
 				skips_buf.append(fr_skips[row].GetData(), fr_skips[row].GetSize());
-				uint32_t stripped = 0;
+				stripped_fields.clear();
 				for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
-					stripped += RowIsValid(shred_fmt[k], row) ? 1 : 0;
-				}
-				if (stripped > 0) {
-					skips_buf.append(reinterpret_cast<const char *>(&stripped), sizeof(stripped));
-					for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
-						if (RowIsValid(shred_fmt[k], row)) {
-							skips_buf.append(manifest_entries[k]);
-						}
+					if (RowIsValid(shred_fmt[k], row)) {
+						stripped_fields.push_back(k);
 					}
+				}
+				if (!stripped_fields.empty()) {
+					JsonoAppendShredManifest(skips_buf, manifest_entries, stripped_fields);
 				}
 				skips_out[row] = WriteBlobInto(r_skips, skips_buf.data(), skips_buf.size());
 			}
@@ -2024,7 +2040,7 @@ constexpr uint32_t LWW_INVALID_SORT_KEY_ID = std::numeric_limits<uint32_t>::max(
 struct LWWScalarLane {
 	bool has_value = false;
 	uint32_t sort_key_id = LWW_INVALID_SORT_KEY_ID;
-	LWWScalarValue value;
+	uint64_t value_bits = 0;
 };
 
 struct LWWListElement {
@@ -2657,6 +2673,81 @@ void MoveLWWTreeNode(LWWTreeNode &target, LWWTreeNode &source) {
 void EnsureLWWScalarLanes(GroupMergeLWWState &state, idx_t count, idx_t text_count);
 void EnsureLWWListLanes(GroupMergeLWWState &state, idx_t count);
 
+LWWScalarLane *FindLWWScalarLane(GroupMergeLWWState &state, idx_t lane_idx) {
+	if (!state.scalar_lanes || lane_idx >= state.scalar_lane_count) {
+		return nullptr;
+	}
+	auto &lane = state.scalar_lanes[lane_idx];
+	return lane.has_value ? &lane : nullptr;
+}
+
+const LWWScalarLane *FindLWWScalarLane(const GroupMergeLWWState &state, idx_t lane_idx) {
+	if (!state.scalar_lanes || lane_idx >= state.scalar_lane_count) {
+		return nullptr;
+	}
+	auto &lane = state.scalar_lanes[lane_idx];
+	return lane.has_value ? &lane : nullptr;
+}
+
+LWWScalarLane &FindOrCreateLWWScalarLane(GroupMergeLWWState &state, idx_t lane_idx) {
+	if (!state.scalar_lanes || lane_idx >= state.scalar_lane_count) {
+		throw InternalException("jsono_group_merge: scalar lane storage is not initialized");
+	}
+	return state.scalar_lanes[lane_idx];
+}
+
+bool LWWScalarLaneHasText(const vector<idx_t> &text_indices, idx_t lane_idx) {
+	return text_indices[lane_idx] != DConstants::INVALID_INDEX;
+}
+
+string *FindLWWScalarLaneText(GroupMergeLWWState &state, const vector<idx_t> &text_indices, idx_t lane_idx) {
+	if (!LWWScalarLaneHasText(text_indices, lane_idx) || !state.scalar_texts) {
+		return nullptr;
+	}
+	return &state.scalar_texts[text_indices[lane_idx]];
+}
+
+const string *FindLWWScalarLaneText(const GroupMergeLWWState &state, const vector<idx_t> &text_indices,
+                                    idx_t lane_idx) {
+	if (!LWWScalarLaneHasText(text_indices, lane_idx) || !state.scalar_texts) {
+		return nullptr;
+	}
+	return &state.scalar_texts[text_indices[lane_idx]];
+}
+
+string *EnsureLWWScalarLaneText(GroupMergeLWWState &state, const vector<idx_t> &text_indices, idx_t lane_idx) {
+	if (!LWWScalarLaneHasText(text_indices, lane_idx)) {
+		return nullptr;
+	}
+	if (!state.scalar_texts) {
+		throw InternalException("jsono_group_merge: scalar text lane storage is not initialized");
+	}
+	return &state.scalar_texts[text_indices[lane_idx]];
+}
+
+string *RequireLWWScalarLaneText(GroupMergeLWWState &state, const vector<idx_t> &text_indices, idx_t lane_idx) {
+	if (!LWWScalarLaneHasText(text_indices, lane_idx)) {
+		return nullptr;
+	}
+	auto *text = FindLWWScalarLaneText(state, text_indices, lane_idx);
+	if (!text) {
+		throw InternalException("jsono_group_merge: missing scalar text lane");
+	}
+	return text;
+}
+
+const string *RequireLWWScalarLaneText(const GroupMergeLWWState &state, const vector<idx_t> &text_indices,
+                                       idx_t lane_idx) {
+	if (!LWWScalarLaneHasText(text_indices, lane_idx)) {
+		return nullptr;
+	}
+	auto *text = FindLWWScalarLaneText(state, text_indices, lane_idx);
+	if (!text) {
+		throw InternalException("jsono_group_merge: missing scalar text lane");
+	}
+	return text;
+}
+
 nonstd::string_view LWWScalarTextView(const string *text) {
 	if (!text) {
 		return nonstd::string_view();
@@ -2664,22 +2755,63 @@ nonstd::string_view LWWScalarTextView(const string *text) {
 	return nonstd::string_view(text->data(), text->size());
 }
 
-string *LWWScalarLaneText(GroupMergeLWWState &state, const vector<idx_t> &text_indices, idx_t lane_idx) {
-	auto text_idx = text_indices[lane_idx];
-	return text_idx == DConstants::INVALID_INDEX ? nullptr : &state.scalar_texts[text_idx];
+LWWScalarValue LWWScalarValueFromShredBits(const LogicalType &type, uint64_t value_bits, nonstd::string_view text) {
+	ShredPrimitive kind;
+	if (!TypeToShredPrimitive(type, kind)) {
+		throw InternalException("jsono_group_merge direct shredded update: non-scalar shred type '%s'",
+		                        type.ToString());
+	}
+	LWWScalarValue result;
+	switch (kind) {
+	case ShredPrimitive::Varchar:
+		if (text.size() > std::numeric_limits<uint32_t>::max()) {
+			throw InvalidInputException("jsono: string value exceeds storage limits");
+		}
+		result.slot = MakeSlot(tag::VAL_STR_HEAP, 0);
+		result.length = uint32_t(text.size());
+		return result;
+	case ShredPrimitive::Bigint: {
+		auto value = int64_t(value_bits);
+		result.slot = FitsInt60(value) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64);
+		result.num = value_bits;
+		return result;
+	}
+	case ShredPrimitive::Ubigint:
+		if (value_bits <= uint64_t(std::numeric_limits<int64_t>::max())) {
+			auto signed_value = int64_t(value_bits);
+			result.slot = FitsInt60(signed_value) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64);
+		} else {
+			result.slot = MakeExtSlot(ext_subtype::UINT64);
+		}
+		result.num = value_bits;
+		return result;
+	case ShredPrimitive::Double:
+		result.slot = MakeExtSlot(ext_subtype::DOUBLE);
+		result.num = value_bits;
+		return result;
+	case ShredPrimitive::Boolean:
+		result.slot = MakeSlot(value_bits != 0 ? tag::VAL_TRUE : tag::VAL_FALSE, 0);
+		return result;
+	}
+	throw InternalException("jsono_group_merge: unhandled scalar shred primitive");
 }
 
-const string *LWWScalarLaneText(const GroupMergeLWWState &state, const vector<idx_t> &text_indices, idx_t lane_idx) {
-	auto text_idx = text_indices[lane_idx];
-	return text_idx == DConstants::INVALID_INDEX ? nullptr : &state.scalar_texts[text_idx];
+int CompareLWWScalarLaneValueTie(const LWWScalarLane &lane, nonstd::string_view lane_text, const LogicalType &type,
+                                 uint64_t candidate_bits, nonstd::string_view candidate_text) {
+	auto lane_value = LWWScalarValueFromShredBits(type, lane.value_bits, lane_text);
+	auto candidate_value = LWWScalarValueFromShredBits(type, candidate_bits, candidate_text);
+	return CompareLWWScalarValueTie(lane_value, lane_text, candidate_value, candidate_text);
 }
 
 void CopyLWWScalarLane(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
                        const GroupMergeLWWState &source_state, const LWWScalarLane &source, const string *source_text) {
 	target.has_value = source.has_value;
 	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
-	target.value = source.value;
+	target.value_bits = source.value_bits;
 	if (target_text) {
+		if (!source_text) {
+			throw InternalException("jsono_group_merge: missing source scalar text lane");
+		}
 		*target_text = *source_text;
 	}
 }
@@ -2688,73 +2820,86 @@ void MoveLWWScalarLane(GroupMergeLWWState &target_state, LWWScalarLane &target, 
                        const GroupMergeLWWState &source_state, LWWScalarLane &source, string *source_text) {
 	target.has_value = source.has_value;
 	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
-	target.value = source.value;
+	target.value_bits = source.value_bits;
 	if (target_text) {
+		if (!source_text) {
+			throw InternalException("jsono_group_merge: missing source scalar text lane");
+		}
 		*target_text = std::move(*source_text);
 		source_text->clear();
 	}
 	source.has_value = false;
 	source.sort_key_id = LWW_INVALID_SORT_KEY_ID;
-	source.value = LWWScalarValue();
+	source.value_bits = 0;
 }
 
-void MergeLWWScalarLaneState(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
-                             const GroupMergeLWWState &source_state, const LWWScalarLane &source,
-                             const string *source_text) {
+void MergeLWWScalarLaneState(GroupMergeLWWState &target_state, const GroupMergeLWWState &source_state, idx_t lane_idx,
+                             const LWWScalarLane &source, const vector<ReconShred> &shreds,
+                             const vector<idx_t> &text_indices) {
 	if (!source.has_value) {
 		return;
 	}
-	if (!target.has_value) {
-		CopyLWWScalarLane(target_state, target, target_text, source_state, source, source_text);
+	auto *source_text = RequireLWWScalarLaneText(source_state, text_indices, lane_idx);
+	auto *target = FindLWWScalarLane(target_state, lane_idx);
+	if (!target) {
+		target = &FindOrCreateLWWScalarLane(target_state, lane_idx);
+		CopyLWWScalarLane(target_state, *target, EnsureLWWScalarLaneText(target_state, text_indices, lane_idx),
+		                  source_state, source, source_text);
 		return;
 	}
-	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target.sort_key_id),
+	auto *target_text = RequireLWWScalarLaneText(target_state, text_indices, lane_idx);
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target->sort_key_id),
 	                              LWWLaneSortKey(source_state, source.sort_key_id));
-	if (key_cmp < 0 || (key_cmp == 0 && CompareLWWScalarValueTie(target.value, LWWScalarTextView(target_text),
-	                                                             source.value, LWWScalarTextView(source_text)) < 0)) {
-		CopyLWWScalarLane(target_state, target, target_text, source_state, source, source_text);
+	if (key_cmp < 0 ||
+	    (key_cmp == 0 && CompareLWWScalarLaneValueTie(*target, LWWScalarTextView(target_text), shreds[lane_idx].type,
+	                                                  source.value_bits, LWWScalarTextView(source_text)) < 0)) {
+		CopyLWWScalarLane(target_state, *target, target_text, source_state, source, source_text);
 	}
 }
 
-void MergeLWWScalarLaneStateDestructive(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
-                                        const GroupMergeLWWState &source_state, LWWScalarLane &source,
-                                        string *source_text) {
+void MergeLWWScalarLaneStateDestructive(GroupMergeLWWState &target_state, GroupMergeLWWState &source_state,
+                                        idx_t lane_idx, LWWScalarLane &source, const vector<ReconShred> &shreds,
+                                        const vector<idx_t> &text_indices) {
 	if (!source.has_value) {
 		return;
 	}
-	if (!target.has_value) {
-		MoveLWWScalarLane(target_state, target, target_text, source_state, source, source_text);
+	auto *source_text = RequireLWWScalarLaneText(source_state, text_indices, lane_idx);
+	auto *target = FindLWWScalarLane(target_state, lane_idx);
+	if (!target) {
+		target = &FindOrCreateLWWScalarLane(target_state, lane_idx);
+		MoveLWWScalarLane(target_state, *target, EnsureLWWScalarLaneText(target_state, text_indices, lane_idx),
+		                  source_state, source, source_text);
 		return;
 	}
-	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target.sort_key_id),
+	auto *target_text = RequireLWWScalarLaneText(target_state, text_indices, lane_idx);
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target->sort_key_id),
 	                              LWWLaneSortKey(source_state, source.sort_key_id));
-	if (key_cmp < 0 || (key_cmp == 0 && CompareLWWScalarValueTie(target.value, LWWScalarTextView(target_text),
-	                                                             source.value, LWWScalarTextView(source_text)) < 0)) {
-		MoveLWWScalarLane(target_state, target, target_text, source_state, source, source_text);
+	if (key_cmp < 0 ||
+	    (key_cmp == 0 && CompareLWWScalarLaneValueTie(*target, LWWScalarTextView(target_text), shreds[lane_idx].type,
+	                                                  source.value_bits, LWWScalarTextView(source_text)) < 0)) {
+		MoveLWWScalarLane(target_state, *target, target_text, source_state, source, source_text);
 	}
 }
 
-void MergeLWWScalarLanes(GroupMergeLWWState &target, const GroupMergeLWWState &source,
+void MergeLWWScalarLanes(GroupMergeLWWState &target, const GroupMergeLWWState &source, const vector<ReconShred> &shreds,
                          const vector<idx_t> &text_indices) {
 	if (!source.scalar_lanes) {
 		return;
 	}
 	EnsureLWWScalarLanes(target, source.scalar_lane_count, source.scalar_text_lane_count);
 	for (idx_t i = 0; i < source.scalar_lane_count; i++) {
-		MergeLWWScalarLaneState(target, target.scalar_lanes[i], LWWScalarLaneText(target, text_indices, i), source,
-		                        source.scalar_lanes[i], LWWScalarLaneText(source, text_indices, i));
+		MergeLWWScalarLaneState(target, source, i, source.scalar_lanes[i], shreds, text_indices);
 	}
 }
 
 void MergeLWWScalarLanesDestructive(GroupMergeLWWState &target, GroupMergeLWWState &source,
-                                    const vector<idx_t> &text_indices) {
+                                    const vector<ReconShred> &shreds, const vector<idx_t> &text_indices) {
 	if (!source.scalar_lanes) {
 		return;
 	}
 	EnsureLWWScalarLanes(target, source.scalar_lane_count, source.scalar_text_lane_count);
 	for (idx_t i = 0; i < source.scalar_lane_count; i++) {
-		MergeLWWScalarLaneStateDestructive(target, target.scalar_lanes[i], LWWScalarLaneText(target, text_indices, i),
-		                                   source, source.scalar_lanes[i], LWWScalarLaneText(source, text_indices, i));
+		MergeLWWScalarLaneStateDestructive(target, source, i, source.scalar_lanes[i], shreds, text_indices);
 	}
 	delete[] source.scalar_lanes;
 	delete[] source.scalar_texts;
@@ -3057,10 +3202,47 @@ void StorePrimitiveLaneValue(const LogicalType &type, const UnifiedVectorFormat 
 	}
 }
 
-void StoreScalarShredLaneValue(const ReconShred &shred, const UnifiedVectorFormat &fmt, idx_t idx, LWWScalarValue &out,
+void StorePrimitiveLaneValueBits(const LogicalType &type, const UnifiedVectorFormat &fmt, idx_t idx, uint64_t &out,
+                                 string *text_out) {
+	ShredPrimitive kind;
+	if (!TypeToShredPrimitive(type, kind)) {
+		throw InternalException("jsono_group_merge direct shredded update: non-scalar shred type '%s'",
+		                        type.ToString());
+	}
+	out = 0;
+	switch (kind) {
+	case ShredPrimitive::Varchar: {
+		auto value = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
+		if (value.GetSize() > std::numeric_limits<uint32_t>::max()) {
+			throw InvalidInputException("jsono: string value exceeds storage limits");
+		}
+		text_out->assign(value.GetData(), value.GetSize());
+		return;
+	}
+	case ShredPrimitive::Bigint:
+		out = uint64_t(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx]);
+		return;
+	case ShredPrimitive::Ubigint:
+		out = UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx];
+		return;
+	case ShredPrimitive::Double: {
+		auto value = UnifiedVectorFormat::GetData<double>(fmt)[idx];
+		if (!std::isfinite(value)) {
+			throw InvalidInputException("jsono: cannot store non-finite double value (NaN/Infinity)");
+		}
+		std::memcpy(&out, &value, sizeof(out));
+		return;
+	}
+	case ShredPrimitive::Boolean:
+		out = UnifiedVectorFormat::GetData<bool>(fmt)[idx] ? 1 : 0;
+		return;
+	}
+}
+
+void StoreScalarShredLaneValue(const ReconShred &shred, const UnifiedVectorFormat &fmt, idx_t idx, uint64_t &out,
                                string &text_out) {
 	text_out.clear();
-	StorePrimitiveLaneValue(shred.type, fmt, idx, out, &text_out);
+	StorePrimitiveLaneValueBits(shred.type, fmt, idx, out, &text_out);
 }
 
 uint32_t ResolveLWWRowSortKey(GroupMergeLWWState &state, nonstd::string_view K, uint32_t &sort_key_id) {
@@ -3070,30 +3252,35 @@ uint32_t ResolveLWWRowSortKey(GroupMergeLWWState &state, nonstd::string_view K, 
 	return sort_key_id;
 }
 
-void StoreLWWScalarLane(LWWScalarLane &lane, string *lane_text, const LWWScalarValue &value, nonstd::string_view text,
+void StoreLWWScalarLane(LWWScalarLane &lane, string *lane_text, uint64_t value_bits, nonstd::string_view text,
                         uint32_t sort_key_id) {
 	lane.has_value = true;
 	lane.sort_key_id = sort_key_id;
-	lane.value = value;
+	lane.value_bits = value_bits;
 	if (lane_text) {
 		lane_text->assign(text.data(), text.size());
 	}
 }
 
-void MergeLWWScalarLane(GroupMergeLWWState &state, LWWScalarLane &lane, string *lane_text,
-                        const LWWScalarValue &candidate, nonstd::string_view candidate_text, nonstd::string_view K,
-                        uint32_t &sort_key_id) {
-	if (!lane.has_value) {
-		StoreLWWScalarLane(lane, lane_text, candidate, candidate_text, ResolveLWWRowSortKey(state, K, sort_key_id));
+void MergeLWWScalarLane(GroupMergeLWWState &state, idx_t lane_idx, const vector<idx_t> &text_indices,
+                        const LogicalType &type, uint64_t candidate_bits, nonstd::string_view candidate_text,
+                        nonstd::string_view K, uint32_t &sort_key_id) {
+	auto *lane = FindLWWScalarLane(state, lane_idx);
+	if (!lane) {
+		lane = &FindOrCreateLWWScalarLane(state, lane_idx);
+		StoreLWWScalarLane(*lane, EnsureLWWScalarLaneText(state, text_indices, lane_idx), candidate_bits,
+		                   candidate_text, ResolveLWWRowSortKey(state, K, sort_key_id));
 		return;
 	}
-	int key_cmp = CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), K);
+	auto *lane_text = RequireLWWScalarLaneText(state, text_indices, lane_idx);
+	int key_cmp = CompareRawBytes(LWWLaneSortKey(state, lane->sort_key_id), K);
 	if (key_cmp > 0) {
 		return;
 	}
 	if (key_cmp < 0 ||
-	    CompareLWWScalarValueTie(lane.value, LWWScalarTextView(lane_text), candidate, candidate_text) < 0) {
-		StoreLWWScalarLane(lane, lane_text, candidate, candidate_text, ResolveLWWRowSortKey(state, K, sort_key_id));
+	    CompareLWWScalarLaneValueTie(*lane, LWWScalarTextView(lane_text), type, candidate_bits, candidate_text) < 0) {
+		StoreLWWScalarLane(*lane, lane_text, candidate_bits, candidate_text,
+		                   ResolveLWWRowSortKey(state, K, sort_key_id));
 	}
 }
 
@@ -3211,7 +3398,7 @@ void FoldManifestedScalarShredsLWW(GroupMergeLWWState &state, const vector<Recon
 	}
 	EnsureLWWScalarLanes(state, shreds.size(), text_count);
 	uint32_t sort_key_id = LWW_INVALID_SORT_KEY_ID;
-	LWWScalarValue candidate;
+	uint64_t candidate_bits;
 	string candidate_text;
 	idx_t shred_idx = 0;
 	for (auto &entry : manifest) {
@@ -3229,11 +3416,10 @@ void FoldManifestedScalarShredsLWW(GroupMergeLWWState &state, const vector<Recon
 		if (!RowIsValid(shred_fmt[shred_idx], row)) {
 			continue;
 		}
-		StoreScalarShredLaneValue(shred, shred_fmt[shred_idx], RowIndex(shred_fmt[shred_idx], row), candidate,
+		StoreScalarShredLaneValue(shred, shred_fmt[shred_idx], RowIndex(shred_fmt[shred_idx], row), candidate_bits,
 		                          candidate_text);
-		MergeLWWScalarLane(state, state.scalar_lanes[shred_idx], LWWScalarLaneText(state, text_indices, shred_idx),
-		                   candidate, nonstd::string_view(candidate_text.data(), candidate_text.size()), K,
-		                   sort_key_id);
+		MergeLWWScalarLane(state, shred_idx, text_indices, shred.type, candidate_bits,
+		                   nonstd::string_view(candidate_text.data(), candidate_text.size()), K, sort_key_id);
 	}
 }
 
@@ -3265,8 +3451,8 @@ bool CanSkipManifestedScalarShredsLWW(const GroupMergeLWWState &state, const vec
 		if (!RowIsValid(shred_fmt[shred_idx], row)) {
 			return false;
 		}
-		auto &lane = state.scalar_lanes[shred_idx];
-		if (!lane.has_value || CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), K) <= 0) {
+		auto *lane = FindLWWScalarLane(state, shred_idx);
+		if (!lane || CompareRawBytes(LWWLaneSortKey(state, lane->sort_key_id), K) <= 0) {
 			return false;
 		}
 	}
@@ -3631,7 +3817,7 @@ void EmitLWWTreeNodeWithListOverrides(const LWWTreeNode &node, JsonoBuilder &bui
 }
 
 int CompareLWWScalarLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWScalarLane &lane, const string *lane_text,
-                                   const LWWTreeNode &node) {
+                                   const ReconShred &shred, const LWWTreeNode &node) {
 	if (node.kind != LWWTreeKind::Leaf) {
 		ThrowMixedKindConflict();
 	}
@@ -3639,7 +3825,9 @@ int CompareLWWScalarLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWSca
 	if (key_cmp != 0) {
 		return key_cmp;
 	}
-	return CompareLWWScalarValueTie(lane.value, LWWScalarTextView(lane_text), node.value);
+	auto text = LWWScalarTextView(lane_text);
+	auto value = LWWScalarValueFromShredBits(shred.type, lane.value_bits, text);
+	return CompareLWWScalarValueTie(value, text, node.value);
 }
 
 int CompareLWWListLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWListLane &lane, const ReconShred &shred,
@@ -3688,7 +3876,33 @@ void WriteLWWScalarLaneValue(const LWWScalarValue &value, nonstd::string_view te
 
 void WriteLWWScalarLaneValue(const LWWScalarLane &lane, const string *lane_text, const ReconShred &shred, Vector &out,
                              idx_t rid) {
-	WriteLWWScalarLaneValue(lane.value, LWWScalarTextView(lane_text), shred.type, out, rid);
+	FlatVector::Validity(out).SetValid(rid);
+	ShredPrimitive primitive;
+	if (!TypeToShredPrimitive(shred.type, primitive)) {
+		throw InternalException("jsono_group_merge direct finalize: non-scalar type '%s'", shred.type.ToString());
+	}
+	switch (primitive) {
+	case ShredPrimitive::Varchar: {
+		auto text = LWWScalarTextView(lane_text);
+		FlatVector::GetData<string_t>(out)[rid] = StringVector::AddString(out, text.data(), text.size());
+		return;
+	}
+	case ShredPrimitive::Bigint:
+		FlatVector::GetData<int64_t>(out)[rid] = int64_t(lane.value_bits);
+		return;
+	case ShredPrimitive::Ubigint:
+		FlatVector::GetData<uint64_t>(out)[rid] = lane.value_bits;
+		return;
+	case ShredPrimitive::Double: {
+		double v;
+		std::memcpy(&v, &lane.value_bits, sizeof(v));
+		FlatVector::GetData<double>(out)[rid] = v;
+		return;
+	}
+	case ShredPrimitive::Boolean:
+		FlatVector::GetData<bool>(out)[rid] = lane.value_bits != 0;
+		return;
+	}
 }
 
 void WriteLWWListLaneValue(const LWWListLane &lane, const ReconShred &shred, Vector &out, idx_t rid) {
@@ -3790,44 +4004,6 @@ LWWPathLookup FindLWWPathNode(LWWTreeNode &root, const vector<PathStep> &steps) 
 	return {LWWPathLookupKind::Found, node};
 }
 
-void AppendLWWIndexedShredManifest(std::string &manifest, uint64_t layout_hash, idx_t shred_count,
-                                   const vector<idx_t> &shred_indices) {
-	auto bitset_byte_count = (shred_count + 7) / 8;
-	auto index_byte_count = shred_indices.size() * sizeof(uint16_t);
-	if (bitset_byte_count < index_byte_count) {
-		if (bitset_byte_count > std::numeric_limits<uint32_t>::max()) {
-			throw InvalidInputException("jsono shred: too many shreds for bitset manifest");
-		}
-		uint32_t bitset_marker = SHRED_MANIFEST_BITSET_MARKER;
-		uint32_t stored_byte_count = uint32_t(bitset_byte_count);
-		manifest.append(reinterpret_cast<const char *>(&bitset_marker), sizeof(bitset_marker));
-		manifest.append(reinterpret_cast<const char *>(&layout_hash), sizeof(layout_hash));
-		manifest.append(reinterpret_cast<const char *>(&stored_byte_count), sizeof(stored_byte_count));
-		auto bitset_start = manifest.size();
-		manifest.resize(bitset_start + bitset_byte_count, '\0');
-		for (auto index : shred_indices) {
-			if (index >= shred_count) {
-				throw InternalException("jsono shred: manifest index is out of bounds");
-			}
-			manifest[bitset_start + index / 8] =
-			    char(uint8_t(manifest[bitset_start + index / 8]) | uint8_t(1U << (index & 7U)));
-		}
-		return;
-	}
-	uint32_t index_marker = SHRED_MANIFEST_INDEX_MARKER;
-	uint32_t entry_count = uint32_t(shred_indices.size());
-	manifest.append(reinterpret_cast<const char *>(&index_marker), sizeof(index_marker));
-	manifest.append(reinterpret_cast<const char *>(&layout_hash), sizeof(layout_hash));
-	manifest.append(reinterpret_cast<const char *>(&entry_count), sizeof(entry_count));
-	for (auto index : shred_indices) {
-		if (index > std::numeric_limits<uint16_t>::max()) {
-			throw InvalidInputException("jsono shred: too many shreds for indexed manifest");
-		}
-		uint16_t stored = uint16_t(index);
-		manifest.append(reinterpret_cast<const char *>(&stored), sizeof(stored));
-	}
-}
-
 bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorFormat &state_fmt,
                                               GroupMergeLWWState *const *state_data,
                                               const GroupMergeLWWBindData &bind_data, idx_t count, idx_t offset) {
@@ -3902,13 +4078,14 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 			for (idx_t s = 0; s < scalar_shreds.size(); s++) {
 				auto &shred = scalar_shreds[s];
 				auto lookup = FindLWWPathNode(*state.root, shred.steps);
-				auto *lane = state.scalar_lanes && state.scalar_lanes[s].has_value ? &state.scalar_lanes[s] : nullptr;
-				auto *lane_text = lane ? LWWScalarLaneText(state, scalar_text_indices, s) : nullptr;
+				auto *lane = FindLWWScalarLane(state, s);
+				auto *lane_text = lane ? RequireLWWScalarLaneText(state, scalar_text_indices, s) : nullptr;
 				if (lane && lookup.kind == LWWPathLookupKind::PrefixLeaf) {
 					ThrowMixedKindConflict();
 				}
 				bool found = lookup.kind == LWWPathLookupKind::Found;
-				if (lane && (!found || CompareLWWScalarLaneToTreeLeaf(state, *lane, lane_text, *lookup.node) >= 0)) {
+				if (lane &&
+				    (!found || CompareLWWScalarLaneToTreeLeaf(state, *lane, lane_text, shred, *lookup.node) >= 0)) {
 					WriteLWWScalarLaneValue(*lane, lane_text, shred, *shred_out[shred.child], rid);
 					if (found) {
 						scalar_strip_paths.push_back(&shred.steps);
@@ -3959,8 +4136,8 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		if (!stripped_shred_indices.empty()) {
 			std::sort(stripped_shred_indices.begin(), stripped_shred_indices.end());
 			manifest.clear();
-			AppendLWWIndexedShredManifest(manifest, manifest_layout_hash, bind_data.shreds.size(),
-			                              stripped_shred_indices);
+			JsonoAppendIndexedShredManifest(manifest, manifest_layout_hash, bind_data.shreds.size(),
+			                                stripped_shred_indices);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(rid, builder, manifest_ptr);
@@ -4122,7 +4299,7 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 				src.has_input = false;
 			} else {
 				tgt.root = CloneLWWTreeNode(*src.root).release();
-				MergeLWWScalarLanes(tgt, src, scalar_text_indices);
+				MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices);
 				MergeLWWListLanes(tgt, src, list_shreds);
 			}
 			tgt.has_input = true;
@@ -4133,14 +4310,14 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 		}
 		if (destructive) {
 			MergeLWWTreeIntoTreeDestructive(*tgt.root, *src.root);
-			MergeLWWScalarLanesDestructive(tgt, src, scalar_text_indices);
+			MergeLWWScalarLanesDestructive(tgt, src, scalar_shreds, scalar_text_indices);
 			MergeLWWListLanesDestructive(tgt, src, list_shreds);
 			delete src.root;
 			src.root = nullptr;
 			src.has_input = false;
 		} else {
 			MergeLWWTreeIntoTree(*tgt.root, *src.root);
-			MergeLWWScalarLanes(tgt, src, scalar_text_indices);
+			MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices);
 			MergeLWWListLanes(tgt, src, list_shreds);
 		}
 	}

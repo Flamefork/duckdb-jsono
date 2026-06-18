@@ -1452,14 +1452,12 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	}
 
 	// Manifest bytes: per-shred entry once, plus the full all-stripped manifest (the hot case).
-	vector<std::string> manifest_entries(shred_count);
+	vector<JsonoShredManifestEntryBytes> manifest_entries(shred_count);
 	std::string hot_manifest;
-	uint32_t hot_entry_count = uint32_t(shred_count);
-	hot_manifest.append(reinterpret_cast<const char *>(&hot_entry_count), sizeof(hot_entry_count));
 	for (idx_t f = 0; f < shred_count; f++) {
 		manifest_entries[f] = JsonoShredManifestEntry(shreds[f].first, shreds[f].second);
-		hot_manifest.append(manifest_entries[f]);
 	}
+	JsonoAppendShredManifest(hot_manifest, manifest_entries);
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
@@ -1475,6 +1473,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	string_t hot_blobs[BODY_BLOB_COUNT];
 
 	vector<uint8_t> stripped(shred_count);
+	vector<idx_t> stripped_fields;
 	std::string manifest;
 	for (idx_t row = 0; row < count; row++) {
 		if (!parent_fmt.validity.RowIsValid(parent_fmt.sel->get_index(row))) {
@@ -1486,6 +1485,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			continue;
 		}
 		idx_t stripped_count = 0;
+		stripped_fields.clear();
 		for (idx_t f = 0; f < shred_count; f++) {
 			auto &src = sources[f];
 			auto idx = src.fmt.sel->get_index(row);
@@ -1496,6 +1496,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			}
 			stripped[f] = 1;
 			stripped_count++;
+			stripped_fields.push_back(f);
 			if (src.raw_uint) {
 				FlatVector::GetData<uint64_t>(*shred_out[f])[row] = src.uint_data[idx];
 				continue;
@@ -1579,13 +1580,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		const std::string *manifest_ptr = nullptr;
 		if (stripped_count > 0) {
 			manifest.clear();
-			uint32_t entry_count = uint32_t(stripped_count);
-			manifest.append(reinterpret_cast<const char *>(&entry_count), sizeof(entry_count));
-			for (idx_t f = 0; f < shred_count; f++) {
-				if (stripped[f]) {
-					manifest.append(manifest_entries[f]);
-				}
-			}
+			JsonoAppendShredManifest(manifest, manifest_entries, stripped_fields);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, builder, manifest_ptr);

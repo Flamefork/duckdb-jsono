@@ -102,10 +102,22 @@ struct JsonoArrayShredSpec {
 // never match (they cannot form the scalar-vs-nested overlap).
 bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b);
 
-// Serialized shred-manifest entry bytes for one shred (u16 path_len, path, u16 type_len,
-// type name); a row's manifest is a u32 entry count followed by the entries of the paths
-// stripped from that row's residual.
-std::string JsonoShredManifestEntry(const string &path, const LogicalType &type);
+struct JsonoShredManifestEntryBytes {
+	std::string full;
+	std::string compact;
+};
+
+JsonoShredManifestEntryBytes JsonoShredManifestEntry(const string &path, const LogicalType &type);
+
+void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries);
+
+void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries,
+                              const vector<idx_t> &entry_indices);
+
+uint64_t JsonoShredManifestLayoutHash(const vector<std::pair<string, LogicalType>> &shreds);
+
+void JsonoAppendIndexedShredManifest(std::string &manifest, uint64_t layout_hash, idx_t shred_count,
+                                     const vector<idx_t> &shred_indices);
 
 // Shred a plain JSONO `input` vector into the shredded `result` STRUCT (the four-BLOB
 // residual prefix followed by one shred column per `shreds` entry, in order). Each shred is

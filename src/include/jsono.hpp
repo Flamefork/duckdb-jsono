@@ -483,10 +483,10 @@ inline uint64_t HashShredManifestSignatures(const std::vector<std::pair<std::str
 	return h;
 }
 
-// The shred manifest is the tail of the skips blob, after the checkpoint sections:
-//   u32 entry_count, then per entry: u16 path_len, path bytes, u16 type_len, type bytes.
-// Entries are sorted by path (the shred writer emits fields in canonical order). A plain value
-// writes no manifest (the skips blob ends at the checkpoints), which reads as zero entries.
+// The shred manifest is the tail of the skips blob, after the checkpoint sections. It is either a
+// full path/type entry list, a compact type-code entry list, or an indexed/bitset list keyed by the
+// canonical shred layout hash (see docs/jsono_format.md). Entries follow canonical shred order. A
+// plain value writes no manifest (the skips blob ends at the checkpoints), which reads as zero entries.
 // The manifest is the write-time record of which paths are NOT in the residual: a reader holding
 // fewer (or differently typed) shreds than the manifest lists cannot reproduce the value — that row
 // was narrowed by a raw struct cast — and must fail loud instead of silently dropping the value.

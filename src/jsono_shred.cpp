@@ -324,28 +324,10 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 			throw BinderException("jsono shred: value must be JSON text or a jsono value");
 		}
 		// Reshred a shredded value in one pass: surviving shreds copy through, dropped/retyped
-		// shreds (return_src) fold back into the residual via a partial overlay, and new target
-		// paths extract from that residual. A plain value takes the plain shred path.
-		bool involves_array = false;
-		for (auto &field : bind_data->fields) {
-			if (field.kind != ShredKind::Scalar) {
-				involves_array = true;
-				break;
-			}
-		}
-		if (!involves_array) {
-			for (auto &shred : src_layout.shreds) {
-				if (IsShredListType(shred.second)) {
-					involves_array = true;
-					break;
-				}
-			}
-		}
-		if (src_layout.kind == JsonoLayoutKind::Shredded && involves_array) {
-			// Conservative: reconstruct the shredded source to plain (the binder inserts the cast)
-			// and take the plain array shred path, rather than a single-pass keep-shreds copy.
-			bound_function.arguments[0] = JsonoType();
-		} else if (src_layout.kind == JsonoLayoutKind::Shredded) {
+		// scalar shreds (return_src) fold back into the residual via a partial overlay, and new
+		// scalar target paths extract from that residual. Array shreds can ride this path only when
+		// they survive unchanged: their residual skeleton and list lane are copied as a pair.
+		if (src_layout.kind == JsonoLayoutKind::Shredded) {
 			bind_data->keep_src.assign(bind_data->fields.size(), DConstants::INVALID_INDEX);
 			vector<bool> src_kept(src_layout.shreds.size(), false);
 			for (idx_t f = 0; f < bind_data->fields.size(); f++) {
@@ -357,6 +339,24 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 						break;
 					}
 				}
+			}
+			bool can_single_pass = true;
+			for (idx_t f = 0; f < bind_data->fields.size(); f++) {
+				if (bind_data->fields[f].kind != ShredKind::Scalar &&
+				    bind_data->keep_src[f] == DConstants::INVALID_INDEX) {
+					can_single_pass = false;
+					break;
+				}
+			}
+			for (idx_t k = 0; k < src_layout.shreds.size() && can_single_pass; k++) {
+				if (IsShredListType(src_layout.shreds[k].second) && !src_kept[k]) {
+					can_single_pass = false;
+				}
+			}
+			if (!can_single_pass) {
+				bind_data->keep_src.clear();
+				bound_function.arguments[0] = JsonoType();
+				return std::move(bind_data);
 			}
 			for (idx_t k = 0; k < src_layout.shreds.size(); k++) {
 				if (!src_kept[k]) {
@@ -629,7 +629,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 	// Per-field manifest entry bytes, built once: the per-row manifest concatenates the entries
 	// of the paths actually stripped from that row's residual (fields are already in canonical
 	// sorted order, so the manifest is too).
-	vector<std::string> manifest_entries(fields.size());
+	vector<JsonoShredManifestEntryBytes> manifest_entries(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
 	}
@@ -714,11 +714,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_fields.empty()) {
 			manifest.clear();
-			uint32_t entry_count = uint32_t(stripped_fields.size());
-			manifest.append(reinterpret_cast<const char *>(&entry_count), sizeof(entry_count));
-			for (auto f : stripped_fields) {
-				manifest.append(manifest_entries[f]);
-			}
+			JsonoAppendShredManifest(manifest, manifest_entries, stripped_fields);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, lstate.builder, manifest_ptr);
@@ -770,7 +766,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		}
 	}
 
-	vector<std::string> manifest_entries(fields.size());
+	vector<JsonoShredManifestEntryBytes> manifest_entries(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
 	}
@@ -843,7 +839,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 				// sits at its path in the residual — which can only be a value the source diverted
 				// (case B), since a captured value would have been stripped. That makes the row not
 				// value-complete: a bare struct_extract would miss the residual value.
-				if (fields[f].primitive != ShredPrimitive::Varchar &&
+				if (fields[f].kind == ShredKind::Scalar && fields[f].primitive != ShredPrimitive::Varchar &&
 				    !FlatVector::Validity(*shred_out[f]).RowIsValid(row)) {
 					auto location = LocatePath(view, fields[f].steps);
 					if (location.found) {
@@ -887,11 +883,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			if (reads_merged && !stripped_fields.empty()) {
 				manifest.clear();
 				manifest.append(blob.skips.GetData(), blob.skips.GetSize());
-				uint32_t entry_count = uint32_t(stripped_fields.size());
-				manifest.append(reinterpret_cast<const char *>(&entry_count), sizeof(entry_count));
-				for (auto f : stripped_fields) {
-					manifest.append(manifest_entries[f]);
-				}
+				JsonoAppendShredManifest(manifest, manifest_entries, stripped_fields);
 				writer.data[BODY_SKIPS][row] = WriteBlobInto(writer.Skips(), manifest.data(), manifest.size());
 			} else {
 				writer.data[BODY_SKIPS][row] =
@@ -905,11 +897,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_fields.empty()) {
 			manifest.clear();
-			uint32_t entry_count = uint32_t(stripped_fields.size());
-			manifest.append(reinterpret_cast<const char *>(&entry_count), sizeof(entry_count));
-			for (auto f : stripped_fields) {
-				manifest.append(manifest_entries[f]);
-			}
+			JsonoAppendShredManifest(manifest, manifest_entries, stripped_fields);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, lstate.builder, manifest_ptr);
@@ -971,7 +959,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	Vector *vc_out = &JsonoVcVector(result);
 	vc_out->SetVectorType(VectorType::FLAT_VECTOR);
 
-	vector<std::string> manifest_entries(fields.size());
+	vector<JsonoShredManifestEntryBytes> manifest_entries(fields.size());
 	jsono_dom::DomShredContext ctx;
 	ctx.nodes = &bind_data.trie;
 	ctx.manifest_entries = &manifest_entries;
@@ -1208,19 +1196,158 @@ bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b) {
 	return true;
 }
 
-std::string JsonoShredManifestEntry(const string &path, const LogicalType &type) {
-	std::string entry;
-	auto append_lv = [&](const string &text) {
-		if (text.size() > std::numeric_limits<uint16_t>::max()) {
-			throw InvalidInputException("jsono shred: path or type name exceeds manifest limits");
+namespace {
+
+uint8_t ShredManifestCompactTypeCode(const string &type) {
+	if (type == "VARCHAR") {
+		return jsono::SHRED_MANIFEST_TYPE_VARCHAR;
+	}
+	if (type == "BIGINT") {
+		return jsono::SHRED_MANIFEST_TYPE_BIGINT;
+	}
+	if (type == "UBIGINT") {
+		return jsono::SHRED_MANIFEST_TYPE_UBIGINT;
+	}
+	if (type == "DOUBLE") {
+		return jsono::SHRED_MANIFEST_TYPE_DOUBLE;
+	}
+	if (type == "BOOLEAN") {
+		return jsono::SHRED_MANIFEST_TYPE_BOOLEAN;
+	}
+	if (type == "VARCHAR[]") {
+		return jsono::SHRED_MANIFEST_TYPE_VARCHAR_LIST;
+	}
+	if (type == "BIGINT[]") {
+		return jsono::SHRED_MANIFEST_TYPE_BIGINT_LIST;
+	}
+	if (type == "UBIGINT[]") {
+		return jsono::SHRED_MANIFEST_TYPE_UBIGINT_LIST;
+	}
+	if (type == "DOUBLE[]") {
+		return jsono::SHRED_MANIFEST_TYPE_DOUBLE_LIST;
+	}
+	if (type == "BOOLEAN[]") {
+		return jsono::SHRED_MANIFEST_TYPE_BOOLEAN_LIST;
+	}
+	return jsono::SHRED_MANIFEST_TYPE_EXTENDED;
+}
+
+void AppendManifestLV(std::string &out, const string &text) {
+	if (text.size() > std::numeric_limits<uint16_t>::max()) {
+		throw InvalidInputException("jsono shred: path or type name exceeds manifest limits");
+	}
+	uint16_t len = uint16_t(text.size());
+	out.append(reinterpret_cast<const char *>(&len), sizeof(len));
+	out.append(text);
+}
+
+template <class EntryAt>
+void JsonoAppendShredManifestInternal(std::string &manifest, idx_t entry_count, EntryAt entry_at) {
+	if (entry_count > std::numeric_limits<uint32_t>::max()) {
+		throw InvalidInputException("jsono shred: too many manifest entries");
+	}
+	size_t full_size = sizeof(uint32_t);
+	size_t compact_size = sizeof(uint32_t) * 2;
+	for (idx_t i = 0; i < entry_count; i++) {
+		auto &entry = entry_at(i);
+		full_size += entry.full.size();
+		compact_size += entry.compact.size();
+	}
+	if (compact_size < full_size) {
+		uint32_t marker = jsono::SHRED_MANIFEST_COMPACT_TYPE_MARKER;
+		uint32_t stored_count = uint32_t(entry_count);
+		manifest.append(reinterpret_cast<const char *>(&marker), sizeof(marker));
+		manifest.append(reinterpret_cast<const char *>(&stored_count), sizeof(stored_count));
+		for (idx_t i = 0; i < entry_count; i++) {
+			manifest.append(entry_at(i).compact);
 		}
-		uint16_t len = uint16_t(text.size());
-		entry.append(reinterpret_cast<const char *>(&len), sizeof(len));
-		entry.append(text);
-	};
-	append_lv(path);
-	append_lv(type.ToString());
+		return;
+	}
+	uint32_t stored_count = uint32_t(entry_count);
+	manifest.append(reinterpret_cast<const char *>(&stored_count), sizeof(stored_count));
+	for (idx_t i = 0; i < entry_count; i++) {
+		manifest.append(entry_at(i).full);
+	}
+}
+
+} // namespace
+
+JsonoShredManifestEntryBytes JsonoShredManifestEntry(const string &path, const LogicalType &type) {
+	auto type_name = type.ToString();
+	JsonoShredManifestEntryBytes entry;
+	AppendManifestLV(entry.full, path);
+	AppendManifestLV(entry.full, type_name);
+	AppendManifestLV(entry.compact, path);
+	auto type_code = ShredManifestCompactTypeCode(type_name);
+	entry.compact.push_back(char(type_code));
+	if (type_code == jsono::SHRED_MANIFEST_TYPE_EXTENDED) {
+		AppendManifestLV(entry.compact, type_name);
+	}
 	return entry;
+}
+
+void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries) {
+	JsonoAppendShredManifestInternal(manifest, entries.size(),
+	                                 [&](idx_t i) -> const JsonoShredManifestEntryBytes & { return entries[i]; });
+}
+
+void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries,
+                              const vector<idx_t> &entry_indices) {
+	JsonoAppendShredManifestInternal(
+	    manifest, entry_indices.size(), [&](idx_t i) -> const JsonoShredManifestEntryBytes & {
+		    auto index = entry_indices[i];
+		    if (index >= entries.size()) {
+			    throw InternalException("jsono shred: manifest entry index is out of bounds");
+		    }
+		    return entries[index];
+	    });
+}
+
+uint64_t JsonoShredManifestLayoutHash(const vector<std::pair<string, LogicalType>> &shreds) {
+	vector<std::pair<std::string, std::string>> signatures;
+	signatures.reserve(shreds.size());
+	for (auto &shred : shreds) {
+		signatures.emplace_back(shred.first, shred.second.ToString());
+	}
+	return jsono::HashShredManifestSignatures(signatures);
+}
+
+void JsonoAppendIndexedShredManifest(std::string &manifest, uint64_t layout_hash, idx_t shred_count,
+                                     const vector<idx_t> &shred_indices) {
+	auto bitset_byte_count = (shred_count + 7) / 8;
+	auto index_byte_count = shred_indices.size() * sizeof(uint16_t);
+	if (bitset_byte_count < index_byte_count) {
+		if (bitset_byte_count > std::numeric_limits<uint32_t>::max()) {
+			throw InvalidInputException("jsono shred: too many shreds for bitset manifest");
+		}
+		uint32_t bitset_marker = jsono::SHRED_MANIFEST_BITSET_MARKER;
+		uint32_t stored_byte_count = uint32_t(bitset_byte_count);
+		manifest.append(reinterpret_cast<const char *>(&bitset_marker), sizeof(bitset_marker));
+		manifest.append(reinterpret_cast<const char *>(&layout_hash), sizeof(layout_hash));
+		manifest.append(reinterpret_cast<const char *>(&stored_byte_count), sizeof(stored_byte_count));
+		auto bitset_start = manifest.size();
+		manifest.resize(bitset_start + bitset_byte_count, '\0');
+		for (auto index : shred_indices) {
+			if (index >= shred_count) {
+				throw InternalException("jsono shred: manifest index is out of bounds");
+			}
+			manifest[bitset_start + index / 8] =
+			    char(uint8_t(manifest[bitset_start + index / 8]) | uint8_t(1U << (index & 7U)));
+		}
+		return;
+	}
+	uint32_t index_marker = jsono::SHRED_MANIFEST_INDEX_MARKER;
+	uint32_t entry_count = uint32_t(shred_indices.size());
+	manifest.append(reinterpret_cast<const char *>(&index_marker), sizeof(index_marker));
+	manifest.append(reinterpret_cast<const char *>(&layout_hash), sizeof(layout_hash));
+	manifest.append(reinterpret_cast<const char *>(&entry_count), sizeof(entry_count));
+	for (auto index : shred_indices) {
+		if (index > std::numeric_limits<uint16_t>::max()) {
+			throw InvalidInputException("jsono shred: too many shreds for indexed manifest");
+		}
+		uint16_t stored = uint16_t(index);
+		manifest.append(reinterpret_cast<const char *>(&stored), sizeof(stored));
+	}
 }
 
 void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<string, LogicalType>> &shreds,
