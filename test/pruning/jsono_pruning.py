@@ -1,7 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# ///
-
 # Row-group pruning regression guard. Shred-leaf filter pushdown is a perf
 # property the SQLLogic suite cannot see (SQLLogic has no access to the profiler
 # metrics), and it is fragile: a format change that makes a shred non-leaf, or a

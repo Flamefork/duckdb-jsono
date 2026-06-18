@@ -1,8 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["hypothesis>=6.100"]
-# ///
-
 from decimal import Decimal
 from json import dumps as json_dumps
 from json import loads as json_loads

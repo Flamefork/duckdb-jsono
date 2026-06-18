@@ -26,8 +26,8 @@ against the built CLI (`JSONO_DUCKDB_BIN` / `JSONO_EXTENSION` override the binar
 and extension paths; both default to the release build):
 
 ```bash
-uv run --no-project test/property/jsono_property.py   # hypothesis property/fuzz harness
-uv run --no-project test/pruning/jsono_pruning.py     # row-group pruning regression guard
+uv run --frozen test/property/jsono_property.py   # hypothesis property/fuzz harness
+uv run --frozen test/pruning/jsono_pruning.py     # row-group pruning regression guard
 ```
 
 `test/pruning/jsono_pruning.py` writes a clustered shredded Parquet and asserts,
