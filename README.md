@@ -301,6 +301,21 @@ SELECT to_json(jsono('{"kind":"commit","time_us":1700,"extra":"e1"}',
 
 Transparent reads over a shredded value go through the bundled `json` extension (present in every standard DuckDB distribution) and the extension's query optimizer. The shredded shape — the `jsono` layout wrapping the `body` blobs and the named `shreds` columns — survives a plain Parquet round-trip and reads back transparently; the scalar shred leaves keep projection and filter pushdown.
 
+Two things decide whether a filter actually **prunes** Parquet row groups (skips them on the per-row-group min/max statistics) rather than scanning the whole file:
+
+- **Filter a typed shred in its own type.** A `VARCHAR` shred prunes on the plain `payload ->> '$.kind' = 'commit'`. A numeric/boolean shred prunes only when the comparison is in the shred's type — `CAST(payload ->> '$.time_us' AS BIGINT) = 1700`, not the string form `payload ->> '$.time_us' = '1700'`. `->>` is textual, so the string form compares the shred *rendered back to text* (a computed expression the scan cannot push down) and reads every row group. Compare with `CAST(... AS <shred type>)` (or project the typed value with `jsono_transform`) to get pruning on a typed shred.
+- **Cluster the rows on the leaf at write time.** Pruning needs each row group to hold a disjoint range of the filtered path, so add `ORDER BY` on that path to the `CREATE TABLE … AS SELECT` (or the `COPY`). Without clustering every row group spans the whole domain and none can be skipped. Clustering also improves compression, so one `ORDER BY` on the dominant filter path pays off twice.
+
+```sql
+CREATE TABLE events AS
+SELECT jsono(payload, shredding := {'$.kind': 'VARCHAR', '$.time_us': 'BIGINT'}) AS payload
+FROM read_parquet('events.parquet')
+ORDER BY CAST(payload ->> '$.time_us' AS BIGINT);   -- cluster on the hot filter path
+
+-- prunes to the matching row groups (typed shred compared as BIGINT)
+SELECT count(*) FROM events WHERE CAST(payload ->> '$.time_us' AS BIGINT) BETWEEN 1700 AND 1800;
+```
+
 Values shredded differently compose freely. A set operation, `CASE` or `COALESCE` over differently-shredded values merges into one shredded type on the union of the shred sets, and an `INSERT` into a column with any other shred set — fully disjoint included — lands losslessly: the optimizer rewrites the struct cast into a reshred against the column's shred set (single-pass when the target keeps every source shred), and a path with no shred column in the target simply stays in the residual.
 
 The safety net for the raw struct cast (no extension optimizer: another process, `SET disabled_optimizers='extension'`) is the *shred manifest*: each shredded value records, inside its residual, which paths were stripped into shred columns and as what type. A cast that silently drops or retypes a shred column leaves that record contradicting the data, and every JSONO reader verifies it — reading such a narrowed row raises an error instead of silently returning partial data. The manifest lives in the value's own blobs, so the protection rides with the data through Parquet and DuckLake. Shred order does not matter: the shred field order is canonicalized (sorted by name), so the same shred set always yields the *identical* type — `jsono_storage_type(<shred DDL>)` and `CREATE TABLE … AS SELECT` produce the same column type regardless of the order shreds are written in.

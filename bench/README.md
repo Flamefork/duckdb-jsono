@@ -113,6 +113,11 @@ Operations paired with a core DuckDB `json` baseline (target `json`):
 - `project_paths`: filterless multi-extract projection `SELECT j->>'p1', ..., j->>'pN'` (no WHERE)
   vs the same `->>` list over core JSON text. The `jsono` input is materialized before the timed
   section; the shredded variant is JSONO-only.
+- `prune_filter`: row-group pruning over a shredded, `event_ts`-clustered Parquet (written untimed in
+  prepare). The timed query is a selective band filter that scans that Parquet directly; the
+  `synthetic_shredded`/`synthetic_native` pair filters the typed shred leaf vs the plain control column
+  and prunes identically. JSONO-only; run with `--row-groups` (see `bench/PROFILING.md`) to print
+  `scanned/total` row groups next to the timing.
 
 ## Correctness gate
 

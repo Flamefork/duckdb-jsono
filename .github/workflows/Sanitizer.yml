@@ -70,3 +70,9 @@ jobs:
           JSONO_EXTENSION: build/debug/extension/jsono/jsono.duckdb_extension
           JSONO_PROPERTY_MAX_EXAMPLES: "1000"
         run: uv run --no-project test/property/jsono_property.py
+
+      - name: Row-group pruning guard under sanitizers
+        env:
+          JSONO_DUCKDB_BIN: build/debug/duckdb
+          JSONO_EXTENSION: build/debug/extension/jsono/jsono.duckdb_extension
+        run: uv run --no-project test/pruning/jsono_pruning.py

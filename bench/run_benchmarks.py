@@ -29,6 +29,14 @@ from sql_literals import sql_identifier, sql_json, sql_string, sql_typed_literal
 DEFAULT_SEED = 42
 TargetKind = Literal["jsono", "json"]
 
+# Profiling settings requested for --row-groups. These two operator metrics are
+# not in the default/detailed set, so they are enabled explicitly per query.
+ROW_GROUP_PROFILING_SETTINGS = (
+    '{"OPERATOR_NAME":"true","OPERATOR_TYPE":"true",'
+    '"OPERATOR_ROW_GROUPS_SCANNED":"true",'
+    '"OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN":"true"}'
+)
+
 
 @dataclass(frozen=True)
 class Target:
@@ -694,6 +702,61 @@ def build_jsono_filter_paths_query(
     )
 
 
+def prune_filter_predicate_sql(scenario_config: dict) -> str:
+    low, high = scenario_config["filter_band"]
+    if scenario_config["filter_kind"] == "shred":
+        leaf = sql_string(scenario_config["shred_leaf"])
+        column = f"CAST(t->>{leaf} AS {scenario_config['shred_leaf_type']})"
+    else:
+        column = sql_identifier(scenario_config["native_column"])
+    return f"{column} BETWEEN {low} AND {high}"
+
+
+def build_jsono_prune_filter_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    # Row-group pruning measurement (see --row-groups). The prepare COPY is untimed:
+    # it shreds the typed leaf, carries the same value in a native control column,
+    # and clusters rows by the leaf so every Parquet row group holds a disjoint
+    # range. The timed query scans that Parquet directly under a selective band
+    # filter, so the parquet reader's per-row-group stats skip the other groups —
+    # the shred leaf and the native column prune identically when filter_kind flips.
+    json_column = scenario_config["json_column"]
+    leaf = sql_string(scenario_config["shred_leaf"])
+    leaf_type = scenario_config["shred_leaf_type"]
+    shred_spec = sql_typed_literal({scenario_config["shred_leaf"]: leaf_type})
+    native_column = sql_identifier(scenario_config["native_column"])
+    cluster_expr = f"CAST({json_column}->>{leaf} AS {leaf_type})"
+    copy_path = sql_string(str(scenario_config["copy_path"]))
+    prepare = f"""
+        COPY (
+            SELECT
+                jsono({json_column}::VARCHAR, shredding := {shred_spec}) AS t,
+                {cluster_expr} AS {native_column}
+            FROM {table_sql(data_path)}
+            ORDER BY {cluster_expr}
+        )
+        TO {copy_path}
+        (
+            FORMAT parquet,
+            COMPRESSION {scenario_config["copy_compression"]},
+            COMPRESSION_LEVEL {scenario_config["copy_compression_level"]},
+            ROW_GROUP_SIZE {scenario_config["copy_row_group_size"]},
+            OVERWRITE_OR_IGNORE true
+        )
+    """
+    predicate = prune_filter_predicate_sql(scenario_config)
+    return BenchmarkQuery(
+        prepare_sql=(prepare,),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT count(*) AS matched
+            FROM read_parquet({copy_path})
+            WHERE {predicate}
+        """,
+    )
+
+
 def merge_patch_one_patch_sql(patch: object) -> str:
     # A tagged patch picks how it is built (and thus the shredded type the merge sees):
     # {"plain": v} parses text -> a plain jsono value; {"shredded"/"auto_shred": v} runs the
@@ -876,6 +939,8 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_project_paths_query(scenario_config, data_path)
         case "filter_paths":
             return build_jsono_filter_paths_query(scenario_config, data_path)
+        case "prune_filter":
+            return build_jsono_prune_filter_query(scenario_config, data_path)
         case "merge_patch":
             return build_jsono_merge_patch_query(scenario_config, data_path)
         case "reshred":
@@ -1058,6 +1123,62 @@ def collect_duckdb_profile(
     conn.execute("PRAGMA disable_profiling")
 
 
+def parse_row_group_scans(profile_path: Path) -> list[dict]:
+    if not profile_path.exists():
+        return []
+    text = profile_path.read_text()
+    if not text.strip():
+        return []
+    document = json.loads(text)
+    scans: list[dict] = []
+
+    def walk(node: dict) -> None:
+        if node.get("operator_type") == "TABLE_SCAN":
+            scanned = node.get("operator_row_groups_scanned")
+            total = node.get("operator_total_row_groups_to_scan")
+            if scanned is not None and total is not None:
+                scans.append(
+                    {
+                        "operator": node.get("operator_name", "TABLE_SCAN"),
+                        "scanned": int(scanned),
+                        "total": int(total),
+                    }
+                )
+        for child in node.get("children", []):
+            walk(child)
+
+    walk(document)
+    return scans
+
+
+def collect_row_group_metrics(
+    conn: duckdb.DuckDBPyConnection, query: BenchmarkQuery, profile_path: Path
+) -> list[dict]:
+    # OPERATOR_ROW_GROUPS_SCANNED / OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN are populated
+    # by the parquet reader (and the native table scan) since DuckDB 1.5.4, but
+    # they are not in the default/detailed profiling set — they must be requested
+    # explicitly, and they do not appear in the query_tree text rendering, only in
+    # the JSON profile. They are meaningful only for a timed query that scans a
+    # Parquet (or native) table directly under a pushable filter; a query that
+    # filters an in-memory temp table emits no TABLE_SCAN node here and yields [].
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    prepare_case(conn, query)
+    conn.execute("PRAGMA enable_profiling='json'")
+    conn.execute(f"PRAGMA custom_profiling_settings='{ROW_GROUP_PROFILING_SETTINGS}'")
+    conn.execute(f"PRAGMA profiling_output={sql_string(str(profile_path))}")
+    conn.execute(query.timed_sql).fetchall()
+    conn.execute("PRAGMA disable_profiling")
+    return parse_row_group_scans(profile_path)
+
+
+def format_row_groups(scans: list[dict]) -> str:
+    if not scans:
+        return "row_groups —"
+    return "row_groups " + ", ".join(
+        f"{scan['scanned']}/{scan['total']}" for scan in scans
+    )
+
+
 def run_single_benchmark(
     conn: duckdb.DuckDBPyConnection, query: BenchmarkQuery, runs: int
 ) -> dict:
@@ -1102,6 +1223,7 @@ def run_benchmarks(
     runs: int,
     thread_modes: list[int],
     profile: bool = False,
+    collect_row_groups: bool = False,
 ) -> list[dict]:
     results = []
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1149,6 +1271,17 @@ def run_benchmarks(
                     collect_duckdb_profile(conn, query, duckdb_profile_path)
                     print(f"{duckdb_profile_path}")
 
+                row_group_scans: list[dict] = []
+                if collect_row_groups:
+                    row_group_path = (
+                        PROFILES_DIR
+                        / f"{case_id.replace('/', '_')}_t{threads}"
+                        / "row_groups.json"
+                    )
+                    row_group_scans = collect_row_group_metrics(
+                        conn, query, row_group_path
+                    )
+
                 timing = run_single_benchmark(conn, query, runs)
                 rows_per_second = None
                 if row_count is not None and timing["min_ms"] > 0:
@@ -1167,7 +1300,14 @@ def run_benchmarks(
                     if output_bytes is not None
                     else ""
                 )
-                print(f"{timing['median_ms']:.1f}ms{throughput_text}{size_text}")
+                row_group_text = (
+                    f", {format_row_groups(row_group_scans)}"
+                    if collect_row_groups
+                    else ""
+                )
+                print(
+                    f"{timing['median_ms']:.1f}ms{throughput_text}{size_text}{row_group_text}"
+                )
 
                 results.append(
                     {
@@ -1185,6 +1325,7 @@ def run_benchmarks(
                         "timestamp": timestamp,
                         "rows_per_second": rows_per_second,
                         "output_bytes": output_bytes,
+                        "row_groups": row_group_scans or None,
                     }
                 )
     finally:
@@ -1230,6 +1371,7 @@ def save_results_json(
                 "row_count": r["row_count"],
                 "rows_per_second": r["rows_per_second"],
                 "output_bytes": r["output_bytes"],
+                "row_groups": r.get("row_groups"),
             }
             for r in results
         ],
@@ -1393,6 +1535,12 @@ def main() -> None:
         "--profile", action="store_true", help="Collect DuckDB query profiles"
     )
     parser.add_argument(
+        "--row-groups",
+        action="store_true",
+        help="Print parquet row groups scanned/total next to each timing "
+        "(pruning measurement; '—' when the timed query has no direct table scan)",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List selected benchmark cases without running them",
@@ -1460,7 +1608,12 @@ def main() -> None:
         print(f"Profile mode: reducing runs to {runs}")
 
     results = run_benchmarks(
-        targets, cases_to_run, runs, thread_modes, profile=args.profile
+        targets,
+        cases_to_run,
+        runs,
+        thread_modes,
+        profile=args.profile,
+        collect_row_groups=args.row_groups,
     )
     if results:
         sizes_used = sorted(set(size for _, size, _ in cases_to_run))

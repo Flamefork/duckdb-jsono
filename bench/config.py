@@ -380,6 +380,23 @@ FIELD_SAMPLE_STRUCT_CORE_SPEC = {
     "product_all_category": "VARCHAR",
 }
 
+# Row-group pruning scenario. Shred the monotonic `event_ts` leaf as a typed
+# BIGINT sibling and cluster the rows by it on write, so each Parquet row group
+# holds a disjoint event_ts range and a selective band filter skips the others.
+# The native control column carries the same value as a plain BIGINT, so the
+# shred-leaf filter and the native-column filter prune identically — the metric
+# (OPERATOR_ROW_GROUPS_SCANNED / OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN, surfaced by
+# --row-groups) shows scanned < total under the filter, scanned == total without.
+# The band targets ~1 of 9 row groups for the seed-42 events_100k event_ts range
+# (≈1.716e9..1.7186e9); it is a property of that generated data, not a runtime
+# computation, so regenerating events with a different seed may shift it.
+PRUNE_FILTER_COPY_PATH = RESULTS_DIR / "synthetic_prune.parquet"
+PRUNE_FILTER_SHRED_LEAF = "$.event_ts"
+PRUNE_FILTER_SHRED_TYPE = "BIGINT"
+PRUNE_FILTER_NATIVE_COLUMN = "event_ts_native"
+PRUNE_FILTER_BAND = (1_717_000_000, 1_717_120_000)
+PRUNE_FILTER_ROW_GROUP_SIZE = 12_000
+
 FIELD_SAMPLE_STRUCT_PRODUCTS_SPEC = {
     "event_name": "VARCHAR",
     "url": "VARCHAR",
