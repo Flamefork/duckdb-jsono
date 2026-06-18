@@ -2307,59 +2307,6 @@ bool LWWScalarValueHasLength(const LWWScalarValue &value) {
 	return slot_tag == tag::VAL_EXT && ExtSubtype(value.slot) == ext_subtype::NUMBER;
 }
 
-int CompareLWWScalarNumBytes(const LWWScalarValue &a, const LWWScalarValue &b) {
-	auto a_size = LWWScalarValueHasNum(a) ? sizeof(a.num) : size_t(0);
-	auto b_size = LWWScalarValueHasNum(b) ? sizeof(b.num) : size_t(0);
-	return CompareRawBytes(a_size == 0 ? nullptr : reinterpret_cast<const char *>(&a.num), a_size,
-	                       b_size == 0 ? nullptr : reinterpret_cast<const char *>(&b.num), b_size);
-}
-
-int CompareLWWScalarLengthBytes(const LWWScalarValue &a, const LWWScalarValue &b) {
-	auto a_size = LWWScalarValueHasLength(a) ? sizeof(a.length) : size_t(0);
-	auto b_size = LWWScalarValueHasLength(b) ? sizeof(b.length) : size_t(0);
-	return CompareRawBytes(a_size == 0 ? nullptr : reinterpret_cast<const char *>(&a.length), a_size,
-	                       b_size == 0 ? nullptr : reinterpret_cast<const char *>(&b.length), b_size);
-}
-
-int CompareLWWScalarValueTie(const LWWScalarValue &a, nonstd::string_view a_text, const LWWScalarValue &b,
-                             nonstd::string_view b_text) {
-	if (int c = CompareRawBytes(reinterpret_cast<const char *>(&a.slot), sizeof(a.slot),
-	                            reinterpret_cast<const char *>(&b.slot), sizeof(b.slot))) {
-		return c;
-	}
-	if (int c = CompareRawBytes(a_text.data(), a_text.size(), b_text.data(), b_text.size())) {
-		return c;
-	}
-	if (int c = CompareLWWScalarNumBytes(a, b)) {
-		return c;
-	}
-	return CompareLWWScalarLengthBytes(a, b);
-}
-
-int CompareLWWScalarValueTie(const LWWScalarValue &a, nonstd::string_view a_text, const OwnedJsonoBlob &b) {
-	if (b.slots.size() < JSONO_HEADER_SIZE) {
-		throw InternalException("jsono_group_merge: malformed leaf blob");
-	}
-	if (int c = CompareRawBytes(reinterpret_cast<const char *>(&a.slot), sizeof(a.slot),
-	                            b.slots.data() + JSONO_HEADER_SIZE, b.slots.size() - JSONO_HEADER_SIZE)) {
-		return c;
-	}
-	if (int c = CompareRawBytes(a_text.data(), a_text.size(), b.string_heap.data(), b.string_heap.size())) {
-		return c;
-	}
-	auto num_size = LWWScalarValueHasNum(a) ? sizeof(a.num) : size_t(0);
-	if (int c = CompareRawBytes(num_size == 0 ? nullptr : reinterpret_cast<const char *>(&a.num), num_size,
-	                            b.nums.data(), b.nums.size())) {
-		return c;
-	}
-	if (int c = CompareRawBytes(nullptr, 0, b.key_heap.data(), b.key_heap.size())) {
-		return c;
-	}
-	auto length_size = LWWScalarValueHasLength(a) ? sizeof(a.length) : size_t(0);
-	return CompareRawBytes(length_size == 0 ? nullptr : reinterpret_cast<const char *>(&a.length), length_size,
-	                       b.lengths.data(), b.lengths.size());
-}
-
 void SerializeLWWScalarValueToBlob(const LWWScalarValue &value, nonstd::string_view text, OwnedJsonoBlob &out) {
 	WriteScalarLeafHeader(out, value.slot);
 	if (LWWScalarValueHasLength(value)) {
@@ -2794,11 +2741,21 @@ LWWScalarValue LWWScalarValueFromShredBits(const LogicalType &type, uint64_t val
 	throw InternalException("jsono_group_merge: unhandled scalar shred primitive");
 }
 
+void SerializeLWWScalarLaneToBlob(const LogicalType &type, uint64_t value_bits, nonstd::string_view text,
+                                  OwnedJsonoBlob &out) {
+	SerializeLWWScalarValueToBlob(LWWScalarValueFromShredBits(type, value_bits, text), text, out);
+}
+
+// All keyed tie-breaks route through CompareBlobValueTie on standalone leaf blobs: serialize the
+// scalar lane value once and compare bytes. Ties (equal sort keys) are rare, so the per-tie
+// serialize is cheaper than carrying a representation-specific comparator per lane shape.
 int CompareLWWScalarLaneValueTie(const LWWScalarLane &lane, nonstd::string_view lane_text, const LogicalType &type,
                                  uint64_t candidate_bits, nonstd::string_view candidate_text) {
-	auto lane_value = LWWScalarValueFromShredBits(type, lane.value_bits, lane_text);
-	auto candidate_value = LWWScalarValueFromShredBits(type, candidate_bits, candidate_text);
-	return CompareLWWScalarValueTie(lane_value, lane_text, candidate_value, candidate_text);
+	static thread_local OwnedJsonoBlob lane_blob;
+	static thread_local OwnedJsonoBlob candidate_blob;
+	SerializeLWWScalarLaneToBlob(type, lane.value_bits, lane_text, lane_blob);
+	SerializeLWWScalarLaneToBlob(type, candidate_bits, candidate_text, candidate_blob);
+	return CompareBlobValueTie(lane_blob, candidate_blob);
 }
 
 // Same copy/move split as the tree above (see TransferLWWTreeNode): `destructive` is the combine's
@@ -3739,9 +3696,9 @@ int CompareLWWScalarLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWSca
 	if (key_cmp != 0) {
 		return key_cmp;
 	}
-	auto text = LWWScalarTextView(lane_text);
-	auto value = LWWScalarValueFromShredBits(shred.type, lane.value_bits, text);
-	return CompareLWWScalarValueTie(value, text, node.value);
+	static thread_local OwnedJsonoBlob lane_blob;
+	SerializeLWWScalarLaneToBlob(shred.type, lane.value_bits, LWWScalarTextView(lane_text), lane_blob);
+	return CompareBlobValueTie(lane_blob, node.value);
 }
 
 int CompareLWWListLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWListLane &lane, const ReconShred &shred,
