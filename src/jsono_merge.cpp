@@ -2801,8 +2801,13 @@ int CompareLWWScalarLaneValueTie(const LWWScalarLane &lane, nonstd::string_view 
 	return CompareLWWScalarValueTie(lane_value, lane_text, candidate_value, candidate_text);
 }
 
-void CopyLWWScalarLane(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
-                       const GroupMergeLWWState &source_state, const LWWScalarLane &source, const string *source_text) {
+// Same copy/move split as the tree above (see TransferLWWTreeNode): `destructive` is the combine's
+// constant combine_type, so the lane copy/move twins become one body. The source lane and its text
+// are mutable in both modes (the non-destructive combine holds a mutable source); only move resets
+// them. Re-storing the sort key into the target is identical for copy and move.
+void TransferLWWScalarLane(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
+                           const GroupMergeLWWState &source_state, LWWScalarLane &source, string *source_text,
+                           bool destructive) {
 	target.has_value = source.has_value;
 	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
 	target.value_bits = source.value_bits;
@@ -2810,30 +2815,23 @@ void CopyLWWScalarLane(GroupMergeLWWState &target_state, LWWScalarLane &target, 
 		if (!source_text) {
 			throw InternalException("jsono_group_merge: missing source scalar text lane");
 		}
-		*target_text = *source_text;
-	}
-}
-
-void MoveLWWScalarLane(GroupMergeLWWState &target_state, LWWScalarLane &target, string *target_text,
-                       const GroupMergeLWWState &source_state, LWWScalarLane &source, string *source_text) {
-	target.has_value = source.has_value;
-	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
-	target.value_bits = source.value_bits;
-	if (target_text) {
-		if (!source_text) {
-			throw InternalException("jsono_group_merge: missing source scalar text lane");
+		if (destructive) {
+			*target_text = std::move(*source_text);
+			source_text->clear();
+		} else {
+			*target_text = *source_text;
 		}
-		*target_text = std::move(*source_text);
-		source_text->clear();
 	}
-	source.has_value = false;
-	source.sort_key_id = LWW_INVALID_SORT_KEY_ID;
-	source.value_bits = 0;
+	if (destructive) {
+		source.has_value = false;
+		source.sort_key_id = LWW_INVALID_SORT_KEY_ID;
+		source.value_bits = 0;
+	}
 }
 
-void MergeLWWScalarLaneState(GroupMergeLWWState &target_state, const GroupMergeLWWState &source_state, idx_t lane_idx,
-                             const LWWScalarLane &source, const vector<ReconShred> &shreds,
-                             const vector<idx_t> &text_indices) {
+void MergeLWWScalarLaneState(GroupMergeLWWState &target_state, GroupMergeLWWState &source_state, idx_t lane_idx,
+                             LWWScalarLane &source, const vector<ReconShred> &shreds, const vector<idx_t> &text_indices,
+                             bool destructive) {
 	if (!source.has_value) {
 		return;
 	}
@@ -2841,8 +2839,8 @@ void MergeLWWScalarLaneState(GroupMergeLWWState &target_state, const GroupMergeL
 	auto *target = FindLWWScalarLane(target_state, lane_idx);
 	if (!target) {
 		target = &FindOrCreateLWWScalarLane(target_state, lane_idx);
-		CopyLWWScalarLane(target_state, *target, EnsureLWWScalarLaneText(target_state, text_indices, lane_idx),
-		                  source_state, source, source_text);
+		TransferLWWScalarLane(target_state, *target, EnsureLWWScalarLaneText(target_state, text_indices, lane_idx),
+		                      source_state, source, source_text, destructive);
 		return;
 	}
 	auto *target_text = RequireLWWScalarLaneText(target_state, text_indices, lane_idx);
@@ -2851,134 +2849,74 @@ void MergeLWWScalarLaneState(GroupMergeLWWState &target_state, const GroupMergeL
 	if (key_cmp < 0 ||
 	    (key_cmp == 0 && CompareLWWScalarLaneValueTie(*target, LWWScalarTextView(target_text), shreds[lane_idx].type,
 	                                                  source.value_bits, LWWScalarTextView(source_text)) < 0)) {
-		CopyLWWScalarLane(target_state, *target, target_text, source_state, source, source_text);
+		TransferLWWScalarLane(target_state, *target, target_text, source_state, source, source_text, destructive);
 	}
 }
 
-void MergeLWWScalarLaneStateDestructive(GroupMergeLWWState &target_state, GroupMergeLWWState &source_state,
-                                        idx_t lane_idx, LWWScalarLane &source, const vector<ReconShred> &shreds,
-                                        const vector<idx_t> &text_indices) {
-	if (!source.has_value) {
-		return;
-	}
-	auto *source_text = RequireLWWScalarLaneText(source_state, text_indices, lane_idx);
-	auto *target = FindLWWScalarLane(target_state, lane_idx);
-	if (!target) {
-		target = &FindOrCreateLWWScalarLane(target_state, lane_idx);
-		MoveLWWScalarLane(target_state, *target, EnsureLWWScalarLaneText(target_state, text_indices, lane_idx),
-		                  source_state, source, source_text);
-		return;
-	}
-	auto *target_text = RequireLWWScalarLaneText(target_state, text_indices, lane_idx);
-	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target->sort_key_id),
-	                              LWWLaneSortKey(source_state, source.sort_key_id));
-	if (key_cmp < 0 ||
-	    (key_cmp == 0 && CompareLWWScalarLaneValueTie(*target, LWWScalarTextView(target_text), shreds[lane_idx].type,
-	                                                  source.value_bits, LWWScalarTextView(source_text)) < 0)) {
-		MoveLWWScalarLane(target_state, *target, target_text, source_state, source, source_text);
-	}
-}
-
-void MergeLWWScalarLanes(GroupMergeLWWState &target, const GroupMergeLWWState &source, const vector<ReconShred> &shreds,
-                         const vector<idx_t> &text_indices) {
+void MergeLWWScalarLanes(GroupMergeLWWState &target, GroupMergeLWWState &source, const vector<ReconShred> &shreds,
+                         const vector<idx_t> &text_indices, bool destructive) {
 	if (!source.scalar_lanes) {
 		return;
 	}
 	EnsureLWWScalarLanes(target, source.scalar_lane_count, source.scalar_text_lane_count);
 	for (idx_t i = 0; i < source.scalar_lane_count; i++) {
-		MergeLWWScalarLaneState(target, source, i, source.scalar_lanes[i], shreds, text_indices);
+		MergeLWWScalarLaneState(target, source, i, source.scalar_lanes[i], shreds, text_indices, destructive);
+	}
+	if (destructive) {
+		delete[] source.scalar_lanes;
+		delete[] source.scalar_texts;
+		source.scalar_lanes = nullptr;
+		source.scalar_lane_count = 0;
+		source.scalar_texts = nullptr;
+		source.scalar_text_lane_count = 0;
 	}
 }
 
-void MergeLWWScalarLanesDestructive(GroupMergeLWWState &target, GroupMergeLWWState &source,
-                                    const vector<ReconShred> &shreds, const vector<idx_t> &text_indices) {
-	if (!source.scalar_lanes) {
-		return;
-	}
-	EnsureLWWScalarLanes(target, source.scalar_lane_count, source.scalar_text_lane_count);
-	for (idx_t i = 0; i < source.scalar_lane_count; i++) {
-		MergeLWWScalarLaneStateDestructive(target, source, i, source.scalar_lanes[i], shreds, text_indices);
-	}
-	delete[] source.scalar_lanes;
-	delete[] source.scalar_texts;
-	source.scalar_lanes = nullptr;
-	source.scalar_lane_count = 0;
-	source.scalar_texts = nullptr;
-	source.scalar_text_lane_count = 0;
-}
-
-void CopyLWWListLane(GroupMergeLWWState &target_state, LWWListLane &target, const GroupMergeLWWState &source_state,
-                     const LWWListLane &source) {
+void TransferLWWListLane(GroupMergeLWWState &target_state, LWWListLane &target, const GroupMergeLWWState &source_state,
+                         LWWListLane &source, bool destructive) {
 	target.has_value = source.has_value;
 	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
-	target.value = source.value;
-}
-
-void MoveLWWListLane(GroupMergeLWWState &target_state, LWWListLane &target, const GroupMergeLWWState &source_state,
-                     LWWListLane &source) {
-	target.has_value = source.has_value;
-	target.sort_key_id = StoreLWWLaneSortKey(target_state, LWWLaneSortKey(source_state, source.sort_key_id));
-	target.value = std::move(source.value);
-	source.has_value = false;
-	source.sort_key_id = LWW_INVALID_SORT_KEY_ID;
-	source.value = LWWListValue();
+	if (destructive) {
+		target.value = std::move(source.value);
+		source.has_value = false;
+		source.sort_key_id = LWW_INVALID_SORT_KEY_ID;
+		source.value = LWWListValue();
+	} else {
+		target.value = source.value;
+	}
 }
 
 void MergeLWWListLaneState(GroupMergeLWWState &target_state, LWWListLane &target,
-                           const GroupMergeLWWState &source_state, const LWWListLane &source, const LogicalType &type) {
+                           const GroupMergeLWWState &source_state, LWWListLane &source, const LogicalType &type,
+                           bool destructive) {
 	if (!source.has_value) {
 		return;
 	}
 	if (!target.has_value) {
-		CopyLWWListLane(target_state, target, source_state, source);
+		TransferLWWListLane(target_state, target, source_state, source, destructive);
 		return;
 	}
 	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target.sort_key_id),
 	                              LWWLaneSortKey(source_state, source.sort_key_id));
 	if (key_cmp < 0 || (key_cmp == 0 && CompareLWWListValueTie(target.value, source.value, type) < 0)) {
-		CopyLWWListLane(target_state, target, source_state, source);
+		TransferLWWListLane(target_state, target, source_state, source, destructive);
 	}
 }
 
-void MergeLWWListLaneStateDestructive(GroupMergeLWWState &target_state, LWWListLane &target,
-                                      const GroupMergeLWWState &source_state, LWWListLane &source,
-                                      const LogicalType &type) {
-	if (!source.has_value) {
-		return;
-	}
-	if (!target.has_value) {
-		MoveLWWListLane(target_state, target, source_state, source);
-		return;
-	}
-	int key_cmp = CompareRawBytes(LWWLaneSortKey(target_state, target.sort_key_id),
-	                              LWWLaneSortKey(source_state, source.sort_key_id));
-	if (key_cmp < 0 || (key_cmp == 0 && CompareLWWListValueTie(target.value, source.value, type) < 0)) {
-		MoveLWWListLane(target_state, target, source_state, source);
-	}
-}
-
-void MergeLWWListLanes(GroupMergeLWWState &target, const GroupMergeLWWState &source, const vector<ReconShred> &shreds) {
+void MergeLWWListLanes(GroupMergeLWWState &target, GroupMergeLWWState &source, const vector<ReconShred> &shreds,
+                       bool destructive) {
 	if (!source.list_lanes) {
 		return;
 	}
 	EnsureLWWListLanes(target, source.list_lane_count);
 	for (idx_t i = 0; i < source.list_lane_count; i++) {
-		MergeLWWListLaneState(target, target.list_lanes[i], source, source.list_lanes[i], shreds[i].type);
+		MergeLWWListLaneState(target, target.list_lanes[i], source, source.list_lanes[i], shreds[i].type, destructive);
 	}
-}
-
-void MergeLWWListLanesDestructive(GroupMergeLWWState &target, GroupMergeLWWState &source,
-                                  const vector<ReconShred> &shreds) {
-	if (!source.list_lanes) {
-		return;
+	if (destructive) {
+		delete[] source.list_lanes;
+		source.list_lanes = nullptr;
+		source.list_lane_count = 0;
 	}
-	EnsureLWWListLanes(target, source.list_lane_count);
-	for (idx_t i = 0; i < source.list_lane_count; i++) {
-		MergeLWWListLaneStateDestructive(target, target.list_lanes[i], source, source.list_lanes[i], shreds[i].type);
-	}
-	delete[] source.list_lanes;
-	source.list_lanes = nullptr;
-	source.list_lane_count = 0;
 }
 
 void MergeLWWTreeInto(LWWTreeNode &target, LWWTreeNode &source, bool destructive) {
@@ -4278,8 +4216,8 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 				src.has_input = false;
 			} else {
 				tgt.root = CloneLWWTreeNode(*src.root).release();
-				MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices);
-				MergeLWWListLanes(tgt, src, list_shreds);
+				MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices, false);
+				MergeLWWListLanes(tgt, src, list_shreds, false);
 			}
 			tgt.has_input = true;
 			continue;
@@ -4289,15 +4227,15 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 		}
 		if (destructive) {
 			MergeLWWTreeInto(*tgt.root, *src.root, true);
-			MergeLWWScalarLanesDestructive(tgt, src, scalar_shreds, scalar_text_indices);
-			MergeLWWListLanesDestructive(tgt, src, list_shreds);
+			MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices, true);
+			MergeLWWListLanes(tgt, src, list_shreds, true);
 			delete src.root;
 			src.root = nullptr;
 			src.has_input = false;
 		} else {
 			MergeLWWTreeInto(*tgt.root, *src.root, false);
-			MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices);
-			MergeLWWListLanes(tgt, src, list_shreds);
+			MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices, false);
+			MergeLWWListLanes(tgt, src, list_shreds, false);
 		}
 	}
 }
