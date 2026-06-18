@@ -291,9 +291,7 @@ void ValidateMetadata(const JsonoView &view, const std::vector<uint32_t> &contai
 			throw InvalidInputException(
 			    "malformed JSONO: object checkpoint index references a non-checkpointed container");
 		}
-		auto expected_stride = child_count >= LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT ? LARGE_OBJECT_CHECKPOINT_STRIDE
-		                                                                              : OBJECT_CHECKPOINT_STRIDE;
-		if (index.checkpoint_stride != expected_stride) {
+		if (index.checkpoint_stride != OBJECT_CHECKPOINT_STRIDE) {
 			throw InvalidInputException("malformed JSONO: object checkpoint stride mismatch");
 		}
 		auto checkpoint_count = (child_count - 1) / index.checkpoint_stride;

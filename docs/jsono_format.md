@@ -574,11 +574,10 @@ base plus the checkpoint delta, then skip the remaining `< stride` values
 with `SkipValueFast` (`MoveObjectValueCursorToRank`, `jsono_reader.hpp`). The
 object cursor only moves forward.
 
-`stride` is currently fixed: `OBJECT_CHECKPOINT_STRIDE = 16` for ordinary
-objects, `LARGE_OBJECT_CHECKPOINT_STRIDE = 16` for objects with
-`child_count ≥ LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT` (= 64). The two values
-currently coincide; they are kept as separate constants for future tuning of
-checkpoint density on large objects.
+`stride` is a single fixed constant `OBJECT_CHECKPOINT_STRIDE = 16` for every
+checkpointed object. Each object records its own stride in `ObjectCheckpointIndex`,
+so a future variable-density scheme can be introduced writer-side without a format
+change.
 
 ## Why two heaps (split-heap)
 

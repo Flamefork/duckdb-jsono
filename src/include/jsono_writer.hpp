@@ -194,8 +194,7 @@ struct JsonoBuilder {
 		auto checkpoint_offset = NO_OBJECT_CHECKPOINTS;
 		auto checkpoint_stride = uint16_t(0);
 		if (container_tag == tag::OBJ_START && child_count > OBJECT_CHECKPOINT_STRIDE) {
-			checkpoint_stride = child_count >= LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT ? LARGE_OBJECT_CHECKPOINT_STRIDE
-			                                                                           : OBJECT_CHECKPOINT_STRIDE;
+			checkpoint_stride = OBJECT_CHECKPOINT_STRIDE;
 			auto checkpoint_count = (child_count - 1) / checkpoint_stride;
 			if (object_checkpoints.size() > std::numeric_limits<uint32_t>::max() - checkpoint_count) {
 				throw InvalidInputException("jsono: too many object cursor checkpoints for storage");

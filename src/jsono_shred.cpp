@@ -969,23 +969,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	ctx.kinds.resize(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
-		switch (fields[f].primitive) {
-		case ShredPrimitive::Varchar:
-			ctx.kinds[f] = jsono_dom::DomShredKind::Varchar;
-			break;
-		case ShredPrimitive::Bigint:
-			ctx.kinds[f] = jsono_dom::DomShredKind::Int64;
-			break;
-		case ShredPrimitive::Ubigint:
-			ctx.kinds[f] = jsono_dom::DomShredKind::Uint64;
-			break;
-		case ShredPrimitive::Double:
-			ctx.kinds[f] = jsono_dom::DomShredKind::Double;
-			break;
-		case ShredPrimitive::Boolean:
-			ctx.kinds[f] = jsono_dom::DomShredKind::Boolean;
-			break;
-		}
+		ctx.kinds[f] = fields[f].primitive;
 	}
 
 	jsono_dom::YyjsonAllocator parser;

@@ -2,8 +2,6 @@
 
 #include "jsono.hpp"
 
-#include "duckdb/common/types/cast_helpers.hpp"
-
 #include "yyjson.hpp"
 #include "string_view.hpp"
 
@@ -55,9 +53,9 @@ bool AccumulateUIntPair(nonstd::string_view int_digits, nonstd::string_view frac
 }
 
 // Write the canonical DEC60 decimal text (mantissa / 10^scale) into `out` and
-// return its length, without heap allocation. Mirrors AppendDec60Text. Bounds:
-// mantissa < 2^53 (≤16 digits), scale ≤ 22 → padded ≤ 23, total ≤ 25; out must
-// hold ≥ 26 bytes.
+// return its length, without heap allocation. Single source of truth for the
+// decimal rendering (AppendDec60Text wraps this). Bounds: mantissa < 2^53
+// (≤16 digits), scale ≤ 22 → padded ≤ 23, total ≤ 25; out must hold ≥ 26 bytes.
 size_t BuildDec60Canonical(char *out, bool negative, uint64_t abs_mantissa, uint64_t scale) {
 	char digits[24];
 	size_t d = 0;
@@ -160,26 +158,11 @@ void EmitDouble(double v, std::string &out) {
 }
 
 void AppendDec60Text(std::string &out, bool negative, uint64_t abs_mantissa, uint64_t scale) {
-	if (negative) {
-		out.push_back('-');
-	}
-	// Zero-pad the mantissa digits so there is at least one digit before the
-	// decimal point (total length >= scale + 1), then split off the last `scale`
-	// digits as the fraction.
-	char buf[20];
-	auto end = buf + sizeof(buf);
-	auto begin = NumericHelper::FormatUnsigned(abs_mantissa, end);
-	auto digit_count = size_t(end - begin);
-	if (digit_count > scale) {
-		auto split = digit_count - scale;
-		out.append(begin, split);
-		out.push_back('.');
-		out.append(begin + split, scale);
-	} else {
-		out.append("0.");
-		out.append(scale - digit_count, '0');
-		out.append(begin, digit_count);
-	}
+	// Single source of truth for the mantissa/scale → decimal text: build the
+	// canonical bytes into a stack buffer, then append in one shot.
+	char buf[26];
+	size_t len = BuildDec60Canonical(buf, negative, abs_mantissa, scale);
+	out.append(buf, len);
 }
 
 ClassifiedNumber ClassifyNumberFromText(nonstd::string_view text) {

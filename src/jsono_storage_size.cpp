@@ -157,18 +157,8 @@ void JsonoStorageSizeExecute(DataChunk &args, ExpressionState &state, Vector &re
 // reconstructed plain blob.
 unique_ptr<FunctionData> JsonoStorageSizeBind(ClientContext &context, ScalarFunction &bound_function,
                                               vector<unique_ptr<Expression>> &arguments) {
-	if (arguments[0]->HasParameter()) {
-		throw ParameterNotResolvedException();
-	}
-	auto &type = arguments[0]->return_type;
-	JsonoRequireExtensionOptimizerForShredded(context, type, bound_function.name);
-	if (IsShreddedJsonoType(type)) {
-		bound_function.arguments[0] = type;
-	} else if (type.id() == LogicalTypeId::SQLNULL || IsJsonoType(type)) {
-		bound_function.arguments[0] = JsonoType();
-	} else {
-		throw BinderException("%s: argument must be JSONO", bound_function.name);
-	}
+	bound_function.arguments[0] =
+	    JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, /*reconstruct_shredded=*/false);
 	return nullptr;
 }
 

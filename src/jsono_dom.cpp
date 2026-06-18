@@ -153,10 +153,10 @@ void SizeDomElement(yyjson_val *element, DomDirectState &s, size_t depth);
 // match, ResidualFill for a VARCHAR shred over a non-string scalar (the `->>` text needs
 // the decoded value, so it is filled from the written residual), nothing otherwise (the
 // shred stays NULL and the value stays in the residual).
-void CaptureShredLeaf(yyjson_val *value, DomShredKind kind, DomShredCapture &cap) {
+void CaptureShredLeaf(yyjson_val *value, ShredPrimitive kind, DomShredCapture &cap) {
 	switch (yyjson_get_type(value)) {
 	case YYJSON_TYPE_STR:
-		if (kind == DomShredKind::Varchar) {
+		if (kind == ShredPrimitive::Varchar) {
 			cap.state = DomShredCapture::State::String;
 			cap.stripped = true;
 			cap.text = nonstd::string_view(yyjson_get_str(value), yyjson_get_len(value));
@@ -166,11 +166,11 @@ void CaptureShredLeaf(yyjson_val *value, DomShredKind kind, DomShredCapture &cap
 		}
 		return;
 	case YYJSON_TYPE_RAW: {
-		if (kind == DomShredKind::Varchar) {
+		if (kind == ShredPrimitive::Varchar) {
 			cap.state = DomShredCapture::State::ResidualFill;
 			return;
 		}
-		if (kind != DomShredKind::Int64 && kind != DomShredKind::Uint64) {
+		if (kind != ShredPrimitive::Bigint && kind != ShredPrimitive::Ubigint) {
 			// A text number is never stored as kind Double; DOUBLE/BOOLEAN shreds stay NULL —
 			// a present number they did not capture is a residual-diverted scalar (case B).
 			cap.diverted_scalar = true;
@@ -180,15 +180,15 @@ void CaptureShredLeaf(yyjson_val *value, DomShredKind kind, DomShredCapture &cap
 		bool int64_kind =
 		    classified.slot == MakeSlot(tag::VAL_INT60, 0) || classified.slot == MakeExtSlot(ext_subtype::INT64);
 		auto int_value = int64_t(classified.num);
-		if (kind == DomShredKind::Int64 && int64_kind) {
+		if (kind == ShredPrimitive::Bigint && int64_kind) {
 			cap.state = DomShredCapture::State::Int;
 			cap.stripped = true;
 			cap.int_value = int_value;
-		} else if (kind == DomShredKind::Uint64 && classified.slot == MakeExtSlot(ext_subtype::UINT64)) {
+		} else if (kind == ShredPrimitive::Ubigint && classified.slot == MakeExtSlot(ext_subtype::UINT64)) {
 			cap.state = DomShredCapture::State::Uint;
 			cap.stripped = true;
 			cap.uint_value = classified.num;
-		} else if (kind == DomShredKind::Uint64 && int64_kind && int_value >= 0) {
+		} else if (kind == ShredPrimitive::Ubigint && int64_kind && int_value >= 0) {
 			cap.state = DomShredCapture::State::Uint;
 			cap.stripped = true;
 			cap.uint_value = uint64_t(int_value);
@@ -200,11 +200,11 @@ void CaptureShredLeaf(yyjson_val *value, DomShredKind kind, DomShredCapture &cap
 		return;
 	}
 	case YYJSON_TYPE_BOOL:
-		if (kind == DomShredKind::Boolean) {
+		if (kind == ShredPrimitive::Boolean) {
 			cap.state = DomShredCapture::State::Bool;
 			cap.stripped = true;
 			cap.bool_value = yyjson_get_bool(value);
-		} else if (kind == DomShredKind::Varchar) {
+		} else if (kind == ShredPrimitive::Varchar) {
 			cap.state = DomShredCapture::State::ResidualFill;
 		} else {
 			// Present boolean at a numeric shred path: stays in the residual, shred NULL (case B).
@@ -388,8 +388,7 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 	auto start_slot_count = s.sz.slot_count;
 	s.sz.slot_count += 2 + emit_count;
 	if (emit_count > OBJECT_CHECKPOINT_STRIDE) {
-		auto stride = emit_count >= LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT ? LARGE_OBJECT_CHECKPOINT_STRIDE
-		                                                                    : OBJECT_CHECKPOINT_STRIDE;
+		auto stride = OBJECT_CHECKPOINT_STRIDE;
 		s.sz.checkpoint_index_count++;
 		s.sz.checkpoint_count += (emit_count - 1) / stride;
 	}
@@ -566,8 +565,7 @@ void WriteDomObjectDirect(DomDirectState &s, DirectDest &d) {
 		frame.span_index = d.AllocSpan(uint32_t(frame.id));
 	}
 	if (plan.emit_count > OBJECT_CHECKPOINT_STRIDE) {
-		checkpoint_stride = plan.emit_count >= LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT ? LARGE_OBJECT_CHECKPOINT_STRIDE
-		                                                                               : OBJECT_CHECKPOINT_STRIDE;
+		checkpoint_stride = OBJECT_CHECKPOINT_STRIDE;
 		checkpoint_offset = uint32_t(d.checkpoint_pos);
 		d.PushCheckpointIndexEntry(
 		    ObjectCheckpointIndex {uint32_t(frame.id), checkpoint_offset, uint16_t(checkpoint_stride), 0});

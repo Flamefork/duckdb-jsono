@@ -250,8 +250,6 @@ struct DomDirectState {
 // never visits it — and captured below; a present-but-lossy leaf of a VARCHAR shred stays in
 // the residual and is marked ResidualFill, so the caller fills the shred from the written row
 // with the exact locate-and-render semantics of the two-pass path.
-enum class DomShredKind : uint8_t { Varchar, Int64, Uint64, Double, Boolean };
-
 struct DomShredCapture {
 	enum class State : uint8_t { Missing, String, Int, Uint, Bool, ResidualFill };
 	State state = State::Missing;
@@ -277,7 +275,7 @@ struct DomShredTrieNode {
 
 struct DomShredContext {
 	const std::vector<DomShredTrieNode> *nodes = nullptr;
-	std::vector<DomShredKind> kinds; // per shred field
+	std::vector<ShredPrimitive> kinds; // per shred field
 	const vector<JsonoShredManifestEntryBytes> *manifest_entries = nullptr;
 	// Per-row outputs: captures parallel to the shred fields, manifest = the row's serialized
 	// shred-manifest tail (empty when nothing was stripped).

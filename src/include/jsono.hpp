@@ -311,8 +311,6 @@ constexpr uint32_t NO_OBJECT_CHECKPOINTS = std::numeric_limits<uint32_t>::max();
 // caps the scan length.
 constexpr uint64_t SPAN_HINT_LIMIT = 4;
 constexpr uint32_t OBJECT_CHECKPOINT_STRIDE = 16;
-constexpr uint16_t LARGE_OBJECT_CHECKPOINT_STRIDE = 16;
-constexpr uint32_t LARGE_OBJECT_CHECKPOINT_MIN_CHILD_COUNT = 64;
 
 // Whether this translation unit is built with AddressSanitizer instrumentation.
 #if defined(__has_feature)
