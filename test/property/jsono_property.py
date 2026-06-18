@@ -290,7 +290,7 @@ def mutate_manifest(skips_hex: str, mutation: str) -> str:
     offset = manifest_offset(bytes(skips))
     if mutation == "count_inflate" and len(skips) >= offset + 4:
         count = int.from_bytes(skips[offset : offset + 4], "little")
-        skips[offset : offset + 4] = (count + 1).to_bytes(4, "little")
+        skips[offset : offset + 4] = ((count + 1) & 0xFFFFFFFF).to_bytes(4, "little")
     elif mutation == "count_huge" and len(skips) >= offset + 4:
         skips[offset : offset + 4] = b"\xff\xff\xff\xff"
     elif mutation == "path_len_huge" and len(skips) >= offset + 6:
