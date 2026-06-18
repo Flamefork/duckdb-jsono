@@ -1961,105 +1961,86 @@ private:
 		return nullptr;
 	}
 
-	// Read a typed shred directly as its own type T. The fallback re-extracts from the
-	// residual as text and casts to T, matching the original CAST's try/strict mode, so
-	// a value kept in the residual still resolves; COALESCE short-circuits so a
-	// homogeneous shred stays a plain typed struct_extract (with column statistics).
-	// When statistics prove the shred total (no residual row), the fallback arm is provably
-	// dead and dropped entirely, leaving a bare struct_extract the planner pushes into the scan.
-	unique_ptr<Expression> MakeTypedShredRead(unique_ptr<Expression> column, const JsonoShred &shred,
-	                                          unique_ptr<Expression> path, const LogicalType &target, bool try_cast,
-	                                          const string &alias) {
-		auto shred_value = ShredExtract(*column, shred.child_index);
-		if (ShredIsTotal(*column, shred.child_index)) {
-			shred_value->SetAlias(alias);
-			return shred_value;
+	// Wrap a shred's primary read in a residual-fallback COALESCE — unless statistics prove the
+	// shred total, in which case the primary reads bare so the planner pushes it into the scan
+	// zone-map. `primary` is the already-rendered shred read (the typed value, or its text);
+	// `finish_fallback` adapts the native residual text extract to the COALESCE result type (a cast
+	// to the target for a typed read, identity for a text read).
+	template <class FinishFallback>
+	unique_ptr<Expression> EmitShredRead(const Expression &column, const JsonoShred &shred,
+	                                     unique_ptr<Expression> primary, unique_ptr<Expression> path,
+	                                     const LogicalType &result_type, FinishFallback finish_fallback,
+	                                     const string &alias) {
+		if (ShredIsTotal(column, shred.child_index)) {
+			primary->SetAlias(alias);
+			return primary;
 		}
 		FunctionBinder function_binder(context);
 		auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
 		// Soft residual: this fallback only runs for rows whose value diverted into the residual (the
 		// lane is NULL). A non-diverted row's lane already won the COALESCE, so a residual miss here
 		// must read as NULL, not a narrowing throw — see ResidualReinterpret.
-		auto residual = ResidualReinterpret(*column, /*soft=*/true);
+		auto residual = ResidualReinterpret(column, /*soft=*/true);
 		vector<unique_ptr<Expression>> ext_children;
 		ext_children.push_back(std::move(residual));
 		ext_children.push_back(std::move(path));
 		auto fallback_text =
 		    function_binder.BindScalarFunction(JsonoExtractStringFunction(path_type), std::move(ext_children));
-		auto fallback = BoundCastExpression::AddCastToType(context, std::move(fallback_text), target, try_cast);
-		auto coalesce = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, target);
-		coalesce->children.push_back(std::move(shred_value));
-		coalesce->children.push_back(std::move(fallback));
+		auto coalesce = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, result_type);
+		coalesce->children.push_back(std::move(primary));
+		coalesce->children.push_back(finish_fallback(std::move(fallback_text)));
 		coalesce->SetAlias(alias);
 		return std::move(coalesce);
 	}
 
-	// Read a string-extracted shred. A VARCHAR shred holds the `->>` text for every row,
-	// so it reads directly. A typed shred holds only values of its type; rows whose value
-	// did not fit were kept in the residual with a NULL shred, so the typed read casts the
-	// shred to text and falls back to a native residual extract. COALESCE short-circuits
-	// per row, so a homogeneous shred (the common case) never evaluates the fallback.
+	// Read a typed shred directly as its own type T. The fallback re-extracts from the residual as
+	// text and casts to T, matching the original CAST's try/strict mode, so a value kept in the
+	// residual still resolves; COALESCE short-circuits so a homogeneous shred stays a plain typed
+	// struct_extract (with column statistics), and a provably total shred drops the fallback to a
+	// bare struct_extract the planner pushes into the scan.
+	unique_ptr<Expression> MakeTypedShredRead(unique_ptr<Expression> column, const JsonoShred &shred,
+	                                          unique_ptr<Expression> path, const LogicalType &target, bool try_cast,
+	                                          const string &alias) {
+		auto primary = ShredExtract(*column, shred.child_index);
+		return EmitShredRead(
+		    *column, shred, std::move(primary), std::move(path), target,
+		    [&](unique_ptr<Expression> fallback_text) {
+			    return BoundCastExpression::AddCastToType(context, std::move(fallback_text), target, try_cast);
+		    },
+		    alias);
+	}
+
+	// Read a string-extracted shred (the `->>` text form). A VARCHAR shred already holds that text;
+	// a DOUBLE shred renders through jsono's own EmitDouble (DuckDB's DOUBLE->VARCHAR cast diverges);
+	// any other typed shred casts to VARCHAR. Each falls back to a native residual text extract for
+	// its NULL-lane rows (EmitShredRead), and COALESCE short-circuits per row.
 	unique_ptr<Expression> MakeShredRead(unique_ptr<Expression> column, const JsonoShred &shred,
 	                                     unique_ptr<Expression> path, const string &alias) {
 		auto shred_value = ShredExtract(*column, shred.child_index);
-		FunctionBinder function_binder(context);
+		unique_ptr<Expression> primary;
 		if (shred.type.id() == LogicalTypeId::VARCHAR) {
-			// A VARCHAR shred holds the `->>` text whenever the lane carries the value. A total shred
-			// reads bare; a non-total one falls back to a residual text extract for its NULL-lane rows.
-			// Crucially this is NOT unconditional: a multi-file read that unioned a narrower shred set
-			// (union_by_name / DuckLake schema evolution) NULL-fills this lane for the files that lacked
-			// it while the value stays in their residual — the value-complete coverage check in
-			// ShredIsTotal sees the per-file hash mismatch and keeps the fallback, so the residual value
-			// is read instead of a silent NULL.
-			if (ShredIsTotal(*column, shred.child_index)) {
-				shred_value->SetAlias(alias);
-				return shred_value;
-			}
-			auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
-			auto residual = ResidualReinterpret(*column, /*soft=*/true);
-			vector<unique_ptr<Expression>> ext_children;
-			ext_children.push_back(std::move(residual));
-			ext_children.push_back(std::move(path));
-			auto fallback =
-			    function_binder.BindScalarFunction(JsonoExtractStringFunction(path_type), std::move(ext_children));
-			auto coalesce = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, LogicalType::VARCHAR);
-			coalesce->children.push_back(std::move(shred_value));
-			coalesce->children.push_back(std::move(fallback));
-			coalesce->SetAlias(alias);
-			return std::move(coalesce);
-		}
-		unique_ptr<Expression> shred_text;
-		if (shred.type.id() == LogicalTypeId::DOUBLE) {
-			// DuckDB's native DOUBLE->VARCHAR cast (1e+16) diverges from jsono's canonical JSON
-			// number text (10000000000000000.0, == to_json and a plain `->>`). A typed DOUBLE shred
-			// only ever holds a binary double (a text number fails the kind gate and stays in the
-			// residual), so its sole canonical text is jsono's own EmitDouble — render through that.
+			// A VARCHAR shred holds the `->>` text whenever the lane carries the value.
+			primary = std::move(shred_value);
+		} else if (shred.type.id() == LogicalTypeId::DOUBLE) {
+			// DuckDB's native DOUBLE->VARCHAR cast (1e+16) diverges from jsono's canonical JSON number
+			// text (10000000000000000.0, == to_json and a plain `->>`). A typed DOUBLE shred only ever
+			// holds a binary double (a text number fails the kind gate and stays in the residual), so
+			// its sole canonical text is jsono's own EmitDouble — render through that.
 			vector<unique_ptr<Expression>> double_text_children;
 			double_text_children.push_back(std::move(shred_value));
-			shred_text = make_uniq<BoundFunctionExpression>(LogicalType::VARCHAR, MakeJsonoInternalDoubleTextFunction(),
-			                                                std::move(double_text_children), nullptr);
+			primary = make_uniq<BoundFunctionExpression>(LogicalType::VARCHAR, MakeJsonoInternalDoubleTextFunction(),
+			                                             std::move(double_text_children), nullptr);
 		} else {
-			shred_text = BoundCastExpression::AddCastToType(context, std::move(shred_value), LogicalType::VARCHAR);
+			primary = BoundCastExpression::AddCastToType(context, std::move(shred_value), LogicalType::VARCHAR);
 		}
-		// A total shred has no residual rows, so the text read needs no fallback.
-		if (ShredIsTotal(*column, shred.child_index)) {
-			shred_text->SetAlias(alias);
-			return shred_text;
-		}
-		auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
-		// Soft residual (see MakeTypedShredRead): a non-diverted row's lane wins the COALESCE, so a
-		// residual miss here reads as NULL rather than the point-read guard's narrowing throw.
-		auto residual = ResidualReinterpret(*column, /*soft=*/true);
-		vector<unique_ptr<Expression>> ext_children;
-		ext_children.push_back(std::move(residual));
-		ext_children.push_back(std::move(path));
-		auto fallback =
-		    function_binder.BindScalarFunction(JsonoExtractStringFunction(path_type), std::move(ext_children));
-		auto coalesce = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, LogicalType::VARCHAR);
-		coalesce->children.push_back(std::move(shred_text));
-		coalesce->children.push_back(std::move(fallback));
-		coalesce->SetAlias(alias);
-		return std::move(coalesce);
+		// The fallback is a native residual text extract, already VARCHAR, so the finisher is identity.
+		// A non-total shred keeps it — including a multi-file read that unioned a narrower shred set
+		// (union_by_name / DuckLake schema evolution) and NULL-filled this lane while the value stays in
+		// the residual: ShredIsTotal's per-file value-complete coverage check keeps the fallback so the
+		// residual value is read instead of a silent NULL.
+		return EmitShredRead(
+		    *column, shred, std::move(primary), std::move(path), LogicalType::VARCHAR,
+		    [](unique_ptr<Expression> fallback_text) { return fallback_text; }, alias);
 	}
 
 	// Build the shred patch as a nested struct_pack tree mirroring each shred's path: a leaf
