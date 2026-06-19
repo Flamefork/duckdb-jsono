@@ -360,50 +360,111 @@ inline size_t ReadArrayEndPos(const JsonoView &view, size_t pos) {
 void SkipValueFast(const JsonoView &view, JsonoCursor &cursor, size_t depth);
 void SkipContainerFromSlot(const JsonoView &view, uint64_t slot, JsonoCursor &cursor, size_t depth);
 
-// Skip a scalar value whose slot is already read at `cursor.pos`. Returns false for
-// containers and non-value slots (the caller dispatches those to the out-of-line
-// container path). Always-inline: per-value walk loops pay no call for the dominant
-// scalar case.
-JSONO_ALWAYS_INLINE bool TrySkipScalarFromSlot(const JsonoView &view, uint64_t slot, JsonoCursor &cursor) {
+// The scalar tag/ext-subtype ladder and its stream-cursor accounting, shared by the decode
+// (DecodeScalarAt) and skip (TrySkipScalarFromSlot) readers via a sink. The ladder is the single
+// owner of how a scalar slot maps to its stream reads and cursor advance; the sink decides what to
+// do with each decoded component — store it (ScalarDecodeSink) or discard it (ScalarSkipSink). The
+// raw stream reads (LengthAt/StringAt/NumAt) stay in the ladder so the skip sink keeps their bounds
+// checks even though it discards the bytes. Returns false for containers and non-value slots (the
+// caller dispatches those); on an unknown VAL_EXT subtype it throws like both originals did.
+// Always-inline: with an empty sink the compiler collapses this back to pure cursor bumps for the
+// skip twin, and scalarizes the decoded value into DecodeScalarAt's caller.
+template <class SINK>
+JSONO_ALWAYS_INLINE bool DecodeScalarSlot(const JsonoView &view, uint64_t slot, JsonoCursor &cursor, SINK &sink) {
 	switch (SlotTag(slot)) {
 	case tag::VAL_STR_HEAP: {
 		auto len = size_t(view.LengthAt(cursor.length_cursor));
-		(void)view.StringAt(cursor.string_cursor, len);
+		sink.OnString(view.StringAt(cursor.string_cursor, len));
 		cursor.string_cursor += len;
 		cursor.length_cursor++;
 		cursor.pos++;
 		return true;
 	}
+	case tag::VAL_INT60:
+		sink.OnInt64(int64_t(view.NumAt(cursor.num_cursor)));
+		cursor.num_cursor++;
+		cursor.pos++;
+		return true;
+	case tag::VAL_DEC60:
+		sink.OnDec60(view.NumAt(cursor.num_cursor));
+		cursor.num_cursor++;
+		cursor.pos++;
+		return true;
 	case tag::VAL_EXT: {
 		auto subtype = ExtSubtype(slot);
 		if (subtype == ext_subtype::NUMBER) {
 			auto len = size_t(view.LengthAt(cursor.length_cursor));
-			(void)view.StringAt(cursor.string_cursor, len);
+			sink.OnNumberText(view.StringAt(cursor.string_cursor, len));
 			cursor.string_cursor += len;
 			cursor.length_cursor++;
-		} else if (subtype < ext_subtype::COUNT) {
-			(void)view.NumAt(cursor.num_cursor);
-			cursor.num_cursor++;
-		} else {
-			throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
+			cursor.pos++;
+			return true;
 		}
-		cursor.pos++;
-		return true;
-	}
-	case tag::VAL_INT60:
-	case tag::VAL_DEC60:
-		(void)view.NumAt(cursor.num_cursor);
+		auto raw = view.NumAt(cursor.num_cursor);
 		cursor.num_cursor++;
 		cursor.pos++;
-		return true;
+		switch (subtype) {
+		case ext_subtype::INT64:
+			sink.OnInt64(int64_t(raw));
+			return true;
+		case ext_subtype::UINT64:
+			sink.OnUInt64(raw);
+			return true;
+		case ext_subtype::DOUBLE: {
+			double value;
+			std::memcpy(&value, &raw, sizeof(value));
+			sink.OnDouble(value);
+			return true;
+		}
+		default:
+			throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
+		}
+	}
 	case tag::VAL_TRUE:
+		sink.OnBool(true);
+		cursor.pos++;
+		return true;
 	case tag::VAL_FALSE:
+		sink.OnBool(false);
+		cursor.pos++;
+		return true;
 	case tag::VAL_NULL:
+		sink.OnNull();
 		cursor.pos++;
 		return true;
 	default:
 		return false;
 	}
+}
+
+// Discarding sink: the skip twin keeps the ladder's stream reads (their bounds checks) but throws
+// the decoded value away, so DecodeScalarSlot<ScalarSkipSink> compiles to pure cursor advances.
+struct ScalarSkipSink {
+	JSONO_ALWAYS_INLINE void OnString(nonstd::string_view) {
+	}
+	JSONO_ALWAYS_INLINE void OnNumberText(nonstd::string_view) {
+	}
+	JSONO_ALWAYS_INLINE void OnInt64(int64_t) {
+	}
+	JSONO_ALWAYS_INLINE void OnUInt64(uint64_t) {
+	}
+	JSONO_ALWAYS_INLINE void OnDouble(double) {
+	}
+	JSONO_ALWAYS_INLINE void OnDec60(uint64_t) {
+	}
+	JSONO_ALWAYS_INLINE void OnBool(bool) {
+	}
+	JSONO_ALWAYS_INLINE void OnNull() {
+	}
+};
+
+// Skip a scalar value whose slot is already read at `cursor.pos`. Returns false for
+// containers and non-value slots (the caller dispatches those to the out-of-line
+// container path). Always-inline: per-value walk loops pay no call for the dominant
+// scalar case.
+JSONO_ALWAYS_INLINE bool TrySkipScalarFromSlot(const JsonoView &view, uint64_t slot, JsonoCursor &cursor) {
+	ScalarSkipSink sink;
+	return DecodeScalarSlot(view, slot, cursor, sink);
 }
 
 // Skip the value whose first slot is `slot`, already read at `cursor.pos` (a valid slot
@@ -510,88 +571,50 @@ struct JsonoScalar {
 	nonstd::string_view text;
 };
 
-// Decode the scalar value at `cursor`, advancing it past the value. This is the single
-// owner of the scalar tag/ext-subtype ladder and the stream-cursor accounting; every
-// reader projects the returned scalar to its sink. Throws on container or non-value
-// slots (callers handle OBJ_START/ARR_START first).
-JSONO_ALWAYS_INLINE JsonoScalar DecodeScalarAt(const JsonoView &view, JsonoCursor &cursor) {
-	if (cursor.pos >= view.Slots()) {
-		throw InvalidInputException("malformed JSONO: value position out of bounds");
-	}
-	auto slot = view.SlotAt(cursor.pos);
-	auto slot_tag = SlotTag(slot);
+// Storing sink: projects each decoded component into a JsonoScalar. The VAL_DEC60 mantissa/
+// scale unpack lives here (not in the ladder) so the skip twin pays nothing for it.
+struct ScalarDecodeSink {
 	JsonoScalar scalar;
-	switch (slot_tag) {
-	case tag::VAL_STR_HEAP: {
-		auto len = size_t(view.LengthAt(cursor.length_cursor));
+	JSONO_ALWAYS_INLINE void OnString(nonstd::string_view text) {
 		scalar.kind = JsonoScalarKind::String;
-		scalar.text = view.StringAt(cursor.string_cursor, len);
-		cursor.string_cursor += len;
-		cursor.length_cursor++;
-		cursor.pos++;
-		return scalar;
+		scalar.text = text;
 	}
-	case tag::VAL_INT60:
+	JSONO_ALWAYS_INLINE void OnNumberText(nonstd::string_view text) {
+		scalar.kind = JsonoScalarKind::NumberText;
+		scalar.text = text;
+	}
+	JSONO_ALWAYS_INLINE void OnInt64(int64_t value) {
 		scalar.kind = JsonoScalarKind::Int64;
-		scalar.int_value = int64_t(view.NumAt(cursor.num_cursor));
-		cursor.num_cursor++;
-		cursor.pos++;
-		return scalar;
-	case tag::VAL_DEC60: {
-		auto packed = view.NumAt(cursor.num_cursor);
-		cursor.num_cursor++;
+		scalar.int_value = value;
+	}
+	JSONO_ALWAYS_INLINE void OnUInt64(uint64_t value) {
+		scalar.kind = JsonoScalarKind::UInt64;
+		scalar.uint_value = value;
+	}
+	JSONO_ALWAYS_INLINE void OnDouble(double value) {
+		scalar.kind = JsonoScalarKind::Double;
+		scalar.double_value = value;
+	}
+	JSONO_ALWAYS_INLINE void OnDec60(uint64_t packed) {
 		scalar.kind = JsonoScalarKind::Dec60;
 		scalar.dec_negative = Dec60Negative(packed);
 		scalar.dec_mantissa = Dec60Mantissa(packed);
 		scalar.dec_scale = Dec60Scale(packed);
-		cursor.pos++;
-		return scalar;
 	}
-	case tag::VAL_EXT: {
-		auto subtype = ExtSubtype(slot);
-		if (subtype == ext_subtype::NUMBER) {
-			auto len = size_t(view.LengthAt(cursor.length_cursor));
-			scalar.kind = JsonoScalarKind::NumberText;
-			scalar.text = view.StringAt(cursor.string_cursor, len);
-			cursor.string_cursor += len;
-			cursor.length_cursor++;
-			cursor.pos++;
-			return scalar;
-		}
-		auto raw = view.NumAt(cursor.num_cursor);
-		cursor.num_cursor++;
-		cursor.pos++;
-		switch (subtype) {
-		case ext_subtype::INT64:
-			scalar.kind = JsonoScalarKind::Int64;
-			scalar.int_value = int64_t(raw);
-			return scalar;
-		case ext_subtype::UINT64:
-			scalar.kind = JsonoScalarKind::UInt64;
-			scalar.uint_value = raw;
-			return scalar;
-		case ext_subtype::DOUBLE:
-			scalar.kind = JsonoScalarKind::Double;
-			std::memcpy(&scalar.double_value, &raw, sizeof(scalar.double_value));
-			return scalar;
-		default:
-			throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
-		}
+	JSONO_ALWAYS_INLINE void OnBool(bool value) {
+		scalar.kind = JsonoScalarKind::Bool;
+		scalar.bool_value = value;
 	}
-	case tag::VAL_TRUE:
-		scalar.kind = JsonoScalarKind::Bool;
-		scalar.bool_value = true;
-		cursor.pos++;
-		return scalar;
-	case tag::VAL_FALSE:
-		scalar.kind = JsonoScalarKind::Bool;
-		scalar.bool_value = false;
-		cursor.pos++;
-		return scalar;
-	case tag::VAL_NULL:
+	JSONO_ALWAYS_INLINE void OnNull() {
 		scalar.kind = JsonoScalarKind::Null;
-		cursor.pos++;
-		return scalar;
+	}
+};
+
+// Out-of-line throw for a non-scalar slot reached by DecodeScalarAt: KEY/OBJ_END/ARR_END are a
+// non-value slot, anything else (containers the caller failed to handle, unknown tags) is an
+// unknown tag. Keeps DecodeScalarAt's two distinct error messages off the hot path.
+[[noreturn]] JSONO_COLD inline void ThrowNonScalarSlot(uint64_t slot) {
+	switch (SlotTag(slot)) {
 	case tag::KEY:
 	case tag::OBJ_END:
 	case tag::ARR_END:
@@ -599,6 +622,22 @@ JSONO_ALWAYS_INLINE JsonoScalar DecodeScalarAt(const JsonoView &view, JsonoCurso
 	default:
 		throw InvalidInputException("malformed JSONO: unknown slot tag");
 	}
+}
+
+// Decode the scalar value at `cursor`, advancing it past the value. The shared DecodeScalarSlot
+// ladder is the single owner of the tag/ext-subtype dispatch and stream-cursor accounting; this
+// projects it into a JsonoScalar. Throws on container or non-value slots (callers handle
+// OBJ_START/ARR_START first).
+JSONO_ALWAYS_INLINE JsonoScalar DecodeScalarAt(const JsonoView &view, JsonoCursor &cursor) {
+	if (cursor.pos >= view.Slots()) {
+		throw InvalidInputException("malformed JSONO: value position out of bounds");
+	}
+	auto slot = view.SlotAt(cursor.pos);
+	ScalarDecodeSink sink;
+	if (!DecodeScalarSlot(view, slot, cursor, sink)) {
+		ThrowNonScalarSlot(slot);
+	}
+	return sink.scalar;
 }
 
 // SQL type name for a scalar kind. Numbers (native double, DEC60, and NUMBER-text
