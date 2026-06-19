@@ -363,36 +363,7 @@ bool TryReadExtractPath(ClientContext &context, Expression &expr, string &path, 
 	return true;
 }
 
-bool TryReadJsonoExtract(ClientContext &context, Expression &expr, BoundColumnRefExpression *&column_ref,
-                         JsonoMatchPredicate &predicate) {
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
-		return false;
-	}
-	auto &function = expr.Cast<BoundFunctionExpression>();
-	if (function.function.name != "->>" && function.function.name != "jsono_extract_string") {
-		return false;
-	}
-	if (function.children.size() != 2 ||
-	    function.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-		return false;
-	}
-	auto &candidate_ref = function.children[0]->Cast<BoundColumnRefExpression>();
-	if (!IsJsonoType(candidate_ref.return_type)) {
-		return false;
-	}
-	string path;
-	vector<PathStep> steps;
-	if (!TryReadExtractPath(context, *function.children[1], path, steps)) {
-		return false;
-	}
-	column_ref = &candidate_ref;
-	predicate.path = std::move(path);
-	predicate.steps = std::move(steps);
-	predicate.compiled_path = CompileJsonoPath(predicate.steps);
-	return true;
-}
-
-// Like TryReadJsonoExtract, but captures the JSONO-typed value the extract reads as an
+// Captures the JSONO-typed value an extract reads as an
 // arbitrary expression rather than requiring a bare column ref. The matcher groups predicates by
 // this source (column-equal for plain columns, Expression::Equals for the residual reinterpret
 // the shredded rewrite emits), so K predicates over one shredded column fuse into a single
@@ -569,20 +540,12 @@ bool LocateSteps(JsonoPathLocalState &lstate, idx_t step_base, const vector<Path
 	return true;
 }
 
-bool LocatePath(JsonoPathLocalState &lstate, const JsonoMatchPredicate &predicate, const JsonoView &view,
-                JsonoMatchLocation &location) {
-	if (predicate.compiled_path.kind != JsonoCompiledPathKind::Generic) {
-		return LocateCompiledPath(lstate, predicate.compiled_path, predicate.step_base, view, location);
+bool LocateByCompiledPathOrSteps(JsonoPathLocalState &lstate, const JsonoCompiledPath &compiled_path, idx_t step_base,
+                                 const vector<PathStep> &steps, const JsonoView &view, JsonoMatchLocation &location) {
+	if (compiled_path.kind != JsonoCompiledPathKind::Generic) {
+		return LocateCompiledPath(lstate, compiled_path, step_base, view, location);
 	}
-	return LocateSteps(lstate, predicate.step_base, predicate.steps, view, location);
-}
-
-bool LocateProjectField(JsonoPathLocalState &lstate, const JsonoProjectField &field, const JsonoView &view,
-                        JsonoMatchLocation &location) {
-	if (field.compiled_path.kind != JsonoCompiledPathKind::Generic) {
-		return LocateCompiledPath(lstate, field.compiled_path, field.step_base, view, location);
-	}
-	return LocateSteps(lstate, field.step_base, field.steps, view, location);
+	return LocateSteps(lstate, step_base, steps, view, location);
 }
 
 bool ContainsExpectedValue(const vector<string> &values, nonstd::string_view candidate) {
@@ -621,7 +584,8 @@ bool LocatedValueMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, co
 bool PredicateMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoMatchPredicate &predicate,
                       const JsonoView &view) {
 	JsonoMatchLocation location;
-	if (!LocatePath(lstate, predicate, view, location)) {
+	if (!LocateByCompiledPathOrSteps(lstate, predicate.compiled_path, predicate.step_base, predicate.steps, view,
+	                                 location)) {
 		// A miss covered by the row's shred manifest must not read as a silent non-match.
 		reader.CheckPathMiss(view, predicate.steps);
 		return false;
@@ -952,7 +916,8 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 		for (idx_t field_index = 0; field_index < bind_data.fields.size(); field_index++) {
 			auto &field = bind_data.fields[field_index];
 			JsonoMatchLocation location;
-			if (!LocateProjectField(lstate, field, view, location)) {
+			if (!LocateByCompiledPathOrSteps(lstate, field.compiled_path, field.step_base, field.steps, view,
+			                                 location)) {
 				// A miss covered by the row's shred manifest must not project a silent NULL.
 				reader.CheckPathMiss(view, field.steps);
 				FlatVector::SetNull(*children[field_index], row, true);
@@ -1188,19 +1153,21 @@ struct JsonoProjectSource {
 };
 
 void CollectProjectSources(ClientContext &context, Expression &expr, vector<JsonoProjectSource> &sources) {
-	BoundColumnRefExpression *column_ref = nullptr;
+	Expression *extract_source = nullptr;
 	JsonoMatchPredicate predicate;
-	if (TryReadJsonoExtract(context, expr, column_ref, predicate)) {
+	if (TryReadJsonoExtractSource(context, expr, extract_source, predicate) &&
+	    extract_source->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &column_ref = extract_source->Cast<BoundColumnRefExpression>();
 		JsonoProjectSource *source = nullptr;
 		for (auto &candidate : sources) {
-			if (candidate.binding == column_ref->binding) {
+			if (candidate.binding == column_ref.binding) {
 				source = &candidate;
 				break;
 			}
 		}
 		if (!source) {
 			sources.push_back(
-			    JsonoProjectSource {column_ref->binding, column_ref->return_type, column_ref->GetAlias(), {}});
+			    JsonoProjectSource {column_ref.binding, column_ref.return_type, column_ref.GetAlias(), {}});
 			source = &sources.back();
 		}
 		if (FindProjectField(source->fields, predicate.steps) == DConstants::INVALID_INDEX) {
@@ -1245,9 +1212,10 @@ bool TryRewriteExtractExtremaAggregate(ClientContext &context, unique_ptr<Expres
 	if (aggregate.return_type.id() != LogicalTypeId::VARCHAR) {
 		return false;
 	}
-	BoundColumnRefExpression *column_ref = nullptr;
+	Expression *extract_source = nullptr;
 	JsonoMatchPredicate predicate;
-	if (!TryReadJsonoExtract(context, *aggregate.children[0], column_ref, predicate)) {
+	if (!TryReadJsonoExtractSource(context, *aggregate.children[0], extract_source, predicate) ||
+	    extract_source->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return false;
 	}
 
@@ -1301,10 +1269,11 @@ unique_ptr<Expression> MakeStructExtractAtExpression(JsonoProjectRewriteState &s
 }
 
 void RewriteProjectExpression(unique_ptr<Expression> &expr, JsonoProjectRewriteState &state) {
-	BoundColumnRefExpression *column_ref = nullptr;
+	Expression *extract_source = nullptr;
 	JsonoMatchPredicate predicate;
-	if (TryReadJsonoExtract(state.context, *expr, column_ref, predicate) &&
-	    column_ref->binding == state.source_binding) {
+	if (TryReadJsonoExtractSource(state.context, *expr, extract_source, predicate) &&
+	    extract_source->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+	    extract_source->Cast<BoundColumnRefExpression>().binding == state.source_binding) {
 		auto field_index = FindProjectField(state.fields, predicate.steps);
 		if (field_index == DConstants::INVALID_INDEX) {
 			throw InternalException("JSONO projector rewrite missing collected field for path '%s'", predicate.path);
