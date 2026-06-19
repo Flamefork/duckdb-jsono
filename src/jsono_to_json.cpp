@@ -105,8 +105,9 @@ void RegisterJsonoToJson(ExtensionLoader &loader) {
 		f.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 		loader.RegisterFunction(f);
 	}
-	loader.RegisterCastFunction(jsono_type, LogicalType::JSON(), BoundCastInfo(JsonoCastToJson), -1);
-	loader.RegisterCastFunction(jsono_type, LogicalType::VARCHAR, BoundCastInfo(JsonoCastToJson), -1);
+	for (auto &target : {LogicalType::JSON(), LogicalType(LogicalType::VARCHAR)}) {
+		loader.RegisterCastFunction(jsono_type, target, BoundCastInfo(JsonoCastToJson), -1);
+	}
 	// Bind-correct shredded->VARCHAR (declines for non-jsono structs). Explicit-only (-1): struct is
 	// not implicitly castable to VARCHAR, and this entry must not make it so.
 	loader.RegisterCastFunction(LogicalType::STRUCT({{"any", LogicalType::ANY}}), LogicalType::VARCHAR,

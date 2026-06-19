@@ -26,13 +26,6 @@ void RegisterJsonoToJson(ExtensionLoader &loader);
 
 namespace {
 
-void JsonoNullExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	(void)args;
-	(void)state;
-	result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	ConstantVector::SetNull(result, true);
-}
-
 void JsonoIdentityExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)state;
 	result.Reference(args.data[0]);
@@ -288,13 +281,7 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 
 	{
 		ScalarFunctionSet set("jsono");
-		set.AddFunction(ScalarFunction({LogicalType::SQLNULL}, jsono_type, JsonoNullExecute));
 		set.AddFunction(ScalarFunction({jsono_type}, jsono_type, JsonoIdentityExecute));
-		loader.RegisterFunction(set);
-	}
-	{
-		ScalarFunctionSet set("try_jsono");
-		set.AddFunction(ScalarFunction({LogicalType::SQLNULL}, jsono_type, JsonoNullExecute));
 		loader.RegisterFunction(set);
 	}
 	{
