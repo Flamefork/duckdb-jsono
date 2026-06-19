@@ -650,14 +650,8 @@ struct JsonoExtractExtremaFunction {
 	}
 };
 
-bool ExtremaStringCandidateWins(JsonoExtremaKind kind, nonstd::string_view current, nonstd::string_view candidate) {
-	if (kind == JsonoExtremaKind::Min) {
-		return candidate < current;
-	}
-	return candidate > current;
-}
-
-bool ExtremaNumericCandidateWins(JsonoExtremaKind kind, uint64_t current, uint64_t candidate) {
+template <class T>
+bool ExtremaCandidateWins(JsonoExtremaKind kind, const T &current, const T &candidate) {
 	if (kind == JsonoExtremaKind::Min) {
 		return candidate < current;
 	}
@@ -722,7 +716,7 @@ void FoldStringExtrema(JsonoExtractExtremaState &state, JsonoExtremaKind kind, n
 	}
 	EnsureExtremaStringMode(state);
 	nonstd::string_view current(state.text_value.GetData(), state.text_value.GetSize());
-	if (ExtremaStringCandidateWins(kind, current, candidate)) {
+	if (ExtremaCandidateWins(kind, current, candidate)) {
 		AssignExtremaText(state, candidate);
 	}
 }
@@ -737,7 +731,7 @@ void FoldNumericExtrema(JsonoExtractExtremaState &state, JsonoExtremaKind kind, 
 		return;
 	}
 	if (state.numeric_mode && state.numeric_width == candidate_width) {
-		if (ExtremaNumericCandidateWins(kind, state.numeric_value, candidate)) {
+		if (ExtremaCandidateWins(kind, state.numeric_value, candidate)) {
 			state.numeric_value = candidate;
 		}
 		return;
@@ -805,45 +799,42 @@ void JsonoExtractExtremaFinalize(Vector &states, AggregateInputData &aggr_input_
 	}
 }
 
-void JsonoVarcharExtremaSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
-                                     data_ptr_t state_ptr, idx_t count) {
-	(void)input_count;
-	auto &bind_data = aggr_input_data.bind_data->Cast<JsonoExtremaAggregateBindData>();
+// The simple (single-state) and scattered (per-row state) updates differ only in how a row maps
+// to its accumulator. state_for monomorphizes per call site to a fixed reference or the same
+// scatter lookup the scattered path did inline, so the shared loop costs nothing extra.
+template <class StateFor>
+void JsonoVarcharExtremaFold(Vector inputs[], JsonoExtremaKind kind, idx_t count, StateFor state_for) {
 	UnifiedVectorFormat input_fmt;
 	inputs[0].ToUnifiedFormat(count, input_fmt);
 	auto input_data = UnifiedVectorFormat::GetData<string_t>(input_fmt);
-	auto &state = *reinterpret_cast<JsonoExtractExtremaState *>(state_ptr);
 	for (idx_t row = 0; row < count; row++) {
 		auto input_idx = RowIndex(input_fmt, row);
 		if (!input_fmt.validity.RowIsValid(input_idx)) {
 			continue;
 		}
 		auto value = input_data[input_idx];
-		FoldVarcharExtrema(state, bind_data.kind, nonstd::string_view(value.GetData(), value.GetSize()));
+		FoldVarcharExtrema(state_for(row), kind, nonstd::string_view(value.GetData(), value.GetSize()));
 	}
+}
+
+void JsonoVarcharExtremaSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                     data_ptr_t state_ptr, idx_t count) {
+	(void)input_count;
+	auto &bind_data = aggr_input_data.bind_data->Cast<JsonoExtremaAggregateBindData>();
+	auto &state = *reinterpret_cast<JsonoExtractExtremaState *>(state_ptr);
+	JsonoVarcharExtremaFold(inputs, bind_data.kind, count, [&](idx_t) -> JsonoExtractExtremaState & { return state; });
 }
 
 void JsonoVarcharExtremaUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &states,
                                idx_t count) {
 	(void)input_count;
 	auto &bind_data = aggr_input_data.bind_data->Cast<JsonoExtremaAggregateBindData>();
-	UnifiedVectorFormat input_fmt;
-	inputs[0].ToUnifiedFormat(count, input_fmt);
-	auto input_data = UnifiedVectorFormat::GetData<string_t>(input_fmt);
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<JsonoExtractExtremaState *>(state_fmt);
-
-	for (idx_t row = 0; row < count; row++) {
-		auto input_idx = RowIndex(input_fmt, row);
-		if (!input_fmt.validity.RowIsValid(input_idx)) {
-			continue;
-		}
-		auto state_idx = RowIndex(state_fmt, row);
-		auto value = input_data[input_idx];
-		FoldVarcharExtrema(*state_data[state_idx], bind_data.kind,
-		                   nonstd::string_view(value.GetData(), value.GetSize()));
-	}
+	JsonoVarcharExtremaFold(inputs, bind_data.kind, count, [&](idx_t row) -> JsonoExtractExtremaState & {
+		return *state_data[RowIndex(state_fmt, row)];
+	});
 }
 
 // The optimizer injects these helpers fully bound: they are query-local artifacts
@@ -1640,6 +1631,12 @@ private:
 		       name == "jsono_extract" || name == "jsono_extract_string";
 	}
 
+	// The string-valued SUBSET of IsExtractFunction: these render a scalar leaf to text, while the
+	// superset also covers the json-valued `->`/json_extract. Kept distinct on purpose — do not merge.
+	static bool IsStringExtractFunction(const string &name) {
+		return name == "->>" || name == "json_extract_string" || name == "jsono_extract_string";
+	}
+
 	// The extract argument is a CAST whose child is a shredded JSONO struct: either
 	// `CAST(shredded->JSON)` from core json's STRUCT->JSON path (the core-named extracts), or
 	// `CAST(shredded->JSONO)` from the jsono-named extracts' bind-time reconstruct cast. Return that
@@ -1663,8 +1660,7 @@ private:
 	// and any extract of a subtree that contains a stripped shred leaf — string extracts
 	// serialize containers, so they need the leaf as much as json-valued ones.
 	unique_ptr<Expression> RewriteShreddedExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast) {
-		bool string_fn = expr.function.name == "->>" || expr.function.name == "json_extract_string" ||
-		                 expr.function.name == "jsono_extract_string";
+		bool string_fn = IsStringExtractFunction(expr.function.name);
 		string path;
 		vector<PathStep> steps;
 		if (!TryReadExtractPath(context, *expr.children[1], path, steps)) {
@@ -1880,9 +1876,7 @@ private:
 			return nullptr;
 		}
 		auto &fn = expr.child->Cast<BoundFunctionExpression>();
-		if (!(fn.function.name == "->>" || fn.function.name == "json_extract_string" ||
-		      fn.function.name == "jsono_extract_string") ||
-		    fn.children.size() != 2) {
+		if (!IsStringExtractFunction(fn.function.name) || fn.children.size() != 2) {
 			return nullptr;
 		}
 		auto shredded_cast = ShreddedJsonCast(*fn.children[0]);
