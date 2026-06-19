@@ -827,14 +827,39 @@ void EmitReconShredScalar(JsonoBuilder &builder, const ReconShred &shred, const 
 	}
 }
 
-// True if an array shred's pure object-key path ends at / continues past `key` when matched at
-// `depth`. Shared by the read overlay and the write skeleton emit (which it precedes in the TU).
-static bool ArrayPathTerminates(const vector<PathStep> &path, size_t depth, nonstd::string_view key) {
+// True if a pure object-key path ends at / continues past `key` when matched at `depth`. The
+// size check precedes the [depth] read, so a path shorter than depth+1 never indexes OOB. The
+// path ref is std::vector so duckdb::vector<PathStep> binds too (derived-to-base). Shared by the
+// array read overlay, the residual skeleton emit, and the LWW tree strip below.
+static bool PathTerminatesOnKey(const std::vector<PathStep> &path, size_t depth, nonstd::string_view key) {
 	return path.size() == depth + 1 && nonstd::string_view(path[depth].key.data(), path[depth].key.size()) == key;
 }
 
-static bool ArrayPathContinues(const vector<PathStep> &path, size_t depth, nonstd::string_view key) {
+static bool PathContinuesPastKey(const std::vector<PathStep> &path, size_t depth, nonstd::string_view key) {
 	return path.size() > depth + 1 && nonstd::string_view(path[depth].key.data(), path[depth].key.size()) == key;
+}
+
+// Multi-path variants: "does any active path terminate on `key`" and "collect the active paths
+// that continue past `key`". Templated over the path-pointer container so both the std::vector
+// skeleton side and the duckdb::vector LWW side share them; both delegate to the predicates above.
+template <class Paths>
+static bool AnyPathTerminatesOnKey(const Paths &paths, size_t depth, nonstd::string_view key) {
+	for (auto *path : paths) {
+		if (PathTerminatesOnKey(*path, depth, key)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+template <class Paths>
+static void CollectContinuingPaths(const Paths &paths, size_t depth, nonstd::string_view key, Paths &out) {
+	out.clear();
+	for (auto *path : paths) {
+		if (PathContinuesPastKey(*path, depth, key)) {
+			out.push_back(path);
+		}
+	}
 }
 
 // ---- Array shred overlay (read side) ----
@@ -984,9 +1009,9 @@ void EmitArrayOverlay(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &
 		const ArrayReconShred *terminal = nullptr;
 		std::vector<const ArrayReconShred *> deeper;
 		for (auto *shred : array_shreds) {
-			if (ArrayPathTerminates(shred->path, depth, key)) {
+			if (PathTerminatesOnKey(shred->path, depth, key)) {
 				terminal = shred;
-			} else if (ArrayPathContinues(shred->path, depth, key)) {
+			} else if (PathContinuesPastKey(shred->path, depth, key)) {
 				deeper.push_back(shred);
 			}
 		}
@@ -3510,27 +3535,6 @@ bool JsonoGroupMergeLWWUpdateDirectShredded(Vector inputs[], const GroupMergeLWW
 	    [&](idx_t row) -> GroupMergeLWWState & { return *state_data[RowIndex(state_fmt, row)]; });
 }
 
-bool LWWPathTerminatesOnKey(const vector<const vector<PathStep> *> &paths, size_t depth, nonstd::string_view key) {
-	for (auto *path : paths) {
-		auto &step = (*path)[depth];
-		if (depth + 1 == path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
-			return true;
-		}
-	}
-	return false;
-}
-
-void LWWContinuingPathsForKey(const vector<const vector<PathStep> *> &paths, size_t depth, nonstd::string_view key,
-                              vector<const vector<PathStep> *> &out) {
-	out.clear();
-	for (auto *path : paths) {
-		auto &step = (*path)[depth];
-		if (depth + 1 < path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
-			out.push_back(path);
-		}
-	}
-}
-
 void EmitLWWTreeNodeStrippingPaths(const LWWTreeNode &node, const vector<const vector<PathStep> *> &strip_paths,
                                    JsonoBuilder &builder, size_t depth) {
 	if (strip_paths.empty() || node.kind != LWWTreeKind::Object) {
@@ -3540,23 +3544,23 @@ void EmitLWWTreeNodeStrippingPaths(const LWWTreeNode &node, const vector<const v
 	idx_t child_count = 0;
 	for (auto &child : node.children) {
 		auto key = nonstd::string_view(child.key.data(), child.key.size());
-		child_count += LWWPathTerminatesOnKey(strip_paths, depth, key) ? 0 : 1;
+		child_count += AnyPathTerminatesOnKey(strip_paths, depth, key) ? 0 : 1;
 	}
 	builder.EmitObjectStart(child_count);
 	for (auto &child : node.children) {
 		auto key = nonstd::string_view(child.key.data(), child.key.size());
-		if (!LWWPathTerminatesOnKey(strip_paths, depth, key)) {
+		if (!AnyPathTerminatesOnKey(strip_paths, depth, key)) {
 			builder.EmitKeySlot(key);
 		}
 	}
 	vector<const vector<PathStep> *> deeper;
 	for (auto &child : node.children) {
 		auto key = nonstd::string_view(child.key.data(), child.key.size());
-		if (LWWPathTerminatesOnKey(strip_paths, depth, key)) {
+		if (AnyPathTerminatesOnKey(strip_paths, depth, key)) {
 			continue;
 		}
 		builder.EmitObjectChildStart();
-		LWWContinuingPathsForKey(strip_paths, depth, key, deeper);
+		CollectContinuingPaths(strip_paths, depth, key, deeper);
 		EmitLWWTreeNodeStrippingPaths(*child.node, deeper, builder, depth + 1);
 	}
 	builder.EmitObjectEnd();
@@ -3598,7 +3602,7 @@ void EmitLWWTreeNodeWithListOverrides(const LWWTreeNode &node, JsonoBuilder &bui
 			continue;
 		}
 		auto key = nonstd::string_view(node.children[i].key.data(), node.children[i].key.size());
-		if (!LWWPathTerminatesOnKey(scalar_strip_paths, depth, key)) {
+		if (!AnyPathTerminatesOnKey(scalar_strip_paths, depth, key)) {
 			entries.push_back(LWWRootEmitEntry {false, i, key});
 		}
 	}
@@ -3623,7 +3627,7 @@ void EmitLWWTreeNodeWithListOverrides(const LWWTreeNode &node, JsonoBuilder &bui
 			EmitLWWListSkeleton(list_lanes[entry.index], builder, depth + 1);
 		} else {
 			vector<const vector<PathStep> *> deeper;
-			LWWContinuingPathsForKey(scalar_strip_paths, depth, entry.key, deeper);
+			CollectContinuingPaths(scalar_strip_paths, depth, entry.key, deeper);
 			EmitLWWTreeNodeStrippingPaths(*node.children[entry.index].node, deeper, builder, depth + 1);
 		}
 	}
@@ -4212,18 +4216,6 @@ void JsonoOverlayShredsToPlain(Vector &input, idx_t count, const vector<idx_t> &
 	ReconstructShreddedToPlainImpl(input, count, result, &shreds);
 }
 
-// True if some active path ends on `key` at this depth — its leaf is the value to strip.
-static bool PathTerminatesOnKey(const std::vector<const std::vector<PathStep> *> &active, size_t depth,
-                                nonstd::string_view key) {
-	for (auto *path : active) {
-		auto &step = (*path)[depth];
-		if (depth + 1 == path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
-			return true;
-		}
-	}
-	return false;
-}
-
 // The residual-emit core (defined below, after the array-skeleton helpers it dispatches to):
 // copy `view`'s object minus the leaves named by `scalar_paths`, and replace each terminal
 // array-shred key with its skeleton array. An empty `array_specs` reduces it to the plain leaf
@@ -4270,50 +4262,43 @@ static bool ElementSubfieldStrippable(const JsonoView &view, const JsonoCursor &
 	return JsonoScalarFitsShredType(scalar, type);
 }
 
-// Emit the skeleton scalar array (cursor at ARR_START): each element that the lane lifts (a scalar
-// fitting `element_type`) becomes a VAL_NULL placeholder — it carries no value, the parallel
-// LIST<element_type> shred does — every other element (a non-conforming scalar, a null, an object or
-// array) stays verbatim. The lift gate is JsonoScalarFitsShredType, the same one WriteScalarArrayShred
-// uses, so the placeholder positions match the shred's non-NULL slots exactly. On reconstruct the
-// placeholder is never read: a non-NULL shred slot overrides it, a NULL slot means the element was
-// kept (and a kept element is never a placeholder), so a placeholder and an explicit JSON null never
-// collide.
-static void EmitSkeletonScalarArray(const JsonoView &view, const JsonoCursor &array_cursor, JsonoBuilder &builder,
-                                    const LogicalType &element_type, size_t depth) {
-	auto end_pos = ReadArrayEndPos(view, array_cursor.pos);
-	builder.EmitArrayStart();
-	JsonoCursor cursor = array_cursor;
-	cursor.pos++; // first element; ARR_START consumes no stream entries
-	while (cursor.pos < end_pos) {
-		auto value_tag = SlotTag(view.SlotAt(cursor.pos));
-		if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
-			JsonoCursor probe = cursor;
-			auto scalar = DecodeScalarAt(view, probe);
-			if (JsonoScalarFitsShredType(scalar, element_type)) {
-				builder.EmitNull(); // lifted: placeholder; the shred holds the value
-				SkipValueFast(view, cursor);
-				continue;
-			}
-		}
-		EmitValueVerbatim(view, cursor, builder, depth + 1);
-	}
-	builder.EmitArrayEnd();
-}
-
-// Emit the skeleton array (cursor at ARR_START): each object element minus its strippable
-// subfields, every other element verbatim.
+// Emit the skeleton array (cursor at ARR_START) for either array shred kind. `spec.kind` is fixed
+// per array, so the lane dispatch hoists out of the element loop.
+//
+// ScalarArray lane: each element the lane lifts (a scalar fitting `spec.element_type`) becomes a
+// VAL_NULL placeholder — it carries no value, the parallel LIST<element_type> shred does — every
+// other element (a non-conforming scalar, a null, an object or array) stays verbatim. The lift gate
+// is JsonoScalarFitsShredType, the same one WriteScalarArrayShred uses, so the placeholder positions
+// match the shred's non-NULL slots exactly. On reconstruct the placeholder is never read: a non-NULL
+// shred slot overrides it, a NULL slot means the element was kept (and a kept element is never a
+// placeholder), so a placeholder and an explicit JSON null never collide.
+//
+// Array lane: each object element loses its strippable `spec.subfields` (lifted into the LIST<STRUCT>
+// shred), every other element verbatim.
 static void EmitSkeletonArray(const JsonoView &view, const JsonoCursor &array_cursor, JsonoBuilder &builder,
-                              const vector<std::pair<string, LogicalType>> &subfields, size_t depth) {
+                              const JsonoArrayShredSpec &spec, size_t depth) {
 	auto end_pos = ReadArrayEndPos(view, array_cursor.pos);
 	builder.EmitArrayStart();
 	JsonoCursor cursor = array_cursor;
 	cursor.pos++; // first element; ARR_START consumes no stream entries
-	std::vector<std::vector<PathStep>> strip_storage;
+	std::vector<std::vector<PathStep>> strip_storage; // Array lane: per-element strip paths
 	std::vector<const std::vector<PathStep> *> strip;
 	while (cursor.pos < end_pos) {
-		if (SlotTag(view.SlotAt(cursor.pos)) == tag::OBJ_START) {
+		if (spec.kind == ShredKind::ScalarArray) {
+			auto value_tag = SlotTag(view.SlotAt(cursor.pos));
+			if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
+				JsonoCursor probe = cursor;
+				auto scalar = DecodeScalarAt(view, probe);
+				if (JsonoScalarFitsShredType(scalar, spec.element_type)) {
+					builder.EmitNull(); // lifted: placeholder; the shred holds the value
+					SkipValueFast(view, cursor);
+					continue;
+				}
+			}
+			EmitValueVerbatim(view, cursor, builder, depth + 1);
+		} else if (SlotTag(view.SlotAt(cursor.pos)) == tag::OBJ_START) {
 			strip_storage.clear();
-			for (auto &sub : subfields) {
+			for (auto &sub : spec.subfields) {
 				if (ElementSubfieldStrippable(view, cursor, sub.first, sub.second)) {
 					strip_storage.push_back({PathStep {PathStepKind::Key, sub.first, 0}});
 				}
@@ -4349,14 +4334,14 @@ static void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cur
 	};
 	size_t surviving = 0;
 	for (size_t i = 0; i < layout.key_count; i++) {
-		if (!PathTerminatesOnKey(scalar_paths, depth, key_at(i))) {
+		if (!AnyPathTerminatesOnKey(scalar_paths, depth, key_at(i))) {
 			surviving++;
 		}
 	}
 	builder.EmitObjectStart(surviving);
 	for (size_t i = 0; i < layout.key_count; i++) {
 		auto key = key_at(i);
-		if (!PathTerminatesOnKey(scalar_paths, depth, key)) {
+		if (!AnyPathTerminatesOnKey(scalar_paths, depth, key)) {
 			builder.EmitKeySlot(key);
 		}
 	}
@@ -4364,7 +4349,7 @@ static void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cur
 	value_cursor.pos = layout.value_start;
 	for (size_t i = 0; i < layout.key_count; i++) {
 		auto key = key_at(i);
-		if (PathTerminatesOnKey(scalar_paths, depth, key)) {
+		if (AnyPathTerminatesOnKey(scalar_paths, depth, key)) {
 			SkipValueFast(view, value_cursor);
 			continue;
 		}
@@ -4379,19 +4364,15 @@ static void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cur
 		const JsonoArrayShredSpec *terminal_array = nullptr;
 		std::vector<const JsonoArrayShredSpec *> deeper_array;
 		for (auto *spec : array_specs) {
-			if (ArrayPathTerminates(spec->path, depth, key)) {
+			if (PathTerminatesOnKey(spec->path, depth, key)) {
 				terminal_array = spec;
-			} else if (ArrayPathContinues(spec->path, depth, key)) {
+			} else if (PathContinuesPastKey(spec->path, depth, key)) {
 				deeper_array.push_back(spec);
 			}
 		}
 		auto value_tag = SlotTag(view.SlotAt(value_cursor.pos));
 		if (terminal_array && value_tag == tag::ARR_START) {
-			if (terminal_array->kind == ShredKind::ScalarArray) {
-				EmitSkeletonScalarArray(view, value_cursor, builder, terminal_array->element_type, depth);
-			} else {
-				EmitSkeletonArray(view, value_cursor, builder, terminal_array->subfields, depth);
-			}
+			EmitSkeletonArray(view, value_cursor, builder, *terminal_array, depth);
 			SkipValueFast(view, value_cursor);
 		} else if ((!deeper_scalar.empty() || !deeper_array.empty()) && value_tag == tag::OBJ_START) {
 			EmitSkeletonObject(view, value_cursor, builder, deeper_scalar, deeper_array, depth + 1);
