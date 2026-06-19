@@ -1393,7 +1393,7 @@ bool RewriteProjectionProjector(OptimizerExtensionInput &input, LogicalProjectio
 //===--------------------------------------------------------------------===//
 // Shredded JSONO transparency
 //
-// A shredded JSONO column reaches the binder as a plain STRUCT (four BLOB prefix
+// A shredded JSONO column reaches the binder as a plain STRUCT (six BLOB prefix
 // followed by VARCHAR shred columns named by canonical path). No implicit cast turns
 // that struct into JSONO, so a bare `j->>'path'` / `to_json(j)` binds to core json's
 // STRUCT->JSON path, which serializes the raw struct (wrong: leaks the blobs, never
@@ -1403,7 +1403,7 @@ bool RewriteProjectionProjector(OptimizerExtensionInput &input, LogicalProjectio
 //     The shred already holds the extracted text, so this skips the JSONO parse and
 //     lets projection/row-group pruning act on the shred column directly.
 //   - any CAST(shredded->JSON) and to_json(shredded) -> reinterpret(col->JSONO)::JSON,
-//     which reconstructs the authoritative value from the four-blob prefix. Because a
+//     which reconstructs the authoritative value from the six-blob prefix. Because a
 //     non-shred extract's inner cast is rewritten too, correctness never depends on a
 //     path being shredded; shreds are purely a fast path.
 //===--------------------------------------------------------------------===//
@@ -1421,7 +1421,8 @@ struct JsonoShred {
 // The shreds of a shredded layout, each named by its canonical path. A shred may be typed (a hot
 // number stored as BIGINT/DOUBLE), so the type is carried: the `->>` text contract reads the shred
 // and casts it to VARCHAR, while reconstruction injects it back at its JSON type. child_index is the
-// shred's 0-based position over the shred set (layout child 1 + child_index, after `body`).
+// shred's 0-based position over the shred set (`shreds` struct field 1 + child_index, after the
+// marker; see ShredExtract).
 vector<JsonoShred> CollectShreddedShreds(const LogicalType &shredded) {
 	vector<JsonoShred> shreds;
 	JsonoLayoutType layout;
@@ -1475,19 +1476,21 @@ struct ShredPatchNode {
 };
 
 // Per shredded jsono column (keyed by its base table ColumnBinding), the totality of each shred:
-// entry[child_index] == false means the shred has no SQL NULL across the whole table, i.e. no row
-// fell into the residual for that path (NULL-shred <=> value-in-residual, see jsono_shred WriteShred).
+// entry[child_index] == false means a bare lane read serves the shred's full `->>` answer on every
+// row (no value spilled to the residual AND the file was written under exactly the read shred set).
 // A total shred lets the rewriter drop the residual COALESCE arm so a plain typed struct_extract is
 // emitted, which the planner pushes MIN/MAX/filter into the scan's zone-map statistics. Absent /
-// unknown / has-null all leave entry true so the safe COALESCE form stays.
+// unknown / a spill / a schema mismatch all leave entry true so the safe COALESCE form stays.
 using ShredTotalityMap = column_binding_map_t<vector<bool>>;
 
-// Walk the plan's LogicalGet leaves and, for each shredded jsono column the scan exposes, pull
-// per-shred null statistics through the table function's statistics_extended pointer (the same one
-// DuckDB's own StatisticsPropagator uses; native tables and Parquet both register it). Descend the
-// returned StructStats twice: top struct child 0 is the layout field, layout child `1 + child_index`
-// is the shred. Fail-safe: no statistics function, nullptr stats, or CanHaveNull() leaves the shred
-// non-total (true).
+// Walk the plan's LogicalGet leaves and, for each shredded jsono column the scan exposes, decide each
+// shred's totality from statistics pulled through the table function's statistics_extended pointer
+// (the same one DuckDB's own StatisticsPropagator uses; native tables and Parquet both register it).
+// Descend the returned StructStats: top struct child 0 is the layout, layout child 1 is the `shreds`
+// struct (child 0 the shred-set marker, child 1 + child_index a scalar shred pair whose child 1 is
+// `complete`). A shred is total iff the marker proves schema identity (min==max==read-type hash) AND
+// the shred's own `complete` (TINYINT 1/0) carries no 0 (min == 1). Fail-safe: no statistics function,
+// nullptr stats, a missing min/max, or a hash/spill mismatch leaves the shred non-total (true).
 void CollectShredTotality(ClientContext &context, const LogicalOperator &op, ShredTotalityMap &totality) {
 	for (auto &child : op.children) {
 		CollectShredTotality(context, *child, totality);
@@ -1517,44 +1520,59 @@ void CollectShredTotality(ClientContext &context, const LogicalOperator &op, Shr
 		} else {
 			stats = get.function.statistics(context, get.bind_data.get(), table_index);
 		}
-		JsonoLayoutType layout_info;
-		bool has_value_complete =
-		    TryParseJsonoLayoutType(returned_types[table_index], layout_info) && layout_info.has_value_complete;
 		vector<bool> per_shred(shreds.size(), true);
 		if (stats && stats->GetType().id() == LogicalTypeId::STRUCT &&
 		    StructType::GetChildCount(stats->GetType()) >= 1) {
 			auto &layout_stats = StructStats::GetChildStats(*stats, 0);
-			if (layout_stats.GetType().id() == LogicalTypeId::STRUCT) {
-				auto layout_children = StructType::GetChildCount(layout_stats.GetType());
-				for (auto &shred : shreds) {
-					// Canonical base-table layout: body (0), value-complete marker (1), shreds (2+).
-					idx_t layout_index = 2 + shred.child_index;
-					if (layout_index < layout_children &&
-					    !StructStats::GetChildStats(layout_stats, layout_index).CanHaveNull()) {
-						per_shred[shred.child_index] = false;
-					}
-				}
-				// Value-complete: the marker carries no NULL AND a single min==max layout hash equal to
-				// the read type's, so every scanned row diverted nothing into the residual AND was
-				// written under EXACTLY the read shred set. Each typed shred's NULLs are then absent
-				// paths, where a bare struct_extract reads the correct NULL, so all shreds are safe to
-				// read COALESCE-free even those that still carry (absent) NULLs. A multi-file read that
-				// unions narrower shred sets (union_by_name, DuckLake schema evolution) leaves the marker
-				// carrying a different hash per file (min!=max, or min==max!=read hash): the file's
-				// value-completeness covered only its own narrower set, not the widened read type, so a
-				// shred NULL-filled by the reader means value-in-residual, not absent — this check fails
-				// and the residual COALESCE fallback stays. (A base-table column is canonical, so the
-				// marker is the last layout child; value_complete_index carries its exact position
-				// regardless.)
-				idx_t vc_index = layout_info.value_complete_index;
-				if (has_value_complete && vc_index < layout_children) {
-					auto &vc_stats = StructStats::GetChildStats(layout_stats, vc_index);
-					auto expected_hash = JsonoLayoutHashOf(returned_types[table_index]);
-					if (!vc_stats.CanHaveNull() && NumericStats::HasMinMax(vc_stats) &&
-					    NumericStats::Min(vc_stats).GetValue<uint64_t>() == expected_hash &&
-					    NumericStats::Max(vc_stats).GetValue<uint64_t>() == expected_hash) {
+			if (layout_stats.GetType().id() == LogicalTypeId::STRUCT &&
+			    StructType::GetChildCount(layout_stats.GetType()) >= 2) {
+				// layout child 1 is the `shreds` struct: child 0 is the shred-set marker, child
+				// 1 + shred.child_index is the shred (a scalar pair whose child 1 is `complete`).
+				auto &shreds_stats = StructStats::GetChildStats(layout_stats, 1);
+				if (shreds_stats.GetType().id() == LogicalTypeId::STRUCT &&
+				    StructType::GetChildCount(shreds_stats.GetType()) >= 1) {
+					auto shred_children = StructType::GetChildCount(shreds_stats.GetType());
+					// Schema identity: the marker carries a single min==max layout hash equal to the read
+					// type's, so every scanned row was written under EXACTLY the read shred set. A
+					// multi-file read unioning narrower shred sets (union_by_name, DuckLake evolution)
+					// carries a different hash per file (min!=max, or min==max!=read hash) and fails this,
+					// keeping the residual COALESCE fallback. SQL-NULL rows null the marker but min/max
+					// ignore nulls, so they do not block schema identity.
+					auto &set_stats = StructStats::GetChildStats(shreds_stats, 0);
+					auto expected_hash = int64_t(JsonoLayoutHashOf(returned_types[table_index]));
+					bool schema_identity = NumericStats::HasMinMax(set_stats) &&
+					                       NumericStats::Min(set_stats).GetValue<int64_t>() == expected_hash &&
+					                       NumericStats::Max(set_stats).GetValue<int64_t>() == expected_hash;
+					if (schema_identity) {
 						for (auto &shred : shreds) {
-							per_shred[shred.child_index] = false;
+							// A scalar shred is total (COALESCE-free) when its own `complete` flag carries
+							// no 0 (min == 1): no row spilled this shred's value into the residual, so a
+							// bare struct_extract of the lane is the full `->>` answer even where the lane is
+							// NULL (absent path / explicit null). A divert on another shred never demotes
+							// this one — completeness is per-shred. `complete` is a TINYINT 1/0 flag, not a
+							// BOOLEAN, because the Parquet stats reader omits BOOLEAN min/max. Array shreds
+							// carry no `complete` (their stat child is a LIST, not a pair) and stay non-total
+							// (always reconstructed). !HasMinMax → conservative (keep COALESCE).
+							idx_t shred_index = 1 + shred.child_index;
+							if (shred_index >= shred_children) {
+								continue;
+							}
+							auto &shred_stats = StructStats::GetChildStats(shreds_stats, shred_index);
+							if (shred_stats.GetType().id() != LogicalTypeId::STRUCT ||
+							    StructType::GetChildCount(shred_stats.GetType()) < 2) {
+								continue;
+							}
+							auto &complete_stats = StructStats::GetChildStats(shred_stats, 1);
+							// Total only when every row's `complete` is exactly 1 (no spill anywhere). Require
+							// min == max == 1, not merely min != 0: `complete` is a 1/0 flag, so a malformed or
+							// out-of-domain value (e.g. 2 from a hand-built struct) must keep the safe COALESCE
+							// fallback rather than be trusted as total. Read as int64 so a non-canonical integer
+							// width (the parser tolerates any integral `complete`) cannot overflow the compare.
+							if (NumericStats::HasMinMax(complete_stats) &&
+							    NumericStats::Min(complete_stats).GetValue<int64_t>() == 1 &&
+							    NumericStats::Max(complete_stats).GetValue<int64_t>() == 1) {
+								per_shred[shred.child_index] = false;
+							}
 						}
 					}
 				}
@@ -1669,18 +1687,26 @@ private:
 			// jsono-named extracts already refused such a path at their own bind.
 			return nullptr;
 		}
-		for (auto &shred : CollectShreddedShreds(shredded_cast.child->return_type)) {
-			// An exact match on a scalar (non-list) shred under a string-valued extract reads the shred
-			// column directly. Every other shred interaction forces reconstruct, so the residual fallback
-			// below is a for-all: reached only when NO shred touched this read.
-			if (PathStepsEqual(shred.steps, steps) && string_fn && !IsShredListType(shred.type)) {
-				auto alias = expr.GetAlias();
-				return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
-			}
+		auto shreds = CollectShreddedShreds(shredded_cast.child->return_type);
+		// Reconstruct-needed reads first, so a render-unsafe container (a shred lives strictly inside
+		// the read path, stripped from the residual) reconstructs rather than bare-reading the lane — a
+		// bare read would miss the nested shred, and the residual alone misses it too. This also covers
+		// a json-valued extract of a shred, an array shred, and a read of a subtree holding a stripped
+		// leaf. The exact-scalar read below is then reached only when no shred forces reconstruct.
+		for (auto &shred : shreds) {
 			if (ReadNeedsReconstruct(steps, shred, string_fn)) {
 				return MakeReconstructExtract(expr, shredded_cast, string_fn);
 			}
 		}
+		// An exact match on a scalar (non-list) shred under a string-valued extract reads the shred
+		// lane directly (with the residual COALESCE fallback, dropped when the shred is total).
+		for (auto &shred : shreds) {
+			if (PathStepsEqual(shred.steps, steps) && string_fn && !IsShredListType(shred.type)) {
+				auto alias = expr.GetAlias();
+				return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
+			}
+		}
+		// No shred touched this read: serve it natively from the residual.
 		return MakeResidualExtract(expr, shredded_cast, string_fn);
 	}
 
@@ -1726,11 +1752,15 @@ private:
 		return function_binder.BindScalarFunction(StructExtractAtFun::GetFunction(), std::move(se_children));
 	}
 
-	// Shred `child_index` (0-based over the shred set) of a shredded column: a canonical layout is
-	// `body` (1-based 1), the value-complete marker (2), then the shreds, so shred k is layout child
-	// 3 + k (1-based). Base-table columns the optimizer reads are always canonical.
+	// Scalar shred `child_index` (0-based over the shred set) of a shredded column, navigated to its
+	// VALUE lane: column -> [1] jsono -> [2] shreds -> [2 + child_index] <path> pair -> [1] value
+	// (the `shreds` struct is the marker at field 1 then the shreds, so shred k is field 2 + k; a
+	// scalar shred is a pair STRUCT(value, complete) whose value is field 1). Only ever called for
+	// scalar shreds (every reconstruct/read site gates list shreds out before reaching here).
 	unique_ptr<Expression> ShredExtract(const Expression &column, idx_t child_index) {
-		return StructExtractAt(StructExtractAt(column.Copy(), 1), int64_t(child_index) + 3);
+		auto shreds = StructExtractAt(StructExtractAt(column.Copy(), 1), 2);
+		auto pair = StructExtractAt(std::move(shreds), int64_t(child_index) + 2);
+		return StructExtractAt(std::move(pair), 1);
 	}
 
 	// True when statistics proved this shred carries no SQL NULL anywhere in the table: NULL-shred
@@ -1973,7 +2003,7 @@ private:
 		// The fallback is a native residual text extract, already VARCHAR, so the finisher is identity.
 		// A non-total shred keeps it — including a multi-file read that unioned a narrower shred set
 		// (union_by_name / DuckLake schema evolution) and NULL-filled this lane while the value stays in
-		// the residual: ShredIsTotal's per-file value-complete coverage check keeps the fallback so the
+		// the residual: ShredIsTotal's per-file shred-set coverage check keeps the fallback so the
 		// residual value is read instead of a silent NULL.
 		return EmitShredRead(
 		    *column, shred, std::move(primary), std::move(path), LogicalType::VARCHAR,

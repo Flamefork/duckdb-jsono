@@ -704,7 +704,7 @@ bool MergeFoldStep(MergeMode mode, bool acc_is_sqlnull, const JsonoView &acc_vie
 }
 
 // A shred carried through a shred-aware merge: its name, the result struct child index it
-// lands in, and its type. The merge folds the four-BLOB residuals (existing logic) and
+// lands in, and its type. The merge folds the six-BLOB residuals (existing logic) and
 // copies each union shred from the last input that declares it. Shred keys are assumed
 // disjoint from residual keys (true when shreds are computed fields lifted into columns).
 struct MergeShred {
@@ -1261,7 +1261,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 }
 
 // Fold the residual views in `inputs` left-to-right under `mode` and write the merged plain
-// JSONO into `out` (the four-BLOB residual). Shared by the shred-aware fast path (raw residuals)
+// JSONO into `out` (the six-BLOB residual). Shared by the shred-aware fast path (raw residuals)
 // and the reshred fallback (reconstructed values). Each input reader carries its own manifest
 // policy: the fold rebuilds the residual without the inputs' manifests, so an unverified
 // narrowed input would launder the loss into a permanently undetectable one — the readers throw
@@ -1657,10 +1657,10 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			writer.Init(result);
 			// The fast path is reached only when scalar shred keys do not appear in the folded
 			// residual. Scalar-array keys may appear as their normal skeleton arrays, but they do not
-			// participate in the value-complete typed-scalar shortcut. A diverted scalar (case B)
+			// participate in the per-shred completeness typed-scalar shortcut. A diverted scalar (case B)
 			// would sit in that residual at the scalar shred's key and trip the gate to the fallback,
 			// so every NULL scalar shred here is an absent path (case A), never a diversion.
-			JsonoFillValueComplete(result, count);
+			JsonoFillShredsComplete(result, count);
 			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
 			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
 			for (idx_t b = 0; b < BODY_BLOB_COUNT; b++) {
@@ -1670,10 +1670,9 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				VectorOperations::Copy(*fr_blobs[b], *writer.vec[b], count, 0, 0);
 			}
 			auto &result_validity = FlatVector::Validity(result);
-			auto &vc = JsonoVcVector(result);
 			for (idx_t row = 0; row < count; row++) {
 				if (!result_validity.RowIsValid(row)) {
-					FlatVector::SetNull(vc, row, true);
+					JsonoSetRowMarkerNull(result, row);
 				}
 			}
 			for (auto &shred : bind_data.shreds) {
@@ -3614,18 +3613,29 @@ void WriteLWWListLaneValue(const LWWListLane &lane, const ReconShred &shred, Vec
 	FinishListRow(out, rid, start, lane.value.elements.size());
 }
 
+// `diverted` (out) is the per-shred completeness signal for the keyed finalize: true when a PRESENT
+// value at this scalar-shred path stays in the residual (a bare lane read would miss its `->>`), so
+// the finalize must mark the shred not-complete. A container (object/array subtree), a present scalar
+// that does not fit the typed/VARCHAR lane — all divert. Only an explicit JSON null leaves it false:
+// a bare NULL read equals `->>` there. This function never runs for an absent path (the caller gates
+// on `found`), so every NULL-lane return except explicit-null is a divert.
 bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, Vector &out, idx_t rid,
                               bool &diverted) {
 	diverted = false;
 	if (node.kind != LWWTreeKind::Leaf) {
+		// A merged object/array subtree at a scalar-shred path: it stays in the residual skeleton.
+		diverted = true;
 		return false;
 	}
 	JsonoView value_view = ViewOfBlob(node.value);
 	if (!value_view.ParseHeader() || value_view.Slots() == 0) {
+		diverted = true;
 		return false;
 	}
 	auto slot_tag = SlotTag(value_view.SlotAt(0));
 	if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
+		// A container value: it cannot fit a scalar lane and stays in the residual.
+		diverted = true;
 		return false;
 	}
 	JsonoCursor cursor;
@@ -3636,6 +3646,9 @@ bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, 
 	}
 	if (primitive == ShredPrimitive::Varchar) {
 		if (scalar.kind != JsonoScalarKind::String) {
+			// A non-string scalar (number/bool) renders to `->>` text but is not captured here, so it
+			// stays in the residual; an explicit JSON null reads NULL either way.
+			diverted = scalar.kind != JsonoScalarKind::Null;
 			return false;
 		}
 		FlatVector::Validity(out).SetValid(rid);
@@ -3643,7 +3656,9 @@ bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, 
 		return true;
 	}
 	if (!JsonoScalarFitsShredType(scalar, shred.type)) {
-		diverted = true;
+		// A present scalar that does not fit the typed lane stays in the residual; an explicit JSON
+		// null reads NULL either way, so a bare read of the NULL lane is correct.
+		diverted = scalar.kind != JsonoScalarKind::Null;
 		return false;
 	}
 	FlatVector::Validity(out).SetValid(rid);
@@ -3715,19 +3730,22 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	JsonoBodyWriter writer;
 	writer.Init(result);
 	vector<Vector *> shred_out(bind_data.shreds.size());
+	vector<Vector *> complete_out(bind_data.shreds.size(), nullptr); // scalar shreds only
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 		shred_out[f] = &JsonoShredVector(result, f);
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
+		if (!IsShredListType(bind_data.shreds[f].second)) {
+			complete_out[f] = &JsonoShredCompleteVector(result, f);
+			complete_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
+		}
 	}
-	Vector *vc_out = &JsonoVcVector(result);
-	vc_out->SetVectorType(VectorType::FLAT_VECTOR);
+	Vector *set_out = &JsonoShredSetVector(result);
+	set_out->SetVectorType(VectorType::FLAT_VECTOR);
 
-	vector<std::pair<std::string, std::string>> manifest_signatures;
-	manifest_signatures.reserve(bind_data.shreds.size());
-	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
-		manifest_signatures.emplace_back(bind_data.shreds[f].first, bind_data.shreds[f].second.ToString());
-	}
-	auto manifest_layout_hash = HashShredManifestSignatures(manifest_signatures);
+	// The shred-set marker value, order-independent over the shred set (see JsonoLayoutHashOf): the
+	// optimizer recomputes it from the read type, which a set-op/reorder cast may present in a
+	// different field order than this finalize built.
+	auto manifest_layout_hash = JsonoLayoutHashOf(result.GetType());
 	vector<JsonoShredManifestEntryBytes> manifest_entries(bind_data.shreds.size());
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 		manifest_entries[f] = JsonoShredManifestEntry(bind_data.shreds[f].first, bind_data.shreds[f].second);
@@ -3744,8 +3762,15 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		for (auto *shred : shred_out) {
 			FlatVector::SetNull(*shred, rid, true);
 		}
-		FlatVector::Validity(*vc_out).SetValid(rid);
-		FlatVector::GetData<uint64_t>(*vc_out)[rid] = manifest_layout_hash;
+		// Shred-set marker on every value row (group_merge never emits a SQL-NULL row — an empty
+		// state emits `{}`); each scalar shred's completeness starts true and a divert clears it below.
+		FlatVector::Validity(*set_out).SetValid(rid);
+		FlatVector::GetData<int64_t>(*set_out)[rid] = int64_t(manifest_layout_hash);
+		for (auto *complete : complete_out) {
+			if (complete) {
+				FlatVector::GetData<int8_t>(*complete)[rid] = 1;
+			}
+		}
 
 		auto &state = *state_data[RowIndex(state_fmt, i)];
 		builder.Reset();
@@ -3753,7 +3778,6 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		stripped_child_indices.clear();
 		stripped_shred_indices.clear();
 		list_override_indices.clear();
-		bool value_complete = true;
 		if (!state.has_input) {
 			builder.EmitObjectStart(0);
 			builder.EmitObjectEnd();
@@ -3799,7 +3823,9 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 					scalar_strip_paths.push_back(&shred.steps);
 					stripped_shred_indices.push_back(shred.child);
 				}
-				value_complete = value_complete && !diverted;
+				if (diverted && complete_out[shred.child]) {
+					FlatVector::GetData<int8_t>(*complete_out[shred.child])[rid] = 0;
+				}
 			}
 			for (idx_t s = 0; s < list_shreds.size(); s++) {
 				auto &shred = list_shreds[s];
@@ -3823,9 +3849,6 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 					list_override_indices.push_back(s);
 				}
 			}
-		}
-		if (!value_complete) {
-			FlatVector::SetNull(*vc_out, rid, true);
 		}
 		std::sort(stripped_child_indices.begin(), stripped_child_indices.end());
 		EmitLWWTreeNodeWithListOverrides(*state.root, builder, scalar_strip_paths, stripped_child_indices,

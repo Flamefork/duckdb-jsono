@@ -50,7 +50,7 @@ Inspect:
 ## Quick Start
 
 > [!NOTE]
-> JSONO is a format, not a SQL type. A JSONO value is this extension's pre-parsed binary representation of a JSON document — physically a nested `STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))`, with no registered type name. There is no `JSONO` to name in a `CAST` or a column definition. Instead: build a value with `jsono(...)` / `try_jsono(...)`, declare storage columns with `jsono_storage_type()`, and let the functions, the `->` / `->>` operators, and `to_json` recognise that `STRUCT` shape structurally — a value read back from Parquet or DuckLake works with no cast. `.body` (and, on a shredded value, the shred fields beside it) are physical storage details, not a public access API.
+> JSONO is a format, not a SQL type. A JSONO value is this extension's pre-parsed binary representation of a JSON document — physically a nested `STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))`, with no registered type name. There is no `JSONO` to name in a `CAST` or a column definition. Instead: build a value with `jsono(...)` / `try_jsono(...)`, declare storage columns with `jsono_storage_type()`, and let the functions, the `->` / `->>` operators, and `to_json` recognise that `STRUCT` shape structurally — a value read back from Parquet or DuckLake works with no cast. `.body` (and, on a shredded value, the shred fields in its sibling `shreds` struct) are physical storage details, not a public access API.
 
 Build and load the extension first (see [Installation](#installation)), then:
 
@@ -119,15 +119,15 @@ To parse and shred hot paths into typed shred columns in one pass, supply a cons
 SELECT jsono('{"kind":"commit","time_us":1700}', shredding := {'$.kind': 'VARCHAR', '$.time_us': 'BIGINT'});
 ```
 
-A JSONO value is physically this nested `STRUCT` — one `jsono` layout field wrapping the four body BLOBs every storage layer (DuckDB-native, Parquet, DuckLake) sees:
+A JSONO value is physically this nested `STRUCT` — one `jsono` layout field wrapping the six body BLOBs every storage layer (DuckDB-native, Parquet, DuckLake) sees:
 
 ```text
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 ```
 
 The JSONO functions (`to_json`, `jsono_transform`, …) recognise this STRUCT structurally, so a value read back from Parquet or DuckLake binds to them with no cast. `jsono_storage_type()` returns the DDL string above for declaring storage columns.
 
-The binary layout of each body BLOB (slot encoding, tag table, string-heap cursor, and the `skips` navigation metadata) is specified in [jsono_format.md](docs/jsono_format.md).
+The binary layout of each body BLOB (slot encoding, tag table, string/key heaps, the `skips` navigation metadata, and the `lengths`/`nums` side columns) is specified in [jsono_format.md](docs/jsono_format.md).
 
 ### `jsono(struct)`
 
@@ -275,7 +275,7 @@ The field names `type`, `path`, and `join_separator` are reserved inside a wrapp
 
 ### `jsono(value, shredding)`
 
-The `shredding` named argument turns `jsono()` into a *shredding* constructor: it produces a *shredded* `STRUCT` — the four-BLOB JSONO residual followed by one typed shred column per path in `spec`. The primary form takes JSON **text** and parses + shreds in one pass; passing an existing **JSONO** value shreds it directly. Those are the two accepted `value` inputs — there is no `jsono(struct, shredding := …)` overload, because a `STRUCT` built with [`jsono(struct)`](#jsonostruct) is already shredded by that constructor (so to shred a struct-built value, build it with `jsono({…})` directly rather than wrapping it). Reads stay transparent — `->>`, `jsono_extract_string`, `to_json`, and casts work on the shredded value exactly as on a plain JSONO column — but extracting a shredded path becomes a direct read of its typed shred instead of a per-row parse, which the planner can push down and prune on.
+The `shredding` named argument turns `jsono()` into a *shredding* constructor: it produces a *shredded* `STRUCT` — the six-BLOB JSONO residual plus a `shreds` struct carrying one typed shred per path in `spec`. The primary form takes JSON **text** and parses + shreds in one pass; passing an existing **JSONO** value shreds it directly. Those are the two accepted `value` inputs — there is no `jsono(struct, shredding := …)` overload, because a `STRUCT` built with [`jsono(struct)`](#jsonostruct) is already shredded by that constructor (so to shred a struct-built value, build it with `jsono({…})` directly rather than wrapping it). Reads stay transparent — `->>`, `jsono_extract_string`, `to_json`, and casts work on the shredded value exactly as on a plain JSONO column — but extracting a shredded path becomes a direct read of its typed shred instead of a per-row parse, which the planner can push down and prune on.
 
 `spec` is a constant `STRUCT` mapping each path to its shred type string (the same shape as Parquet's `SHREDDING` option and `read_json`'s `columns`; same path grammar as `jsono_transform`, no wildcards; shred types `VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`):
 
@@ -485,7 +485,7 @@ SELECT jsono_type(jsono('{"items":[1,2,3]}'), '$.items[0]');
 
 ```sql
 SELECT jsono_storage_type();
--- STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB)))
+-- STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 ```
 
 These helpers are primarily used by the JSONO workflows and tests. Treat their exact surface as less stable than `jsono_transform`, `jsono`, and `to_json`.
@@ -541,7 +541,7 @@ Use power-of-two values when comparing performance. The default is tuned for loc
 - `jsono_extract` / `->` / `jsono_extract_string` / `->>` require a constant path, do not support wildcard list extraction yet, and do not support negative array indexes.
 - Unsupported scalar types in `jsono_transform` fail at bind time.
 - JSON nested deeper than 1000 levels is rejected with an error (the limit is lowered to 50 under sanitizer builds).
-- The binary JSONO format is strict-versioned (current `version = 3`, reported by `jsono_version()`). Incompatible storage changes must bump `jsono::VERSION`. A present-but-unreadable header — wrong magic, a different format version, misaligned slots — fails loud on read rather than silently reading as SQL `NULL`; only an absent value (a slots blob too short to hold a header) reads as `NULL`, and `jsono_validate` reports a corrupt blob as `false`.
+- The binary JSONO format is strict-versioned (current `version = 4`, reported by `jsono_version()`). Incompatible storage changes must bump `jsono::VERSION`. A present-but-unreadable header — wrong magic, a different format version, misaligned slots — fails loud on read rather than silently reading as SQL `NULL`; only an absent value (a slots blob too short to hold a header) reads as `NULL`, and `jsono_validate` reports a corrupt blob as `false`.
 - Malformed input raises DuckDB errors unless `try_jsono` is used.
 
 ## Known limitations
@@ -549,7 +549,7 @@ Use power-of-two values when comparing performance. The default is tuned for loc
 The current surface is intentionally small. The following are not implemented:
 
 - No cast from JSONO to a scalar type (`jsono('42')::INTEGER` is unsupported). Project string values out with `->>` / `jsono_extract_string` or typed fields with `jsono_transform`.
-- No cast from JSONO to an arbitrary `STRUCT`. Only the physical four-BLOB shape is interchangeable with JSONO; field extraction goes through `jsono_transform`.
+- No cast from JSONO to an arbitrary `STRUCT`. Only the physical six-BLOB shape is interchangeable with JSONO; field extraction goes through `jsono_transform`.
 - No dedicated table function that unnests a JSONO array or object into rows. Use `unnest(jsono_entries(...))` for flattened scalar leaves.
 - Object key order is not preserved: keys are stored and emitted in sorted byte order (see [Error Handling and Caveats](#error-handling-and-caveats)).
 

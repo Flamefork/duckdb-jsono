@@ -1,9 +1,9 @@
 # name: test/sql/jsono_shredded_multifile.test
-# description: Multi-file read combining jsono Parquet files with DIFFERENT shred sets (union_by_name / glob / DuckLake-style schema evolution) reads every path correctly — a value-complete marker covers only its own file's shred set, so a widened read keeps the residual COALESCE fallback instead of a silent NULL.
+# description: Multi-file read combining jsono Parquet files with DIFFERENT shred sets (union_by_name / glob / DuckLake-style schema evolution) reads every path correctly — the shred-set marker ($jsono$set) covers only its own file's shred set, so a widened read keeps the residual COALESCE fallback instead of a silent NULL.
 # group: [sql]
 
 # The reader NULL-fills each file's missing shred lanes while the value stays in that file's residual,
-# so a shred read must fall back to the residual for those rows. Regression for the value-complete
+# so a shred read must fall back to the residual for those rows. Regression for the shred-set marker
 # coverage fix: each file's marker carries its own shred-set layout hash, so a widened multi-file read
 # sees per-file hash mismatches and keeps the COALESCE fallback (a bare struct_extract would read NULL
 # for a path that lives in another file's residual). to_json reconstructs correctly either way; the bug
@@ -83,7 +83,7 @@ ORDER BY j;
 {"m":22,"n":12}	12	22
 
 # Control: a HOMOGENEOUS multi-file read (both files the same shred set) is unaffected — every row's
-# value-complete marker carries the same hash, and the residual path reads correctly throughout.
+# shred-set marker carries the same hash, and the residual path reads correctly throughout.
 statement ok
 COPY (SELECT jsono('{"a":"H1","b":"G1"}', shredding := {'a':'VARCHAR'}) AS e)
 TO '__TEST_DIR__/mh_1.parquet' (FORMAT parquet);

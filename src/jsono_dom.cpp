@@ -225,8 +225,20 @@ void CaptureShredLeaf(yyjson_val *value, ShredPrimitive kind, DomShredCapture &c
 		}
 		return;
 	default:
-		// null literal or container: shred NULL, value stays in the residual. A `->>`+CAST read
-		// yields NULL here too, so the bare struct_extract stays correct — not a diversion.
+		if (yyjson_get_type(value) == YYJSON_TYPE_OBJ || yyjson_get_type(value) == YYJSON_TYPE_ARR) {
+			// Container: for a VARCHAR shred defer to the residual fill, which inlines a render-safe
+			// container's `->>` text into the lane (complete) or leaves it NULL+incomplete when
+			// render-unsafe; for a typed shred the lane cannot hold it, so the value stays in the
+			// residual and a bare typed read would miss the `->>` container text (not complete).
+			if (kind == ShredPrimitive::Varchar) {
+				cap.state = DomShredCapture::State::ResidualFill;
+			} else {
+				cap.diverted_scalar = true;
+			}
+			return;
+		}
+		// null literal: shred NULL, value stays in the residual. A `->>` read yields NULL here too,
+		// so the bare struct_extract stays correct — not a diversion.
 		return;
 	}
 }

@@ -485,7 +485,7 @@ PRAGMA explain_output='physical_only';
 query II
 EXPLAIN SELECT jsono_extract_string(j, '$.kind') AS r FROM jsono_extract_shredded;
 ----
-physical_plan	<REGEX>:.*jsono\.\$\.kind.*
+physical_plan	<REGEX>:.*jsono\.shreds\.\$\.kind\.value.*
 
 # A json-valued non-shred extract still avoids reconstruction, but the residual wrapper also checks
 # the parent row validity so a NULL shredded value stays top-level NULL rather than

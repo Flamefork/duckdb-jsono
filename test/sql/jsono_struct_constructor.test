@@ -184,7 +184,7 @@ corrupt JSONO storage
 # (NULL shred = "value lives in the residual"), non-NULL shred fields are stripped and
 # manifest-covered. Mixed NULL masks per row exercise the partial-strip emit.
 query III
-SELECT j.jsono."a", j.jsono."k", to_json(j)::VARCHAR
+SELECT j.jsono.shreds."a".value, j.jsono.shreds."k".value, to_json(j)::VARCHAR
 FROM (
     SELECT jsono(struct_pack(a := a, k := k)) AS j
     FROM (VALUES ('x', 1::BIGINT), (NULL, 2::BIGINT), ('z', NULL::BIGINT)) v(a, k)
@@ -198,7 +198,7 @@ NULL	2	{"a":null,"k":2}
 # name parses as the path $.x, which does not exist, so the shred is NULL and the value
 # stays in the residual under its literal key.
 query II
-SELECT j.jsono."$.x" IS NULL, to_json(j)::VARCHAR FROM (SELECT jsono({'$.x': 'v', 'y': 1}) AS j);
+SELECT j.jsono.shreds."$.x".value IS NULL, to_json(j)::VARCHAR FROM (SELECT jsono({'$.x': 'v', 'y': 1}) AS j);
 ----
 true	{"$.x":"v","y":1}
 
@@ -208,14 +208,14 @@ true	{"$.x":"v","y":1}
 query I
 SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.commit.collection" STRUCT("value" VARCHAR, complete TINYINT), "$.commit.operation" STRUCT("value" VARCHAR, complete TINYINT), did STRUCT("value" VARCHAR, complete TINYINT), kind STRUCT("value" VARCHAR, complete TINYINT))))
 
 # The walk stops after one level: a scalar two or more levels deep stays in the residual (a deep
 # schema would otherwise lift many cold leaves). Only $.b.c is shredded; $.b.d.e is not.
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep'}}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, "$.b.c" VARCHAR, a BIGINT))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.b.c" STRUCT("value" VARCHAR, complete TINYINT), a STRUCT("value" BIGINT, complete TINYINT))))
 
 # Losslessness holds for the un-shredded deep leaf too: $.b.d.e round-trips through the residual.
 query I
@@ -232,7 +232,7 @@ SELECT to_json(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll',
 # A nested NULL scalar stays an explicit null in the residual (NULL shred = value-in-residual);
 # the typed nested shred captures the present value.
 query III
-SELECT j.jsono."$.commit.collection", j.jsono."$.commit.n", to_json(j)::VARCHAR
+SELECT j.jsono.shreds."$.commit.collection".value, j.jsono.shreds."$.commit.n".value, to_json(j)::VARCHAR
 FROM (
     SELECT jsono({'commit': {'collection': c, 'n': n}}) AS j
     FROM (VALUES ('post', 1::BIGINT), (NULL, NULL::BIGINT)) v(c, n)
@@ -289,11 +289,11 @@ nested	flat
 query I
 SELECT typeof(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, "$.commit.operation" VARCHAR))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.commit.operation" STRUCT("value" VARCHAR, complete TINYINT))))
 
-# Type-driven auto-shred is always value-complete: a shred's type IS its field's type, so a present
+# Type-driven auto-shred is always complete: a shred's type IS its field's type, so a present
 # value always fits and a NULL is only an absent field, never a residual diversion. A typed shred
-# with absent (NULL) rows is therefore read COALESCE-free — the value-complete fast path that gives
+# with absent (NULL) rows is therefore read COALESCE-free — the per-shred totality fast path that gives
 # jsono(struct, shredding) the zone-map pushdown on read-back.
 statement ok
 CREATE TABLE sc_value_complete AS

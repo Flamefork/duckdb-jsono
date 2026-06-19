@@ -8,8 +8,8 @@ require jsono
 # struct binds it via an implicit struct->JSON cast, which the optimizer rewrites.
 require json
 
-# A "shredded" JSONO value is a top-level STRUCT with one "jsono<fp>" layout field,
-# carrying a `body` STRUCT (the authoritative four-blob JSONO encoding) and a `shreds` STRUCT of
+# A "shredded" JSONO value is a top-level STRUCT with one "jsono" layout field,
+# carrying a `body` STRUCT (the authoritative six-blob JSONO encoding) and a `shreds` STRUCT of
 # shred columns named by canonical path. PRESERVE model: the body encodes the full document and
 # each shred also holds j ->> path. The body here is {"kind":"commit","did":"d1","extra":"e1"};
 # shreds cover $.kind and $.did (layout fp jsono).
@@ -18,9 +18,10 @@ CREATE TABLE shred AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"kind":"commit","did":"d1","extra":"e1"}')."jsono".body,
-        "$jsono$vc" := NULL::UBIGINT,
-        "$.did"  := 'd1',
-            "$.kind" := 'commit')
+        shreds := struct_pack(
+            "$jsono$set" := NULL::BIGINT,
+            "$.did"  := struct_pack(value := 'd1', complete := 1::TINYINT),
+            "$.kind" := struct_pack(value := 'commit', complete := 1::TINYINT)))
 ) AS j;
 
 # bare ->> on a shred path resolves transparently
@@ -71,8 +72,9 @@ CREATE TABLE shred_sentinel AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"kind":"commit","did":"d1"}')."jsono".body,
-        "$jsono$vc" := NULL::UBIGINT,
-        "$.kind" := 'SENTINEL')
+        shreds := struct_pack(
+            "$jsono$set" := NULL::BIGINT,
+            "$.kind" := struct_pack(value := 'SENTINEL', complete := 1::TINYINT)))
 ) AS j;
 
 query I
@@ -176,9 +178,10 @@ CREATE TABLE shred_typed AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"n":5,"s":"blob_s"}')."jsono".body,
-        "$jsono$vc" := NULL::UBIGINT,
-        "$.n" := 999::BIGINT,
-            "$.s" := 'shred_s')
+        shreds := struct_pack(
+            "$jsono$set" := NULL::BIGINT,
+            "$.n" := struct_pack(value := 999::BIGINT, complete := 1::TINYINT),
+            "$.s" := struct_pack(value := 'shred_s', complete := 1::TINYINT)))
 ) AS j;
 
 # typed BIGINT shred read through the ->> text contract returns the shred value
@@ -207,8 +210,9 @@ CREATE TABLE typed_het AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         body := jsono('{"n":"hello"}')."jsono".body,
-        "$jsono$vc" := NULL::UBIGINT,
-        "$.n" := NULL::BIGINT)
+        shreds := struct_pack(
+            "$jsono$set" := NULL::BIGINT,
+            "$.n" := struct_pack(value := NULL::BIGINT, complete := 0::TINYINT)))
 ) AS j;
 
 query I

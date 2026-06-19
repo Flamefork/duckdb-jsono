@@ -35,43 +35,52 @@ handles far better.
 ## Shredded layout
 
 For fast columnar reads of hot paths, a JSONO value can be stored *shredded*:
-the `jsono` layout field carries the `body` plus one typed *shred* per
-chosen path, as the `body`'s sibling fields (produced by
-`jsono(value, shredding := spec)`).
+the `jsono` layout field carries the `body` plus a sibling `shreds` STRUCT — a
+reserved shred-set marker followed by one typed *shred* per chosen path
+(produced by `jsono(value, shredding := spec)`).
 
 ```
 STRUCT(
   jsono STRUCT(
     body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB,
                 lengths BLOB, nums BLOB),
-    "<path1>" <type1>, -- shred: value at <path1>, typed, named by the path
-    "<path2>" <type2>,
-    …
+    shreds STRUCT(
+      "$jsono$set" BIGINT,                          -- shred-set marker (see below)
+      "<path1>" STRUCT("value" <type1>, complete TINYINT), -- scalar shred: value + spill flag
+      "<path2>" STRUCT("value" <type2>, complete TINYINT),
+      "<arrpath>" <list_type>,                      -- array shred: a bare LIST, no pair
+      …
+    )
   )
 )
 ```
 
 Shredding does **not** change the binary slot format. The six `body` blobs are
 an ordinary JSONO value — the *residual* — so everything else in this spec
-applies to them unchanged, including `version`. Each *shred* is the
-value at its canonical path (`$.kind`, `$.commit.operation`, …) materialized as
-a plain typed DuckDB column (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`,
-`BOOLEAN`), with the path as the field name. Nested shred paths are allowed. No
-JSON key is reserved: a JSON key named `body` can still be shredded through its
-`$.`-prefixed path form (`$.body`), which is a different field name.
+applies to them unchanged, including `version`. A plain (unshredded) value has
+**no** `shreds` field (`STRUCT(jsono STRUCT(body …))`); shredded-ness is exactly
+the presence of `shreds`. Each scalar *shred* is the value at its canonical path
+(`$.kind`, `$.commit.operation`, …) materialized as a plain typed DuckDB column
+(`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`) inside a pair
+`STRUCT(value, complete)`, with the path as the field name. Nested shred paths
+are allowed. No JSON key is reserved: a JSON key named `body` can still be
+shredded through its `$.`-prefixed path form (`$.body`), which lands inside
+`shreds` and cannot collide with the layout's `body`.
 
-The single layout name (`jsono` for both plain and shredded) and the shreds
-sitting beside `body` are both deliberate. DuckDB reconciles struct types by
-field name, so a set operation, CASE or COALESCE over differently-shredded
-values merges them into one ordinary shredded type carrying the union of the
-shred sets — the struct cast `NULL`-fills a branch's missing shreds, which is
-exactly the writer's own "value stayed in the residual" encoding, so the merged
-value reads losslessly by construction. And because `body` is a field every two
-JSONO types share, DuckDB's by-name struct cast *binds* between any two of them
-— fully disjoint shred sets included — so the extension optimizer can rewrite
-every such cast into a lossless reconstruct + reshred. The remaining flip side —
-a raw by-name cast silently *dropping* a shred when the optimizer is not running
-— is caught at read time by the shred manifest (below), not by the type system.
+The single layout name (`jsono` for both plain and shredded) and the nested
+`shreds` struct are both deliberate. DuckDB reconciles struct types by field
+name, so a set operation, CASE or COALESCE over differently-shredded values
+merges them into one ordinary shredded type carrying the union of the shred sets
+— the struct cast `NULL`-fills a branch's missing shreds, which is exactly the
+writer's own "value stayed in the residual" encoding, so the merged value reads
+losslessly by construction. The `$jsono$set` marker is the mandatory shared
+member inside `shreds`, so DuckDB's by-name struct cast *binds* between any two
+shred sets — fully disjoint ones included — and the extension optimizer can
+rewrite every such cast into a lossless reconstruct + reshred. The nested struct
+also keeps the marker contiguous with its shreds across set-op merges (a flat
+sibling layout interleaved it among the shreds). The remaining flip side — a raw
+by-name cast silently *dropping* a shred when the optimizer is not running — is
+caught at read time by the shred manifest (below), not by the type system.
 
 Shreds are emitted in canonical order (sorted by name), so a constructed
 type is a pure function of the shred *set*: `jsono_storage_type(<shred DDL>)` and
@@ -79,8 +88,54 @@ the constructor produce the identical type for the same shreds regardless of the
 order they are listed in, so a column declared from one accepts a value built
 from the other. (A type DuckDB merges out of differently-shredded branches lists
 the left branch's shreds first — same shred set, branch-dependent field order.)
-Shreds stay scalar columns, so Parquet/DuckLake projection and filter
-pushdown act on them directly.
+Shred `value` lanes stay scalar columns, so Parquet/DuckLake projection and
+filter pushdown act on them directly.
+
+### Shred-set marker and per-shred completeness
+
+Two orthogonal signals let the optimizer decide, per shred, whether a bare
+`struct_extract` of the `value` lane is the full `->>` answer (a zone-map-pushed
+columnar read) or whether it must fall back to / reconstruct from the residual:
+
+- **`shreds.$jsono$set`** (`BIGINT`, one per value): the canonical layout hash of
+  the shred *set* (paths + types) the row was written under — its `uint64` hash
+  bits reinterpreted as a signed `BIGINT`. It is the *schema identity* across
+  files: a scan whose marker zone-map proves a single `min == max == ` the read
+  type's layout hash was written under exactly the read shred set. A multi-file
+  read that unions narrower/retyped shred sets (`union_by_name`, DuckLake schema
+  evolution) carries a different hash per file (`min != max`), which keeps the
+  residual fallback so a reader-NULL-filled lane is read from the residual, not as
+  a silent `NULL`. The hash is **order-independent** (the marker identifies the
+  set, not the field order, so a set-op/reorder cast that permutes the shreds
+  still matches). It is `NULL` only on a SQL-NULL row; a divert never nulls it.
+  It is a signed `BIGINT`, not `UBIGINT`, because DuckDB's Parquet writer omits
+  min/max stats for unsigned integers — a `UBIGINT` marker would carry no zone-map
+  on a Parquet scan.
+- **`shreds.<path>.complete`** (`TINYINT`, per scalar shred, per row): `1` when the
+  `value` lane holds the complete `->>` answer for this row, `0` when the value
+  spilled to the residual. Per-shred, so a divert on one shred never demotes
+  another. A scan whose `complete` zone-map proves `min == 1` (no spill) AND whose
+  marker proves schema identity reads that shred bare. It is a `TINYINT` 1/0 flag,
+  not a `BOOLEAN`, because DuckDB's Parquet statistics reader does not transform
+  `BOOLEAN` page min/max into zone-map statistics — a `BOOLEAN` flag would never
+  prove totality on a Parquet scan. Array shreds carry no `complete` (they are
+  always reconstructed, never bare-read).
+
+`complete` by case, for a scalar shred at path `P`:
+
+- absent path / explicit JSON `null`: `value` = `NULL`, `->>` = `NULL` →
+  `complete = 1` (a bare `NULL` read is correct).
+- a scalar that round-trips through the shred type, or any scalar's `->>` text in
+  a `VARCHAR` shred (a read copy): `value` set → `complete = 1`.
+- a container at a **render-safe** `VARCHAR` shred path: the container's sorted
+  `->>` text is stored in `value` as a read copy (the residual keeps the
+  container; reconstruct ignores the copy) → `complete = 1`. *Render-safe* means
+  no other shred lives strictly inside `P`.
+- a typed-divert (a string at a `BIGINT` lane, …), a container at a typed shred,
+  or a container at a **render-unsafe** `VARCHAR` path (another shred lives
+  strictly inside `P`, so the residual cannot hold the full container either):
+  `value` = `NULL`, the value stays in the residual → `complete = 0`. The
+  optimizer routes an exact `->>` on a render-unsafe path to reconstruct.
 
 **Lossless invariant: the residual holds everything a shred cannot reproduce
 exactly.** A value is removed from the residual and kept only in its shred when it
@@ -193,9 +248,9 @@ alone cannot reproduce them).
 The binary blob format is unchanged: a skeleton residual is an ordinary value
 and the manifest reuses the length-prefixed `(path, type)` framing (the
 `LIST<STRUCT>` type string is just longer). The shred `LIST<STRUCT>` is a
-DuckDB/Parquet column beside `body`, not part of the blob, so no `version` bump
-is needed; an old reader lacking array-shred support rejects the unknown
-`LIST<STRUCT>` sibling at bind or fails loud on the manifest rather than
+DuckDB/Parquet column inside the `shreds` struct, not part of the blob, so no
+`version` bump is needed; an old reader lacking array-shred support rejects the
+unknown `LIST<STRUCT>` shred field at bind or fails loud on the manifest rather than
 silently dropping data.
 
 ### Scalar array shreds (`LIST<TYPE>`)
@@ -244,7 +299,7 @@ drops or retypes the scalar array shred is caught the same way (the placeholders
 missing their values and the residual alone cannot reproduce them). The binary blob
 format is unchanged — `VAL_NULL` is an existing slot tag and the manifest reuses the
 same framing — so no `version` bump is needed; the shred `LIST<TYPE>` is a
-DuckDB/Parquet column beside `body`.
+DuckDB/Parquet column inside the `shreds` struct.
 
 ## Compatibility policy
 

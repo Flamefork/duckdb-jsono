@@ -2053,7 +2053,7 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 } // namespace
 
 void RegisterJsonoTransform(ExtensionLoader &loader) {
-	// ANY input so a shredded JSONO struct (four BLOB prefix + shred columns) also binds; the
+	// ANY input so a shredded JSONO struct (six BLOB prefix + shred columns) also binds; the
 	// bind validates it is a plain or shredded JSONO and maps shred columns to scalar fields.
 	ScalarFunctionSet set("jsono_transform");
 	ScalarFunction binary({LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, JsonoTransformExecute,

@@ -229,8 +229,9 @@ statement error
 SELECT struct_pack(
         "jsono" := struct_pack(
             body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
-            "$jsono$vc" := NULL::UBIGINT,
-            a := 'v'))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
+            shreds := struct_pack(
+                "$jsono$set" := NULL::BIGINT,
+                a := struct_pack(value := 'v', complete := 1::TINYINT))))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
 ----
 body is NULL
 
@@ -253,7 +254,7 @@ statement ok
 CREATE TABLE case_out AS SELECT CASE WHEN true THEN sa.e ELSE sb.e END AS e FROM shred_a AS sa, shred_b AS sb;
 
 query I
-SELECT t LIKE '%a VARCHAR%' AND t LIKE '%b VARCHAR%'
+SELECT t LIKE '%a STRUCT("value" VARCHAR, complete TINYINT)%' AND t LIKE '%b STRUCT("value" VARCHAR, complete TINYINT)%'
 FROM (SELECT (SELECT column_type FROM (DESCRIBE case_out)) AS t);
 ----
 true
@@ -268,7 +269,7 @@ statement ok
 CREATE TABLE coalesce_out AS SELECT COALESCE(sa.e, sb.e) AS e FROM shred_a AS sa, shred_b AS sb;
 
 query I
-SELECT t LIKE '%a VARCHAR%' AND t LIKE '%b VARCHAR%'
+SELECT t LIKE '%a STRUCT("value" VARCHAR, complete TINYINT)%' AND t LIKE '%b STRUCT("value" VARCHAR, complete TINYINT)%'
 FROM (SELECT (SELECT column_type FROM (DESCRIBE coalesce_out)) AS t);
 ----
 true

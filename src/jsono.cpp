@@ -53,11 +53,12 @@ void JsonoVersionExecute(DataChunk &args, ExpressionState &state, Vector &result
 	result.SetValue(0, Value::INTEGER(int32_t(jsono::VERSION)));
 }
 
-// jsono_storage_type(shreds) -> the shredded storage type's DDL: the 4-BLOB residual plus the
+// jsono_storage_type(shreds) -> the shredded storage type's DDL: the 6-BLOB residual plus the
 // given shred columns, so a schema can declare a shredded jsono column from a readable shred spec
 // (e.g. 'event_name VARCHAR, n BIGINT'). The shred DDL is parsed into (name, type) and re-emitted
 // through JsonoShreddedStructType, so the declared column is byte-identical to a value built from
-// the same shreds.
+// the same shreds. Reserved shred names are rejected the same way the constructor rejects them, so a
+// declared column always matches some value the constructor can produce.
 void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	// Parser::ParseColumnList parses the DDL but leaves binder-resolved type aliases (UBIGINT and the
 	// other unsigned ints, nested ones included) as unresolved USER types; bind each shred type so a
@@ -67,6 +68,7 @@ void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, 
 		auto columns = Parser::ParseColumnList(shreds.GetString());
 		child_list_t<LogicalType> shred_types;
 		for (auto &col : columns.Logical()) {
+			JsonoValidateShredFieldName(col.Name());
 			auto type = col.Type();
 			binder->BindLogicalType(type);
 			shred_types.emplace_back(col.Name(), type);
@@ -82,17 +84,58 @@ void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, 
 }
 
 constexpr const char *JSONO_LAYOUT = "jsono";
-// Reserved name of the optional trailing value-complete marker (see JsonoValueCompleteName). The
-// double `$` cannot occur in a shred path (object-key paths are `$.key…`); the shred-spec parsers
-// reject it outright so no shred can collide.
-constexpr const char *JSONO_VALUE_COMPLETE = "$jsono$vc";
+// Name of the nested STRUCT holding the shred set: it sits beside `body` inside the layout struct.
+// Shredded-ness is exactly the presence of this field.
+constexpr const char *JSONO_SHREDS = "shreds";
+// Reserved name of the shred-set marker, the first field inside `shreds`. It is a BIGINT hash of the
+// shred set (paths + types) — schema identity across files, and the mandatory shared member that lets
+// a by-name struct cast bind between any two shred sets (even disjoint ones). The double `$` cannot
+// occur in a shred path (object-key paths are `$.key…`); the shred-spec parsers reject it so no shred
+// can collide.
+constexpr const char *JSONO_SHRED_SET = "$jsono$set";
+// The two children of a scalar shred pair: the typed value lane and the per-shred completeness flag
+// (TINYINT, 1 = the lane holds the full `->>` answer; 0 = the value spilled to the residual).
+constexpr const char *JSONO_SHRED_VALUE = "value";
+constexpr const char *JSONO_SHRED_COMPLETE = "complete";
+
+// A scalar shred field is a pair STRUCT(value <scalar>, complete TINYINT); an array shred field is a
+// LIST as-is. Unwrap either into its logical VALUE type (the scalar type / the LIST type) so the
+// rest of the layout machinery (hash, casts, reconstruct) sees the shred's logical type, not the
+// pair wrapper. Returns false when `type` is neither a scalar pair nor a list shred.
+// `complete` is matched as IsIntegral (any integer width), not strictly TINYINT, for the same reason
+// the shred-set marker is (see TryParseJsonoLayoutField): a value round-tripped through a generic
+// value->SQL->value path (DuckLake inlined-data INSERT) re-parses the bare 1/0 flag as INTEGER/BIGINT
+// instead of TINYINT, and a strict-TINYINT rule would then fail to recognise the pair — dropping the
+// whole value to a plain user struct, so to_json leaks the physical layout and `->>` reads NULL. The
+// flag is a metadata 1/0, so its width carries no semantics (unlike `value`, whose type IS the shred
+// type); tolerating the width keeps recognition. No ambiguity with user data: `value` must be a scalar
+// shred type, so a {value, complete} pair can only be the writer's wrapper, never a JSON object.
+bool UnwrapShredFieldType(const LogicalType &type, LogicalType &value_type) {
+	if (IsShredListType(type)) {
+		value_type = type;
+		return true;
+	}
+	if (type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(type)) {
+		return false;
+	}
+	auto &pair = StructType::GetChildTypes(type);
+	if (pair.size() != 2 || pair[0].first != JSONO_SHRED_VALUE || pair[1].first != JSONO_SHRED_COMPLETE ||
+	    !pair[1].second.IsIntegral() || !IsShredValueType(pair[0].second)) {
+		return false;
+	}
+	value_type = pair[0].second;
+	return true;
+}
 
 // Parse one layout field (top-level child name + its STRUCT type) into `out`. The body must be the
-// six-BLOB body struct as field 0; a shredded layout adds its typed shreds as the remaining sibling
-// fields. Shreds sit beside `body` (not in a nested struct) deliberately: `body` is then a field
-// every two JSONO types share, so DuckDB's by-name struct cast binds between ANY two of them —
-// including fully disjoint shred sets — and the optimizer can rewrite every such cast into the
-// lossless reconstruct + reshred.
+// six-BLOB body struct as field 0; a shredded layout adds a `shreds` STRUCT sibling holding the
+// shred-set marker plus one field per shred. The single layout name (`jsono` for plain and shredded)
+// is deliberate: DuckDB reconciles set-operation branch types by field name (CombineStructTypes), so
+// differently-shredded branches merge into one shredded type whose `shreds` is the union of the
+// branches' shreds, and the marker stays the left branch's `shreds` field 0. The nested `shreds`
+// struct keeps the marker contiguous with the shreds (a flat sibling layout interleaved it among
+// the shreds under set-ops), and the marker is the mandatory shared member that lets a by-name cast
+// bind between ANY two shred sets — including fully disjoint ones.
 bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type, JsonoLayoutType &out) {
 	if (name != JSONO_LAYOUT) {
 		return false;
@@ -111,42 +154,45 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 		out.shreds.clear();
 		return true;
 	}
-	// A field named JSONO_VALUE_COMPLETE (any integer width) is the value-complete marker, not a shred,
-	// and it is identified by name at ANY position: a set-operation merged type interleaves it among the
-	// shreds (CombineStructTypes iterates the left branch's fields — body, marker, shreds — then
-	// appends the right branch's unique shreds after the marker), so a positional rule would misread
-	// it as a shred. The width is matched as IsIntegral, not strictly UBIGINT: a value round-tripped
-	// through a generic value->SQL->value path (DuckLake inlined-data INSERT, which serializes the
-	// marker as a bare integer literal that re-parses as BIGINT/HUGEINT) keeps the reserved name but
-	// loses the exact UBIGINT width — and the name is reserved (no shred path can collide, see
-	// JsonoValueCompleteName / the shred-spec guard), so the name alone identifies the marker. A
-	// strict-UBIGINT rule would misclassify such a marker as a typed shred, shifting the shred->vector
-	// mapping and corrupting reconstruct. Every other sibling of `body` must be a shred value type;
-	// anything else means this is not a JSONO struct (a user struct that merely carries a body-shaped
-	// field stays theirs).
+	// Shredded: exactly `body` plus a `shreds` STRUCT. The set-op merge keeps the layout struct at
+	// these two by-name fields, so a third sibling means this is not a JSONO struct (a user struct
+	// that merely carries a body-shaped field stays theirs).
+	if (fields.size() != 2 || fields[1].first != JSONO_SHREDS) {
+		return false;
+	}
+	auto &shreds_type = fields[1].second;
+	if (shreds_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(shreds_type)) {
+		return false;
+	}
+	// Inside `shreds`: the marker is field 0 (any integer width — a value round-tripped through a
+	// generic value->SQL->value path, e.g. DuckLake inlined-data INSERT, re-parses the bare-integer
+	// marker as BIGINT/HUGEINT instead of BIGINT, but the reserved name still identifies it). It must
+	// sit at field 0, not merely be present by name: every writer emits it first and every set-op
+	// merge keeps it first (it is the left branch's `shreds` field 0 — the whole reason `shreds` is a
+	// nested struct), and all accessors (JsonoShredVector / ShredExtract / CollectShredTotality) index
+	// shred k as `shreds` field 1 + k. Accepting a marker at any other position would let a hand-built
+	// reordered struct parse as JSONO and then crash on read (the accessor would read the marker as a
+	// shred pair). Every following field is a shred — unwrap a scalar pair to its value type, keep a
+	// list as-is.
+	auto &shred_fields = StructType::GetChildTypes(shreds_type);
+	if (shred_fields.empty() || shred_fields[0].first != JSONO_SHRED_SET || !shred_fields[0].second.IsIntegral()) {
+		return false;
+	}
 	child_list_t<LogicalType> shreds;
-	bool has_value_complete = false;
-	idx_t value_complete_index = 0;
-	for (idx_t i = 1; i < fields.size(); i++) {
-		if (fields[i].first == JSONO_VALUE_COMPLETE && fields[i].second.IsIntegral()) {
-			has_value_complete = true;
-			value_complete_index = i;
-			continue;
-		}
-		if (!IsShredValueType(fields[i].second) && !IsShredListType(fields[i].second)) {
+	for (idx_t i = 1; i < shred_fields.size(); i++) {
+		LogicalType value_type;
+		if (!UnwrapShredFieldType(shred_fields[i].second, value_type)) {
 			return false;
 		}
-		shreds.push_back(fields[i]);
+		shreds.emplace_back(shred_fields[i].first, value_type);
 	}
 	if (shreds.empty()) {
-		return false; // body plus only the marker is not a valid shredded value
+		return false; // the marker alone is not a valid shredded value
 	}
 	out.kind = JsonoLayoutKind::Shredded;
 	out.layout_name = name;
 	out.layout_type = layout_type;
 	out.shreds = std::move(shreds);
-	out.has_value_complete = has_value_complete;
-	out.value_complete_index = value_complete_index;
 	return true;
 }
 
@@ -218,8 +264,33 @@ string JsonoLayoutName() {
 	return JSONO_LAYOUT;
 }
 
-string JsonoValueCompleteName() {
-	return JSONO_VALUE_COMPLETE;
+string JsonoShredsName() {
+	return JSONO_SHREDS;
+}
+
+string JsonoShredSetName() {
+	return JSONO_SHRED_SET;
+}
+
+string JsonoShredValueName() {
+	return JSONO_SHRED_VALUE;
+}
+
+string JsonoShredCompleteName() {
+	return JSONO_SHRED_COMPLETE;
+}
+
+void JsonoValidateShredFieldName(const string &name) {
+	if (name == "body") {
+		// `body` is the residual field beside the `shreds` struct in the layout. A bare 'body' shred name
+		// is rejected for clarity and to keep the DDL path consistent with the constructor; the path form
+		// '$.body' is a different name and is fine.
+		throw BinderException("jsono shred: a shred cannot be named 'body' (the residual field); "
+		                      "shred the JSON key through its path form '$.body'");
+	}
+	if (name == JSONO_SHRED_SET) {
+		throw BinderException("jsono shred: '%s' is a reserved layout field name", name);
+	}
 }
 
 uint64_t JsonoLayoutHashOf(const LogicalType &type) {
@@ -232,28 +303,44 @@ uint64_t JsonoLayoutHashOf(const LogicalType &type) {
 	for (auto &shred : layout.shreds) {
 		signatures.emplace_back(shred.first, shred.second.ToString());
 	}
+	// Canonicalize order: the marker identifies the shred SET (paths + types), not the field order. A
+	// set-operation merged type lists the left branch's shreds first then the right's unique ones
+	// (CombineStructTypes), so a writer stamping the canonical-order hash and a reader recomputing it
+	// over a reorder-cast result type would otherwise disagree and lose the schema-identity match.
+	std::sort(signatures.begin(), signatures.end());
 	return jsono::HashShredManifestSignatures(signatures);
 }
 
 LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds) {
+	// `shreds` STRUCT: the marker first, then one field per shred — a scalar shred wraps its value
+	// type in a pair STRUCT(value, complete TINYINT); an array shred (LIST) is kept as-is (it carries
+	// no per-shred completeness — array shreds are always reconstructed, never bare-read). The marker
+	// (JsonoShredSetName) is the canonical layout hash of the shred set (its uint64 bits reinterpreted
+	// as a signed BIGINT), so the optimizer can confirm via its min/max zone-map that every scanned row
+	// was written under EXACTLY the read type's shred set; a multi-file read unioning narrower shred
+	// sets carries a different hash per file (min!=max), which keeps the residual COALESCE fallback
+	// (see CollectShredTotality). It is BIGINT, not UBIGINT, on purpose: DuckDB's Parquet writer omits
+	// min/max stats for unsigned integers (the signed page-stat ordering would misrepresent them), so a
+	// UBIGINT marker would carry no Parquet zone-map and never prove schema identity on a Parquet scan.
+	child_list_t<LogicalType> shred_children;
+	shred_children.emplace_back(JSONO_SHRED_SET, LogicalType::BIGINT);
+	for (auto &shred : shreds) {
+		if (IsShredListType(shred.second)) {
+			shred_children.push_back(shred);
+			continue;
+		}
+		child_list_t<LogicalType> pair;
+		pair.emplace_back(JSONO_SHRED_VALUE, shred.second);
+		// `complete` is a 1/0 flag, not a BOOLEAN: DuckDB's Parquet statistics reader does not
+		// transform BOOLEAN page min/max into NumericStats (it has no BOOLEAN case), so a BOOLEAN flag
+		// would carry no zone-map on a Parquet scan and never prove per-shred totality there. TINYINT
+		// is transformed, so its min == 1 ("no spill") is provable. See CollectShredTotality.
+		pair.emplace_back(JSONO_SHRED_COMPLETE, LogicalType::TINYINT);
+		shred_children.emplace_back(shred.first, LogicalType::STRUCT(std::move(pair)));
+	}
 	child_list_t<LogicalType> layout_children;
 	layout_children.emplace_back("body", JsonoBodyStructType());
-	// Every shredded layout carries the value-complete marker, uniformly. Its value is the canonical
-	// layout hash (JsonoLayoutHashOf) of the shred set the row was written under when the row is
-	// value-complete, NULL otherwise — so the optimizer can confirm via the marker's min/max zone-map
-	// that every scanned row was written under EXACTLY the read type's shred set before dropping the
-	// residual COALESCE fallback. A multi-file read that unions narrower shred sets leaves the marker
-	// carrying a different hash per file, which keeps the fallback (see CollectShredTotality). It sits
-	// right after `body`, BEFORE the shreds, on purpose: DuckDB's set-operation type reconciliation
-	// (CombineStructTypes) iterates the left branch's fields then appends the right branch's unique
-	// ones, so a marker placed after `body` stays at a fixed position with the shreds contiguous after
-	// it in every branch and their merge — whereas a trailing marker would be interleaved (body,
-	// shreds_left, marker, shreds_right), reordering the merged type away from the canonical one and
-	// breaking the positional struct cast between them.
-	layout_children.emplace_back(JSONO_VALUE_COMPLETE, LogicalType::UBIGINT);
-	for (auto &shred : shreds) {
-		layout_children.push_back(shred);
-	}
+	layout_children.emplace_back(JSONO_SHREDS, LogicalType::STRUCT(std::move(shred_children)));
 	child_list_t<LogicalType> top;
 	top.emplace_back(JsonoLayoutName(), LogicalType::STRUCT(std::move(layout_children)));
 	return LogicalType::STRUCT(std::move(top));

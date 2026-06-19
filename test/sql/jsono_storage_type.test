@@ -63,10 +63,9 @@ SELECT jsono_extract_string({'jsono_slots': ''::BLOB, 'jsono_key_heap': ''::BLOB
 ----
 jsono_extract_string: argument must be JSONO
 
-# jsono_storage_type(shreds) emits the shredded storage DDL: the 4-blob residual plus one shred
-# column per spec entry. Every field name carries the shred-set fingerprint suffix, so the DDL is
-# byte-identical to the type the constructor produces from the same shreds (asserted by equality
-# rather than a hardcoded fingerprint).
+# jsono_storage_type(shreds) emits the shredded storage DDL: the 6-blob residual plus one shred
+# column per spec entry inside the `shreds` struct. The DDL is byte-identical to the type the
+# constructor produces from the same shreds (asserted by equality rather than a hardcoded literal).
 query I
 SELECT jsono_storage_type('event_name VARCHAR, n BIGINT')
      = typeof(jsono('{}', shredding := {'event_name':'VARCHAR','n':'BIGINT'}));
@@ -85,7 +84,7 @@ SELECT jsono_storage_type('n BIGINT, event_name VARCHAR')
 true
 
 # A column declared from that DDL is a valid storage column for a value shredded on the same
-# shreds (CTAS infers the fingerprinted type); the shred reads back transparently through ->>.
+# shreds (CTAS infers the shredded type); the shred reads back transparently through ->>.
 statement ok
 CREATE TABLE probe_shred AS
 SELECT jsono('{"event_name":"page_view","a":1}', shredding := {'event_name':'VARCHAR'}) AS e;
@@ -105,3 +104,23 @@ SELECT to_json(e)::VARCHAR FROM probe_shred ORDER BY 1;
 ----
 {"a":1,"event_name":"page_view"}
 {"x":"y"}
+
+# Reserved shred names are rejected by the same check the constructor uses (a single source of truth),
+# so jsono_storage_type can only emit a type the constructor can actually produce. Without it, a shred
+# named '$jsono$set' duplicated the marker field (an unusable type) and 'body' declared a column the
+# value path rejects.
+statement error
+SELECT jsono_storage_type('"$jsono$set" VARCHAR');
+----
+reserved layout field name
+
+statement error
+SELECT jsono_storage_type('body BIGINT');
+----
+cannot be named 'body'
+
+# The path form '$.body' is a different field name and stays allowed (matches the constructor).
+query I
+SELECT jsono_storage_type('"$.body" BIGINT') = typeof(jsono('{"body":1}', shredding := {'$.body':'BIGINT'}));
+----
+true

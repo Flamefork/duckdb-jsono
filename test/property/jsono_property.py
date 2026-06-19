@@ -485,7 +485,7 @@ hex_blob = st.text(alphabet="0123456789ABCDEF", min_size=0, max_size=48).map(
 @settings(PROPERTY_SETTINGS)
 @given(slots=hex_blob, key=hex_blob, string=hex_blob, skips=hex_blob)
 def test_fuzz_blob_no_crash(slots: str, key: str, string: str, skips: str) -> None:
-    # The four-BLOB physical shape is reachable from Parquet, so arbitrary bytes
+    # The six-BLOB physical shape is reachable from Parquet, so arbitrary bytes
     # must be rejected by the reader's bound checks, not dereferenced blindly.
     struct = (
         f"{{'jsono': {{'body': {{'slots': unhex('{slots}'), 'key_heap': unhex('{key}'), "

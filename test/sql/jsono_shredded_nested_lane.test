@@ -1,0 +1,172 @@
+# name: test/sql/jsono_shredded_nested_lane.test
+# description: A nested VARCHAR shred lane reads COALESCE-free even when an unrelated typed shred spills to the residual (its own per-shred complete flag clears, the nested lane's stays set), and a container at a VARCHAR shred path serializes into the lane
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+# A nested VARCHAR shred ($.URL.scheme) alongside a typed BIGINT shred (n) that diverts on a few rows
+# (a present numeric STRING that cannot fit the BIGINT shred). That spill clears the `n` shred's OWN
+# per-shred `complete` flag, yet $.URL.scheme's `complete` stays 1 (a VARCHAR lane always holds the
+# `->>` answer), so the nested lane reads COALESCE-free — completeness is per-shred, so one shred's
+# spill never demotes another. $.URL.scheme is also absent on a quarter of the rows (URL object
+# omitted) — a bare struct_extract reads the correct NULL there.
+statement ok
+CREATE TABLE nested_lane AS
+SELECT jsono(
+  CASE
+    WHEN i % 4 = 0 THEN '{"n": ' || (CASE WHEN i % 500 = 8 THEN '"oops"' ELSE i::VARCHAR END) || '}'
+    ELSE '{"URL":{"scheme":"' || (CASE WHEN i % 3 = 0 THEN 'goal' ELSE 'https' END) || '"}, "n": ' ||
+         (CASE WHEN i % 500 = 8 THEN '"oops"' ELSE i::VARCHAR END) || '}'
+  END,
+  shredding := {'$.URL.scheme':'VARCHAR','n':'BIGINT'}) AS j
+FROM range(2000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# The headline fix: the nested VARCHAR lane filter is COALESCE-free despite the unrelated typed shred spilling,
+# so the predicate pushes into the scan as a bare struct_extract (zone-map prunable) instead of a
+# per-row jsono_extract_string over the reconstructed residual.
+query II
+EXPLAIN SELECT count(*) FROM nested_lane WHERE j->>'$.URL.scheme' = 'goal';
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+# Contrast: the typed BIGINT shred DID divert, so its NULL lane can hide a residual value — a bare
+# read would miss it. That shred correctly keeps the residual COALESCE fallback.
+query II
+EXPLAIN SELECT count(*) FROM nested_lane WHERE TRY_CAST(j->>'n' AS BIGINT) = 12;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Values stay correct after the COALESCE-free rewrite: 2000 rows, 3/4 carry a URL.scheme, of those
+# every third is 'goal'.
+query III
+SELECT
+  count(*) FILTER (WHERE j->>'$.URL.scheme' = 'goal'),
+  count(j->>'$.URL.scheme'),
+  count(*)
+FROM nested_lane;
+----
+500	1500	2000
+
+# Every row's lane read equals the authoritative plain (unshredded) jsono read of the same value.
+query I
+SELECT count(*) FROM nested_lane
+WHERE (j->>'$.URL.scheme') IS DISTINCT FROM (jsono(to_json(j)::VARCHAR)->>'$.URL.scheme');
+----
+0
+
+# A container at a VARCHAR shred path: `->>` serializes the (sorted) JSON text. The shred stores that
+# text as a read copy so a bare lane read equals `->>`; reconstruction still rebuilds the value. This
+# was a silent wrong-NULL before: the lane held NULL and a bare (trusted-complete) read returned NULL.
+statement ok
+CREATE TABLE varchar_container AS
+SELECT i, jsono(json, shredding := {'$.a':'VARCHAR'}) AS j
+FROM (VALUES
+  (0, '{"a":"str"}'),
+  (1, '{"a":{"z":1,"m":2}}'),
+  (2, '{"a":[3,1,2]}'),
+  (3, '{"a":42}'),
+  (4, '{"a":null}'),
+  (5, '{"b":1}')
+) v(i, json);
+
+query II
+SELECT i, j->>'$.a' FROM varchar_container ORDER BY i;
+----
+0	str
+1	{"m":2,"z":1}
+2	[3,1,2]
+3	42
+4	NULL
+5	NULL
+
+# Same column round-tripped through Parquet, where the per-shred totality fast path applies: the lane
+# carries the container text, so the bare read still returns the serialized container (not NULL).
+statement ok
+COPY (SELECT * FROM varchar_container) TO '__TEST_DIR__/varchar_container.parquet' (FORMAT parquet);
+
+query II
+SELECT i, j->>'$.a' FROM read_parquet('__TEST_DIR__/varchar_container.parquet') ORDER BY i;
+----
+0	str
+1	{"m":2,"z":1}
+2	[3,1,2]
+3	42
+4	NULL
+5	NULL
+
+# to_json reconstructs the original value (containers in the lane are read copies, ignored by the
+# residual-authoritative reconstruct).
+query II
+SELECT i, to_json(j)::VARCHAR FROM read_parquet('__TEST_DIR__/varchar_container.parquet') ORDER BY i;
+----
+0	{"a":"str"}
+1	{"a":{"m":2,"z":1}}
+2	{"a":[3,1,2]}
+3	{"a":42}
+4	{"a":null}
+5	{"b":1}
+
+# A container at a TYPED shred path cannot be held by the lane, so it is a residual diversion that
+# keeps the COALESCE fallback and serializes correctly from the residual.
+statement ok
+CREATE TABLE typed_container AS
+SELECT i, jsono(json, shredding := {'$.a':'BIGINT'}) AS j
+FROM (VALUES (0, '{"a":7}'), (1, '{"a":{"k":1}}'), (2, '{"a":"x"}')) v(i, json);
+
+query II
+SELECT i, j->>'$.a' FROM typed_container ORDER BY i;
+----
+0	7
+1	{"k":1}
+2	x
+
+# Render-unsafe: shredding both a container path ($.a) AND a path strictly inside it ($.a.b). The
+# nested shred is stripped from the residual, so the lane cannot hold the full container — the read
+# reconstructs (overlaying the nested shred) and returns the complete container.
+statement ok
+CREATE TABLE unsafe_container AS
+SELECT jsono('{"a":{"b":"x","c":"y"}}', shredding := {'$.a':'VARCHAR','$.a.b':'VARCHAR'}) AS j;
+
+query I
+SELECT j->>'$.a' FROM unsafe_container;
+----
+{"b":"x","c":"y"}
+
+query I
+SELECT j->>'$.a.b' FROM unsafe_container;
+----
+x
+
+# Multi-file union of a narrower shred set: file B omits the $.URL.scheme shred (its value stays in
+# B's residual). The unioned read NULL-fills B's lane, but the per-file marker hash differs from the
+# read type's, so the optimizer keeps the residual COALESCE — B's rows read from the residual, not a
+# silent bare NULL.
+statement ok
+COPY (SELECT jsono(json, shredding := {'$.URL.scheme':'VARCHAR','n':'BIGINT'}) AS j
+      FROM (VALUES ('{"URL":{"scheme":"goal"},"n":1}'),('{"URL":{"scheme":"https"},"n":2}')) v(json))
+  TO '__TEST_DIR__/union_a.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono(json, shredding := {'other':'VARCHAR'}) AS j
+      FROM (VALUES ('{"URL":{"scheme":"autogoal"},"other":"z"}'),('{"URL":{"scheme":"direct"}}')) v(json))
+  TO '__TEST_DIR__/union_b.parquet' (FORMAT parquet);
+
+query I
+SELECT j->>'$.URL.scheme' AS scheme
+FROM read_parquet(['__TEST_DIR__/union_a.parquet','__TEST_DIR__/union_b.parquet'], union_by_name=true)
+ORDER BY scheme;
+----
+autogoal
+direct
+goal
+https

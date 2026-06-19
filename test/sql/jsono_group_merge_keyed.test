@@ -334,6 +334,62 @@ SELECT to_json(jsono_group_merge_max(j, ts)) FROM p;
 ----
 order-dependent
 
+# --- Materialized keyed merge: a container at a scalar-shred path must not read as a silent NULL ---
+
+require parquet
+
+# The keyed finalize writes shred lanes directly. When a group's winning value at a scalar-shred path
+# is a CONTAINER (object/array), it cannot fit the lane and stays in the residual — the finalize must
+# mark that shred not-complete so the materialized column does not let the optimizer bare-read the
+# NULL lane. A VARCHAR shred ($.a) and a typed BIGINT shred ($.n) both exercise it. Before the fix the
+# bare `->>` returned NULL on the container groups while to_json showed the full container.
+# One row per group keeps each group's path kind self-consistent (the keyed merge rejects a path that
+# is an object in one row and a scalar/array in another). g1: $.a is an object; g2: $.a is an array;
+# g3: $.n is an object; g4: both scalar (control). Each container sits at a scalar-shred path.
+statement ok
+CREATE TABLE gm_src AS
+SELECT k, ts, jsono(json, shredding := {'$.a':'VARCHAR','$.n':'BIGINT'}) AS j
+FROM (VALUES
+  ('g1', 1, '{"a":{"z":1,"m":2},"n":3}'),
+  ('g2', 1, '{"a":[3,1,2],"n":4}'),
+  ('g3', 1, '{"a":"plain","n":{"k":9}}'),
+  ('g4', 1, '{"a":"x","n":5}')
+) v(k, ts, json);
+
+statement ok
+CREATE TABLE gm AS
+SELECT k, jsono_group_merge_max(j, ts) AS m FROM gm_src GROUP BY k;
+
+# Bare lane reads over the materialized column agree with the authoritative to_json round-trip read,
+# for every group (the container winners g1/g2/g3 and the scalar control g4).
+query I
+SELECT count(*) FROM gm
+WHERE (m->>'$.a') IS DISTINCT FROM (jsono(to_json(m)::VARCHAR)->>'$.a')
+   OR (m->>'$.n') IS DISTINCT FROM (jsono(to_json(m)::VARCHAR)->>'$.n');
+----
+0
+
+query III
+SELECT m->>'$.a', m->>'$.n', to_json(m)::VARCHAR FROM gm ORDER BY k;
+----
+{"m":2,"z":1}	3	{"a":{"m":2,"z":1},"n":3}
+[3,1,2]	4	{"a":[3,1,2],"n":4}
+plain	{"k":9}	{"a":"plain","n":{"k":9}}
+x	5	{"a":"x","n":5}
+
+# Same column round-tripped through Parquet, where the per-shred totality fast path applies.
+statement ok
+COPY gm TO '__TEST_DIR__/gm_keyed_container.parquet' (FORMAT parquet);
+
+query III
+SELECT m->>'$.a', m->>'$.n', to_json(m)::VARCHAR
+FROM read_parquet('__TEST_DIR__/gm_keyed_container.parquet') ORDER BY k;
+----
+{"m":2,"z":1}	3	{"a":{"m":2,"z":1},"n":3}
+[3,1,2]	4	{"a":[3,1,2],"n":4}
+plain	{"k":9}	{"a":"plain","n":{"k":9}}
+x	5	{"a":"x","n":5}
+
 # --- Bind-time errors ---
 
 statement error

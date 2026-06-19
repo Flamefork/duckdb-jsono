@@ -18,7 +18,7 @@ CREATE MACRO jsono_residual(j) AS struct_pack(
     "jsono" := struct_pack(
         body := struct_extract_at(struct_extract_at(j, 1), 1)));
 
-# jsono(j, shredding := spec) returns the shredded STRUCT: four blob residual + one shred per
+# jsono(j, shredding := spec) returns the shredded STRUCT: six blob residual + one shred per
 # spec path (named by the path, typed by the spec). The read side reconstructs the
 # original value, so to_json round-trips losslessly.
 
@@ -220,7 +220,7 @@ FROM (
 
 # jsono(struct) lifts top-level scalar fields of shred types into shreds directly (no spec):
 # scalars of shred types become columns, the rest stays in the residual tape. The type is the same
-# one jsono_storage_type builds from the same shreds (asserted by equality, fingerprint and all).
+# one jsono_storage_type builds from the same shreds (asserted by struct-type equality).
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'name': 'x', 'nested': {'k': 2}}))
      = jsono_storage_type('a BIGINT, "name" VARCHAR');
@@ -338,7 +338,7 @@ SELECT to_json(jsono(jsono('{"a":"1","b":"2","c":"3","d":4}', shredding := {'a':
 
 query II
 SELECT to_json(jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})),
-       jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})."jsono"."a";
+       jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})."jsono"."shreds"."a"."value";
 ----
 {"a":7,"b":"x"}	7
 
@@ -361,14 +361,14 @@ SELECT to_json(jsono(jsono('{"p":{"q":"deep"},"r":"top"}', shredding := {'$.p.q'
 # Two spec entries naming the same key path ('a' and '$.a'): both shreds fill and the key
 # strips once (the duplicate-path fallback keeps the per-row locate-and-strip semantics).
 query III
-SELECT to_json(j), j."jsono"."a", j."jsono"."$.a"
+SELECT to_json(j), j."jsono"."shreds"."a"."value", j."jsono"."shreds"."$.a"."value"
 FROM (SELECT jsono('{"a":"v","z":1}', shredding := {'a':'VARCHAR', '$.a':'VARCHAR'}) AS j);
 ----
 {"a":"v","z":1}	v	v
 
 # A UBIGINT shred strips values past int64 range and plain non-negative integers alike.
 query III
-SELECT to_json(j), j."jsono"."big", j."jsono"."small"
+SELECT to_json(j), j."jsono"."shreds"."big"."value", j."jsono"."shreds"."small"."value"
 FROM (SELECT jsono('{"big":18446744073709551615,"small":7}', shredding := {'big':'UBIGINT','small':'UBIGINT'}) AS j);
 ----
 {"big":18446744073709551615,"small":7}	18446744073709551615	7

@@ -1,79 +1,70 @@
 # name: test/sql/jsono_shredded_marker_width.test
-# description: The reserved value-complete marker $jsono$vc is identified by name with any integer width, not strictly UBIGINT — a shredded jsono value round-tripped through a generic value->SQL->value path (e.g. DuckLake inlined-data INSERT serializes the marker as a bare integer literal that re-parses as BIGINT/HUGEINT) must still cast back to the canonical UBIGINT-marker type losslessly. A strict-UBIGINT rule misread the degraded marker as a typed shred, shifting the shred->vector mapping and crashing in reconstruct (Expected INT64, found VARCHAR).
+# description: The reserved integer-width metadata fields ($jsono$set marker, per-shred complete flag) are identified by name with any integer width, not strictly their canonical width — a shredded jsono value round-tripped through a generic value->SQL->value path (e.g. DuckLake inlined-data INSERT serializes them as bare integer literals that may re-parse wider, HUGEINT/INTEGER) must still be recognised as shredded jsono. A strict-width rule drops the whole value to a plain user struct, so to_json leaks the physical layout and `->>` reads NULL. A degraded `complete` width must also survive a same-spec reshred (the keep-path casts the flag down instead of a verbatim copy). The marker is still positional: it must sit at `shreds` field 0, so a hand-built struct with the marker elsewhere is rejected rather than mis-mapped onto a shred (which crashed on read).
 # group: [sql]
 
 require jsono
 
 require json
 
-# A canonical shredded value carries the marker as UBIGINT.
+# A canonical shredded value carries the marker as BIGINT, the first field inside `shreds`.
 query I
-SELECT typeof(jsono({'event_name':'pv','goals':'buy'}).jsono."$jsono$vc");
+SELECT typeof(jsono({'event_name':'pv','goals':'buy'}).jsono.shreds."$jsono$set");
 ----
-UBIGINT
+BIGINT
 
-# Degrade the marker to BIGINT exactly as DuckLake's value->SQL->value inlining does (the UBIGINT hash
-# serializes to a bare integer literal that re-parses signed), then cast the struct back to the
-# canonical UBIGINT-marker type. Before the fix this crashed in reconstruct; now it round-trips.
+# Degrade the marker to HUGEINT exactly as a generic value->SQL->value inlining can (the BIGINT hash
+# serializes to a bare integer literal that re-parses wider), then cast the struct back to the
+# canonical BIGINT-marker type. The marker must be recognized by name, so this round-trips.
 query I
 WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT to_json(
   struct_pack(jsono := struct_pack(
     body := c.jsono.body,
-    "$jsono$vc" := c.jsono."$jsono$vc"::BIGINT,
-    event_name := c.jsono.event_name,
-    goals := c.jsono.goals
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR, goals VARCHAR))
+    shreds := struct_pack(
+      "$jsono$set" := c.jsono.shreds."$jsono$set"::HUGEINT,
+      event_name := c.jsono.shreds.event_name,
+      goals := c.jsono.shreds.goals
+    )
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, event_name STRUCT(value VARCHAR, complete TINYINT), goals STRUCT(value VARCHAR, complete TINYINT))))
 )
 FROM v;
 ----
 {"event_name":"pv","goals":"buy"}
 
-# The reconstructed value is exactly the canonical shredded type (marker back to UBIGINT, same shreds):
+# The reconstructed value is exactly the canonical shredded type (marker back to BIGINT, same shreds):
 # the cast took the lossless plain struct-cast path, NOT a reshred, because the marker was recognized.
 query I
 WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT typeof(
   struct_pack(jsono := struct_pack(
     body := c.jsono.body,
-    "$jsono$vc" := c.jsono."$jsono$vc"::BIGINT,
-    event_name := c.jsono.event_name,
-    goals := c.jsono.goals
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR, goals VARCHAR))
+    shreds := struct_pack(
+      "$jsono$set" := c.jsono.shreds."$jsono$set"::HUGEINT,
+      event_name := c.jsono.shreds.event_name,
+      goals := c.jsono.shreds.goals
+    )
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, event_name STRUCT(value VARCHAR, complete TINYINT), goals STRUCT(value VARCHAR, complete TINYINT))))
 ) = jsono_storage_type('event_name VARCHAR, goals VARCHAR')
 FROM v;
 ----
 true
 
-# A 64-bit hash above INT64_MAX re-parses as HUGEINT, not UBIGINT — the name match must cover that too.
-query I
-WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
-SELECT to_json(
-  struct_pack(jsono := struct_pack(
-    body := c.jsono.body,
-    "$jsono$vc" := c.jsono."$jsono$vc"::HUGEINT,
-    event_name := c.jsono.event_name,
-    goals := c.jsono.goals
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR, goals VARCHAR))
-)
-FROM v;
-----
-{"event_name":"pv","goals":"buy"}
-
-# Extracts over the round-tripped value agree with to_json (the bug made the typed-shred read diverge):
-# the reserved marker never leaks into the residual as a $jsono$vc data key.
+# Extracts over the round-tripped value agree with to_json (a width-misread made the typed-shred read
+# diverge): the reserved marker never leaks into the residual as a $jsono$set data key.
 query II
 WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c),
 rt AS (
   SELECT struct_pack(jsono := struct_pack(
     body := c.jsono.body,
-    "$jsono$vc" := c.jsono."$jsono$vc"::BIGINT,
-    event_name := c.jsono.event_name,
-    goals := c.jsono.goals
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR, goals VARCHAR)) AS r
+    shreds := struct_pack(
+      "$jsono$set" := c.jsono.shreds."$jsono$set"::HUGEINT,
+      event_name := c.jsono.shreds.event_name,
+      goals := c.jsono.shreds.goals
+    )
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, event_name STRUCT(value VARCHAR, complete TINYINT), goals STRUCT(value VARCHAR, complete TINYINT)))) AS r
   FROM v
 )
-SELECT jsono_extract_string(r, '$.event_name'), jsono_extract_string(r, '$."$jsono$vc"') FROM rt;
+SELECT jsono_extract_string(r, '$.event_name'), jsono_extract_string(r, '$."$jsono$set"') FROM rt;
 ----
 pv	NULL
 
@@ -84,11 +75,103 @@ WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT to_json(
   struct_pack(jsono := struct_pack(
     body := c.jsono.body,
-    "$jsono$vc" := c.jsono."$jsono$vc"::BIGINT,
-    event_name := c.jsono.event_name,
-    goals := c.jsono.goals
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "$jsono$vc" UBIGINT, event_name VARCHAR))
+    shreds := struct_pack(
+      "$jsono$set" := c.jsono.shreds."$jsono$set"::HUGEINT,
+      event_name := c.jsono.shreds.event_name,
+      goals := c.jsono.shreds.goals
+    )
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, event_name STRUCT(value VARCHAR, complete TINYINT))))
 )
 FROM v;
 ----
 {"event_name":"pv","goals":"buy"}
+
+# The per-shred `complete` flag must survive the SAME width degradation as the marker: a generic
+# value->SQL->value path re-parses the bare 1/0 flag as INTEGER, not TINYINT. The degraded value is read
+# WITHOUT casting back to the canonical type, so the layout parser must recognise the wider `complete` in
+# place. A strict-TINYINT rule dropped the whole value to a plain user struct here — to_json leaked the
+# physical layout and `->>` read NULL.
+query II
+WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c),
+deg AS (
+  SELECT struct_pack(jsono := struct_pack(
+    body := c.jsono.body,
+    shreds := struct_pack(
+      "$jsono$set" := c.jsono.shreds."$jsono$set",
+      event_name := struct_pack(value := c.jsono.shreds.event_name.value,
+                                complete := c.jsono.shreds.event_name.complete::INTEGER),
+      goals := struct_pack(value := c.jsono.shreds.goals.value,
+                           complete := c.jsono.shreds.goals.complete::INTEGER)
+    )
+  )) AS r
+  FROM v
+)
+SELECT to_json(r)::VARCHAR, r ->> '$.event_name' FROM deg;
+----
+{"event_name":"pv","goals":"buy"}	pv
+
+# The degraded-`complete` value still casts losslessly back to the canonical TINYINT-complete type
+# (the recognised pair is a plain INTEGER->TINYINT field cast, not a reshred).
+query I
+WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
+SELECT typeof(
+  struct_pack(jsono := struct_pack(
+    body := c.jsono.body,
+    shreds := struct_pack(
+      "$jsono$set" := c.jsono.shreds."$jsono$set",
+      event_name := struct_pack(value := c.jsono.shreds.event_name.value,
+                                complete := c.jsono.shreds.event_name.complete::INTEGER),
+      goals := struct_pack(value := c.jsono.shreds.goals.value,
+                           complete := c.jsono.shreds.goals.complete::INTEGER)
+    )
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, event_name STRUCT(value VARCHAR, complete TINYINT), goals STRUCT(value VARCHAR, complete TINYINT))))
+) = jsono_storage_type('event_name VARCHAR, goals VARCHAR')
+FROM v;
+----
+true
+
+# Reshredding a degraded-`complete` value to the SAME shred set takes the fast keep-path, which copies
+# each kept shred's `complete` lane through. The source lane is INTEGER (degraded) but the target lane
+# is canonical TINYINT — a verbatim vector copy crashed (Expected INT8, found INT32); the copy must
+# cast the 1/0 flag down. The reshred round-trips to the original value.
+query I
+WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c),
+deg AS (
+  SELECT struct_pack(jsono := struct_pack(
+    body := c.jsono.body,
+    shreds := struct_pack(
+      "$jsono$set" := c.jsono.shreds."$jsono$set",
+      event_name := struct_pack(value := c.jsono.shreds.event_name.value,
+                                complete := c.jsono.shreds.event_name.complete::INTEGER),
+      goals := struct_pack(value := c.jsono.shreds.goals.value,
+                           complete := c.jsono.shreds.goals.complete::INTEGER)
+    )
+  )) AS r
+  FROM v
+)
+SELECT to_json(jsono(r, shredding := {'event_name':'VARCHAR','goals':'VARCHAR'}))::VARCHAR FROM deg;
+----
+{"event_name":"pv","goals":"buy"}
+
+# The marker is identified by name BUT must sit at `shreds` field 0: every writer and set-op merge emits
+# it first, and all accessors index shred k as physical field 1 + k. A hand-built struct with the marker
+# NOT at field 0 is therefore NOT a canonical JSONO layout — the parser rejects it (reads it as a plain
+# user struct) rather than mis-mapping a shred onto the marker, which read the marker as a shred pair and
+# crashed on every read. to_json then dumps the raw struct (keeping the literal `$jsono$set` key) and a
+# jsono extract returns NULL — no internal error.
+query II
+WITH v AS (SELECT jsono({'a':'x','b':'y'}) AS c),
+reord AS (
+  SELECT struct_pack(jsono := struct_pack(
+    body := c.jsono.body,
+    shreds := struct_pack(
+      a := c.jsono.shreds.a,
+      "$jsono$set" := c.jsono.shreds."$jsono$set",
+      b := c.jsono.shreds.b
+    )
+  )) AS r
+  FROM v
+)
+SELECT to_json(r)::VARCHAR LIKE '%"$jsono$set":%', r ->> '$.a' FROM reord;
+----
+true	NULL

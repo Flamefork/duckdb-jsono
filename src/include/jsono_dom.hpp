@@ -256,7 +256,7 @@ struct DomShredCapture {
 	bool stripped = false;
 	// A present scalar value at a typed (non-VARCHAR) shred path that the shred did not capture
 	// (kept in the residual, shred NULL): a bare struct_extract would read NULL while the residual
-	// `->>`+CAST would yield the value, so this row is NOT value-complete for the typed fast path.
+	// `->>`+CAST would yield the value, so this shred is NOT complete on this row for the typed fast path.
 	// Absent paths and present null/container values stay false (both read NULL either way).
 	bool diverted_scalar = false;
 	nonstd::string_view text;

@@ -1190,10 +1190,10 @@ void AppendShredPathStep(string &path, const string &key) {
 void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix, bool top_level,
                        vector<pair<string, LogicalType>> &shreds) {
 	for (auto &child : StructType::GetChildTypes(struct_type)) {
-		// A top-level field named 'body' or the reserved value-complete marker would collide with a
-		// layout field, so it stays in the residual instead of becoming a shred (auto-shred must not
+		// A top-level field named 'body' or the reserved shred-set marker would collide with a layout
+		// field name, so it stays in the residual instead of becoming a shred (auto-shred must not
 		// error on field names).
-		if (top_level && (child.first == "body" || child.first == JsonoValueCompleteName())) {
+		if (top_level && (child.first == "body" || child.first == JsonoShredSetName())) {
 			continue;
 		}
 		if (IsShredValueType(child.second)) {
@@ -1447,9 +1447,9 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	writer.Init(result);
 	// Type-driven auto-shred never diverts: each shred's type is its source field's type, so a
 	// present value always fits the shred and a NULL shred is only an absent field. The value is
-	// therefore always value-complete — which gives jsono(struct, shredding) the COALESCE-free typed
+	// therefore always complete — which gives jsono(struct, shredding) the COALESCE-free typed
 	// read on read-back for struct-ingest workloads.
-	JsonoFillValueComplete(result, count);
+	JsonoFillShredsComplete(result, count);
 	auto &builder = lstate.builder;
 
 	// All-stripped rows with an empty residual share constant blobs (header + {} + manifest).
@@ -1462,7 +1462,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	for (idx_t row = 0; row < count; row++) {
 		if (!parent_fmt.validity.RowIsValid(parent_fmt.sel->get_index(row))) {
 			writer.SetRowNull(row);
-			FlatVector::SetNull(JsonoVcVector(result), row, true);
+			JsonoSetRowMarkerNull(result, row);
 			for (idx_t f = 0; f < shred_count; f++) {
 				FlatVector::SetNull(*shred_out[f], row, true);
 			}
@@ -1642,7 +1642,7 @@ bool JsonoPrefixReinterpretCast(Vector &source, Vector &result, idx_t count, Cas
 // Cast a shredded JSONO struct to plain JSONO losslessly: overlay each row's shreds back onto
 // its residual. This is what an implicit cast / INSERT into a plain JSONO column needs — the
 // reinterpret path would silently drop the shred columns. The optimizer never reaches here for
-// its residual extraction; it reinterprets the four-blob prefix directly.
+// its residual extraction; it reinterprets the six-blob prefix directly.
 bool JsonoShreddedReconstructCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	(void)parameters;
 	JsonoReconstructToPlain(source, count, result);
