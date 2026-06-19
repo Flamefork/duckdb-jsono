@@ -456,15 +456,17 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const Location &
 	return false;
 }
 
-// Write the LIST<STRUCT> shred column for one row's array at `location` and return whether any
-// element subfield was losslessly stripped (so the manifest must list the array path). A missing
-// path, a non-array value, or an absent location writes a NULL list (the value stays whole in the
-// residual). Each array element becomes one struct row: an object element's lifted subfields are
-// written typed (NULL where absent/diverted/type-mismatched), a non-object/null element a NULL
-// struct. The skeleton residual emit (jsono_merge.cpp) strips exactly the subfields whose write
-// here reports strippable, since both gate on JsonoScalarFitsShredType.
-bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Location &location, Vector &list_vec,
-                     idx_t row, std::string &scratch) {
+// Shared array-lane shred scaffold: both shred lanes (LIST<STRUCT> objects, LIST<scalar>) reject a
+// missing path / non-array / absent location with a NULL list, count elements via SkipValueFast,
+// reserve list capacity, then walk each element once writing into list slot `child`. Only the
+// per-element body differs between lanes, so it is passed as `write_element(elem, child) -> bool`
+// returning whether that element was losslessly lifted; the OR of those drives the manifest return.
+// `setup` runs once after capacity is reserved, lane-side, to flatten the lane's child vectors (the
+// FLAT setup is lane-specific — LIST<STRUCT> must flatten every subfield, LIST<scalar> only the one
+// child). The caller's NULL-slot handling for non-conforming elements lives inside write_element.
+template <class Setup, class WriteElement>
+bool WriteArrayLaneShred(const JsonoView &view, const Location &location, Vector &list_vec, idx_t row, Setup setup,
+                         WriteElement write_element) {
 	if (!location.found || SlotTag(view.SlotAt(location.cursor.pos)) != tag::ARR_START) {
 		SetListRowNull(list_vec, row);
 		return false;
@@ -479,42 +481,62 @@ bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Locat
 	}
 	auto start = ListVector::GetListSize(list_vec);
 	EnsureListCapacity(list_vec, start + element_count);
-	auto &struct_vec = ListVector::GetEntry(list_vec);
-	struct_vec.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &subfield_vecs = StructVector::GetEntries(struct_vec);
-	for (auto &sub : subfield_vecs) {
-		sub->SetVectorType(VectorType::FLAT_VECTOR);
-	}
+	setup();
 	bool stripped_any = false;
 	JsonoCursor elem = first;
 	for (idx_t i = 0; i < element_count; i++) {
-		idx_t child = start + i;
-		if (SlotTag(view.SlotAt(elem.pos)) == tag::OBJ_START) {
-			FlatVector::Validity(struct_vec).SetValid(child);
-			for (idx_t j = 0; j < field.subfields.size(); j++) {
-				auto &sub = field.subfields[j];
-				ShredField subfield;
-				subfield.steps.push_back(PathStep {PathStepKind::Key, sub.name, 0});
-				subfield.primitive = sub.primitive;
-				subfield.logical_type = sub.logical_type;
-				JsonoCursor probe = elem;
-				Location subloc;
-				if (LocatePathStep(nullptr, 0, view, subfield.steps[0], probe)) {
-					subloc = Location {probe, true};
-				}
-				stripped_any |= WriteShred(subfield, view, subloc, *subfield_vecs[j], child, scratch);
-			}
-		} else {
-			// Non-object element (null/scalar/array): no subfields, a NULL struct row.
-			FlatVector::SetNull(struct_vec, child, true);
-			for (auto &sub : subfield_vecs) {
-				FlatVector::SetNull(*sub, child, true);
-			}
-		}
+		stripped_any |= write_element(elem, start + i);
 		SkipValueFast(view, elem);
 	}
 	FinishListRow(list_vec, row, start, element_count);
 	return stripped_any;
+}
+
+// Write the LIST<STRUCT> shred column for one row's array at `location` and return whether any
+// element subfield was losslessly stripped (so the manifest must list the array path). A missing
+// path, a non-array value, or an absent location writes a NULL list (the value stays whole in the
+// residual). Each array element becomes one struct row: an object element's lifted subfields are
+// written typed (NULL where absent/diverted/type-mismatched), a non-object/null element a NULL
+// struct. The skeleton residual emit (jsono_merge.cpp) strips exactly the subfields whose write
+// here reports strippable, since both gate on JsonoScalarFitsShredType.
+bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Location &location, Vector &list_vec,
+                     idx_t row, std::string &scratch) {
+	auto &struct_vec = ListVector::GetEntry(list_vec);
+	auto &subfield_vecs = StructVector::GetEntries(struct_vec);
+	return WriteArrayLaneShred(
+	    view, location, list_vec, row,
+	    [&]() {
+		    struct_vec.SetVectorType(VectorType::FLAT_VECTOR);
+		    for (auto &sub : subfield_vecs) {
+			    sub->SetVectorType(VectorType::FLAT_VECTOR);
+		    }
+	    },
+	    [&](JsonoCursor elem, idx_t child) -> bool {
+		    if (SlotTag(view.SlotAt(elem.pos)) != tag::OBJ_START) {
+			    // Non-object element (null/scalar/array): no subfields, a NULL struct row.
+			    FlatVector::SetNull(struct_vec, child, true);
+			    for (auto &sub : subfield_vecs) {
+				    FlatVector::SetNull(*sub, child, true);
+			    }
+			    return false;
+		    }
+		    FlatVector::Validity(struct_vec).SetValid(child);
+		    bool stripped = false;
+		    for (idx_t j = 0; j < field.subfields.size(); j++) {
+			    auto &sub = field.subfields[j];
+			    ShredField subfield;
+			    subfield.steps.push_back(PathStep {PathStepKind::Key, sub.name, 0});
+			    subfield.primitive = sub.primitive;
+			    subfield.logical_type = sub.logical_type;
+			    JsonoCursor probe = elem;
+			    Location subloc;
+			    if (LocatePathStep(nullptr, 0, view, subfield.steps[0], probe)) {
+				    subloc = Location {probe, true};
+			    }
+			    stripped |= WriteShred(subfield, view, subloc, *subfield_vecs[j], child, scratch);
+		    }
+		    return stripped;
+	    });
 }
 
 // Write one fitting scalar into a flat shred vector at `idx`. The caller has already checked the
@@ -556,45 +578,23 @@ void WriteFittingScalarElement(Vector &out, idx_t idx, const JsonoScalar &scalar
 // exactly the elements lifted here, since both gate on JsonoScalarFitsShredType.
 bool WriteScalarArrayShred(const ShredField &field, const JsonoView &view, const Location &location, Vector &list_vec,
                            idx_t row, std::string &scratch) {
-	if (!location.found || SlotTag(view.SlotAt(location.cursor.pos)) != tag::ARR_START) {
-		SetListRowNull(list_vec, row);
-		return false;
-	}
-	auto end_pos = ReadArrayEndPos(view, location.cursor.pos);
-	JsonoCursor first = location.cursor;
-	first.pos++; // ARR_START consumes no stream entries, so the stream cursors are the first element's
-	idx_t element_count = 0;
-	for (JsonoCursor walk = first; walk.pos < end_pos;) {
-		SkipValueFast(view, walk);
-		element_count++;
-	}
-	auto start = ListVector::GetListSize(list_vec);
-	EnsureListCapacity(list_vec, start + element_count);
 	auto &child_vec = ListVector::GetEntry(list_vec);
-	child_vec.SetVectorType(VectorType::FLAT_VECTOR);
-	bool stripped_any = false;
-	JsonoCursor elem = first;
-	for (idx_t i = 0; i < element_count; i++) {
-		idx_t child = start + i;
-		auto value_tag = SlotTag(view.SlotAt(elem.pos));
-		bool lifted = false;
-		if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
-			JsonoCursor probe = elem;
-			auto scalar = DecodeScalarAt(view, probe);
-			if (JsonoScalarFitsShredType(scalar, field.element_type)) {
-				WriteFittingScalarElement(child_vec, child, scalar, field.element_primitive, scratch);
-				lifted = true;
-			}
-		}
-		if (!lifted) {
-			// Kept verbatim in the residual skeleton: a NULL slot disambiguates it from a lifted element.
-			FlatVector::SetNull(child_vec, child, true);
-		}
-		stripped_any = stripped_any || lifted;
-		SkipValueFast(view, elem);
-	}
-	FinishListRow(list_vec, row, start, element_count);
-	return stripped_any;
+	return WriteArrayLaneShred(
+	    view, location, list_vec, row, [&]() { child_vec.SetVectorType(VectorType::FLAT_VECTOR); },
+	    [&](JsonoCursor elem, idx_t child) -> bool {
+		    auto value_tag = SlotTag(view.SlotAt(elem.pos));
+		    if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
+			    JsonoCursor probe = elem;
+			    auto scalar = DecodeScalarAt(view, probe);
+			    if (JsonoScalarFitsShredType(scalar, field.element_type)) {
+				    WriteFittingScalarElement(child_vec, child, scalar, field.element_primitive, scratch);
+				    return true;
+			    }
+		    }
+		    // Kept verbatim in the residual skeleton: a NULL slot disambiguates it from a lifted element.
+		    FlatVector::SetNull(child_vec, child, true);
+		    return false;
+	    });
 }
 
 void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &fields, Vector &result,
