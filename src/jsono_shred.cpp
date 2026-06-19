@@ -160,26 +160,16 @@ struct YyjsonDoc {
 	yyjson_doc *doc;
 };
 
-// Resolve one spec entry's type string into a shred field: a scalar leaf shred, or a
-// LIST<STRUCT<...>> array shred lifting the element subfields of the array at `path`.
-void BindShredFieldType(const string &type_name, ClientContext &context, const string &path, ShredField &field) {
-	LogicalType type;
-	try {
-		type = TransformStringToLogicalType(type_name, context);
-	} catch (const std::exception &) {
-		throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
-	}
+// Populate a shred field's kind and shred-specific members (subfields / element type) from its
+// logical type. Returns false when the type is not a recognizable shred type — the caller raises
+// the exception that fits its context. The object-key-path gate likewise stays caller-side.
+bool FillShredFieldFromType(const LogicalType &type, ShredField &field) {
 	field.logical_type = type;
 	if (TypeToShredPrimitive(type, field.primitive)) {
 		field.kind = ShredKind::Scalar;
-		return;
+		return true;
 	}
 	if (IsShredArrayType(type)) {
-		if (!IsObjectKeyPath(field.steps)) {
-			throw BinderException("jsono shred: array shred '%s' must address an array by an object-key path "
-			                      "(no array index or wildcard)",
-			                      path);
-		}
 		field.kind = ShredKind::Array;
 		auto &element = ListType::GetChildType(type);
 		for (auto &sub : StructType::GetChildTypes(element)) {
@@ -189,20 +179,34 @@ void BindShredFieldType(const string &type_name, ClientContext &context, const s
 			TypeToShredPrimitive(sub.second, subfield.primitive);
 			field.subfields.push_back(std::move(subfield));
 		}
-		return;
+		return true;
 	}
 	if (IsShredScalarArrayType(type)) {
-		if (!IsObjectKeyPath(field.steps)) {
-			throw BinderException("jsono shred: array shred '%s' must address an array by an object-key path "
-			                      "(no array index or wildcard)",
-			                      path);
-		}
 		field.kind = ShredKind::ScalarArray;
 		field.element_type = ListType::GetChildType(type);
 		TypeToShredPrimitive(field.element_type, field.element_primitive);
-		return;
+		return true;
 	}
-	throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
+	return false;
+}
+
+// Resolve one spec entry's type string into a shred field: a scalar leaf shred, or a
+// LIST<STRUCT<...>> array shred lifting the element subfields of the array at `path`.
+void BindShredFieldType(const string &type_name, ClientContext &context, const string &path, ShredField &field) {
+	LogicalType type;
+	try {
+		type = TransformStringToLogicalType(type_name, context);
+	} catch (const std::exception &) {
+		throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
+	}
+	if (!FillShredFieldFromType(type, field)) {
+		throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
+	}
+	if ((field.kind == ShredKind::Array || field.kind == ShredKind::ScalarArray) && !IsObjectKeyPath(field.steps)) {
+		throw BinderException("jsono shred: array shred '%s' must address an array by an object-key path "
+		                      "(no array index or wildcard)",
+		                      path);
+	}
 }
 
 // The shredding spec is a constant STRUCT mapping each path to its shred type string, e.g.
@@ -1290,24 +1294,7 @@ void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<strin
 		ShredField field;
 		field.path_name = shred.first;
 		field.steps = ParseShredFieldPath(shred.first);
-		field.logical_type = shred.second;
-		if (TypeToShredPrimitive(shred.second, field.primitive)) {
-			field.kind = ShredKind::Scalar;
-		} else if (IsShredArrayType(shred.second)) {
-			field.kind = ShredKind::Array;
-			auto &element = ListType::GetChildType(shred.second);
-			for (auto &sub : StructType::GetChildTypes(element)) {
-				ShredArraySubfield subfield;
-				subfield.name = sub.first;
-				subfield.logical_type = sub.second;
-				TypeToShredPrimitive(sub.second, subfield.primitive);
-				field.subfields.push_back(std::move(subfield));
-			}
-		} else if (IsShredScalarArrayType(shred.second)) {
-			field.kind = ShredKind::ScalarArray;
-			field.element_type = ListType::GetChildType(shred.second);
-			TypeToShredPrimitive(field.element_type, field.element_primitive);
-		} else {
+		if (!FillShredFieldFromType(shred.second, field)) {
 			throw InternalException("jsono shred field '%s' has a non-shred type", shred.first);
 		}
 		fields.push_back(std::move(field));
