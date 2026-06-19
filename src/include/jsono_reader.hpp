@@ -131,44 +131,21 @@ inline void PrefetchJsonoRowStreams(const JsonoBlobRow &blob) {
 #endif
 }
 
-// Permissive row read for union-merged reconstruction: a dead layout group is expected to be NULL,
-// so any missing nested field is treated as an absent row.
-inline bool ReadJsonoRow(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
-	if (data.all_valid) {
-		ReadJsonoRowBlobs(data, row, out);
-		return true;
-	}
-	if (!RowIsValid(data.struct_fmt, row) || !RowIsValid(data.layout_fmt, row) || !RowIsValid(data.body_fmt, row)) {
-		return false;
-	}
-	auto slots_idx = RowIndex(data.slots_fmt, row);
-	auto key_heap_idx = RowIndex(data.key_heap_fmt, row);
-	auto string_heap_idx = RowIndex(data.string_heap_fmt, row);
-	auto skips_idx = RowIndex(data.skips_fmt, row);
-	auto lengths_idx = RowIndex(data.lengths_fmt, row);
-	auto nums_idx = RowIndex(data.nums_fmt, row);
-	if (!data.slots_fmt.validity.RowIsValid(slots_idx) || !data.key_heap_fmt.validity.RowIsValid(key_heap_idx) ||
-	    !data.string_heap_fmt.validity.RowIsValid(string_heap_idx) || !data.skips_fmt.validity.RowIsValid(skips_idx) ||
-	    !data.lengths_fmt.validity.RowIsValid(lengths_idx) || !data.nums_fmt.validity.RowIsValid(nums_idx)) {
-		return false;
-	}
-	out.slots = data.slots_data[slots_idx];
-	out.key_heap = data.key_heap_data[key_heap_idx];
-	out.string_heap = data.string_heap_data[string_heap_idx];
-	out.skips = data.skips_data[skips_idx];
-	out.lengths = data.lengths_data[lengths_idx];
-	out.nums = data.nums_data[nums_idx];
-	return true;
-}
-
-inline void ThrowCorruptJsonoRow(const char *field) {
+[[noreturn]] inline void ThrowCorruptJsonoRow(const char *field) {
 	throw InvalidInputException(
 	    "corrupt JSONO storage: top-level row is valid but %s is NULL; this can be produced by an unsafe "
 	    "STRUCT cast when the extension optimizer is disabled",
 	    field);
 }
 
-inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
+// Read one row's six body blobs once validity is unsettled. `Strict` selects the missing-child
+// policy: the strict read (the default for value-decoding operators) treats a present top-level row
+// with a NULL nested field as corruption and fails loud with the field name; the permissive read
+// (union-merged reconstruction, where a dead layout group is expected to be NULL) treats any missing
+// nested field as an absent row. A NULL top-level struct is an absent value under both. The
+// all_valid fast copy and the per-field handling are otherwise identical, so one body owns both.
+template <bool Strict>
+JSONO_ALWAYS_INLINE bool ReadJsonoRowImpl(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
 	if (data.all_valid) {
 		ReadJsonoRowBlobs(data, row, out);
 		return true;
@@ -177,10 +154,16 @@ inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlob
 		return false;
 	}
 	if (!RowIsValid(data.layout_fmt, row)) {
-		ThrowCorruptJsonoRow("layout");
+		if (Strict) {
+			ThrowCorruptJsonoRow("layout");
+		}
+		return false;
 	}
 	if (!RowIsValid(data.body_fmt, row)) {
-		ThrowCorruptJsonoRow("body");
+		if (Strict) {
+			ThrowCorruptJsonoRow("body");
+		}
+		return false;
 	}
 	auto slots_idx = RowIndex(data.slots_fmt, row);
 	auto key_heap_idx = RowIndex(data.key_heap_fmt, row);
@@ -189,22 +172,40 @@ inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlob
 	auto lengths_idx = RowIndex(data.lengths_fmt, row);
 	auto nums_idx = RowIndex(data.nums_fmt, row);
 	if (!data.slots_fmt.validity.RowIsValid(slots_idx)) {
-		ThrowCorruptJsonoRow("slots blob");
+		if (Strict) {
+			ThrowCorruptJsonoRow("slots blob");
+		}
+		return false;
 	}
 	if (!data.key_heap_fmt.validity.RowIsValid(key_heap_idx)) {
-		ThrowCorruptJsonoRow("key_heap blob");
+		if (Strict) {
+			ThrowCorruptJsonoRow("key_heap blob");
+		}
+		return false;
 	}
 	if (!data.string_heap_fmt.validity.RowIsValid(string_heap_idx)) {
-		ThrowCorruptJsonoRow("string_heap blob");
+		if (Strict) {
+			ThrowCorruptJsonoRow("string_heap blob");
+		}
+		return false;
 	}
 	if (!data.skips_fmt.validity.RowIsValid(skips_idx)) {
-		ThrowCorruptJsonoRow("skips blob");
+		if (Strict) {
+			ThrowCorruptJsonoRow("skips blob");
+		}
+		return false;
 	}
 	if (!data.lengths_fmt.validity.RowIsValid(lengths_idx)) {
-		ThrowCorruptJsonoRow("lengths blob");
+		if (Strict) {
+			ThrowCorruptJsonoRow("lengths blob");
+		}
+		return false;
 	}
 	if (!data.nums_fmt.validity.RowIsValid(nums_idx)) {
-		ThrowCorruptJsonoRow("nums blob");
+		if (Strict) {
+			ThrowCorruptJsonoRow("nums blob");
+		}
+		return false;
 	}
 	out.slots = data.slots_data[slots_idx];
 	out.key_heap = data.key_heap_data[key_heap_idx];
@@ -213,6 +214,16 @@ inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlob
 	out.lengths = data.lengths_data[lengths_idx];
 	out.nums = data.nums_data[nums_idx];
 	return true;
+}
+
+// Permissive row read for union-merged reconstruction: a dead layout group is expected to be NULL,
+// so any missing nested field is treated as an absent row.
+inline bool ReadJsonoRow(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
+	return ReadJsonoRowImpl<false>(data, row, out);
+}
+
+inline bool ReadJsonoRowStrict(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
+	return ReadJsonoRowImpl<true>(data, row, out);
 }
 
 // Emit `text` as a result string_t without copying its bytes. For a long value the string_t
