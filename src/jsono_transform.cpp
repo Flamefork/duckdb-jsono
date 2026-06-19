@@ -828,6 +828,29 @@ bool TryCastDec60Text(const JsonoScalar &scalar, T &value) {
 	return TryCastScalarText(nonstd::string_view(text.data(), text.size()), value);
 }
 
+// Shared scalar->numeric conversion ladder for the integral/boolean Convert targets. The DOUBLE
+// target handles Dec60 via Dec60ToDouble instead of text and stays inline at its call site.
+template <class T>
+bool TryCastScalarTo(const JsonoScalar &scalar, T &value) {
+	switch (scalar.kind) {
+	case JsonoScalarKind::Bool:
+		return TryCast::Operation(scalar.bool_value, value, false);
+	case JsonoScalarKind::Int64:
+		return TryCast::Operation(scalar.int_value, value, false);
+	case JsonoScalarKind::UInt64:
+		return TryCast::Operation(scalar.uint_value, value, false);
+	case JsonoScalarKind::Double:
+		return TryCast::Operation(scalar.double_value, value, false);
+	case JsonoScalarKind::Dec60:
+		return TryCastDec60Text(scalar, value);
+	case JsonoScalarKind::NumberText:
+	case JsonoScalarKind::String:
+		return TryCastScalarText(scalar.text, value);
+	default:
+		return false;
+	}
+}
+
 bool TryWriteExactScalarValue(const TransformField &field, const JsonoScalar &scalar, Vector &result, idx_t row) {
 	switch (field.primitive) {
 	case TransformPrimitive::Bigint:
@@ -905,31 +928,7 @@ bool TryWriteConvertedScalarValue(const TransformField &field, const JsonoScalar
 	switch (field.primitive) {
 	case TransformPrimitive::Bigint: {
 		int64_t value = 0;
-		bool ok = false;
-		switch (scalar.kind) {
-		case JsonoScalarKind::Bool:
-			ok = TryCast::Operation(scalar.bool_value, value, false);
-			break;
-		case JsonoScalarKind::Int64:
-			ok = TryCast::Operation(scalar.int_value, value, false);
-			break;
-		case JsonoScalarKind::UInt64:
-			ok = TryCast::Operation(scalar.uint_value, value, false);
-			break;
-		case JsonoScalarKind::Double:
-			ok = TryCast::Operation(scalar.double_value, value, false);
-			break;
-		case JsonoScalarKind::Dec60:
-			ok = TryCastDec60Text(scalar, value);
-			break;
-		case JsonoScalarKind::NumberText:
-		case JsonoScalarKind::String:
-			ok = TryCastScalarText(scalar.text, value);
-			break;
-		default:
-			break;
-		}
-		if (ok) {
+		if (TryCastScalarTo(scalar, value)) {
 			FlatVector::Validity(result).SetValid(row);
 			FlatVector::GetData<int64_t>(result)[row] = value;
 			return true;
@@ -938,31 +937,7 @@ bool TryWriteConvertedScalarValue(const TransformField &field, const JsonoScalar
 	}
 	case TransformPrimitive::Ubigint: {
 		uint64_t value = 0;
-		bool ok = false;
-		switch (scalar.kind) {
-		case JsonoScalarKind::Bool:
-			ok = TryCast::Operation(scalar.bool_value, value, false);
-			break;
-		case JsonoScalarKind::Int64:
-			ok = TryCast::Operation(scalar.int_value, value, false);
-			break;
-		case JsonoScalarKind::UInt64:
-			ok = TryCast::Operation(scalar.uint_value, value, false);
-			break;
-		case JsonoScalarKind::Double:
-			ok = TryCast::Operation(scalar.double_value, value, false);
-			break;
-		case JsonoScalarKind::Dec60:
-			ok = TryCastDec60Text(scalar, value);
-			break;
-		case JsonoScalarKind::NumberText:
-		case JsonoScalarKind::String:
-			ok = TryCastScalarText(scalar.text, value);
-			break;
-		default:
-			break;
-		}
-		if (ok) {
+		if (TryCastScalarTo(scalar, value)) {
 			FlatVector::Validity(result).SetValid(row);
 			FlatVector::GetData<uint64_t>(result)[row] = value;
 			return true;
@@ -1019,31 +994,7 @@ bool TryWriteConvertedScalarValue(const TransformField &field, const JsonoScalar
 	}
 	case TransformPrimitive::Boolean: {
 		bool value = false;
-		bool ok = false;
-		switch (scalar.kind) {
-		case JsonoScalarKind::Bool:
-			ok = TryCast::Operation(scalar.bool_value, value, false);
-			break;
-		case JsonoScalarKind::Int64:
-			ok = TryCast::Operation(scalar.int_value, value, false);
-			break;
-		case JsonoScalarKind::UInt64:
-			ok = TryCast::Operation(scalar.uint_value, value, false);
-			break;
-		case JsonoScalarKind::Double:
-			ok = TryCast::Operation(scalar.double_value, value, false);
-			break;
-		case JsonoScalarKind::Dec60:
-			ok = TryCastDec60Text(scalar, value);
-			break;
-		case JsonoScalarKind::NumberText:
-		case JsonoScalarKind::String:
-			ok = TryCastScalarText(scalar.text, value);
-			break;
-		default:
-			break;
-		}
-		if (ok) {
+		if (TryCastScalarTo(scalar, value)) {
 			FlatVector::Validity(result).SetValid(row);
 			FlatVector::GetData<bool>(result)[row] = value;
 			return true;
@@ -1297,6 +1248,32 @@ void AppendWildcardMissing(const TransformBindData &bind_data, idx_t node_index,
 	}
 }
 
+// A trie edge whose child key is absent: a simple scalar leaf nulls its own output column, any
+// other child nulls its whole subtree. The caller passes the already-resolved simple_scalar_leaf
+// so the shared dispatch costs no extra trie load on the apply hot path.
+void NullScalarEdge(const TransformBindData &bind_data, idx_t simple_scalar_leaf, idx_t child,
+                    vector<unique_ptr<Vector>> &children, idx_t row) {
+	if (simple_scalar_leaf == DConstants::INVALID_INDEX) {
+		SetTrieNodeOutputsNull(bind_data, child, children, row);
+	} else {
+		FlatVector::SetNull(*children[simple_scalar_leaf], row, true);
+	}
+}
+
+// The present-value twin of NullScalarEdge: a simple scalar leaf writes its column directly, any
+// other child recurses into ApplyTrieNode.
+void ApplyScalarEdge(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t simple_scalar_leaf,
+                     idx_t child, const JsonoView &view, const JsonoCursor &value_cursor,
+                     vector<unique_ptr<Vector>> &children, idx_t row, vector<string> &join_buffers,
+                     vector<idx_t> &join_counts) {
+	if (simple_scalar_leaf == DConstants::INVALID_INDEX) {
+		ApplyTrieNode(lstate, bind_data, child, view, value_cursor, children, row, join_buffers, join_counts);
+	} else {
+		WriteScalarField(bind_data.fields[simple_scalar_leaf], view, Location {value_cursor, true},
+		                 *children[simple_scalar_leaf], row, bind_data.mismatch_mode);
+	}
+}
+
 void ApplyObjectNodeWithCheckpoints(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                                     const JsonoView &view, const ObjectLayout &layout, const JsonoCursor &obj_cursor,
                                     vector<unique_ptr<Vector>> &children, idx_t row, vector<string> &join_buffers,
@@ -1315,21 +1292,13 @@ void ApplyObjectNodeWithCheckpoints(TransformLocalState &lstate, const Transform
 		auto &edge = node.key_edges[edge_index];
 		auto simple_scalar_leaf = bind_data.trie[edge.child].simple_scalar_leaf;
 		if (!entry.found[edge_index]) {
-			if (simple_scalar_leaf == DConstants::INVALID_INDEX) {
-				SetTrieNodeOutputsNull(bind_data, edge.child, children, row);
-			} else {
-				FlatVector::SetNull(*children[simple_scalar_leaf], row, true);
-			}
+			NullScalarEdge(bind_data, simple_scalar_leaf, edge.child, children, row);
 			continue;
 		}
 		auto rank = entry.ranks[edge_index];
 		MoveObjectValueCursorToRank(view, layout, value_block_base, rank, value_rank, value_cursor);
-		if (simple_scalar_leaf == DConstants::INVALID_INDEX) {
-			ApplyTrieNode(lstate, bind_data, edge.child, view, value_cursor, children, row, join_buffers, join_counts);
-		} else {
-			WriteScalarField(bind_data.fields[simple_scalar_leaf], view, Location {value_cursor, true},
-			                 *children[simple_scalar_leaf], row, bind_data.mismatch_mode);
-		}
+		ApplyScalarEdge(lstate, bind_data, simple_scalar_leaf, edge.child, view, value_cursor, children, row,
+		                join_buffers, join_counts);
 	}
 }
 
@@ -1433,22 +1402,13 @@ void ApplyObjectNode(TransformLocalState &lstate, const TransformBindData &bind_
 				break;
 			}
 			auto simple_scalar_leaf = bind_data.trie[node.key_edges[edge_index].child].simple_scalar_leaf;
-			if (simple_scalar_leaf == DConstants::INVALID_INDEX) {
-				SetTrieNodeOutputsNull(bind_data, node.key_edges[edge_index].child, children, row);
-			} else {
-				FlatVector::SetNull(*children[simple_scalar_leaf], row, true);
-			}
+			NullScalarEdge(bind_data, simple_scalar_leaf, node.key_edges[edge_index].child, children, row);
 			edge_index++;
 		}
 		if (edge_index < node.key_edges.size() && key_compare == 0) {
 			auto simple_scalar_leaf = bind_data.trie[node.key_edges[edge_index].child].simple_scalar_leaf;
-			if (simple_scalar_leaf == DConstants::INVALID_INDEX) {
-				ApplyTrieNode(lstate, bind_data, node.key_edges[edge_index].child, view, value_cursor, children, row,
-				              join_buffers, join_counts);
-			} else {
-				WriteScalarField(bind_data.fields[simple_scalar_leaf], view, Location {value_cursor, true},
-				                 *children[simple_scalar_leaf], row, bind_data.mismatch_mode);
-			}
+			ApplyScalarEdge(lstate, bind_data, simple_scalar_leaf, node.key_edges[edge_index].child, view, value_cursor,
+			                children, row, join_buffers, join_counts);
 			edge_index++;
 		}
 		if (edge_index >= node.key_edges.size()) {
@@ -1458,11 +1418,7 @@ void ApplyObjectNode(TransformLocalState &lstate, const TransformBindData &bind_
 	}
 	while (edge_index < node.key_edges.size()) {
 		auto simple_scalar_leaf = bind_data.trie[node.key_edges[edge_index].child].simple_scalar_leaf;
-		if (simple_scalar_leaf == DConstants::INVALID_INDEX) {
-			SetTrieNodeOutputsNull(bind_data, node.key_edges[edge_index].child, children, row);
-		} else {
-			FlatVector::SetNull(*children[simple_scalar_leaf], row, true);
-		}
+		NullScalarEdge(bind_data, simple_scalar_leaf, node.key_edges[edge_index].child, children, row);
 		edge_index++;
 	}
 }
