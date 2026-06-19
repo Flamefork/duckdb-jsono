@@ -80,6 +80,39 @@ struct JsonoOpsLocalState : public FunctionLocalState {
 // own nulls stripped. IgnoreNulls implements jsono_group_merge (null members
 // dropped). Array values (and everything nested inside an array) are verbatim.
 
+// How a raw scalar slot's value bytes are encoded, derived from the slot tag and the
+// EXT subtype. The three outcomes drive both the verbatim builder copy and the
+// standalone-blob store: a num word, a length+heap pair, or nothing (literal). The two
+// throws are the fail-loud guard against forged/corrupt raw slots — they must NOT be
+// dropped (unlike the trusted LWWScalarValue accessors which skip validation).
+enum class RawScalarValueKind { Number, LengthHeap, Literal };
+
+inline RawScalarValueKind ClassifyRawScalarSlot(uint64_t slot) {
+	switch (SlotTag(slot)) {
+	case tag::VAL_STR_HEAP:
+		return RawScalarValueKind::LengthHeap;
+	case tag::VAL_EXT: {
+		auto subtype = ExtSubtype(slot);
+		if (subtype == ext_subtype::NUMBER) {
+			return RawScalarValueKind::LengthHeap;
+		}
+		if (subtype >= ext_subtype::COUNT) {
+			throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
+		}
+		return RawScalarValueKind::Number;
+	}
+	case tag::VAL_INT60:
+	case tag::VAL_DEC60:
+		return RawScalarValueKind::Number;
+	case tag::VAL_TRUE:
+	case tag::VAL_FALSE:
+	case tag::VAL_NULL:
+		return RawScalarValueKind::Literal;
+	default:
+		throw InvalidInputException("malformed JSONO: non-value slot in value position");
+	}
+}
+
 // Copy a scalar value at `cursor` byte-for-byte into the builder, advancing the
 // cursor. Equivalent to decoding the scalar and re-emitting it, but without
 // reconstructing the value: every scalar encoding round-trips to the identical
@@ -90,9 +123,8 @@ struct JsonoOpsLocalState : public FunctionLocalState {
 // excluded container slots.
 void EmitScalarVerbatim(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &builder) {
 	auto slot = view.SlotAt(cursor.pos);
-	auto slot_tag = SlotTag(slot);
-	switch (slot_tag) {
-	case tag::VAL_STR_HEAP: {
+	switch (ClassifyRawScalarSlot(slot)) {
+	case RawScalarValueKind::LengthHeap: {
 		auto len = view.LengthAt(cursor.length_cursor);
 		auto s = view.StringAt(cursor.string_cursor, len);
 		builder.string_heap.insert(builder.string_heap.end(), s.begin(), s.end());
@@ -103,43 +135,16 @@ void EmitScalarVerbatim(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder
 		cursor.pos++;
 		return;
 	}
-	case tag::VAL_EXT: {
-		auto subtype = ExtSubtype(slot);
-		if (subtype == ext_subtype::NUMBER) {
-			auto len = view.LengthAt(cursor.length_cursor);
-			auto s = view.StringAt(cursor.string_cursor, len);
-			builder.string_heap.insert(builder.string_heap.end(), s.begin(), s.end());
-			builder.lengths.push_back(len);
-			builder.slots.push_back(slot);
-			cursor.string_cursor += len;
-			cursor.length_cursor++;
-			cursor.pos++;
-			return;
-		}
-		if (subtype >= ext_subtype::COUNT) {
-			throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
-		}
+	case RawScalarValueKind::Number:
 		builder.slots.push_back(slot);
 		builder.nums.push_back(view.NumAt(cursor.num_cursor));
 		cursor.num_cursor++;
 		cursor.pos++;
 		return;
-	}
-	case tag::VAL_INT60:
-	case tag::VAL_DEC60:
-		builder.slots.push_back(slot);
-		builder.nums.push_back(view.NumAt(cursor.num_cursor));
-		cursor.num_cursor++;
-		cursor.pos++;
-		return;
-	case tag::VAL_TRUE:
-	case tag::VAL_FALSE:
-	case tag::VAL_NULL:
+	case RawScalarValueKind::Literal:
 		builder.slots.push_back(slot);
 		cursor.pos++;
 		return;
-	default:
-		throw InvalidInputException("malformed JSONO: non-value slot in value position");
 	}
 }
 
@@ -2237,10 +2242,9 @@ void WriteScalarLeafHeader(OwnedJsonoBlob &out, uint64_t slot) {
 
 void StoreScalarLeafBlob(const JsonoView &view, JsonoCursor &cursor, OwnedJsonoBlob &out) {
 	auto slot = view.SlotAt(cursor.pos);
-	auto slot_tag = SlotTag(slot);
 	WriteScalarLeafHeader(out, slot);
-	switch (slot_tag) {
-	case tag::VAL_STR_HEAP: {
+	switch (ClassifyRawScalarSlot(slot)) {
+	case RawScalarValueKind::LengthHeap: {
 		auto len = view.LengthAt(cursor.length_cursor);
 		auto s = view.StringAt(cursor.string_cursor, len);
 		out.string_heap.assign(s.data(), s.size());
@@ -2250,42 +2254,16 @@ void StoreScalarLeafBlob(const JsonoView &view, JsonoCursor &cursor, OwnedJsonoB
 		cursor.pos++;
 		return;
 	}
-	case tag::VAL_EXT: {
-		auto subtype = ExtSubtype(slot);
-		if (subtype == ext_subtype::NUMBER) {
-			auto len = view.LengthAt(cursor.length_cursor);
-			auto s = view.StringAt(cursor.string_cursor, len);
-			out.string_heap.assign(s.data(), s.size());
-			out.lengths.assign(reinterpret_cast<const char *>(&len), sizeof(uint32_t));
-			cursor.string_cursor += len;
-			cursor.length_cursor++;
-			cursor.pos++;
-			return;
-		}
-		if (subtype >= ext_subtype::COUNT) {
-			throw InvalidInputException("malformed JSONO: unknown VAL_EXT subtype");
-		}
+	case RawScalarValueKind::Number: {
 		auto num = view.NumAt(cursor.num_cursor);
 		out.nums.assign(reinterpret_cast<const char *>(&num), sizeof(uint64_t));
 		cursor.num_cursor++;
 		cursor.pos++;
 		return;
 	}
-	case tag::VAL_INT60:
-	case tag::VAL_DEC60: {
-		auto num = view.NumAt(cursor.num_cursor);
-		out.nums.assign(reinterpret_cast<const char *>(&num), sizeof(uint64_t));
-		cursor.num_cursor++;
+	case RawScalarValueKind::Literal:
 		cursor.pos++;
 		return;
-	}
-	case tag::VAL_TRUE:
-	case tag::VAL_FALSE:
-	case tag::VAL_NULL:
-		cursor.pos++;
-		return;
-	default:
-		throw InvalidInputException("malformed JSONO: non-value slot in value position");
 	}
 }
 
