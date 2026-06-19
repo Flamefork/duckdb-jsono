@@ -165,54 +165,34 @@ JSONO_ALWAYS_INLINE bool ReadJsonoRowImpl(const JsonoVectorData &data, idx_t row
 		}
 		return false;
 	}
-	auto slots_idx = RowIndex(data.slots_fmt, row);
-	auto key_heap_idx = RowIndex(data.key_heap_fmt, row);
-	auto string_heap_idx = RowIndex(data.string_heap_fmt, row);
-	auto skips_idx = RowIndex(data.skips_fmt, row);
-	auto lengths_idx = RowIndex(data.lengths_fmt, row);
-	auto nums_idx = RowIndex(data.nums_fmt, row);
-	if (!data.slots_fmt.validity.RowIsValid(slots_idx)) {
-		if (Strict) {
-			ThrowCorruptJsonoRow("slots blob");
+	// The six body blobs share one validity/copy shape; only the field name (strict throw) and the
+	// destination member differ. The body and layout checks above gate this loop and stay explicit.
+	const struct {
+		const UnifiedVectorFormat &fmt;
+		const string_t *blob_data;
+		const char *field;
+		string_t JsonoBlobRow::*member;
+	} blobs[] = {
+	    {data.slots_fmt, data.slots_data, "slots blob", &JsonoBlobRow::slots},
+	    {data.key_heap_fmt, data.key_heap_data, "key_heap blob", &JsonoBlobRow::key_heap},
+	    {data.string_heap_fmt, data.string_heap_data, "string_heap blob", &JsonoBlobRow::string_heap},
+	    {data.skips_fmt, data.skips_data, "skips blob", &JsonoBlobRow::skips},
+	    {data.lengths_fmt, data.lengths_data, "lengths blob", &JsonoBlobRow::lengths},
+	    {data.nums_fmt, data.nums_data, "nums blob", &JsonoBlobRow::nums},
+	};
+	idx_t blob_idx[6];
+	for (idx_t i = 0; i < 6; i++) {
+		blob_idx[i] = RowIndex(blobs[i].fmt, row);
+		if (!blobs[i].fmt.validity.RowIsValid(blob_idx[i])) {
+			if (Strict) {
+				ThrowCorruptJsonoRow(blobs[i].field);
+			}
+			return false;
 		}
-		return false;
 	}
-	if (!data.key_heap_fmt.validity.RowIsValid(key_heap_idx)) {
-		if (Strict) {
-			ThrowCorruptJsonoRow("key_heap blob");
-		}
-		return false;
+	for (idx_t i = 0; i < 6; i++) {
+		out.*blobs[i].member = blobs[i].blob_data[blob_idx[i]];
 	}
-	if (!data.string_heap_fmt.validity.RowIsValid(string_heap_idx)) {
-		if (Strict) {
-			ThrowCorruptJsonoRow("string_heap blob");
-		}
-		return false;
-	}
-	if (!data.skips_fmt.validity.RowIsValid(skips_idx)) {
-		if (Strict) {
-			ThrowCorruptJsonoRow("skips blob");
-		}
-		return false;
-	}
-	if (!data.lengths_fmt.validity.RowIsValid(lengths_idx)) {
-		if (Strict) {
-			ThrowCorruptJsonoRow("lengths blob");
-		}
-		return false;
-	}
-	if (!data.nums_fmt.validity.RowIsValid(nums_idx)) {
-		if (Strict) {
-			ThrowCorruptJsonoRow("nums blob");
-		}
-		return false;
-	}
-	out.slots = data.slots_data[slots_idx];
-	out.key_heap = data.key_heap_data[key_heap_idx];
-	out.string_heap = data.string_heap_data[string_heap_idx];
-	out.skips = data.skips_data[skips_idx];
-	out.lengths = data.lengths_data[lengths_idx];
-	out.nums = data.nums_data[nums_idx];
 	return true;
 }
 
