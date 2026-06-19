@@ -523,68 +523,17 @@ inline size_t JsonoSkipsManifestOffset(const uint8_t *skips, size_t skips_size) 
 	return size_t(required);
 }
 
-// Parse a shred manifest from its raw tail bytes into `entries` (string_views into `data`).
-// Returns the entry count; an empty tail is a value without a manifest. Throws on framing
-// corruption (declared entries longer than the tail, or trailing bytes).
-inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector<ShredManifestEntry> &entries) {
-	entries.clear();
-	if (size == 0) {
-		return 0;
-	}
-	size_t cursor = 0;
-	auto read_bytes = [&](void *dst, size_t bytes) {
-		if (bytes > size - cursor) {
-			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
-		}
-		std::memcpy(dst, data + cursor, bytes);
-		cursor += bytes;
-	};
-	uint32_t entry_count;
-	read_bytes(&entry_count, sizeof(entry_count));
-	bool compact_types = false;
-	if (entry_count == SHRED_MANIFEST_COMPACT_TYPE_MARKER) {
-		compact_types = true;
-		read_bytes(&entry_count, sizeof(entry_count));
-	}
-	entries.reserve(entry_count);
-	for (uint32_t i = 0; i < entry_count; i++) {
-		uint16_t path_len;
-		read_bytes(&path_len, sizeof(path_len));
-		if (path_len > size - cursor) {
-			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
-		}
-		auto path = nonstd::string_view(data + cursor, path_len);
-		cursor += path_len;
-		if (compact_types) {
-			uint8_t type_code;
-			read_bytes(&type_code, sizeof(type_code));
-			if (type_code != SHRED_MANIFEST_TYPE_EXTENDED) {
-				entries.push_back(ShredManifestEntry {path, ShredManifestCompactTypeName(type_code)});
-				continue;
-			}
-		}
-		uint16_t type_len;
-		read_bytes(&type_len, sizeof(type_len));
-		if (type_len > size - cursor) {
-			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
-		}
-		auto type = nonstd::string_view(data + cursor, type_len);
-		cursor += type_len;
-		entries.push_back(ShredManifestEntry {path, type});
-	}
-	if (cursor != size) {
-		throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
-	}
-	return entries.size();
-}
-
-// Validate the framing of a shred-manifest tail without materializing its entries. Accepts exactly
-// the same byte sequences as ParseShredManifestBytes, but allocates nothing: the parser reserves
-// `entry_count` entries up front, so a corrupt tail with a bogus huge count would throw std::bad_alloc
-// before the framing read can reject it. jsono_validate (ValidateJsonoBlob) catches only
-// InvalidInputException, so it relies on this allocation-free path to report corruption as `false`
-// rather than letting an uncaught bad_alloc escape. Do not fold this into ParseShredManifestBytes.
-inline void ValidateShredManifestBytes(const char *data, size_t size) {
+// The shred-manifest framing walker, shared by the parse (ParseShredManifestBytes) and validate
+// (ValidateShredManifestBytes) paths via a sink — the same pattern as DecodeScalarSlot's decode/skip
+// twins. The walker owns how the tail's bytes frame into entries; the sink decides what to do with
+// each one: collect it (ShredManifestCollectSink) or discard it (ShredManifestDiscardSink). It
+// streams entries one at a time through the cursor's bounds-checked reads and NEVER sizes an
+// allocation from the untrusted entry_count, so a corrupt over-long count throws
+// InvalidInputException on the first over-read before any large allocation — keeping the validate
+// path allocation-free (jsono_validate catches only InvalidInputException; a reserve(entry_count) on
+// a bogus huge count would std::bad_alloc and crash instead of reporting corruption as `false`).
+template <class SINK>
+inline void WalkShredManifestBytes(const char *data, size_t size, SINK &sink) {
 	if (size == 0) {
 		return;
 	}
@@ -609,12 +558,13 @@ inline void ValidateShredManifestBytes(const char *data, size_t size) {
 		if (path_len > size - cursor) {
 			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
 		}
+		auto path = nonstd::string_view(data + cursor, path_len);
 		cursor += path_len;
 		if (compact_types) {
 			uint8_t type_code;
 			read_bytes(&type_code, sizeof(type_code));
 			if (type_code != SHRED_MANIFEST_TYPE_EXTENDED) {
-				(void)ShredManifestCompactTypeName(type_code);
+				sink.OnEntry(ShredManifestEntry {path, ShredManifestCompactTypeName(type_code)});
 				continue;
 			}
 		}
@@ -623,11 +573,47 @@ inline void ValidateShredManifestBytes(const char *data, size_t size) {
 		if (type_len > size - cursor) {
 			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
 		}
+		auto type = nonstd::string_view(data + cursor, type_len);
 		cursor += type_len;
+		sink.OnEntry(ShredManifestEntry {path, type});
 	}
 	if (cursor != size) {
 		throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
 	}
+}
+
+// Collecting sink: grows `entries` incrementally with push_back (never reserve(entry_count)), so the
+// parse path never allocates beyond bytes the cursor has already bounds-checked.
+struct ShredManifestCollectSink {
+	std::vector<ShredManifestEntry> &entries;
+	void OnEntry(ShredManifestEntry entry) {
+		entries.push_back(entry);
+	}
+};
+
+// Discarding sink: keeps the walker's bounds checks but throws each framed entry away, so the
+// validate path stays allocation-free.
+struct ShredManifestDiscardSink {
+	void OnEntry(const ShredManifestEntry &) {
+	}
+};
+
+// Parse a shred manifest from its raw tail bytes into `entries` (string_views into `data`).
+// Returns the entry count; an empty tail is a value without a manifest. Throws on framing
+// corruption (declared entries longer than the tail, or trailing bytes).
+inline size_t ParseShredManifestBytes(const char *data, size_t size, std::vector<ShredManifestEntry> &entries) {
+	entries.clear();
+	ShredManifestCollectSink sink {entries};
+	WalkShredManifestBytes(data, size, sink);
+	return entries.size();
+}
+
+// Validate the framing of a shred-manifest tail without materializing its entries. Accepts exactly
+// the same byte sequences as ParseShredManifestBytes; the discarding sink keeps the walk
+// allocation-free (see WalkShredManifestBytes).
+inline void ValidateShredManifestBytes(const char *data, size_t size) {
+	ShredManifestDiscardSink sink;
+	WalkShredManifestBytes(data, size, sink);
 }
 
 // Fingerprint an object's stored KEY slots (sorted order, length-prefixed) into a
