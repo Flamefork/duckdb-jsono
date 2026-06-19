@@ -62,8 +62,8 @@ public:
 	// without a manifest.
 	const std::vector<ShredManifestEntry> &VerifiedEntries(const JsonoView &view) {
 		if (!view.HasShredManifest()) {
-			no_entries_.clear();
-			return no_entries_;
+			static const std::vector<ShredManifestEntry> no_entries;
+			return no_entries;
 		}
 		return entries_;
 	}
@@ -84,7 +84,6 @@ private:
 	std::vector<std::pair<std::string, std::string>> signatures_;
 	std::string tail_;
 	std::vector<ShredManifestEntry> entries_;
-	std::vector<ShredManifestEntry> no_entries_;
 	bool verified_ = false;
 };
 
