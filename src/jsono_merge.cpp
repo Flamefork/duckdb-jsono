@@ -805,10 +805,10 @@ struct ReconShred {
 	string manifest_path;
 };
 
-void EmitReconShredScalar(JsonoBuilder &builder, const ReconShred &shred, const UnifiedVectorFormat &fmt, idx_t idx) {
+void EmitReconShredScalar(JsonoBuilder &builder, const LogicalType &type, const UnifiedVectorFormat &fmt, idx_t idx) {
 	ShredPrimitive kind;
-	if (!TypeToShredPrimitive(shred.type, kind)) {
-		throw InternalException("jsono reconstruct: non-scalar shred type '%s'", shred.type.ToString());
+	if (!TypeToShredPrimitive(type, kind)) {
+		throw InternalException("jsono reconstruct: non-scalar shred type '%s'", type.ToString());
 	}
 	// Exhaustive over the closed scalar shred set, so a new scalar shred type fails to compile here.
 	switch (kind) {
@@ -927,8 +927,7 @@ void OverlayArray(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &buil
 			// verbatim from the skeleton. Validity alone disambiguates the lifted from the kept.
 			auto elem_idx = shred.element_fmt.sel->get_index(child);
 			if (shred.element_fmt.validity.RowIsValid(elem_idx)) {
-				ReconShred element_shred {0, shred.element_type, {}};
-				EmitReconShredScalar(builder, element_shred, shred.element_fmt, elem_idx);
+				EmitReconShredScalar(builder, shred.element_type, shred.element_fmt, elem_idx);
 				SkipValueFast(view, cursor);
 			} else {
 				EmitValueVerbatim(view, cursor, builder, depth + 1);
@@ -961,8 +960,7 @@ void OverlayArray(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &buil
 				auto sub_idx = shred.sub_fmt[j].sel->get_index(child);
 				if (shred.sub_fmt[j].validity.RowIsValid(sub_idx)) {
 					scratch.patch_builder.EmitObjectChildStart();
-					ReconShred sub_shred {0, shred.subfields[j].second, {}};
-					EmitReconShredScalar(scratch.patch_builder, sub_shred, shred.sub_fmt[j], sub_idx);
+					EmitReconShredScalar(scratch.patch_builder, shred.subfields[j].second, shred.sub_fmt[j], sub_idx);
 				}
 			}
 			scratch.patch_builder.EmitObjectEnd();
@@ -1213,7 +1211,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 					continue;
 				}
 				patch_builder.EmitObjectChildStart();
-				EmitReconShredScalar(patch_builder, shreds[k], shred_fmt[k], RowIndex(shred_fmt[k], row));
+				EmitReconShredScalar(patch_builder, shreds[k].type, shred_fmt[k], RowIndex(shred_fmt[k], row));
 			}
 			patch_builder.EmitObjectEnd();
 			SerializeBuilderToBlob(patch_builder, patch_storage);
@@ -1240,7 +1238,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 				patch_builder.EmitKeySlot(step.key);
 				patch_builder.EmitObjectChildStart();
 			}
-			EmitReconShredScalar(patch_builder, shreds[k], shred_fmt[k], RowIndex(shred_fmt[k], row));
+			EmitReconShredScalar(patch_builder, shreds[k].type, shred_fmt[k], RowIndex(shred_fmt[k], row));
 			for (idx_t s = 0; s < shreds[k].steps.size(); s++) {
 				patch_builder.EmitObjectEnd();
 			}
@@ -2169,18 +2167,8 @@ int CompareRawBytes(const char *a, size_t na, const char *b, size_t nb) {
 	return na < nb ? -1 : (na > nb ? 1 : 0);
 }
 
-int CompareRawBytes(const string &a, const string &b) {
-	return CompareRawBytes(a.data(), a.size(), b.data(), b.size());
-}
-
-int CompareRawBytes(const string &a, nonstd::string_view b) {
-	return CompareRawBytes(a.data(), a.size(), b.data(), b.size());
-}
-
-int CompareRawBytes(nonstd::string_view a, const string &b) {
-	return CompareRawBytes(a.data(), a.size(), b.data(), b.size());
-}
-
+// std::string binds here via the implicit string_view conversion, yielding the same pointer+size
+// the explicit per-type overloads built by hand. One wrapper covers every (string|string_view) pair.
 int CompareRawBytes(nonstd::string_view a, nonstd::string_view b) {
 	return CompareRawBytes(a.data(), a.size(), b.data(), b.size());
 }
@@ -2650,14 +2638,6 @@ string *FindLWWScalarLaneText(GroupMergeLWWState &state, const vector<idx_t> &te
 	return &state.scalar_texts[text_indices[lane_idx]];
 }
 
-const string *FindLWWScalarLaneText(const GroupMergeLWWState &state, const vector<idx_t> &text_indices,
-                                    idx_t lane_idx) {
-	if (!LWWScalarLaneHasText(text_indices, lane_idx) || !state.scalar_texts) {
-		return nullptr;
-	}
-	return &state.scalar_texts[text_indices[lane_idx]];
-}
-
 string *EnsureLWWScalarLaneText(GroupMergeLWWState &state, const vector<idx_t> &text_indices, idx_t lane_idx) {
 	if (!LWWScalarLaneHasText(text_indices, lane_idx)) {
 		return nullptr;
@@ -2669,18 +2649,6 @@ string *EnsureLWWScalarLaneText(GroupMergeLWWState &state, const vector<idx_t> &
 }
 
 string *RequireLWWScalarLaneText(GroupMergeLWWState &state, const vector<idx_t> &text_indices, idx_t lane_idx) {
-	if (!LWWScalarLaneHasText(text_indices, lane_idx)) {
-		return nullptr;
-	}
-	auto *text = FindLWWScalarLaneText(state, text_indices, lane_idx);
-	if (!text) {
-		throw InternalException("jsono_group_merge: missing scalar text lane");
-	}
-	return text;
-}
-
-const string *RequireLWWScalarLaneText(const GroupMergeLWWState &state, const vector<idx_t> &text_indices,
-                                       idx_t lane_idx) {
 	if (!LWWScalarLaneHasText(text_indices, lane_idx)) {
 		return nullptr;
 	}
