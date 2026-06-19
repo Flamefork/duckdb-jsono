@@ -1,0 +1,66 @@
+# name: test/sql/jsono_path_ops_rank_cache.test
+# description: jsono_type/jsono_keys resolve a repeated path correctly across many same-shape rows (rank cache)
+# group: [sql]
+
+require jsono
+
+# Many rows of one object shape feed jsono_type/jsono_keys the same constant path, so every row
+# after the first hits the per-expression rank cache. The result must stay correct on every row.
+statement ok
+CREATE TABLE wide AS
+SELECT jsono('{"a":{"x":' || i || '},"b":[1,2,3],"c":"s' || i || '"}') AS v
+FROM range(5000) t(i);
+
+query I
+SELECT DISTINCT jsono_type(v, '$.a') FROM wide;
+----
+OBJECT
+
+query I
+SELECT DISTINCT jsono_type(v, '$.b') FROM wide;
+----
+ARRAY
+
+query I
+SELECT DISTINCT jsono_type(v, '$.c') FROM wide;
+----
+VARCHAR
+
+query I
+SELECT DISTINCT jsono_type(v, '$.a.x') FROM wide;
+----
+BIGINT
+
+query I
+SELECT DISTINCT list_aggregate(jsono_keys(v), 'string_agg', ',') FROM wide;
+----
+a,b,c
+
+query I
+SELECT DISTINCT list_aggregate(jsono_keys(v, '$.a'), 'string_agg', ',') FROM wide;
+----
+x
+
+# A path miss covered by no manifest yields NULL on every row, not a stale cached hit.
+query I
+SELECT count(*) FROM wide WHERE jsono_type(v, '$.missing') IS NULL;
+----
+5000
+
+# Same key_count, same constant path, but the target key's rank flips between rows: half the rows
+# pair "m" with a key that sorts before it (rank 1) and half with one that sorts after it (rank 0),
+# so a rank cached for one row must be re-validated, not blindly reused, for the next.
+statement ok
+CREATE TABLE shapes AS
+SELECT
+  CASE WHEN i % 2 = 0
+       THEN jsono('{"a":"' || i || '","m":' || i || '}')
+       ELSE jsono('{"m":' || i || ',"z":"' || i || '"}')
+  END AS v,
+  i AS i
+FROM range(5000) t(i);
+
+query I
+SELECT count(*) FROM shapes WHERE jsono_type(v, '$.m') = 'BIGINT';
+----
+5000

@@ -69,10 +69,6 @@ struct ExtractLocalState : public FunctionLocalState {
 	}
 };
 
-struct Location {
-	JsonoCursor cursor;
-};
-
 vector<PathStep> LiteralKeyPath(nonstd::string_view name) {
 	vector<PathStep> path;
 	path.push_back(PathStep {PathStepKind::Key, string(name), 0});
@@ -127,15 +123,6 @@ unique_ptr<FunctionData> JsonoExtractBind(ClientContext &context, ScalarFunction
 		}
 	}
 	return make_uniq<ExtractPathBindData>(std::move(path), std::move(steps));
-}
-
-bool LocatePath(ExtractLocalState &lstate, const vector<PathStep> &steps, const JsonoView &view, Location &location) {
-	JsonoCursor cursor;
-	if (!LocatePathSteps(&lstate.rank_cache, 0, steps, view, cursor)) {
-		return false;
-	}
-	location.cursor = cursor;
-	return true;
 }
 
 // Copy the container subtree at `start` into `builder` as a standalone value. The subtree
@@ -472,13 +459,12 @@ void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result
 			writer.SetRowNull(row);
 			continue;
 		}
-		Location location;
-		if (!LocatePath(lstate, bind_data.steps, view, location)) {
+		JsonoCursor cursor;
+		if (!LocatePathSteps(&lstate.rank_cache, 0, bind_data.steps, view, cursor)) {
 			reader.CheckPathMiss(view, bind_data.steps);
 			writer.SetRowNull(row);
 			continue;
 		}
-		auto cursor = location.cursor;
 		auto found_tag = SlotTag(view.SlotAt(cursor.pos));
 		if (found_tag == tag::OBJ_START || found_tag == tag::ARR_START) {
 			reader.CheckContainerRead(view, bind_data.steps);
@@ -515,14 +501,14 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
-		Location location;
-		if (!LocatePath(lstate, bind_data.steps, view, location)) {
+		JsonoCursor cursor;
+		if (!LocatePathSteps(&lstate.rank_cache, 0, bind_data.steps, view, cursor)) {
 			reader.CheckPathMiss(view, bind_data.steps);
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
 		JsonoExtractStringSink sink {result, result_data, row};
-		EmitLocatedText(reader, view, bind_data.steps, location.cursor, scratch, sink);
+		EmitLocatedText(reader, view, bind_data.steps, cursor, scratch, sink);
 	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);

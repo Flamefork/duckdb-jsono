@@ -52,14 +52,19 @@ void SetListRowNull(Vector &result, idx_t row) {
 	ListVector::GetData(result)[row] = {0, 0};
 }
 
-// Walk from the document root to the slot addressed by `steps`, tracking the
-// string heap cursor so nested string payloads resolve correctly. Returns false
-// when a step misses (absent key, out-of-range index, or stepping into a
-// non-container). Wildcard steps are rejected at bind, so they never reach here.
-bool NavigateToPath(const JsonoView &view, const vector<PathStep> &steps, JsonoCursor &cursor) {
-	cursor = JsonoCursor();
-	return LocatePathSteps(nullptr, 0, steps, view, cursor);
-}
+// Per-expression rank cache so repeated reads of the same path over many same-shape rows trust a
+// cached key rank by a shape_hash/int compare instead of re-running the binary search each row.
+struct PathOpsLocalState : public FunctionLocalState {
+	RankCache rank_cache;
+
+	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
+	                                           FunctionData *bind_data) {
+		(void)state;
+		(void)expr;
+		(void)bind_data;
+		return make_uniq<PathOpsLocalState>();
+	}
+};
 
 struct JsonoPathBindData : public FunctionData {
 	explicit JsonoPathBindData(vector<PathStep> steps_p) : steps(std::move(steps_p)) {
@@ -155,6 +160,7 @@ const char *JsonoTypeName(const JsonoView &view, JsonoCursor cursor) {
 // miss covered by the manifest still fails loud (the silent NULL would be the data loss).
 void JsonoTypeExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
+	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<PathOpsLocalState>();
 	JsonoRowReader reader;
 	reader.InitPointRead(args.data[0], count);
 	auto steps = PathStepsFromState(state, args.ColumnCount());
@@ -168,7 +174,7 @@ void JsonoTypeExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 			continue;
 		}
 		JsonoCursor cursor;
-		if (steps && !NavigateToPath(view, *steps, cursor)) {
+		if (steps && !LocatePathSteps(&lstate.rank_cache, 0, *steps, view, cursor)) {
 			reader.CheckPathMiss(view, *steps);
 			FlatVector::SetNull(result, row, true);
 			continue;
@@ -191,6 +197,7 @@ void JsonoTypeExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 // here is always a narrowed row.
 void JsonoKeysExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
+	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<PathOpsLocalState>();
 	JsonoRowReader reader;
 	reader.InitPointRead(args.data[0], count);
 	auto steps = PathStepsFromState(state, args.ColumnCount());
@@ -206,7 +213,7 @@ void JsonoKeysExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 			continue;
 		}
 		JsonoCursor cursor;
-		if (steps && !NavigateToPath(view, *steps, cursor)) {
+		if (steps && !LocatePathSteps(&lstate.rank_cache, 0, *steps, view, cursor)) {
 			reader.CheckPathMiss(view, *steps);
 			SetListRowNull(result, row);
 			continue;
@@ -236,20 +243,30 @@ void JsonoKeysExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 
 } // namespace
 
+// jsono_type/jsono_keys carry a per-expression RankCache in their local state, so the constructed
+// ScalarFunction must register PathOpsLocalState::Init in its init_local_state slot.
+ScalarFunction MakePathOpFunction(vector<LogicalType> arguments, LogicalType return_type, scalar_function_t function,
+                                  bind_scalar_function_t bind) {
+	return ScalarFunction(std::move(arguments), std::move(return_type), std::move(function), bind, nullptr, nullptr,
+	                      PathOpsLocalState::Init);
+}
+
 void RegisterJsonoPathOps(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet set("jsono_type");
-		set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::VARCHAR, JsonoTypeExecute, JsonoArgOnlyBind));
-		set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::VARCHAR, JsonoTypeExecute,
-		                               JsonoTypePathBind));
+		set.AddFunction(
+		    MakePathOpFunction({LogicalType::ANY}, LogicalType::VARCHAR, JsonoTypeExecute, JsonoArgOnlyBind));
+		set.AddFunction(MakePathOpFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::VARCHAR,
+		                                   JsonoTypeExecute, JsonoTypePathBind));
 		loader.RegisterFunction(set);
 	}
 	{
 		ScalarFunctionSet set("jsono_keys");
-		set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::LIST(LogicalType::VARCHAR), JsonoKeysExecute,
-		                               JsonoArgOnlyBind));
-		set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR},
-		                               LogicalType::LIST(LogicalType::VARCHAR), JsonoKeysExecute, JsonoKeysPathBind));
+		set.AddFunction(MakePathOpFunction({LogicalType::ANY}, LogicalType::LIST(LogicalType::VARCHAR),
+		                                   JsonoKeysExecute, JsonoArgOnlyBind));
+		set.AddFunction(MakePathOpFunction({LogicalType::ANY, LogicalType::VARCHAR},
+		                                   LogicalType::LIST(LogicalType::VARCHAR), JsonoKeysExecute,
+		                                   JsonoKeysPathBind));
 		loader.RegisterFunction(set);
 	}
 }
