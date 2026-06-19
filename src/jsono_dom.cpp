@@ -9,31 +9,65 @@ using namespace duckdb_yyjson;
 
 bool EmitDomElement(yyjson_val *element, DomJsonoBuilder &b);
 
+// Collect this object's key/value pairs at the end of the shared kvs buffer and hash the DOM-order
+// key sequence in one pass — both touch the key bytes, so the hash rides loads we'd do anyway. The
+// caller seeds shape_hash and owns the kv_offset/idx_offset stack discipline. Templated over the
+// DOM state (builder emit vs size pass) so both passes share one body and cannot drift apart.
+template <class STATE>
+JSONO_ALWAYS_INLINE size_t CollectObjectKvs(STATE &s, yyjson_val *obj, size_t kv_offset, size_t idx_offset,
+                                            uint64_t &shape_hash) {
+	yyjson_obj_iter iter = yyjson_obj_iter_with(obj);
+	yyjson_val *key;
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		nonstd::string_view key_view(yyjson_get_str(key), yyjson_get_len(key));
+		shape_hash = HashKey(shape_hash, key_view);
+		s.kvs.emplace_back(key_view, yyjson_obj_iter_get_val(key));
+	}
+	size_t N = s.kvs.size() - kv_offset;
+	s.indices.resize(idx_offset + N);
+	return N;
+}
+
+// Sort this object's index slice (4-byte swaps, cheaper than sorting the 24-byte kv pairs) and
+// collapse runs of equal keys in place keeping the last occurrence (last-wins), so the stored
+// object holds the unique sorted keys the readers' binary search assumes. Returns the post-dedup
+// key count. Shared by both passes so the sort+dedup rule the readers depend on stays in lockstep.
+template <class STATE>
+JSONO_ALWAYS_INLINE size_t SortAndDedupObjectIndices(STATE &s, size_t kv_offset, size_t idx_offset, size_t N) {
+	for (size_t i = 0; i < N; i++) {
+		s.indices[idx_offset + i] = uint32_t(i);
+	}
+	// Tie-break equal keys by input index so the last duplicate sorts last in its run.
+	std::sort(s.indices.begin() + idx_offset, s.indices.begin() + idx_offset + N,
+	          [&s, kv_offset](uint32_t a, uint32_t c) {
+		          int cmp = s.kvs[kv_offset + a].first.compare(s.kvs[kv_offset + c].first);
+		          return cmp != 0 ? cmp < 0 : a < c;
+	          });
+	size_t write = idx_offset;
+	for (size_t read = idx_offset; read < idx_offset + N;) {
+		size_t run_end = read + 1;
+		while (run_end < idx_offset + N &&
+		       s.kvs[kv_offset + s.indices[run_end]].first == s.kvs[kv_offset + s.indices[read]].first) {
+			run_end++;
+		}
+		s.indices[write++] = s.indices[run_end - 1];
+		read = run_end;
+	}
+	return write - idx_offset;
+}
+
 bool EmitDomObject(yyjson_val *obj, DomJsonoBuilder &b) {
 	// Stack-via-offset on both kvs and indices; collect this object's data at
 	// the end of each shared buffer, do the work, truncate back on return.
 	size_t kv_offset = b.kvs.size();
 	size_t idx_offset = b.indices.size();
 
-	// Collect kvs and hash the DOM-order key sequence in one pass. Both touch
-	// the same bytes (key bytes) so the hash is "free" — it rides along the
-	// memory loads we'd be doing anyway for the emplace.
 	uint64_t shape_hash = HASH_SEED;
-	yyjson_obj_iter iter = yyjson_obj_iter_with(obj);
-	yyjson_val *key;
-	while ((key = yyjson_obj_iter_next(&iter))) {
-		nonstd::string_view key_view(yyjson_get_str(key), yyjson_get_len(key));
-		shape_hash = HashKey(shape_hash, key_view);
-		b.kvs.emplace_back(key_view, yyjson_obj_iter_get_val(key));
-	}
-	size_t N = b.kvs.size() - kv_offset;
-	b.indices.resize(idx_offset + N);
+	size_t N = CollectObjectKvs(b, obj, kv_offset, idx_offset, shape_hash);
 
-	// Shape cache lookup. On hit we copy the cached (deduplicated) permutation into
-	// this object's indices slice and skip std::sort. On miss we sort indices
-	// (cheaper than sorting kv pairs: 4-byte swaps vs 24-byte), drop duplicate keys
-	// keeping the last occurrence, and cache the result for next time. emit_count is
-	// the post-dedup key count and equals N for the common unique-key case.
+	// Shape cache lookup. On hit we copy the cached (deduplicated) permutation into this
+	// object's indices slice and skip the sort/dedup. On miss we build, dedup, and cache it.
+	// emit_count is the post-dedup key count and equals N for the common unique-key case.
 	// An empty object has no keys to sort, dedup, cache or copy: emit_count stays 0 and the
 	// whole permutation block is skipped. Beyond saving work, this avoids `indices.data()`/
 	// `indices.begin() + offset` and the cache memcpy on an empty (null-data) vector, which is
@@ -45,28 +79,7 @@ bool EmitDomObject(yyjson_val *obj, DomJsonoBuilder &b) {
 			emit_count = cached->perm.size();
 			std::memcpy(b.indices.data() + idx_offset, cached->perm.data(), emit_count * sizeof(uint32_t));
 		} else {
-			for (size_t i = 0; i < N; i++) {
-				b.indices[idx_offset + i] = uint32_t(i);
-			}
-			// Tie-break equal keys by input index so the last duplicate sorts last in its run.
-			std::sort(b.indices.begin() + idx_offset, b.indices.begin() + idx_offset + N,
-			          [&b, kv_offset](uint32_t a, uint32_t c) {
-				          int cmp = b.kvs[kv_offset + a].first.compare(b.kvs[kv_offset + c].first);
-				          return cmp != 0 ? cmp < 0 : a < c;
-			          });
-			// Collapse runs of equal keys in place, keeping the last (last-wins), so the
-			// stored object has the unique sorted keys the readers' binary search assumes.
-			size_t write = idx_offset;
-			for (size_t read = idx_offset; read < idx_offset + N;) {
-				size_t run_end = read + 1;
-				while (run_end < idx_offset + N &&
-				       b.kvs[kv_offset + b.indices[run_end]].first == b.kvs[kv_offset + b.indices[read]].first) {
-					run_end++;
-				}
-				b.indices[write++] = b.indices[run_end - 1];
-				read = run_end;
-			}
-			emit_count = write - idx_offset;
+			emit_count = SortAndDedupObjectIndices(b, kv_offset, idx_offset, N);
 			b.ShapeCacheInsert(shape_hash, uint32_t(N), b.indices.data() + idx_offset, uint32_t(emit_count));
 		}
 	}
@@ -241,15 +254,7 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 	// Same collect+hash pass as EmitDomObject; the kvs stay retained for the
 	// whole row so pass 2 can replay them.
 	uint64_t shape_hash = HASH_SEED;
-	yyjson_obj_iter iter = yyjson_obj_iter_with(obj);
-	yyjson_val *key;
-	while ((key = yyjson_obj_iter_next(&iter))) {
-		nonstd::string_view key_view(yyjson_get_str(key), yyjson_get_len(key));
-		shape_hash = HashKey(shape_hash, key_view);
-		s.kvs.emplace_back(key_view, yyjson_obj_iter_get_val(key));
-	}
-	size_t N = s.kvs.size() - kv_offset;
-	s.indices.resize(idx_offset + N);
+	size_t N = CollectObjectKvs(s, obj, kv_offset, idx_offset, shape_hash);
 
 	// An empty object has no keys: emit_count stays 0, sorted_hash stays the empty-sequence
 	// seed (what the miss branch would hash over zero keys), and the whole permutation block is
@@ -264,27 +269,7 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 			std::memcpy(s.indices.data() + idx_offset, cached->perm.data(), emit_count * sizeof(uint32_t));
 			sorted_hash = cached->sorted_hash;
 		} else {
-			for (size_t i = 0; i < N; i++) {
-				s.indices[idx_offset + i] = uint32_t(i);
-			}
-			// Tie-break equal keys by input index so the last duplicate sorts last in its run.
-			std::sort(s.indices.begin() + idx_offset, s.indices.begin() + idx_offset + N,
-			          [&s, kv_offset](uint32_t a, uint32_t c) {
-				          int cmp = s.kvs[kv_offset + a].first.compare(s.kvs[kv_offset + c].first);
-				          return cmp != 0 ? cmp < 0 : a < c;
-			          });
-			// Collapse runs of equal keys in place, keeping the last (last-wins).
-			size_t write = idx_offset;
-			for (size_t read = idx_offset; read < idx_offset + N;) {
-				size_t run_end = read + 1;
-				while (run_end < idx_offset + N &&
-				       s.kvs[kv_offset + s.indices[run_end]].first == s.kvs[kv_offset + s.indices[read]].first) {
-					run_end++;
-				}
-				s.indices[write++] = s.indices[run_end - 1];
-				read = run_end;
-			}
-			emit_count = write - idx_offset;
+			emit_count = SortAndDedupObjectIndices(s, kv_offset, idx_offset, N);
 			// The stored shape_hash fingerprints the sorted key sequence (what
 			// HashObjectKeySlots computes from emitted KEY slots); caching it next
 			// to the permutation makes it free on every subsequent hit.
