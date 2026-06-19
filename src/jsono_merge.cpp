@@ -3181,34 +3181,11 @@ bool PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
 	return true;
 }
 
-// Shared manifest two-pointer walk: the manifest and the shred set are both sorted by path, so a
-// single advancing `shred_idx` matches each manifest entry to its shred (a manifest entry with no
-// shred is skipped; shred_idx is never advanced past a matched entry). `fn(shred_idx)` runs per
-// matched shred and signals whether to keep walking or abort early; an exception thrown inside it
-// (the incomplete-list-shred case) propagates unchanged.
-enum class ManifestWalk { Continue, Abort };
-
-template <class Fn>
-void ForEachManifestedShred(const vector<ReconShred> &shreds, const std::vector<ShredManifestEntry> &manifest, Fn fn) {
-	idx_t shred_idx = 0;
-	for (auto &entry : manifest) {
-		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
-		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
-			shred_idx++;
-		}
-		if (shred_idx >= shreds.size()) {
-			break;
-		}
-		if (entry.path !=
-		    nonstd::string_view(shreds[shred_idx].manifest_path.data(), shreds[shred_idx].manifest_path.size())) {
-			continue;
-		}
-		if (fn(shred_idx) == ManifestWalk::Abort) {
-			return;
-		}
-	}
-}
-
+// The four manifest walkers below each run the same two-pointer advance (manifest and shreds are
+// both sorted by path, so one rising `shred_idx` matches each entry to its shred). A shared functor
+// helper was tried but regressed the keyed group_merge hot path ~6%: capturing the loop-carried
+// accumulators (sort_key_id, candidate_bits) by reference forces them to the stack and defeats
+// register allocation in the inner loop. The walk is deliberately inlined per function instead.
 void FoldManifestedScalarShredsLWW(GroupMergeLWWState &state, const vector<ReconShred> &shreds,
                                    const vector<idx_t> &text_indices, idx_t text_count,
                                    vector<UnifiedVectorFormat> &shred_fmt,
@@ -3220,17 +3197,27 @@ void FoldManifestedScalarShredsLWW(GroupMergeLWWState &state, const vector<Recon
 	uint32_t sort_key_id = LWW_INVALID_SORT_KEY_ID;
 	uint64_t candidate_bits;
 	string candidate_text;
-	ForEachManifestedShred(shreds, manifest, [&](idx_t shred_idx) {
-		if (!RowIsValid(shred_fmt[shred_idx], row)) {
-			return ManifestWalk::Continue;
+	idx_t shred_idx = 0;
+	for (auto &entry : manifest) {
+		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
+		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+			shred_idx++;
+		}
+		if (shred_idx >= shreds.size()) {
+			break;
 		}
 		auto &shred = shreds[shred_idx];
+		if (entry.path != nonstd::string_view(shred.manifest_path.data(), shred.manifest_path.size())) {
+			continue;
+		}
+		if (!RowIsValid(shred_fmt[shred_idx], row)) {
+			continue;
+		}
 		StoreScalarShredLaneValue(shred, shred_fmt[shred_idx], RowIndex(shred_fmt[shred_idx], row), candidate_bits,
 		                          candidate_text);
 		MergeLWWScalarLane(state, shred_idx, text_indices, shred.type, candidate_bits,
 		                   nonstd::string_view(candidate_text.data(), candidate_text.size()), K, sort_key_id);
-		return ManifestWalk::Continue;
-	});
+	}
 }
 
 bool CanSkipManifestedScalarShredsLWW(const GroupMergeLWWState &state, const vector<ReconShred> &shreds,
@@ -3244,43 +3231,59 @@ bool CanSkipManifestedScalarShredsLWW(const GroupMergeLWWState &state, const vec
 		throw InternalException("jsono_group_merge: scalar lane count changed inside one aggregate state");
 	}
 	bool saw_scalar = false;
-	bool can_skip = true;
-	ForEachManifestedShred(shreds, manifest, [&](idx_t shred_idx) {
+	idx_t shred_idx = 0;
+	for (auto &entry : manifest) {
+		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
+		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+			shred_idx++;
+		}
+		if (shred_idx >= shreds.size()) {
+			break;
+		}
+		auto &shred = shreds[shred_idx];
+		if (entry.path != nonstd::string_view(shred.manifest_path.data(), shred.manifest_path.size())) {
+			continue;
+		}
 		saw_scalar = true;
 		if (!RowIsValid(shred_fmt[shred_idx], row)) {
-			can_skip = false;
-			return ManifestWalk::Abort;
+			return false;
 		}
 		auto *lane = FindLWWScalarLane(state, shred_idx);
 		if (!lane || CompareRawBytes(LWWLaneSortKey(state, lane->sort_key_id), K) <= 0) {
-			can_skip = false;
-			return ManifestWalk::Abort;
+			return false;
 		}
-		return ManifestWalk::Continue;
-	});
-	return can_skip && saw_scalar;
+	}
+	return saw_scalar;
 }
 
 bool DirectListShredManifestRowComplete(const vector<ReconShred> &shreds, vector<UnifiedVectorFormat> &list_fmt,
                                         vector<UnifiedVectorFormat> &element_fmt,
                                         const std::vector<ShredManifestEntry> &manifest, idx_t row) {
-	bool complete = true;
-	ForEachManifestedShred(shreds, manifest, [&](idx_t shred_idx) {
+	idx_t shred_idx = 0;
+	for (auto &entry : manifest) {
+		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
+		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+			shred_idx++;
+		}
+		if (shred_idx >= shreds.size()) {
+			break;
+		}
+		auto &shred = shreds[shred_idx];
+		if (entry.path != nonstd::string_view(shred.manifest_path.data(), shred.manifest_path.size())) {
+			continue;
+		}
 		if (!RowIsValid(list_fmt[shred_idx], row)) {
-			complete = false;
-			return ManifestWalk::Abort;
+			return false;
 		}
 		auto list_entry =
 		    UnifiedVectorFormat::GetData<list_entry_t>(list_fmt[shred_idx])[RowIndex(list_fmt[shred_idx], row)];
 		for (idx_t i = 0; i < list_entry.length; i++) {
 			if (!RowIsValid(element_fmt[shred_idx], list_entry.offset + i)) {
-				complete = false;
-				return ManifestWalk::Abort;
+				return false;
 			}
 		}
-		return ManifestWalk::Continue;
-	});
-	return complete;
+	}
+	return true;
 }
 
 bool CanUseDirectListShreds(Vector &input, idx_t count, const vector<ReconShred> &shreds,
@@ -3314,16 +3317,26 @@ void FoldManifestedListShredsLWW(GroupMergeLWWState &state, const vector<ReconSh
 	EnsureLWWListLanes(state, shreds.size());
 	uint32_t sort_key_id = LWW_INVALID_SORT_KEY_ID;
 	LWWListValue candidate;
-	ForEachManifestedShred(shreds, manifest, [&](idx_t shred_idx) {
+	idx_t shred_idx = 0;
+	for (auto &entry : manifest) {
+		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
+		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+			shred_idx++;
+		}
+		if (shred_idx >= shreds.size()) {
+			break;
+		}
 		auto &shred = shreds[shred_idx];
+		if (entry.path != nonstd::string_view(shred.manifest_path.data(), shred.manifest_path.size())) {
+			continue;
+		}
 		if (!StoreCompleteListShredLaneValue(shred, base_view, list_fmt[shred_idx], element_fmt[shred_idx], row,
 		                                     scratch, candidate)) {
 			throw InternalException("jsono_group_merge direct list update: manifested list shred is incomplete");
 		}
 		MergeLWWListLane(state, state.list_lanes[shred_idx], candidate, shred.type, K, sort_key_id);
 		skip_root_keys.push_back(nonstd::string_view(shred.steps[0].key.data(), shred.steps[0].key.size()));
-		return ManifestWalk::Continue;
-	});
+	}
 }
 
 // The grouped (per-row state) and ungrouped (single state) direct-shredded updates differ only in
