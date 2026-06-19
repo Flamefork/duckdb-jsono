@@ -135,3 +135,16 @@ query I
 SELECT to_json(j) FROM ov_null;
 ----
 {"a":"x","b":null,"c":"z"}
+
+# A read of an ancestor subtree ($.b) over a DISJOINT shred set where a non-matching
+# shred ($.a) is visited BEFORE the descended shred ($.b.c): the ancestor read must
+# reconstruct so the stripped $.b.c leaf is overlaid back, returning {"c":2}. If the
+# residual fallback were a per-shred short-circuit instead of a for-all, the leading
+# $.a non-match would emit a residual-only read and return {} (the V3 manifest guard
+# does not catch this partial read).
+query I
+SELECT j ->> '$.b' FROM (
+    SELECT jsono('{"a":1,"b":{"c":2}}', shredding := {'$.a':'BIGINT','$.b.c':'BIGINT'}) AS j
+);
+----
+{"c":2}

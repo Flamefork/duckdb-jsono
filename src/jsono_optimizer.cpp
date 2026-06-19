@@ -1450,6 +1450,21 @@ vector<JsonoShred> CollectShreddedShreds(const LogicalType &shredded) {
 	return shreds;
 }
 
+// True when an extract `read` cannot be served against `shred` from the residual and must reconstruct:
+//   - an exact json-valued extract, or an exact array shred (whose LIST<STRUCT>/LIST<scalar> column is
+//     not the JSON array text a `->>` expects) — only a scalar shred under a string-valued extract is
+//     readable, every other exact match reconstructs;
+//   - a read of a subtree holding a stripped shred leaf, which would miss it in the residual (a stripped
+//     scalar leaf is itself a shred, caught by the exact case);
+//   - a read descending into a shredded array ($.products[i].subfield), whose lifted element subfields
+//     are stripped from the skeleton residual.
+bool ReadNeedsReconstruct(const vector<PathStep> &read, const JsonoShred &shred, bool string_fn) {
+	if (PathStepsEqual(shred.steps, read)) {
+		return !string_fn || IsShredListType(shred.type);
+	}
+	return PathStepsObjectKeyPrefix(read, shred.steps) || ReadDescendsIntoArrayShred(shred.type, shred.steps, read);
+}
+
 // A node in the shred reconstruction patch. Shreds are inserted by their path so the patch
 // rebuilds the original nesting as a struct_pack tree; a leaf (no children) carries the
 // shred's struct child index, a group carries nested keys.
@@ -1659,25 +1674,14 @@ private:
 			return nullptr;
 		}
 		for (auto &shred : CollectShreddedShreds(shredded_cast.child->return_type)) {
-			if (PathStepsEqual(shred.steps, steps)) {
-				if (string_fn && !IsShredListType(shred.type)) {
-					auto alias = expr.GetAlias();
-					return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
-				}
-				// A json-valued extract, or an array shred (whose LIST<STRUCT>/LIST<scalar> column is
-				// not the JSON array text a `->>` expects): reconstruct and extract natively (jsono's
-				// renderer), not core json's `->>`, so numbers/escapes match to_json.
-				return MakeReconstructExtract(expr, shredded_cast, string_fn);
+			// An exact match on a scalar (non-list) shred under a string-valued extract reads the shred
+			// column directly. Every other shred interaction forces reconstruct, so the residual fallback
+			// below is a for-all: reached only when NO shred touched this read.
+			if (PathStepsEqual(shred.steps, steps) && string_fn && !IsShredListType(shred.type)) {
+				auto alias = expr.GetAlias();
+				return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
 			}
-			// A read of a subtree holding a stripped shred leaf would miss it in the
-			// residual; reconstruct. (A stripped scalar leaf is itself a shred, handled
-			// by the exact match above.)
-			if (PathStepsObjectKeyPrefix(steps, shred.steps)) {
-				return MakeReconstructExtract(expr, shredded_cast, string_fn);
-			}
-			// A read descending into a shredded array ($.products[i].subfield) cannot be served from
-			// the skeleton residual (the lifted element subfields are stripped); reconstruct.
-			if (ReadDescendsIntoArrayShred(shred.type, shred.steps, steps)) {
+			if (ReadNeedsReconstruct(steps, shred, string_fn)) {
 				return MakeReconstructExtract(expr, shredded_cast, string_fn);
 			}
 		}
