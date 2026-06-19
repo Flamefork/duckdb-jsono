@@ -4224,62 +4224,13 @@ static bool PathTerminatesOnKey(const std::vector<const std::vector<PathStep> *>
 	return false;
 }
 
-// One object level of the residual emit: copy `view`'s object at `obj_pos` minus the
-// leaves named by `active`. Each active path is a sequence of object keys, matched against
-// this object's keys at `depth`: a path that terminates here strips that key's value, a
-// longer path recurses into the child object so only its leaf is removed. Surrounding
-// keys are emitted verbatim. Every active path has length > depth by construction.
-static void EmitObjectStrippingPaths(const JsonoView &view, const JsonoCursor &obj_cursor, JsonoBuilder &builder,
-                                     const std::vector<const std::vector<PathStep> *> &active, size_t depth) {
-	auto layout = ReadObjectLayout(view, obj_cursor.pos);
-	auto key_at = [&](size_t i) {
-		auto key_slot = view.SlotAt(layout.key_start + i);
-		if (SlotTag(key_slot) != tag::KEY) {
-			throw InvalidInputException("malformed JSONO: expected KEY slot");
-		}
-		return view.KeyAt(SlotPayload(key_slot));
-	};
-	size_t surviving = 0;
-	for (size_t i = 0; i < layout.key_count; i++) {
-		if (!PathTerminatesOnKey(active, depth, key_at(i))) {
-			surviving++;
-		}
-	}
-	builder.EmitObjectStart(surviving);
-	for (size_t i = 0; i < layout.key_count; i++) {
-		auto key = key_at(i);
-		if (!PathTerminatesOnKey(active, depth, key)) {
-			builder.EmitKeySlot(key);
-		}
-	}
-	JsonoCursor value_cursor = obj_cursor;
-	value_cursor.pos = layout.value_start;
-	for (size_t i = 0; i < layout.key_count; i++) {
-		auto key = key_at(i);
-		if (PathTerminatesOnKey(active, depth, key)) {
-			SkipValueFast(view, value_cursor);
-			continue;
-		}
-		builder.EmitObjectChildStart();
-		// Paths that continue past this key descend into the child. A path can only have
-		// located through an object, so recurse only into an object child; otherwise the
-		// value is verbatim.
-		std::vector<const std::vector<PathStep> *> deeper;
-		for (auto *path : active) {
-			auto &step = (*path)[depth];
-			if (depth + 1 < path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
-				deeper.push_back(path);
-			}
-		}
-		if (!deeper.empty() && SlotTag(view.SlotAt(value_cursor.pos)) == tag::OBJ_START) {
-			EmitObjectStrippingPaths(view, value_cursor, builder, deeper, depth + 1);
-			SkipValueFast(view, value_cursor);
-		} else {
-			EmitValueVerbatim(view, value_cursor, builder, depth + 1);
-		}
-	}
-	builder.EmitObjectEnd();
-}
+// The residual-emit core (defined below, after the array-skeleton helpers it dispatches to):
+// copy `view`'s object minus the leaves named by `scalar_paths`, and replace each terminal
+// array-shred key with its skeleton array. An empty `array_specs` reduces it to the plain leaf
+// strip — the shredded scalar writer's residual emit.
+static void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cursor, JsonoBuilder &builder,
+                               const std::vector<const std::vector<PathStep> *> &scalar_paths,
+                               const std::vector<const JsonoArrayShredSpec *> &array_specs, size_t depth);
 
 // Emit `view` into `builder` with the located leaf of each path removed, used by the
 // shredded writer to build the residual once it knows which paths were losslessly lifted
@@ -4294,7 +4245,7 @@ void JsonoEmitObjectStrippingPaths(const JsonoView &view, const std::vector<cons
 		EmitValueVerbatim(view, cursor, builder, 0);
 		return;
 	}
-	EmitObjectStrippingPaths(view, jsono::JsonoCursor(), builder, paths, 0);
+	EmitSkeletonObject(view, jsono::JsonoCursor(), builder, paths, {}, 0);
 }
 
 // ---- Residual skeleton emit for array shreds (write side) ----
@@ -4371,7 +4322,7 @@ static void EmitSkeletonArray(const JsonoView &view, const JsonoCursor &array_cu
 			for (auto &path : strip_storage) {
 				strip.push_back(&path);
 			}
-			EmitObjectStrippingPaths(view, cursor, builder, strip, 0);
+			EmitSkeletonObject(view, cursor, builder, strip, {}, 0);
 			SkipValueFast(view, cursor);
 		} else {
 			EmitValueVerbatim(view, cursor, builder, depth + 1);
@@ -4380,8 +4331,11 @@ static void EmitSkeletonArray(const JsonoView &view, const JsonoCursor &array_cu
 	builder.EmitArrayEnd();
 }
 
-// One object level of the residual skeleton: strip the scalar leaves (`scalar_paths`) and replace
-// the array at each terminal array-shred key with its skeleton, recursing for deeper paths.
+// One object level of the residual emit (the strip core forward-declared above): strip the scalar
+// leaves (`scalar_paths`) and replace the array at each terminal array-shred key with its skeleton,
+// recursing for deeper paths. With an empty `array_specs` this is the plain leaf strip a top-level
+// path drops a root key, a nested path drops only its leaf and keeps the surrounding object;
+// surrounding keys are emitted verbatim. Every scalar path has length > depth by construction.
 static void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cursor, JsonoBuilder &builder,
                                const std::vector<const std::vector<PathStep> *> &scalar_paths,
                                const std::vector<const JsonoArrayShredSpec *> &array_specs, size_t depth) {
