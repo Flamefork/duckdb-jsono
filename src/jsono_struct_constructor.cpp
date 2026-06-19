@@ -48,26 +48,10 @@ enum class StructValueStrategy : uint8_t {
 	Decimal
 };
 
-bool IsPrimitiveConstructorListChild(StructValueStrategy strategy) {
-	switch (strategy) {
-	case StructValueStrategy::Null:
-	case StructValueStrategy::Int:
-	case StructValueStrategy::Double:
-	case StructValueStrategy::String:
-	case StructValueStrategy::Bool:
-		return true;
-	case StructValueStrategy::RawJson:
-	case StructValueStrategy::Jsono:
-	case StructValueStrategy::List:
-	case StructValueStrategy::Struct:
-	case StructValueStrategy::NumberText:
-	case StructValueStrategy::Decimal:
-		return false;
-	}
-	return false;
-}
-
-bool IsPrimitiveConstructorScalar(StructValueStrategy strategy) {
+// A strategy that emits a single scalar slot — true for the leaf scalars, false for the composite
+// and deferred-render strategies. Shared by the list-child primitive check and the flat-scalar
+// object gate.
+bool IsPrimitiveConstructorStrategy(StructValueStrategy strategy) {
 	switch (strategy) {
 	case StructValueStrategy::Null:
 	case StructValueStrategy::Int:
@@ -295,7 +279,7 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 			    child_plan.children[0].flat_scalar_object &&
 			    child_plan.children[0].field_perm.size() <= OBJECT_CHECKPOINT_STRIDE) {
 				list_flat_scalar_object_count++;
-			} else if (!IsPrimitiveConstructorScalar(child_plan.strategy)) {
+			} else if (!IsPrimitiveConstructorStrategy(child_plan.strategy)) {
 				plan.one_list_flat_scalar_object = false;
 			}
 			bound_children.emplace_back(children[i].first, child_plan.bound_type);
@@ -342,14 +326,14 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 	case LogicalTypeId::LIST: {
 		plan.strategy = StructValueStrategy::List;
 		plan.children.push_back(BuildStructConstructorPlan(ListType::GetChildType(source_type), function_name));
-		plan.primitive_list = IsPrimitiveConstructorListChild(plan.children[0].strategy);
+		plan.primitive_list = IsPrimitiveConstructorStrategy(plan.children[0].strategy);
 		plan.bound_type = LogicalType::LIST(plan.children[0].bound_type);
 		return plan;
 	}
 	case LogicalTypeId::ARRAY: {
 		plan.strategy = StructValueStrategy::List;
 		plan.children.push_back(BuildStructConstructorPlan(ArrayType::GetChildType(source_type), function_name));
-		plan.primitive_list = IsPrimitiveConstructorListChild(plan.children[0].strategy);
+		plan.primitive_list = IsPrimitiveConstructorStrategy(plan.children[0].strategy);
 		plan.bound_type = LogicalType::LIST(plan.children[0].bound_type);
 		return plan;
 	}
