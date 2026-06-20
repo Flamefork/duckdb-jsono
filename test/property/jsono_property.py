@@ -130,15 +130,28 @@ class JsonoSession:
             self.proc.wait()
         self._start()
 
-    # Evaluate one scalar expression and return its text, or None for SQL NULL /
-    # empty result. The expression is cast to VARCHAR so a JSON-typed result comes
-    # back as a single JSON string (the renderer would otherwise inline a JSON
-    # column as a nested object, which is not round-trippable through json_loads).
-    # Property queries are written to return data (never to raise), so a JsonoCrash
-    # here means a genuine process death, not a SQL error.
-    def value(self, expr: str) -> str | None:
+    # A SQL error raised by the evaluated expression. `value()` collapses this to None (its
+    # contract is "the value, or None for NULL/error"), but the 3-state `read()` returns it so a
+    # fails-loud property can assert a LOUD ERROR specifically — not merely "not a value". `message`
+    # is the CLI's stderr text for this one statement (the error goes to stderr, never the result
+    # stream), so a property can pin the expected error to its real substring.
+    class Errored:
+        def __init__(self, message: str) -> None:
+            self.message = message
+
+    # Evaluate one scalar expression and return one of three states: an Errored (the SQL raised),
+    # None (the result was SQL NULL or empty), or the value's text. The expression is cast to VARCHAR
+    # so a JSON-typed result comes back as a single JSON string (the renderer would otherwise inline a
+    # JSON column as a nested object, which is not round-trippable through json_loads). A JsonoCrash
+    # here is a genuine process death, distinct from a SQL error (which leaves the process alive and
+    # surfaces as Errored). An errored statement emits no result row, so its payload is empty; a NULL
+    # result emits a row whose cell is null — the two are told apart by the payload, not stderr.
+    def read(self, expr: str) -> "JsonoSession.Errored | str | None":
         if self.proc is None or self.proc.poll() is not None:
             self.restart()
+        assert self.stderr_file is not None
+        self.stderr_file.seek(0, 2)
+        stderr_before = self.stderr_file.tell()
         try:
             stmt = f"SELECT CAST(({expr}) AS VARCHAR) AS v;"
             self._send(stmt)
@@ -147,13 +160,20 @@ class JsonoSession:
             self.restart()
             raise
         payload = "".join(rows).strip()
-        if not payload or payload == "[]":
-            return None
-        parsed = json_loads(payload)
+        parsed = json_loads(payload) if payload and payload != "[]" else None
         if not parsed:
-            return None
+            self.stderr_file.seek(stderr_before)
+            return JsonoSession.Errored(self.stderr_file.read().decode("utf-8", "replace"))
         (cell,) = parsed[0].values()
         return None if cell is None else str(cell)
+
+    # Evaluate one scalar expression and return its text, or None for SQL NULL / error / empty
+    # result. Property queries that are written to always return data use this; a property that must
+    # distinguish a raised error from a NULL uses read() instead. A JsonoCrash here means a genuine
+    # process death, not a SQL error.
+    def value(self, expr: str) -> str | None:
+        result = self.read(expr)
+        return None if isinstance(result, JsonoSession.Errored) else result
 
     # Run one non-SELECT statement (DDL/DML/SET) for its side effect; an error is dropped
     # (stderr is detached) — properties that need to observe one read through value().
@@ -181,16 +201,16 @@ def sql_literal(text: str) -> str:
     return "(" + " || chr(0) || ".join(runs) + ")"
 
 
+BLOB_FIELDS = ["slots", "key_heap", "string_heap", "skips"]
+
+
+def blob_hex_expr(body_expr: str) -> str:
+    return " || '|' || ".join(f"hex(({body_expr}).{field})" for field in BLOB_FIELDS)
+
+
 def jsono_blob_hex_expr(text: str) -> str:
     body_expr = f'jsono({sql_literal(text)})."jsono".body'
-    return " || '|' || ".join(
-        [
-            f"hex(({body_expr}).slots)",
-            f"hex(({body_expr}).key_heap)",
-            f"hex(({body_expr}).string_heap)",
-            f"hex(({body_expr}).skips)",
-        ]
-    )
+    return blob_hex_expr(body_expr)
 
 
 def jsono_struct_sql(blobs: BlobHex) -> str:
@@ -287,14 +307,7 @@ def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
 
 def shredded_blob_hex_expr(text: str, spec_sql: str) -> str:
     body_expr = f'jsono({sql_literal(text)}, shredding := {spec_sql})."jsono".body'
-    return " || '|' || ".join(
-        [
-            f"hex(({body_expr}).slots)",
-            f"hex(({body_expr}).key_heap)",
-            f"hex(({body_expr}).string_heap)",
-            f"hex(({body_expr}).skips)",
-        ]
-    )
+    return blob_hex_expr(body_expr)
 
 
 def manifest_offset(skips: bytes) -> int:
@@ -712,6 +725,11 @@ def _to_json_parity(shredded: str, plain: str) -> str:
     return f"SELECT (to_json({shredded}) IS NOT DISTINCT FROM to_json({plain}))"
 
 
+def descend_reads_parity(shredded: str, plain: str, reads: list[str]) -> str:
+    cond = " AND ".join(f"(sj ->> '{r}') IS NOT DISTINCT FROM (pj ->> '{r}')" for r in reads)
+    return f"SELECT ({cond}) FROM (SELECT {shredded} sj, {plain} pj)"
+
+
 def _descend_reads_parity(shredded: str, plain: str) -> str:
     # Reads that descend INTO the shredded array ($.items[i].field, and the whole $.items): the lifted
     # subfields are stripped from the skeleton residual, so the optimizer must reconstruct rather than
@@ -719,8 +737,7 @@ def _descend_reads_parity(shredded: str, plain: str) -> str:
     # core-JSON render boundary.
     reads = [f"$.items[{i}].{f}" for i in (0, 1, 2, 9) for f in array_subfield_names]
     reads.append("$.items")
-    cond = " AND ".join(f"(sj ->> '{r}') IS NOT DISTINCT FROM (pj ->> '{r}')" for r in reads)
-    return f"SELECT ({cond}) FROM (SELECT {shredded} sj, {plain} pj)"
+    return descend_reads_parity(shredded, plain, reads)
 
 
 def _entries_parity(shredded: str, plain: str) -> str:
@@ -784,8 +801,7 @@ def _scalar_descend_reads_parity(shredded: str, plain: str) -> str:
     # rather than read the placeholder NULL.
     reads = [f"$.items[{i}]" for i in (0, 1, 2, 9)]
     reads.append("$.items")
-    cond = " AND ".join(f"(sj ->> '{r}') IS NOT DISTINCT FROM (pj ->> '{r}')" for r in reads)
-    return f"SELECT ({cond}) FROM (SELECT {shredded} sj, {plain} pj)"
+    return descend_reads_parity(shredded, plain, reads)
 
 
 SCALAR_ARRAY_READER_PARITY = [
@@ -983,10 +999,16 @@ def test_narrowing_fails_loud(doc: dict[str, Any], data: Any) -> None:
     SESSION.statement("SET disabled_optimizers='extension';")
     SESSION.statement(f"INSERT INTO narrow_prop SELECT jsono({sql_literal(text)}, shredding := {wide_spec});")
     SESSION.statement("RESET disabled_optimizers;")
-    read = SESSION.value("(SELECT to_json(e)::VARCHAR FROM narrow_prop LIMIT 1)")
-    # The narrowed row must error (the session returns None for an errored query), never a
-    # partial document.
-    assert read is None, f"narrowed row read silently: {text!r} dropped {dropped!r} -> {read!r}"
+    result = SESSION.read("(SELECT to_json(e)::VARCHAR FROM narrow_prop LIMIT 1)")
+    # The narrowed row must fail LOUD — a raised SQL error, not a partial document and not a silent
+    # NULL (which read() reports distinctly from an error). Pin the error to the manifest-guard's
+    # real message so a regression that swaps the throw for a NULL/empty result is caught.
+    assert isinstance(result, JsonoSession.Errored), (
+        f"narrowed row did not fail loud: {text!r} dropped {dropped!r} -> {result!r}"
+    )
+    assert "was narrowed by a raw struct cast and cannot be read losslessly" in result.message, (
+        f"narrowed row errored with an unexpected message: {text!r} dropped {dropped!r} -> {result.message!r}"
+    )
 
 
 manifest_mutations = st.sampled_from(
