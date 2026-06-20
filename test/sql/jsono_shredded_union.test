@@ -222,19 +222,6 @@ SELECT to_json(e)::VARCHAR FROM ins_target ORDER BY 1;
 {"a":"AAA","b":"BBB"}
 {"a":"XXX","b":"YYY"}
 
-# A valid (non-NULL) row whose residual blob is NULL is corrupt — the writer nulls the whole
-# struct for a NULL value, so this is the trace of a struct cast NULL-filling the row's body.
-# The lossless reconstruct cast refuses to invent a value.
-statement error
-SELECT struct_pack(
-        "jsono" := struct_pack(
-            body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
-            shreds := struct_pack(
-                "$jsono$set" := NULL::BIGINT,
-                a := struct_pack(value := 'v', complete := 1::TINYINT))))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
-----
-body is NULL
-
 # --- CASE/COALESCE also reconcile two differently shredded values: DuckDB merges their shred
 # sets into one shredded type and the optimizer reshredds each arm — values correct, type
 # normalized, dedup honest. ---

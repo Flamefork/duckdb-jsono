@@ -180,6 +180,19 @@ SELECT jsono_extract_string(TRY_CAST(struct_pack(jsono := struct_pack(body := NU
 ----
 corrupt JSONO storage
 
+# A valid (non-NULL) row whose residual blob is NULL is corrupt — the writer nulls the whole
+# struct for a NULL value, so this is the trace of a struct cast NULL-filling the row's body.
+# The lossless reconstruct cast refuses to invent a value.
+statement error
+SELECT struct_pack(
+        "jsono" := struct_pack(
+            body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
+            shreds := struct_pack(
+                "$jsono$set" := NULL::BIGINT,
+                a := struct_pack(value := 'v', complete := 1::TINYINT))))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
+----
+body is NULL
+
 # One-pass shredded write: a NULL shred field stays in the residual as an explicit null
 # (NULL shred = "value lives in the residual"), non-NULL shred fields are stripped and
 # manifest-covered. Mixed NULL masks per row exercise the partial-strip emit.
