@@ -27,7 +27,7 @@ SELECT to_json(e)::VARCHAR FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM s
 {"a":"XXX","b":"YYY"}
 
 query I
-SELECT jsono_type(e) FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b);
+SELECT jsono_type(e) FROM (SELECT e FROM shred_a UNION ALL SELECT e FROM shred_b) ORDER BY 1;
 ----
 OBJECT
 OBJECT

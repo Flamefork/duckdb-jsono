@@ -146,6 +146,10 @@ RESET disabled_optimizers;
 
 # The surviving $.a shred is total (no NULL), so its read is COALESCE-free — yet reading the dropped
 # $.b path on the same narrowed row still fails loud.
+# Contract owner: jsono_shredded_cast_guard.test owns the "narrowed by a raw struct cast"
+# manifest-guard contract. This site's distinct entry-mechanism: the narrowed row sits in a
+# total typed (BIGINT) shred column whose surviving shred is read COALESCE-free — the total
+# fast path must NOT mask the manifest guard on the dropped path.
 query I
 SELECT CAST(j->>'$.a' AS BIGINT) FROM narrow_total;
 ----

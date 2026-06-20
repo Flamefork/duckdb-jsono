@@ -19,6 +19,22 @@ When changing `JSONO` storage or casts, cover bind-time errors, runtime
 invalid-input behavior, NULL behavior, and Parquet round-trips. For bug fixes,
 add or update a focused SQLLogic case before changing the implementation.
 
+### Spelling the storage type
+
+Two non-obvious rules govern how the `jsono` storage type is spelled in tests:
+
+1. `jsono_storage_type()` returns a `VARCHAR`, so it cannot follow `::` (you
+   cannot write `x::jsono_storage_type()`). When you need the raw 6-blob layout
+   as a cast *target*, spell it out as the `::STRUCT(jsono STRUCT(body
+   STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB,
+   nums BLOB)))` literal.
+2. The storage-path anchor checks (`jsono_storage_type.test`,
+   `jsono_roundtrip.test`, `jsono_parquet.test`) spell that literal raw *on
+   purpose* — they are the anchor that pins the physical layout, so rewriting
+   them to `= jsono_storage_type()` would make the assertion circular (the
+   function reading from the same source it is meant to verify). Everywhere else
+   prefer `typeof(x) = jsono_storage_type(spec)`.
+
 ## Python guards (non-SQLLogic)
 
 Some invariants are invisible to SQLLogic and run as standalone `uv` scripts

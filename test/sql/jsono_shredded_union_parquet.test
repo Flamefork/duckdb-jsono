@@ -50,6 +50,10 @@ statement ok
 RESET disabled_optimizers;
 
 # The sb row's 'b' shred was dropped by the raw cast; its manifest makes the read fail loud.
+# Contract owner: jsono_shredded_cast_guard.test owns the "narrowed by a raw struct cast"
+# manifest-guard contract. This site's distinct entry-mechanism: the narrowing arrives via a
+# Parquet round-trip feeding an optimizer-disabled INSERT (the shred manifest survives the
+# Parquet schema, then a raw by-name cast drops a shred on the way in).
 statement error
 SELECT to_json(e)::VARCHAR FROM narrowed ORDER BY 1;
 ----

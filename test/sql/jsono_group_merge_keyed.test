@@ -194,6 +194,10 @@ INSERT INTO indexed_keyed_narrow SELECT m FROM indexed_keyed_wide;
 statement ok
 RESET disabled_optimizers;
 
+# Contract owner: jsono_shredded_cast_guard.test owns the "narrowed by a raw struct cast"
+# manifest-guard contract. This site's distinct entry-mechanism: the narrowed row originates
+# from the keyed group_merge finalize (which writes a layout-indexed shred manifest), then an
+# optimizer-disabled INSERT drops a shred via a raw by-name cast.
 statement error
 SELECT to_json(j) FROM indexed_keyed_narrow;
 ----

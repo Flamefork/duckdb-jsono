@@ -10,6 +10,12 @@ require jsono
 
 require json
 
+# Inverse of the contract owned by jsono_shredded_cast_guard.test ("narrowed by a raw struct
+# cast"): that file asserts the manifest guard MUST fire on a genuinely narrowed row; here the
+# row is NOT narrowed (both values live in their lanes), so the guard must NOT fire. This site's
+# distinct entry-mechanism: the eager fused __jsono_internal_project reads the shred lanes from
+# the residual, which spuriously tripped the same guard.
+#
 # Two typed extracts of distinct shred lanes in one projection. Each folds to a lane read with a
 # lazy residual fallback; fusing both fallbacks into one eager projector read the lanes from the
 # residual and tripped the shred-manifest guard. Both values live in their lanes, so this must just
