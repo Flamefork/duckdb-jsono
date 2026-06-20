@@ -1878,7 +1878,10 @@ private:
 			return nullptr;
 		}
 		for (auto &shred : CollectShreddedShreds(shredded_cast->child->return_type)) {
-			if (!PathStepsEqual(shred.steps, steps) || shred.type != target) {
+			// MakeTypedShredRead navigates the scalar pair STRUCT(value, complete) via ShredExtract; a
+			// list shred stays a bare LIST (no pair), so folding it crashes the extract. Leave the inner
+			// `->>` to RewriteShreddedExtract (which reconstructs for list shreds) and the cast on top.
+			if (!PathStepsEqual(shred.steps, steps) || shred.type != target || IsShredListType(shred.type)) {
 				continue;
 			}
 			return MakeTypedShredRead(std::move(shredded_cast->child), shred, std::move(fn.children[1]), target,

@@ -164,6 +164,45 @@ SELECT s ->> '$.a[9]' FROM arr_reads;
 NULL
 
 # ---------------------------------------------------------------------------
+# Regression: CAST(shredded ->> path AS <list type>) must NOT fold into a direct
+# typed-shred read. The fold (TryFoldTypedShredCast) navigates the scalar pair
+# STRUCT(value, complete) via ShredExtract, but an array shred stays a bare LIST
+# (no pair) — folding it struct_extracts a non-struct and crashes the binder. A
+# list shred is gated out, so the cast reconstructs through the residual text.
+# ---------------------------------------------------------------------------
+
+# $.path array shred, typed-array cast of the `->>` text.
+query I
+SELECT (jsono('{"a":[1,2,3]}', shredding := {'$.a':'UBIGINT[]'}) ->> '$.a')::UBIGINT[];
+----
+[1, 2, 3]
+
+# Bare-name auto-shred (jsono(STRUCT)) with a bare-key extract — the events4 shape.
+query I
+SELECT (jsono({'goalsID': [1,2]::UBIGINT[]}) ->> 'goalsID')::UBIGINT[];
+----
+[1, 2]
+
+# The shred type carried on a table column folds the same way; reads correctly.
+statement ok
+CREATE TABLE arr_cast AS SELECT jsono({'goalsID': [5,6,7]::UBIGINT[]}) AS rp;
+
+query I
+SELECT (rp ->> 'goalsID')::UBIGINT[] FROM arr_cast;
+----
+[5, 6, 7]
+
+# CREATE TABLE AS ... LIMIT 0 — the schema-reconcile site that crashed; binds clean.
+statement ok
+CREATE TABLE arr_cast_schema AS
+SELECT (rp ->> 'goalsID')::UBIGINT[] AS g FROM arr_cast LIMIT 0;
+
+query I
+SELECT count(*) FROM arr_cast_schema;
+----
+0
+
+# ---------------------------------------------------------------------------
 # jsono_entries expands each lifted element into a `<base>[i]` leaf; kept elements
 # come from the residual walk. The union matches a plain parse (compared sorted).
 # ---------------------------------------------------------------------------
