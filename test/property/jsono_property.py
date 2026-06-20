@@ -1077,6 +1077,147 @@ def test_group_merge_keyed_parity(rows: list[dict[str, Any]], data: Any) -> None
     assert keyed_max == keyed_reordered, f"order-dependent: {rows!r} -> {keyed_max!r} vs {keyed_reordered!r}"
 
 
+# jsono_transform parity: the multi-field one-pass object walk (WalkTransformObject /
+# WalkTransformObjectCheckpoints, with NormalEdgePolicy for named fields and WildcardEdgePolicy for
+# the list field) must agree, value-by-value, with two independent oracles: (A) running the same
+# spec over the SAME document once shredded and once plain (the shred-lane read and the residual walk
+# are different code paths) and (B) the equivalent single-path `->>` extraction per VARCHAR field
+# (the operator path, not the multi-field walk). The generated cross-product spans the branches the
+# walk dispatches on: named AND wildcard fields in one spec; objects both <=16 keys (linear walk) and
+# >16 keys (checkpoint walk); present AND absent keys (NullScalarEdge / AppendWildcardMissing);
+# nested-path AND top-level fields; typed coercion AND lenient string extraction.
+transform_leaf_keys = ["a", "b", "c", "d"]
+transform_nest_keys = ["x", "y"]
+transform_scalars = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(min_value=-(2**62), max_value=2**62),
+    st.floats(allow_nan=False, allow_infinity=False, width=64),
+    st.text(alphabet="abcdefghij0123456789", max_size=5),
+)
+# A wildcard item is heterogeneous: an object carrying the '$.items[*].v' leaf (present / absent /
+# null / non-string scalar / container), a bare scalar, or null — so the wildcard list field walks
+# present, missing, JSON-null, and type-mismatch element cases.
+transform_item = st.one_of(
+    st.dictionaries(st.sampled_from(["v", "w"]), transform_scalars, max_size=2),
+    st.none(),
+    transform_scalars,
+    st.fixed_dictionaries({"v": st.lists(st.integers(min_value=0, max_value=3), max_size=2)}),
+)
+
+
+@st.composite
+def transform_documents(draw: Any) -> tuple[dict[str, Any], int]:
+    doc: dict[str, Any] = draw(st.dictionaries(st.sampled_from(transform_leaf_keys), transform_scalars, max_size=4))
+    if draw(st.booleans()):
+        doc["nest"] = draw(
+            st.dictionaries(st.sampled_from(transform_nest_keys), transform_scalars, min_size=1, max_size=2)
+        )
+    if draw(st.booleans()):
+        doc["items"] = draw(st.lists(transform_item, max_size=5))
+    # Padding keys straddle OBJECT_CHECKPOINT_STRIDE (16): with the up-to-6 semantic keys above, a
+    # width of 0..18 puts the top-level object both at or below 16 keys (the linear merge walk) and
+    # above 16 (WalkTransformObjectCheckpoints). The pad keys are never named by the spec, so they
+    # only change the object width the walk traverses, not the expected field values.
+    width = draw(st.integers(min_value=0, max_value=18))
+    for i in range(width):
+        doc[f"pad{i:02d}"] = i
+    return doc, width
+
+
+# Every VARCHAR scalar field in the spec, paired with its JSONPath, so the per-field `->>` oracle
+# (leg B) can rebuild the expected value independently of the transform walk. Each is an
+# explicit-path wrapper field so the field's value IS the value at that JSONPath: a bare scalar
+# shorthand instead names a literal top-level key (e.g. 'a_str' would read the key "a_str", not
+# $.a), which the dotted-key `.test` case covers separately and the `->>` oracle would not match.
+TRANSFORM_VARCHAR_FIELDS = [
+    ("a_str", "$.a"),
+    ("missing_str", "$.zzz_absent"),
+    ("nest_x", "$.nest.x"),
+]
+
+
+def transform_spec_sql() -> str:
+    # One spec mixing: explicit-path VARCHAR fields (NormalEdgePolicy), a present and an absent key
+    # (NullScalarEdge fires on the absent one), a nested-path field, typed coercion targets
+    # (BIGINT/DOUBLE/BOOLEAN), and a wildcard list field over '$.items[*].v' (WildcardEdgePolicy +
+    # emit_index_tail; AppendWildcardMissing fires on items lacking 'v'). The 'd_flag' field uses bare
+    # scalar shorthand so the literal-top-level-key resolution (the simple_scalar_leaf fast edge) is
+    # exercised alongside the path wrappers.
+    return (
+        "{'a_str':{'type':'VARCHAR','path':'$.a'},"
+        "'missing_str':{'type':'VARCHAR','path':'$.zzz_absent'},"
+        "'nest_x':{'type':'VARCHAR','path':'$.nest.x'},"
+        "'b_int':{'type':'BIGINT','path':'$.b'},"
+        "'c_dbl':{'type':'DOUBLE','path':'$.c'},"
+        "'d':'BOOLEAN',"
+        "'item_vs':{'type':['VARCHAR'],'path':'$.items[*].v'}}"
+    )
+
+
+def transform_varchar_oracle_sql(plain: str, transformed: str) -> str:
+    # Leg B: each VARCHAR field equals the single-path `->>` of the same JSONPath on the plain value,
+    # except a container leaf (OBJECT/ARRAY) where the scalar transform yields NULL while `->>` would
+    # render the container text — that divergence is by design (a container is a scalar mismatch), so
+    # the oracle nulls it the same way. jsono_type returns NULL for a missing/JSON-null leaf, which is
+    # not a container, so those fall through to `->>` (also NULL) and match.
+    conds = []
+    for field_name, path in TRANSFORM_VARCHAR_FIELDS:
+        expected = (
+            f"CASE WHEN jsono_type({plain}, '{path}') IN ('OBJECT', 'ARRAY') "
+            f"THEN NULL ELSE {plain} ->> '{path}' END"
+        )
+        conds.append(f"(({transformed}).{field_name} IS NOT DISTINCT FROM ({expected}))")
+    return "SELECT (" + " AND ".join(conds) + ")"
+
+
+@settings(PROPERTY_SETTINGS)
+# Force a >16-key object (checkpoint walk) carrying present named fields, a nested path, an absent
+# key, and a wildcard array whose items mix present / absent / null / container '$.items[*].v'.
+@example(
+    generated=(
+        {f"pad{i:02d}": i for i in range(17)}
+        | {
+            "a": "hi",
+            "b": 5,
+            "c": 1.5,
+            "d": True,
+            "nest": {"x": "deep"},
+            "items": [{"v": "p"}, {"w": 1}, {"v": None}, {"v": [1]}],
+        },
+        17,
+    )
+)
+# A <=16-key object (linear merge walk) with the same field shapes.
+@example(generated=({"a": "x", "b": 2, "nest": {"x": "n"}, "items": [{"v": "q"}]}, 0))
+# Empty wildcard array and a fully absent items container both exercise AppendWildcardMissing.
+@example(generated=({"a": "y", "items": []}, 0))
+@example(generated=({"a": "z"}, 0))
+@given(generated=transform_documents())
+def test_transform_walk_parity(generated: tuple[dict[str, Any], int]) -> None:
+    document, _ = generated
+    text = json_dumps(document)
+    spec = transform_spec_sql()
+    plain = f"jsono({sql_literal(text)})"
+    transformed_plain = f"jsono_transform({plain}, {spec})"
+
+    # Leg A: the same multi-field spec over a SHREDDED build of the same document must equal the plain
+    # build. The shred set covers the scalar fields the spec reads (so the shred-lane read path runs);
+    # values that do not fit a typed shred stay in the residual (the lossless gate), exercising the
+    # residual-first / shred-fallback split inside the walk.
+    shred_spec = "{'$.a': 'VARCHAR', '$.b': 'BIGINT', '$.c': 'DOUBLE', '$.d': 'BOOLEAN'}"
+    shredded = f"jsono({sql_literal(text)}, shredding := {shred_spec})"
+    transformed_shredded = f"jsono_transform({shredded}, {spec})"
+    leg_a = SESSION.value(
+        f"SELECT (to_json({transformed_shredded}) IS NOT DISTINCT FROM to_json({transformed_plain}))"
+    )
+    assert leg_a == "true", f"transform shredded != plain: {text!r}"
+
+    # Leg B: each VARCHAR field matches the independent single-path `->>` extraction on the same value.
+    leg_b = SESSION.value(transform_varchar_oracle_sql(plain, transformed_plain))
+    assert leg_b == "true", f"transform field != ->> extraction: {text!r}"
+
+
 PROPERTIES = [
     test_round_trip_idempotent,
     test_value_parity,
@@ -1092,6 +1233,7 @@ PROPERTIES = [
     test_scalar_array_auto_shred_lossless,
     test_narrowing_fails_loud,
     test_group_merge_keyed_parity,
+    test_transform_walk_parity,
     test_fuzz_text_no_crash,
     test_fuzz_blob_no_crash,
     test_fuzz_validish_blob_no_crash,
