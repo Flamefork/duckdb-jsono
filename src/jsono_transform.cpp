@@ -1248,7 +1248,52 @@ void ApplyScalarEdge(TransformLocalState &lstate, const TransformBindData &bind_
 	}
 }
 
-void ApplyObjectNodeWithCheckpoints(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
+// The two transform object-walks (NullScalarEdge/ApplyScalarEdge vs AppendWildcardMissing/
+// ApplyWildcardElement) share a byte-identical sorted-merge over key slots and diverge only in the
+// missing-leaf and present-leaf handlers, the early-exit predicate, and whether the trailing
+// index_edges sweep runs. The divergence is captured by a stateless POLICY type parameter so the
+// core monomorphizes per policy with no runtime branch on the hot path. Policy hooks take all loop
+// state by argument and never capture it, keeping edge_index/value_cursor as by-value locals in the
+// core (a captured accumulator would spill to the stack and regress the inner loop).
+struct NormalEdgePolicy {
+	static constexpr bool emit_index_tail = false;
+
+	static JSONO_ALWAYS_INLINE void OnMissing(TransformLocalState &lstate, const TransformBindData &bind_data,
+	                                          idx_t child, const JsonoView &view, const JsonoCursor &value_cursor,
+	                                          vector<unique_ptr<Vector>> &children, idx_t row,
+	                                          vector<string> &join_buffers, vector<idx_t> &join_counts) {
+		NullScalarEdge(bind_data, bind_data.trie[child].simple_scalar_leaf, child, children, row);
+	}
+
+	static JSONO_ALWAYS_INLINE void OnPresent(TransformLocalState &lstate, const TransformBindData &bind_data,
+	                                          idx_t child, const JsonoView &view, const JsonoCursor &value_cursor,
+	                                          vector<unique_ptr<Vector>> &children, idx_t row,
+	                                          vector<string> &join_buffers, vector<idx_t> &join_counts) {
+		ApplyScalarEdge(lstate, bind_data, bind_data.trie[child].simple_scalar_leaf, child, view, value_cursor,
+		                children, row, join_buffers, join_counts);
+	}
+};
+
+struct WildcardEdgePolicy {
+	static constexpr bool emit_index_tail = true;
+
+	static JSONO_ALWAYS_INLINE void OnMissing(TransformLocalState &lstate, const TransformBindData &bind_data,
+	                                          idx_t child, const JsonoView &view, const JsonoCursor &value_cursor,
+	                                          vector<unique_ptr<Vector>> &children, idx_t row,
+	                                          vector<string> &join_buffers, vector<idx_t> &join_counts) {
+		AppendWildcardMissing(bind_data, child, children, row);
+	}
+
+	static JSONO_ALWAYS_INLINE void OnPresent(TransformLocalState &lstate, const TransformBindData &bind_data,
+	                                          idx_t child, const JsonoView &view, const JsonoCursor &value_cursor,
+	                                          vector<unique_ptr<Vector>> &children, idx_t row,
+	                                          vector<string> &join_buffers, vector<idx_t> &join_counts) {
+		ApplyWildcardElement(lstate, bind_data, child, view, value_cursor, children, row, join_buffers, join_counts);
+	}
+};
+
+template <class POLICY>
+void WalkTransformObjectCheckpoints(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                                     const JsonoView &view, const ObjectLayout &layout, const JsonoCursor &obj_cursor,
                                     vector<unique_ptr<Vector>> &children, idx_t row, vector<string> &join_buffers,
                                     vector<idx_t> &join_counts) {
@@ -1264,44 +1309,20 @@ void ApplyObjectNodeWithCheckpoints(TransformLocalState &lstate, const Transform
 
 	for (idx_t edge_index = 0; edge_index < node.key_edges.size(); edge_index++) {
 		auto &edge = node.key_edges[edge_index];
-		auto simple_scalar_leaf = bind_data.trie[edge.child].simple_scalar_leaf;
 		if (!entry.found[edge_index]) {
-			NullScalarEdge(bind_data, simple_scalar_leaf, edge.child, children, row);
+			POLICY::OnMissing(lstate, bind_data, edge.child, view, value_cursor, children, row, join_buffers,
+			                  join_counts);
 			continue;
 		}
 		auto rank = entry.ranks[edge_index];
 		MoveObjectValueCursorToRank(view, layout, value_block_base, rank, value_rank, value_cursor);
-		ApplyScalarEdge(lstate, bind_data, simple_scalar_leaf, edge.child, view, value_cursor, children, row,
-		                join_buffers, join_counts);
+		POLICY::OnPresent(lstate, bind_data, edge.child, view, value_cursor, children, row, join_buffers, join_counts);
 	}
-}
-
-void ApplyWildcardObjectNodeWithCheckpoints(TransformLocalState &lstate, const TransformBindData &bind_data,
-                                            idx_t node_index, const JsonoView &view, const ObjectLayout &layout,
-                                            const JsonoCursor &obj_cursor, vector<unique_ptr<Vector>> &children,
-                                            idx_t row, vector<string> &join_buffers, vector<idx_t> &join_counts) {
-	auto &node = bind_data.trie[node_index];
-	size_t value_rank = 0;
-	JsonoCursor value_block_base = obj_cursor;
-	value_block_base.pos = layout.value_start;
-	JsonoCursor value_cursor = value_block_base;
-
-	// Holding the reference across recursion is safe (see ApplyObjectNodeWithCheckpoints).
-	auto &entry = GetObjectRankCacheEntry(lstate, bind_data, node_index, view, layout);
-
-	for (idx_t edge_index = 0; edge_index < node.key_edges.size(); edge_index++) {
-		auto &edge = node.key_edges[edge_index];
-		if (!entry.found[edge_index]) {
-			AppendWildcardMissing(bind_data, edge.child, children, row);
-			continue;
+	if (POLICY::emit_index_tail) {
+		for (auto &edge : node.index_edges) {
+			POLICY::OnMissing(lstate, bind_data, edge.child, view, value_cursor, children, row, join_buffers,
+			                  join_counts);
 		}
-		auto rank = entry.ranks[edge_index];
-		MoveObjectValueCursorToRank(view, layout, value_block_base, rank, value_rank, value_cursor);
-		ApplyWildcardElement(lstate, bind_data, edge.child, view, value_cursor, children, row, join_buffers,
-		                     join_counts);
-	}
-	for (auto &edge : node.index_edges) {
-		AppendWildcardMissing(bind_data, edge.child, children, row);
 	}
 }
 
@@ -1347,9 +1368,10 @@ void MaterializeWildcardLeaves(const TransformBindData &bind_data, idx_t node_in
 	}
 }
 
-void ApplyObjectNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
-                     const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children, idx_t row,
-                     vector<string> &join_buffers, vector<idx_t> &join_counts) {
+template <class POLICY>
+void WalkTransformObject(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
+                         const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children,
+                         idx_t row, vector<string> &join_buffers, vector<idx_t> &join_counts) {
 	auto &node = bind_data.trie[node_index];
 	auto layout = ReadObjectLayout(view, cursor.pos);
 	JsonoCursor value_cursor = cursor;
@@ -1358,8 +1380,8 @@ void ApplyObjectNode(TransformLocalState &lstate, const TransformBindData &bind_
 	bool use_checkpoints =
 	    layout.checkpoint_offset != NO_OBJECT_CHECKPOINTS && layout.key_count > OBJECT_CHECKPOINT_STRIDE;
 	if (use_checkpoints) {
-		ApplyObjectNodeWithCheckpoints(lstate, bind_data, node_index, view, layout, cursor, children, row, join_buffers,
-		                               join_counts);
+		WalkTransformObjectCheckpoints<POLICY>(lstate, bind_data, node_index, view, layout, cursor, children, row,
+		                                       join_buffers, join_counts);
 		return;
 	}
 
@@ -1375,26 +1397,38 @@ void ApplyObjectNode(TransformLocalState &lstate, const TransformBindData &bind_
 			if (key_compare >= 0) {
 				break;
 			}
-			auto simple_scalar_leaf = bind_data.trie[node.key_edges[edge_index].child].simple_scalar_leaf;
-			NullScalarEdge(bind_data, simple_scalar_leaf, node.key_edges[edge_index].child, children, row);
+			POLICY::OnMissing(lstate, bind_data, node.key_edges[edge_index].child, view, value_cursor, children, row,
+			                  join_buffers, join_counts);
 			edge_index++;
 		}
 		if (edge_index < node.key_edges.size() && key_compare == 0) {
-			auto simple_scalar_leaf = bind_data.trie[node.key_edges[edge_index].child].simple_scalar_leaf;
-			ApplyScalarEdge(lstate, bind_data, simple_scalar_leaf, node.key_edges[edge_index].child, view, value_cursor,
-			                children, row, join_buffers, join_counts);
+			POLICY::OnPresent(lstate, bind_data, node.key_edges[edge_index].child, view, value_cursor, children, row,
+			                  join_buffers, join_counts);
 			edge_index++;
 		}
-		if (edge_index >= node.key_edges.size()) {
+		if (edge_index >= node.key_edges.size() && (!POLICY::emit_index_tail || node.index_edges.empty())) {
 			return;
 		}
 		SkipValueFast(view, value_cursor);
 	}
 	while (edge_index < node.key_edges.size()) {
-		auto simple_scalar_leaf = bind_data.trie[node.key_edges[edge_index].child].simple_scalar_leaf;
-		NullScalarEdge(bind_data, simple_scalar_leaf, node.key_edges[edge_index].child, children, row);
+		POLICY::OnMissing(lstate, bind_data, node.key_edges[edge_index].child, view, value_cursor, children, row,
+		                  join_buffers, join_counts);
 		edge_index++;
 	}
+	if (POLICY::emit_index_tail) {
+		for (auto &edge : node.index_edges) {
+			POLICY::OnMissing(lstate, bind_data, edge.child, view, value_cursor, children, row, join_buffers,
+			                  join_counts);
+		}
+	}
+}
+
+void ApplyObjectNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
+                     const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children, idx_t row,
+                     vector<string> &join_buffers, vector<idx_t> &join_counts) {
+	WalkTransformObject<NormalEdgePolicy>(lstate, bind_data, node_index, view, cursor, children, row, join_buffers,
+	                                      join_counts);
 }
 
 void ApplyArrayNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
@@ -1436,51 +1470,8 @@ void ApplyArrayNode(TransformLocalState &lstate, const TransformBindData &bind_d
 void ApplyWildcardObjectNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                              const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children,
                              idx_t row, vector<string> &join_buffers, vector<idx_t> &join_counts) {
-	auto &node = bind_data.trie[node_index];
-	auto layout = ReadObjectLayout(view, cursor.pos);
-	JsonoCursor value_cursor = cursor;
-	value_cursor.pos = layout.value_start;
-	idx_t edge_index = 0;
-	bool use_checkpoints =
-	    layout.checkpoint_offset != NO_OBJECT_CHECKPOINTS && layout.key_count > OBJECT_CHECKPOINT_STRIDE;
-	if (use_checkpoints) {
-		ApplyWildcardObjectNodeWithCheckpoints(lstate, bind_data, node_index, view, layout, cursor, children, row,
-		                                       join_buffers, join_counts);
-		return;
-	}
-
-	for (size_t key_index = 0; key_index < layout.key_count; key_index++) {
-		auto key_slot = view.SlotAt(layout.key_start + key_index);
-		if (SlotTag(key_slot) != tag::KEY) {
-			throw InvalidInputException("malformed JSONO: expected KEY slot");
-		}
-		auto key = view.KeyAt(SlotPayload(key_slot));
-		int key_compare = 1;
-		while (edge_index < node.key_edges.size()) {
-			key_compare = CompareTrieKeyToJsonKey(node.key_edges[edge_index].key, key);
-			if (key_compare >= 0) {
-				break;
-			}
-			AppendWildcardMissing(bind_data, node.key_edges[edge_index].child, children, row);
-			edge_index++;
-		}
-		if (edge_index < node.key_edges.size() && key_compare == 0) {
-			ApplyWildcardElement(lstate, bind_data, node.key_edges[edge_index].child, view, value_cursor, children, row,
-			                     join_buffers, join_counts);
-			edge_index++;
-		}
-		if (edge_index >= node.key_edges.size() && node.index_edges.empty()) {
-			return;
-		}
-		SkipValueFast(view, value_cursor);
-	}
-	while (edge_index < node.key_edges.size()) {
-		AppendWildcardMissing(bind_data, node.key_edges[edge_index].child, children, row);
-		edge_index++;
-	}
-	for (auto &edge : node.index_edges) {
-		AppendWildcardMissing(bind_data, edge.child, children, row);
-	}
+	WalkTransformObject<WildcardEdgePolicy>(lstate, bind_data, node_index, view, cursor, children, row, join_buffers,
+	                                        join_counts);
 }
 
 void ApplyWildcardArrayNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
