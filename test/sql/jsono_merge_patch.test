@@ -174,13 +174,16 @@ NULL
 
 # Wide result (>16 keys) builds object cursor checkpoints, and the merge value
 # block copies scalar runs as bulk string slices that span the stride boundaries.
-# Merge a tiny patch (one strip, one add) into a 25-key base and read back, so the
-# checkpoint navigation a high-rank path lookup uses must agree with the bulk emit.
-query I
-SELECT to_json(jsono_merge_patch(
+# Merge a tiny patch (one strip, one add) into a 25-key base once, then read it
+# back three ways, so the checkpoint navigation a high-rank path lookup uses must
+# agree with the bulk emit.
+statement ok
+CREATE TABLE merge25 AS SELECT jsono_merge_patch(
   jsono('{"k00":"v00","k01":"v01","k02":"v02","k03":"v03","k04":"v04","k05":"v05","k06":"v06","k07":"v07","k08":"v08","k09":"v09","k10":"v10","k11":"v11","k12":"v12","k13":"v13","k14":"v14","k15":"v15","k16":"v16","k17":"v17","k18":"v18","k19":"v19","k20":"v20","k21":"v21","k22":"v22","k23":"v23","k24":"v24"}'),
-  jsono('{"k05":null,"knew":"new"}')
-));
+  jsono('{"k05":null,"knew":"new"}')) AS m;
+
+query I
+SELECT to_json(m) FROM merge25;
 ----
 {"k00":"v00","k01":"v01","k02":"v02","k03":"v03","k04":"v04","k06":"v06","k07":"v07","k08":"v08","k09":"v09","k10":"v10","k11":"v11","k12":"v12","k13":"v13","k14":"v14","k15":"v15","k16":"v16","k17":"v17","k18":"v18","k19":"v19","k20":"v20","k21":"v21","k22":"v22","k23":"v23","k24":"v24","knew":"new"}
 
@@ -191,17 +194,13 @@ SELECT
   jsono_type(m, '$.k20'),
   jsono_type(m, '$.knew'),
   jsono_type(m, '$.k05')
-FROM (SELECT jsono_merge_patch(
-  jsono('{"k00":"v00","k01":"v01","k02":"v02","k03":"v03","k04":"v04","k05":"v05","k06":"v06","k07":"v07","k08":"v08","k09":"v09","k10":"v10","k11":"v11","k12":"v12","k13":"v13","k14":"v14","k15":"v15","k16":"v16","k17":"v17","k18":"v18","k19":"v19","k20":"v20","k21":"v21","k22":"v22","k23":"v23","k24":"v24"}'),
-  jsono('{"k05":null,"knew":"new"}')) AS m);
+FROM merge25;
 ----
 VARCHAR	VARCHAR	NULL
 
 # The merged wide object exposes exactly its surviving keys (k05 stripped, knew
 # added), in sorted order.
 query I
-SELECT jsono_keys(jsono_merge_patch(
-  jsono('{"k00":"v00","k01":"v01","k02":"v02","k03":"v03","k04":"v04","k05":"v05","k06":"v06","k07":"v07","k08":"v08","k09":"v09","k10":"v10","k11":"v11","k12":"v12","k13":"v13","k14":"v14","k15":"v15","k16":"v16","k17":"v17","k18":"v18","k19":"v19","k20":"v20","k21":"v21","k22":"v22","k23":"v23","k24":"v24"}'),
-  jsono('{"k05":null,"knew":"new"}')));
+SELECT jsono_keys(m) FROM merge25;
 ----
 [k00, k01, k02, k03, k04, k06, k07, k08, k09, k10, k11, k12, k13, k14, k15, k16, k17, k18, k19, k20, k21, k22, k23, k24, knew]
