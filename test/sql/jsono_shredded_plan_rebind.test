@@ -1,4 +1,4 @@
-# name: test/sql/jsono_shredded_verification.test
+# name: test/sql/jsono_shredded_plan_rebind.test
 # description: Auto-shred jsono({...}) survives plan serialization re-bind (debug plan verification)
 # group: [sql]
 
