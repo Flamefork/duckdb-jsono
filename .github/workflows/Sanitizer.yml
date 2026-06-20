@@ -11,10 +11,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly deep fuzz pass: every push/PR runs a small example budget for fast
+  # feedback, so the thorough sweep lives on a schedule. Monday 04:00 UTC.
+  schedule:
+    - cron: "0 4 * * 1"
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # event_name is in the key so a routine push to main never cancels the
+  # in-flight weekly `schedule` deep run (both resolve to refs/heads/main).
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -64,11 +70,14 @@ jobs:
       - name: SQLLogic tests under sanitizers
         run: make test_debug
 
+      # Example budget is tiered: push/PR runs a fast ~100-example sweep (~7 min)
+      # for quick feedback; the weekly `schedule` run cranks it up for a deep
+      # fuzz pass. Cost is linear in the example count.
       - name: Property + fuzz harness under sanitizers
         env:
           JSONO_DUCKDB_BIN: build/debug/duckdb
           JSONO_EXTENSION: build/debug/extension/jsono/jsono.duckdb_extension
-          JSONO_PROPERTY_MAX_EXAMPLES: "1000"
+          JSONO_PROPERTY_MAX_EXAMPLES: ${{ github.event_name == 'schedule' && '2000' || '100' }}
         run: uv run --frozen test/property/jsono_property.py
 
       - name: Row-group pruning guard under sanitizers
