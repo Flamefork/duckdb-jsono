@@ -1,4 +1,5 @@
 #include "jsono.hpp"
+#include "jsono_copy.hpp"
 #include "jsono_dom.hpp"
 #include "jsono_number.hpp"
 #include "jsono_reader.hpp"
@@ -414,81 +415,6 @@ bool ConstructorValueRowIsNull(const JsonoStructVectorData &data, idx_t row) {
 	}
 }
 
-void EmitJsonoSubtree(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &builder) {
-	if (cursor.pos >= view.Slots()) {
-		builder.EmitNull();
-		return;
-	}
-	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
-	switch (slot_tag) {
-	case tag::OBJ_START: {
-		auto layout = ReadObjectLayout(view, cursor.pos);
-		auto key_start = layout.key_start;
-		auto key_count = layout.key_count;
-		cursor.pos = layout.value_start;
-		builder.EmitObjectStart(key_count);
-		for (size_t i = 0; i < key_count; i++) {
-			auto key_slot = view.SlotAt(key_start + i);
-			if (SlotTag(key_slot) != tag::KEY) {
-				throw InvalidInputException("malformed JSONO: object key slot expected");
-			}
-			builder.EmitKeySlot(view.KeyAt(SlotPayload(key_slot)));
-		}
-		for (size_t i = 0; i < key_count; i++) {
-			builder.EmitObjectChildStart();
-			EmitJsonoSubtree(view, cursor, builder);
-		}
-		builder.EmitObjectEnd();
-		if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
-			throw InvalidInputException("malformed JSONO: object value span mismatch");
-		}
-		cursor.pos++;
-		return;
-	}
-	case tag::ARR_START: {
-		auto end_pos = ReadArrayEndPos(view, cursor.pos);
-		builder.EmitArrayStart();
-		cursor.pos++;
-		while (cursor.pos < end_pos) {
-			EmitJsonoSubtree(view, cursor, builder);
-		}
-		cursor.pos = end_pos + 1;
-		builder.EmitArrayEnd();
-		return;
-	}
-	default: {
-		auto scalar = DecodeScalarAt(view, cursor);
-		switch (scalar.kind) {
-		case JsonoScalarKind::String:
-			builder.EmitString(scalar.text);
-			return;
-		case JsonoScalarKind::Int64:
-			builder.EmitInt(scalar.int_value);
-			return;
-		case JsonoScalarKind::UInt64:
-			builder.EmitUInt(scalar.uint_value);
-			return;
-		case JsonoScalarKind::Double:
-			builder.EmitDouble(scalar.double_value);
-			return;
-		case JsonoScalarKind::Dec60:
-			builder.EmitDec60(scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
-			return;
-		case JsonoScalarKind::NumberText:
-			builder.EmitNumberText(scalar.text);
-			return;
-		case JsonoScalarKind::Bool:
-			builder.EmitBool(scalar.bool_value);
-			return;
-		case JsonoScalarKind::Null:
-			builder.EmitNull();
-			return;
-		}
-		return;
-	}
-	}
-}
-
 void EmitConstructorValue(const JsonoStructVectorData &data, idx_t row, JsonoStructLocalState &lstate,
                           DomJsonoBuilder &builder);
 
@@ -880,7 +806,7 @@ void EmitConstructorValue(const JsonoStructVectorData &data, idx_t row, JsonoStr
 		}
 		lstate.embedded_jsono_verifier.Verify(view);
 		JsonoCursor cursor;
-		EmitJsonoSubtree(view, cursor, builder);
+		EmitValueVerbatim(view, cursor, builder, 0);
 		return;
 	}
 

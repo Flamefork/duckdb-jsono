@@ -1,0 +1,31 @@
+# name: test/sql/jsono_embedded_verbatim.test
+# description: Constructor verbatim copy of an embedded jsono field round-trips every scalar encoding and empty containers
+# group: [sql]
+
+require jsono
+
+require json
+
+# The constructor's embedded-jsono path (StructValueStrategy::Jsono) copies an
+# inner jsono value byte-for-byte via EmitValueVerbatim. Embed scalars that exercise
+# every raw encoding kind — DEC60 (small decimal), UINT64 in the 2^63..2^64-1 range
+# (ext INT64/UINT64 raw bits), and a bignum NumberText (length+heap) — plus empty
+# object and empty array, and assert the outer construction equals constructing the
+# same shape from raw JSON text.
+query I
+SELECT to_json(jsono({'z': 1, 'nested': jsono('{"dec":12345.12,"u":18446744073709551615,"big":123456789012345678901234567890123456789,"eo":{},"ea":[]}')}))
+     = to_json(jsono('{"z":1,"nested":{"dec":12345.12,"u":18446744073709551615,"big":123456789012345678901234567890123456789,"eo":{},"ea":[]}}'));
+----
+true
+
+# Direct render of the embedded value (sorted keys, scalars preserved verbatim).
+query I
+SELECT to_json(jsono({'z': 1, 'nested': jsono('{"dec":12345.12,"u":18446744073709551615,"big":123456789012345678901234567890123456789,"eo":{},"ea":[]}')}));
+----
+{"nested":{"big":123456789012345678901234567890123456789,"dec":12345.12,"ea":[],"eo":{},"u":18446744073709551615},"z":1}
+
+# Embedded value that is itself an empty object / empty array round-trips.
+query I
+SELECT to_json(jsono({'eo': jsono('{}'), 'ea': jsono('[]')}));
+----
+{"ea":[],"eo":{}}
