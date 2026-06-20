@@ -1247,35 +1247,10 @@ bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b) {
 namespace {
 
 uint8_t ShredManifestCompactTypeCode(const string &type) {
-	if (type == "VARCHAR") {
-		return jsono::SHRED_MANIFEST_TYPE_VARCHAR;
-	}
-	if (type == "BIGINT") {
-		return jsono::SHRED_MANIFEST_TYPE_BIGINT;
-	}
-	if (type == "UBIGINT") {
-		return jsono::SHRED_MANIFEST_TYPE_UBIGINT;
-	}
-	if (type == "DOUBLE") {
-		return jsono::SHRED_MANIFEST_TYPE_DOUBLE;
-	}
-	if (type == "BOOLEAN") {
-		return jsono::SHRED_MANIFEST_TYPE_BOOLEAN;
-	}
-	if (type == "VARCHAR[]") {
-		return jsono::SHRED_MANIFEST_TYPE_VARCHAR_LIST;
-	}
-	if (type == "BIGINT[]") {
-		return jsono::SHRED_MANIFEST_TYPE_BIGINT_LIST;
-	}
-	if (type == "UBIGINT[]") {
-		return jsono::SHRED_MANIFEST_TYPE_UBIGINT_LIST;
-	}
-	if (type == "DOUBLE[]") {
-		return jsono::SHRED_MANIFEST_TYPE_DOUBLE_LIST;
-	}
-	if (type == "BOOLEAN[]") {
-		return jsono::SHRED_MANIFEST_TYPE_BOOLEAN_LIST;
+	for (auto &entry : jsono::SHRED_MANIFEST_COMPACT_TYPES) {
+		if (entry.name == nonstd::string_view(type.data(), type.size())) {
+			return entry.code;
+		}
 	}
 	return jsono::SHRED_MANIFEST_TYPE_EXTENDED;
 }

@@ -476,31 +476,35 @@ constexpr uint8_t SHRED_MANIFEST_TYPE_UBIGINT_LIST = 8;
 constexpr uint8_t SHRED_MANIFEST_TYPE_DOUBLE_LIST = 9;
 constexpr uint8_t SHRED_MANIFEST_TYPE_BOOLEAN_LIST = 10;
 
+struct ShredManifestCompactType {
+	uint8_t code;
+	nonstd::string_view name;
+};
+
+// Codes are wire format (format-locked): they are written into the residual skips blob and must not
+// be renumbered. The EXTENDED sentinel (0) is not in this table — it is the out-of-band escape.
+static constexpr ShredManifestCompactType SHRED_MANIFEST_COMPACT_TYPES[] = {
+    {SHRED_MANIFEST_TYPE_VARCHAR, nonstd::string_view("VARCHAR", 7)},
+    {SHRED_MANIFEST_TYPE_BIGINT, nonstd::string_view("BIGINT", 6)},
+    {SHRED_MANIFEST_TYPE_UBIGINT, nonstd::string_view("UBIGINT", 7)},
+    {SHRED_MANIFEST_TYPE_DOUBLE, nonstd::string_view("DOUBLE", 6)},
+    {SHRED_MANIFEST_TYPE_BOOLEAN, nonstd::string_view("BOOLEAN", 7)},
+    {SHRED_MANIFEST_TYPE_VARCHAR_LIST, nonstd::string_view("VARCHAR[]", 9)},
+    {SHRED_MANIFEST_TYPE_BIGINT_LIST, nonstd::string_view("BIGINT[]", 8)},
+    {SHRED_MANIFEST_TYPE_UBIGINT_LIST, nonstd::string_view("UBIGINT[]", 9)},
+    {SHRED_MANIFEST_TYPE_DOUBLE_LIST, nonstd::string_view("DOUBLE[]", 8)},
+    {SHRED_MANIFEST_TYPE_BOOLEAN_LIST, nonstd::string_view("BOOLEAN[]", 9)},
+};
+static_assert(sizeof(SHRED_MANIFEST_COMPACT_TYPES) / sizeof(SHRED_MANIFEST_COMPACT_TYPES[0]) == 10,
+              "compact shred manifest type table must cover all 10 non-EXTENDED codes");
+
 inline nonstd::string_view ShredManifestCompactTypeName(uint8_t code) {
-	switch (code) {
-	case SHRED_MANIFEST_TYPE_VARCHAR:
-		return nonstd::string_view("VARCHAR", 7);
-	case SHRED_MANIFEST_TYPE_BIGINT:
-		return nonstd::string_view("BIGINT", 6);
-	case SHRED_MANIFEST_TYPE_UBIGINT:
-		return nonstd::string_view("UBIGINT", 7);
-	case SHRED_MANIFEST_TYPE_DOUBLE:
-		return nonstd::string_view("DOUBLE", 6);
-	case SHRED_MANIFEST_TYPE_BOOLEAN:
-		return nonstd::string_view("BOOLEAN", 7);
-	case SHRED_MANIFEST_TYPE_VARCHAR_LIST:
-		return nonstd::string_view("VARCHAR[]", 9);
-	case SHRED_MANIFEST_TYPE_BIGINT_LIST:
-		return nonstd::string_view("BIGINT[]", 8);
-	case SHRED_MANIFEST_TYPE_UBIGINT_LIST:
-		return nonstd::string_view("UBIGINT[]", 9);
-	case SHRED_MANIFEST_TYPE_DOUBLE_LIST:
-		return nonstd::string_view("DOUBLE[]", 8);
-	case SHRED_MANIFEST_TYPE_BOOLEAN_LIST:
-		return nonstd::string_view("BOOLEAN[]", 9);
-	default:
-		throw InvalidInputException("malformed JSONO: unknown compact shred manifest type code");
+	for (auto &entry : SHRED_MANIFEST_COMPACT_TYPES) {
+		if (entry.code == code) {
+			return entry.name;
+		}
 	}
+	throw InvalidInputException("malformed JSONO: unknown compact shred manifest type code");
 }
 
 inline uint64_t HashShredManifestSignatures(const std::vector<std::pair<std::string, std::string>> &signatures) {
