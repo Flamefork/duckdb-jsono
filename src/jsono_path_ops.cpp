@@ -110,16 +110,10 @@ unique_ptr<FunctionData> JsonoArgOnlyBind(ClientContext &context, ScalarFunction
 	return nullptr;
 }
 
-unique_ptr<FunctionData> JsonoTypePathBind(ClientContext &context, ScalarFunction &bound_function,
+unique_ptr<FunctionData> JsonoPathOnlyBind(ClientContext &context, ScalarFunction &bound_function,
                                            vector<unique_ptr<Expression>> &arguments) {
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_type", true);
-	return JsonoPathBind(context, arguments, "jsono_type");
-}
-
-unique_ptr<FunctionData> JsonoKeysPathBind(ClientContext &context, ScalarFunction &bound_function,
-                                           vector<unique_ptr<Expression>> &arguments) {
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_keys", true);
-	return JsonoPathBind(context, arguments, "jsono_keys");
+	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, true);
+	return JsonoPathBind(context, arguments, bound_function.name.c_str());
 }
 
 const vector<PathStep> *PathStepsFromState(ExpressionState &state, idx_t column_count) {
@@ -248,7 +242,7 @@ void RegisterJsonoPathOps(ExtensionLoader &loader) {
 		set.AddFunction(
 		    MakePathOpFunction({LogicalType::ANY}, LogicalType::VARCHAR, JsonoTypeExecute, JsonoArgOnlyBind));
 		set.AddFunction(MakePathOpFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-		                                   JsonoTypeExecute, JsonoTypePathBind));
+		                                   JsonoTypeExecute, JsonoPathOnlyBind));
 		loader.RegisterFunction(set);
 	}
 	{
@@ -257,7 +251,7 @@ void RegisterJsonoPathOps(ExtensionLoader &loader) {
 		                                   JsonoKeysExecute, JsonoArgOnlyBind));
 		set.AddFunction(MakePathOpFunction({LogicalType::ANY, LogicalType::VARCHAR},
 		                                   LogicalType::LIST(LogicalType::VARCHAR), JsonoKeysExecute,
-		                                   JsonoKeysPathBind));
+		                                   JsonoPathOnlyBind));
 		loader.RegisterFunction(set);
 	}
 }

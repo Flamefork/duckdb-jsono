@@ -57,6 +57,18 @@ SELECT jsono_extract_string(j, 'name'), to_json(jsono_extract(j, '$.b')), jsono_
 ----
 requires the extension optimizer
 
+# The 2-arg path overloads of jsono_type/jsono_keys share one bind; the error must still name the
+# specific function, confirming the shared bind reads bound_function.name rather than a hardcoded literal.
+statement error
+SELECT jsono_type(j, '$.a') FROM t;
+----
+jsono_type on shredded JSONO requires the extension optimizer
+
+statement error
+SELECT jsono_keys(j, '$.b') FROM t;
+----
+jsono_keys on shredded JSONO requires the extension optimizer
+
 statement ok
 RESET disabled_optimizers;
 
