@@ -1,0 +1,52 @@
+# name: test/sql/jsono_overlay.test
+# description: jsono_overlay base-authoritative fill over plain inputs
+# group: [sql]
+
+require jsono
+
+# Shred-aware merge reconstructs through to_json, which rides core json's to_json(ANY).
+require json
+
+# jsono_overlay: base (residual) is authoritative; the patch (shreds) fills only what the
+# base lacks, recursively into nested objects. Powers shredded reconstruction.
+
+# Top-level fill: a key the base lacks comes from the patch.
+query I
+SELECT to_json(jsono_overlay(jsono('{"did":"d1"}'), jsono('{"kind":"commit"}')));
+----
+{"did":"d1","kind":"commit"}
+
+# Scalar conflict: the base wins, the patch copy is ignored.
+query I
+SELECT to_json(jsono_overlay(jsono('{"kind":"base"}'), jsono('{"kind":"patch"}')));
+----
+{"kind":"base"}
+
+# Deep recurse: both have the object key, but the base dropped a nested leaf — the patch
+# refills it while the base keeps the leaves it has.
+query I
+SELECT to_json(jsono_overlay(
+  jsono('{"commit":{"operation":"create"}}'),
+  jsono('{"commit":{"cid":"X","rev":"r1"}}')));
+----
+{"commit":{"cid":"X","operation":"create","rev":"r1"}}
+
+# Nested conflict: the base wins each leaf even several levels down.
+query I
+SELECT to_json(jsono_overlay(
+  jsono('{"a":{"b":{"c":"base"}}}'),
+  jsono('{"a":{"b":{"c":"patch","d":"fill"}}}')));
+----
+{"a":{"b":{"c":"base","d":"fill"}}}
+
+# An all-null patch subtree contributes nothing: no spurious empty object is introduced.
+query I
+SELECT to_json(jsono_overlay(jsono('{"did":"d2"}'), jsono('{"commit":{"cid":null,"rev":null}}')));
+----
+{"did":"d2"}
+
+# The base's own explicit null is real data and is kept (base authoritative).
+query I
+SELECT to_json(jsono_overlay(jsono('{"a":null}'), jsono('{"a":"x","b":"y"}')));
+----
+{"a":null,"b":"y"}

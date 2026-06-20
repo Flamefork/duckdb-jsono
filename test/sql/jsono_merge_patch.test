@@ -1,0 +1,207 @@
+# name: test/sql/jsono_merge_patch.test
+# description: jsono_merge_patch RFC 7396 plain cursor fast-path, multi-arg fold, and NULL behavior
+# group: [sql]
+
+require jsono
+
+# Shred-aware merge reconstructs through to_json, which rides core json's to_json(ANY).
+require json
+
+# The 2-argument object/object jsono_merge_patch takes a cursor fast-path that
+# walks the sorted-key views straight into the builder (no OwnedValue DOM). These
+# cases lock the behaviors that path must match ApplyMergePatch (RFC 7396,
+# DeleteNulls) on; the >2-arg and non-object cases exercise the DOM fallback.
+
+# Array values are replaced wholesale (not deep-merged) and copied verbatim, so
+# null array elements are preserved. The target-only key "b" survives untouched.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"b":1}'), jsono('{"a":[3,null,4]}')));
+----
+{"a":[3,null,4],"b":1}
+
+# Everything inside an array is verbatim: an object nested in an array keeps its
+# null member.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{}'), jsono('{"items":[{"x":1,"y":null}]}')));
+----
+{"items":[{"x":1,"y":null}]}
+
+# Target nulls are values, not deletions (RFC 7396): the base's nested y:null and
+# top-level b:null survive because the patch does not mention them.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":{"x":1,"y":null},"b":null}'), jsono('{"c":2}')));
+----
+{"a":{"x":1,"y":null},"b":null,"c":2}
+
+# A patch null deletes the key it names, but a patch object value is merged onto an
+# absent/empty target and so drops its own null members.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{}'), jsono('{"obj":{"p":1,"q":null}}')));
+----
+{"obj":{"p":1}}
+
+# A non-object patch replaces the target wholesale (DOM fallback).
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":1}'), jsono('5')));
+----
+5
+
+# A non-object base is replaced by a fresh object before the patch applies.
+query I
+SELECT to_json(jsono_merge_patch(jsono('5'), jsono('{"a":1}')));
+----
+{"a":1}
+
+# The cursor fast-path (2 args) and the DOM fold (>2 args, here with an empty
+# trailing patch) must agree on a value mixing nested objects, arrays with nulls,
+# a deleted key, and a preserved scalar.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":{"b":[1,null,2]},"c":null,"d":"x"}'),
+  jsono('{"a":{"e":3},"c":5}')
+));
+----
+{"a":{"b":[1,null,2],"e":3},"c":5,"d":"x"}
+
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":{"b":[1,null,2]},"c":null,"d":"x"}'),
+  jsono('{"a":{"e":3},"c":5}'),
+  jsono('{}')
+));
+----
+{"a":{"b":[1,null,2],"e":3},"c":5,"d":"x"}
+
+# RFC 7396 Appendix A: an explicit null in the target survives a patch that does
+# not name its key. The cursor fast-path (2 args) and the DOM fold (3 args, empty
+# trailing patch) must agree.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"e":null}'), jsono('{"a":1}')));
+----
+{"a":1,"e":null}
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"e":null}'), jsono('{"a":1}'), jsono('{}')));
+----
+{"a":1,"e":null}
+
+# Nested target null preserved when the patch touches a sibling key; the deeply
+# nested f.g.h:null survives a verbatim target-only copy. A patch scalar replaces
+# a target null (g), and a patch null deletes a key even when the target value is
+# itself null (k).
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":{"x":null,"y":1},"f":{"g":{"h":null,"i":2}},"g":null,"k":null}'),
+  jsono('{"a":{"y":3},"g":2,"k":null}')
+));
+----
+{"a":{"x":null,"y":3},"f":{"g":{"h":null,"i":2}},"g":2}
+
+# A one-key scalar patch inserts the patch key in sorted order while the target's
+# own nulls (top-level b, nested d.x) are preserved verbatim (RFC 7396).
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":1,"b":null,"d":{"x":null},"f":6}'),
+  jsono('{"c":"patch"}')
+));
+----
+{"a":1,"b":null,"c":"patch","d":{"x":null},"f":6}
+
+# The same one-key scalar path replaces an existing base value instead of
+# duplicating the key.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":1,"c":{"x":1},"d":2}'),
+  jsono('{"c":"patch"}')
+));
+----
+{"a":1,"c":"patch","d":2}
+
+# jsono_merge_patch folds N arguments through the cursor engine (no DOM): the first
+# is the verbatim target, the rest are patches. A lone target is identity and keeps
+# its nulls.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"keep":null,"a":1}')));
+----
+{"a":1,"keep":null}
+
+# A non-object patch replaces the accumulator wholesale; an object patch merged onto
+# a non-object/array accumulator starts from an empty object (its own nulls stripped).
+query I
+SELECT to_json(jsono_merge_patch(jsono('[1,2]'), jsono('{"a":1}')));
+----
+{"a":1}
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":1}'), jsono('[3,4]')));
+----
+[3,4]
+
+# A JSON null patch is a value (not a SQL NULL): it replaces the accumulator with null.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":1}'), jsono('null')));
+----
+null
+
+# A four-argument chain mixing non-object and object values folds left to right.
+query I
+SELECT to_json(jsono_merge_patch(jsono('5'), jsono('{"a":1}'), jsono('[1,2]'), jsono('{"b":2}')));
+----
+{"b":2}
+
+# SQL NULL (a missing row, distinct from a JSON null) propagates: a SQL NULL patch
+# argument makes the whole result SQL NULL, while a SQL NULL target is an empty
+# document an object patch merges onto. A mid-chain SQL NULL resets the accumulator.
+query I
+SELECT to_json(jsono_merge_patch(NULL, jsono('{"a":1}')));
+----
+{"a":1}
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":1}'), NULL));
+----
+NULL
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":1}'), NULL, jsono('{"c":3}')));
+----
+{"c":3}
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":1}'), jsono('{"b":2}'), NULL));
+----
+NULL
+
+# Wide result (>16 keys) builds object cursor checkpoints, and the merge value
+# block copies scalar runs as bulk string slices that span the stride boundaries.
+# Merge a tiny patch (one strip, one add) into a 25-key base and read back, so the
+# checkpoint navigation a high-rank path lookup uses must agree with the bulk emit.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"k00":"v00","k01":"v01","k02":"v02","k03":"v03","k04":"v04","k05":"v05","k06":"v06","k07":"v07","k08":"v08","k09":"v09","k10":"v10","k11":"v11","k12":"v12","k13":"v13","k14":"v14","k15":"v15","k16":"v16","k17":"v17","k18":"v18","k19":"v19","k20":"v20","k21":"v21","k22":"v22","k23":"v23","k24":"v24"}'),
+  jsono('{"k05":null,"knew":"new"}')
+));
+----
+{"k00":"v00","k01":"v01","k02":"v02","k03":"v03","k04":"v04","k06":"v06","k07":"v07","k08":"v08","k09":"v09","k10":"v10","k11":"v11","k12":"v12","k13":"v13","k14":"v14","k15":"v15","k16":"v16","k17":"v17","k18":"v18","k19":"v19","k20":"v20","k21":"v21","k22":"v22","k23":"v23","k24":"v24","knew":"new"}
+
+# Path navigation into the wide merged object uses the cursor checkpoints: a
+# high-rank key past the stride boundary resolves, the stripped null is absent.
+query III
+SELECT
+  jsono_type(m, '$.k20'),
+  jsono_type(m, '$.knew'),
+  jsono_type(m, '$.k05')
+FROM (SELECT jsono_merge_patch(
+  jsono('{"k00":"v00","k01":"v01","k02":"v02","k03":"v03","k04":"v04","k05":"v05","k06":"v06","k07":"v07","k08":"v08","k09":"v09","k10":"v10","k11":"v11","k12":"v12","k13":"v13","k14":"v14","k15":"v15","k16":"v16","k17":"v17","k18":"v18","k19":"v19","k20":"v20","k21":"v21","k22":"v22","k23":"v23","k24":"v24"}'),
+  jsono('{"k05":null,"knew":"new"}')) AS m);
+----
+VARCHAR	VARCHAR	NULL
+
+# The merged wide object exposes exactly its surviving keys (k05 stripped, knew
+# added), in sorted order.
+query I
+SELECT jsono_keys(jsono_merge_patch(
+  jsono('{"k00":"v00","k01":"v01","k02":"v02","k03":"v03","k04":"v04","k05":"v05","k06":"v06","k07":"v07","k08":"v08","k09":"v09","k10":"v10","k11":"v11","k12":"v12","k13":"v13","k14":"v14","k15":"v15","k16":"v16","k17":"v17","k18":"v18","k19":"v19","k20":"v20","k21":"v21","k22":"v22","k23":"v23","k24":"v24"}'),
+  jsono('{"k05":null,"knew":"new"}')));
+----
+[k00, k01, k02, k03, k04, k06, k07, k08, k09, k10, k11, k12, k13, k14, k15, k16, k17, k18, k19, k20, k21, k22, k23, k24, knew]

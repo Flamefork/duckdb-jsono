@@ -1,0 +1,368 @@
+# name: test/sql/jsono_merge_shredded.test
+# description: jsono_merge_patch/jsono_overlay shred/residual conflict correctness and the all-shredded fast-path arc
+# group: [sql]
+
+require jsono
+
+# Shred-aware merge reconstructs through to_json, which rides core json's to_json(ANY).
+require json
+
+# Shred-aware merge: a shredded patch (event_name shred) merged onto a plain target keeps
+# the shred (does not flatten), so the result is shredded and the shred reads from its column.
+query I
+SELECT typeof(jsono_merge_patch(
+  jsono('{"a":1}'),
+  jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'})
+)) = typeof(jsono('{}', shredding := {'event_name':'VARCHAR'}));
+----
+true
+
+# the merged value reconstructs the full document and the shred carries the value
+query II
+SELECT to_json(m), m ->> 'event_name' FROM (
+  SELECT jsono_merge_patch(
+    jsono('{"a":1}'),
+    jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'})
+  ) AS m
+);
+----
+{"a":1,"event_name":"page_view"}	page_view
+
+# --- Shred/residual conflict correctness (default-shred makes jsono({...}) patches shredded) ---
+
+# merge_patch: a shredded patch key that overlaps a base residual key must WIN (RFC 7386).
+# Regression: the base used to shadow the shred via the residual-authoritative reconstruct.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"event_name":"search","x":1}'), jsono({'event_name': 'page_view'})));
+----
+{"event_name":"page_view","x":1}
+
+# Bidirectional: a plain patch overriding a shredded base shred — the patch still wins.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'event_name': 'a'}), jsono('{"event_name":"b"}')));
+----
+{"event_name":"b"}
+
+# Disjoint keys: the shredded patch adds a new key, base keys preserved.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"x":1,"y":2}'), jsono({'event_name': 'click'})));
+----
+{"event_name":"click","x":1,"y":2}
+
+# A typed (BIGINT) shred patch overwrites a base numeric key.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"n":1,"x":2}'), jsono({'n': 99::BIGINT})));
+----
+{"n":99,"x":2}
+
+# overlay is base-authoritative: the shredded patch must NOT override an existing base key.
+query I
+SELECT to_json(jsono_overlay(jsono('{"event_name":"search"}'), jsono({'event_name': 'page_view'})));
+----
+{"event_name":"search"}
+
+# overlay fills a key absent from the base from the shredded patch's shred.
+query I
+SELECT to_json(jsono_overlay(jsono('{"x":1}'), jsono({'event_name': 'page_view'})));
+----
+{"event_name":"page_view","x":1}
+
+# Multi-arg merge_patch: later shredded patch wins over earlier patches and the base.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"event_name":"a","x":1}'),
+                                 jsono({'event_name': 'b'}),
+                                 jsono({'event_name': 'c'})));
+----
+{"event_name":"c","x":1}
+
+# The merged value still round-trips its shred via the typed accessor (result stays shredded).
+query II
+SELECT typeof(m) = typeof(jsono('{}', shredding := {'event_name':'VARCHAR'})), m ->> 'event_name' FROM (
+  SELECT jsono_merge_patch(jsono('{"event_name":"search","x":1}'), jsono({'event_name': 'page_view'})) AS m
+);
+----
+true	page_view
+
+# A NULL base with a shredded patch reconstructs to just the patch.
+query I
+SELECT to_json(jsono_merge_patch(jsono(NULL), jsono({'event_name': 'x'})));
+----
+{"event_name":"x"}
+
+# Reconstructing a shredded value whose residual is a non-object scalar must emit it verbatim
+# (shreds are object-key paths, necessarily absent here) rather than overlaying onto a non-object.
+query I
+SELECT to_json(jsono('5', shredding := {'k':'VARCHAR'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+----
+5
+
+query I
+SELECT to_json(jsono_merge_patch(jsono('5', shredding := {'k':'VARCHAR'}), jsono('{"a":1}')));
+----
+{"a":1}
+
+# --- Fast shred-merge path: all-shredded inputs, top-level shreds (no reconstruct/reshred) ---
+
+# Disjoint shredded base + shredded patch: both stay shreds, result is shredded.
+query II
+SELECT to_json(m), typeof(m) = jsono_storage_type('a VARCHAR, b VARCHAR, c VARCHAR') FROM (
+  SELECT jsono_merge_patch(jsono({'a': '1', 'b': '2'}), jsono({'c': '3'})) AS m
+);
+----
+{"a":"1","b":"2","c":"3"}	true
+
+# Same shred key in both shredded inputs: patch wins (RFC 7396), handled on the fast path
+# because the key lives in the shreds, never the residual.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'a': 'old', 'b': 'keep'}), jsono({'a': 'new'})));
+----
+{"a":"new","b":"keep"}
+
+# JSONPath shred names must stay JSONPath names when merge_patch falls back to reconstruct+reshred;
+# otherwise the reshred populates a literal "$.a" key shred and transparent reads of $.a return NULL.
+query III
+SELECT (jsono_storage_size(m)).shreds, m ->> '$.a', to_json(m)
+FROM (
+  SELECT jsono_merge_patch(
+    jsono('{"a":"old","b":1}', shredding := {'$.a':'VARCHAR'}),
+    jsono('{"a":"new"}', shredding := {'$.a':'VARCHAR'})
+  ) AS m
+);
+----
+3	new	{"a":"new","b":1}
+
+# overlay over all-shredded inputs is base-authoritative even on the fast path.
+query I
+SELECT to_json(jsono_overlay(jsono({'a': 'base', 'b': 'keep'}), jsono({'a': 'patch', 'c': 'add'})));
+----
+{"a":"base","b":"keep","c":"add"}
+
+# Typed shreds through the fast path.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'n': 1::BIGINT, 'f': true}), jsono({'n': 9::BIGINT})));
+----
+{"f":true,"n":9}
+
+# Multi-arg fast path: last shredded patch wins.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'k': 'a'}), jsono({'k': 'b'}), jsono({'k': 'c'})));
+----
+{"k":"c"}
+
+# Nested residual content (non-shred) is preserved through the fast path alongside the shreds.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'name': 'x', 'meta': {'src': 'web'}}), jsono({'name': 'y'})));
+----
+{"meta":{"src":"web"},"name":"y"}
+
+# --- Fast path with PLAIN inputs (a plain jsono argument no longer forces the reshred
+# fallback). The lane copy-through must match the fallback exactly; the gate diverts to the
+# fallback whenever a plain input could make it wrong. ---
+
+# Disjoint plain patch (an object-valued key, kept plain): the base lanes copy through, the
+# plain key folds into the residual.
+query II
+SELECT to_json(m), typeof(m) = jsono_storage_type('event_name VARCHAR, goals VARCHAR, url VARCHAR')
+FROM (
+  SELECT jsono_merge_patch(
+    jsono({'event_name': 'pv', 'url': 'u'}),
+    jsono('{"params":{"a":1,"b":2}}'),
+    jsono({'goals': 'g'})
+  ) AS m
+);
+----
+{"event_name":"pv","goals":"g","params":{"a":1,"b":2},"url":"u"}	true
+
+# The merged document still reads its lanes back through the typed accessor.
+query III
+SELECT m ->> 'event_name', m ->> 'goals', m ->> 'url'
+FROM (
+  SELECT jsono_merge_patch(
+    jsono({'event_name': 'pv', 'url': 'u'}),
+    jsono('{"params":{"a":1,"b":2}}'),
+    jsono({'goals': 'g'})
+  ) AS m
+);
+----
+pv	g	u
+
+# Plain patch naming a lane with a NON-NULL value: the value lands in the folded residual,
+# the gate sees the collision and falls back so the patch wins (RFC 7396 last-wins).
+query I
+SELECT to_json(jsono_merge_patch(jsono({'event_name': 'x', 'goals': 'y'}), jsono('{"event_name":"z"}')));
+----
+{"event_name":"z","goals":"y"}
+
+# Plain patch naming a lane with an RFC 7396 NULL deletes the lane. This is the trap the lane
+# copy-through cannot express (the null leaves no trace in the folded residual), so the gate
+# must divert to the fallback — without that guard the deleted lane would be wrongly kept.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'event_name': 'x', 'goals': 'y'}), jsono('{"event_name":null}')));
+----
+{"goals":"y"}
+
+# Non-object plain patch replaces the whole document (RFC 7396): the merged value has no lanes,
+# so the gate diverts to the fallback rather than attaching the base lanes to a scalar.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'event_name': 'x', 'goals': 'y'}), jsono('5')));
+----
+5
+
+# Plain patch first, shredded base second (plain target replaced by the shredded object patch).
+query I
+SELECT to_json(jsono_merge_patch(jsono('7'), jsono({'event_name': 'x'})));
+----
+{"event_name":"x"}
+
+# Vector-scale: every row is a disjoint plain patch onto a shredded base — the whole vector
+# rides the fast path and each row reconstructs correctly.
+query II
+SELECT g, to_json(m)
+FROM (
+  SELECT g, jsono_merge_patch(j, jsono('{"params":{"n":' || g || '}}')) AS m
+  FROM (
+    SELECT i AS g, jsono('{"event_name":"e' || i || '","seq":"' || i || '"}',
+                         shredding := {'event_name':'VARCHAR','seq':'VARCHAR'}) AS j
+    FROM range(2050) t(i)
+  )
+) WHERE g IN (0, 1024, 2049)
+ORDER BY g;
+----
+0	{"event_name":"e0","params":{"n":0},"seq":"0"}
+1024	{"event_name":"e1024","params":{"n":1024},"seq":"1024"}
+2049	{"event_name":"e2049","params":{"n":2049},"seq":"2049"}
+
+# Vector-scale with a poisoned row: one row's plain patch deletes a lane, forcing the whole
+# vector to the fallback — the other rows must still be correct.
+query II
+SELECT g, to_json(m)
+FROM (
+  SELECT g, jsono_merge_patch(j, patch) AS m
+  FROM (
+    SELECT i AS g,
+           jsono('{"event_name":"e' || i || '","seq":"' || i || '"}',
+                 shredding := {'event_name':'VARCHAR','seq':'VARCHAR'}) AS j,
+           CASE WHEN i = 5 THEN jsono('{"event_name":null}') ELSE jsono('{"kept":1}') END AS patch
+    FROM range(2050) t(i)
+  )
+) WHERE g IN (5, 1024)
+ORDER BY g;
+----
+5	{"seq":"5"}
+1024	{"event_name":"e1024","kept":1,"seq":"1024"}
+
+# --- Fast path with NESTED object-key shreds (jsono({'params':{...}}) auto-shreds nested scalars
+# into $.params.* lanes). A nested lane copies through like a top-level one, overlaid at its path
+# on read; the gate diverts to the fallback on any collision/non-object along the path. ---
+
+# Production shape: shredded base + auto-shredded nested patch + small shredded patch, all disjoint.
+# The nested $.params.* lanes copy through; the result stays shredded over the union shred set.
+query II
+SELECT to_json(m), typeof(m) = jsono_storage_type(
+  'event_name VARCHAR, goals VARCHAR, url VARCHAR, "$.params.a" VARCHAR, "$.params.b" VARCHAR'
+)
+FROM (
+  SELECT jsono_merge_patch(
+    jsono({'event_name': 'pv', 'url': 'u'}),
+    jsono({'params': {'a': '1', 'b': '2'}}),
+    jsono({'goals': 'g'})
+  ) AS m
+);
+----
+{"event_name":"pv","goals":"g","params":{"a":"1","b":"2"},"url":"u"}	true
+
+# The nested lanes read back through the path accessor.
+query III
+SELECT m ->> '$.params.a', m ->> '$.params.b', m ->> 'goals'
+FROM (
+  SELECT jsono_merge_patch(
+    jsono({'event_name': 'pv', 'url': 'u'}),
+    jsono({'params': {'a': '1', 'b': '2'}}),
+    jsono({'goals': 'g'})
+  ) AS m
+);
+----
+1	2	g
+
+# Nested collision: a plain patch overwriting a nested lane lands the value in the folded residual,
+# the path-aware probe sees it and falls back so the patch wins.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'params': {'a': 'base'}}), jsono('{"params":{"a":"patch"}}')));
+----
+{"params":{"a":"patch"}}
+
+# Nested null-delete: a plain patch nulling a nested lane deletes it. The null leaves no trace in the
+# folded residual, so the plain-input path descent must catch it and fall back.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'params': {'a': 'x', 'b': 'y'}}), jsono('{"params":{"a":null}}')));
+----
+{"params":{"b":"y"}}
+
+# Nested parent replaced by a scalar: the lane cannot overlay into a non-object, so the path descent
+# (a non-object node before the leaf) forces the fallback; RFC 7396 replaces params wholesale.
+query I
+SELECT to_json(jsono_merge_patch(jsono({'params': {'a': 'x'}}), jsono('{"params":5}')));
+----
+{"params":5}
+
+# Disjoint nested addition: a plain patch adding a sibling key under the same parent keeps the base's
+# nested lane (the patch key folds into the residual skeleton, the lane overlays beside it).
+query I
+SELECT to_json(jsono_merge_patch(jsono({'params': {'a': 'keep'}}), jsono('{"params":{"c":"add"}}')));
+----
+{"params":{"a":"keep","c":"add"}}
+
+# Vector-scale nested fast path: every row's nested lane copies through across chunk boundaries.
+query II
+SELECT g, to_json(m)
+FROM (
+  SELECT g, jsono_merge_patch(j, jsono('{"tag":"t' || g || '"}')) AS m
+  FROM (
+    SELECT i AS g, jsono({'params': {'a': 'v' || i}}) AS j
+    FROM range(2050) t(i)
+  )
+) WHERE g IN (0, 1024, 2049)
+ORDER BY g;
+----
+0	{"params":{"a":"v0"},"tag":"t0"}
+1024	{"params":{"a":"v1024"},"tag":"t1024"}
+2049	{"params":{"a":"v2049"},"tag":"t2049"}
+
+# Scalar↔object cross-patch: a field changes from a scalar to a nested object across patches, so the
+# merged shred set carries both `a` (top-level scalar lane) and `$.a.a` (nested lane) — a sparse
+# multi-shape layout. The fast path bails such overlapping lanes to the reshred fallback, which writes
+# both lanes correctly; the to_json overlay reconstructs them (independent-overlay fallback). The
+# shredded fold must equal the plain RFC 7396 reference. See test/sql/jsono_shredded_overlap.test.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"a":null}'), jsono('{"a":{"a":false}}'), jsono('{"a":false}')));
+----
+{"a":false}
+
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":null}', shredding := {'a':'VARCHAR'}),
+  jsono({'a': {'a': false}}),
+  jsono({'a': false})
+));
+----
+{"a":false}
+
+# The merge keeps the value shredded over both overlapping lanes (it is not reduced to plain).
+query I
+SELECT typeof(jsono_merge_patch(
+  jsono('{"a":null}', shredding := {'a':'VARCHAR'}),
+  jsono({'a': {'a': false}}),
+  jsono({'a': false})
+)) = jsono_storage_type('a BOOLEAN, "$.a.a" BOOLEAN');
+----
+true
+
+# Reverse direction (the field ends as the nested object): same overlapping merged set, shredded
+# equals plain.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":false}', shredding := {'a':'BOOLEAN'}),
+  jsono({'a': {'a': true}})
+)) = to_json(jsono_merge_patch(jsono('{"a":false}'), jsono('{"a":{"a":true}}')));
+----
+true

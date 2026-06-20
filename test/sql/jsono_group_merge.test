@@ -1,0 +1,158 @@
+# name: test/sql/jsono_group_merge.test
+# description: jsono_group_merge fold over plain and shredded inputs (sticky shreds)
+# group: [sql]
+
+require jsono
+
+# Shred-aware merge reconstructs through to_json, which rides core json's to_json(ANY).
+require json
+
+# Group merge folds each row's view straight into the accumulator, ignoring nulls:
+# keeps the latest non-null; array values are replaced verbatim, not merged.
+query I
+SELECT to_json(jsono_group_merge(j ORDER BY ts))
+FROM (VALUES
+  (jsono('{"a":[1,2],"b":1}'), 1),
+  (jsono('{"a":null,"c":3}'), 2)
+) AS t(j, ts);
+----
+{"a":[1,2],"b":1,"c":3}
+
+# --- jsono_group_merge over shredded inputs: accepts shredded, returns shredded (sticky shreds) ---
+
+# Shredded inputs fold the same as plain (latest non-null wins, nulls ignored), and the
+# result stays shredded with the same shred set so the shred reads back from its column.
+query III
+SELECT to_json(m), m ->> 'event_name', typeof(m) = jsono_storage_type('event_name VARCHAR')
+FROM (
+  SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
+    (jsono('{"event_name":"search","x":1}', shredding := {'event_name':'VARCHAR'}), 1),
+    (jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}), 2)
+  ) t(j, ts)
+);
+----
+{"event_name":"page_view","x":1}	page_view	true
+
+# Same sticky-shred contract for public JSONPath shred names, not only bare top-level names.
+query III
+SELECT to_json(m), m ->> '$.event_name', (jsono_storage_size(m)).shreds
+FROM (
+  SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
+    (jsono('{"event_name":"search","x":1}', shredding := {'$.event_name':'VARCHAR'}), 1),
+    (jsono('{"event_name":"page_view"}', shredding := {'$.event_name':'VARCHAR'}), 2)
+  ) t(j, ts)
+);
+----
+{"event_name":"page_view","x":1}	page_view	9
+
+# GROUP BY: each group folds independently and reshreds to its own shred value.
+query III
+SELECT g, to_json(m), m ->> 'k'
+FROM (
+  SELECT g, jsono_group_merge(j ORDER BY ts) AS m
+  FROM (VALUES
+    ('a', jsono('{"k":"a1"}', shredding := {'k':'VARCHAR'}), 1),
+    ('a', jsono('{"k":"a2","p":1}', shredding := {'k':'VARCHAR'}), 2),
+    ('b', jsono('{"k":"b1"}', shredding := {'k':'VARCHAR'}), 1)
+  ) t(g, j, ts)
+  GROUP BY g
+) s
+ORDER BY g;
+----
+a	{"k":"a2","p":1}	a2
+b	{"k":"b1"}	b1
+
+# Many groups (> vector size) exercise Finalize across multiple result chunks at nonzero
+# offsets; every single-row group must reshred its shred correctly.
+query I
+SELECT count(*) FROM (
+  SELECT g, jsono_group_merge(j) AS m
+  FROM (
+    SELECT i AS g, jsono('{"k":"v' || i || '"}', shredding := {'k':'VARCHAR'}) AS j
+    FROM range(5000) t(i)
+  ) GROUP BY g
+) WHERE (m ->> 'k') = 'v' || g;
+----
+5000
+
+# Window finalize: a full-frame merge over an ordered partition reshreds per output row.
+query I
+SELECT DISTINCT m ->> 'k' FROM (
+  SELECT jsono_group_merge(j) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS m
+  FROM (VALUES
+    (jsono('{"k":"a"}', shredding := {'k':'VARCHAR'}), 1),
+    (jsono('{"k":"b"}', shredding := {'k':'VARCHAR'}), 2)
+  ) t(j, ts)
+);
+----
+b
+
+# A group whose only value is NULL reshreds to an empty object with a NULL shred.
+query III
+SELECT to_json(m), m ->> 'k', typeof(m) = jsono_storage_type('k VARCHAR')
+FROM (
+  SELECT jsono_group_merge(j) AS m FROM (
+    SELECT CASE WHEN i > 0 THEN jsono('{"k":"x"}', shredding := {'k':'VARCHAR'}) END AS j
+    FROM range(1) t(i)
+  )
+);
+----
+{}	NULL	true
+
+# A non-object value replaces the accumulator wholesale; reshredding a scalar yields a
+# scalar residual with a NULL shred (still the shredded type).
+query III
+SELECT to_json(m), m ->> 'k', typeof(m) = jsono_storage_type('k VARCHAR')
+FROM (
+  SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
+    (jsono('{"k":"x"}', shredding := {'k':'VARCHAR'}), 1),
+    (jsono('5', shredding := {'k':'VARCHAR'}), 2)
+  ) t(j, ts)
+);
+----
+5	NULL	true
+
+# A nested-path shred ($.a.b) is reshredded with the same path grammar as public shredding.
+query III
+SELECT to_json(m), m ->> '$.a.b', (jsono_storage_size(m)).shreds
+FROM (
+  SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
+    (jsono('{"a":{"b":1}}', shredding := {'$.a.b':'BIGINT'}), 1),
+    (jsono('{"a":{"b":2}}', shredding := {'$.a.b':'BIGINT'}), 2)
+  ) t(j, ts)
+);
+----
+{"a":{"b":2}}	2	8
+
+# Shredded group_merge requires the extension optimizer; otherwise core DuckDB can route
+# differently-shredded values through generic STRUCT casts before the aggregate sees them.
+statement ok
+SET disabled_optimizers='extension';
+
+statement error
+SELECT
+  typeof(m) = jsono_storage_type('event_name VARCHAR'),
+  to_json(m::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))))
+FROM (
+  SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
+    (jsono('{"event_name":"search","x":1}', shredding := {'event_name':'VARCHAR'}), 1),
+    (jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}), 2)
+  ) t(j, ts)
+);
+----
+requires the extension optimizer
+
+statement ok
+RESET disabled_optimizers;
+
+# Regression: plain (non-shredded) input keeps the plain return contract.
+query I
+SELECT typeof(jsono_group_merge(jsono('{"a":1}'))) = jsono_storage_type();
+----
+true
+
+# A bare SQLNULL argument keeps the plain return contract (no shreds to stick).
+query I
+SELECT typeof(jsono_group_merge(NULL)) = jsono_storage_type();
+----
+true
