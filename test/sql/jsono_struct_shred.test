@@ -1,0 +1,144 @@
+# name: test/sql/jsono_struct_shred.test
+# description: Shredding via the jsono(STRUCT) constructor (auto nested descend, collision, totality)
+# group: [sql]
+
+require jsono
+
+require json
+
+# One-pass shredded write: a NULL shred field stays in the residual as an explicit null
+# (NULL shred = "value lives in the residual"), non-NULL shred fields are stripped and
+# manifest-covered. Mixed NULL masks per row exercise the partial-strip emit.
+query III
+SELECT j.jsono.shreds."a".value, j.jsono.shreds."k".value, to_json(j)::VARCHAR
+FROM (
+    SELECT jsono(struct_pack(a := a, k := k)) AS j
+    FROM (VALUES ('x', 1::BIGINT), (NULL, 2::BIGINT), ('z', NULL::BIGINT)) v(a, k)
+) ORDER BY ALL;
+----
+x	1	{"a":"x","k":1}
+z	NULL	{"a":"z","k":null}
+NULL	2	{"a":null,"k":2}
+
+# A field literally named like a JSONPath keeps the locate-and-strip semantics: the shred
+# name parses as the path $.x, which does not exist, so the shred is NULL and the value
+# stays in the residual under its literal key.
+query II
+SELECT j.jsono.shreds."$.x".value IS NULL, to_json(j)::VARCHAR FROM (SELECT jsono({'$.x': 'v', 'y': 1}) AS j);
+----
+true	{"$.x":"v","y":1}
+
+# Type-driven auto-shred descends one struct level: top-level scalars keep their bare name, scalars
+# directly inside a nested STRUCT are lifted under their $.parent.child JSON path. The shred set is
+# a pure function of the input type (known at bind), so the constructor's return type carries them.
+query I
+SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.commit.collection" STRUCT("value" VARCHAR, complete TINYINT), "$.commit.operation" STRUCT("value" VARCHAR, complete TINYINT), did STRUCT("value" VARCHAR, complete TINYINT), kind STRUCT("value" VARCHAR, complete TINYINT))))
+
+# The walk stops after one level: a scalar two or more levels deep stays in the residual (a deep
+# schema would otherwise lift many cold leaves). Only $.b.c is shredded; $.b.d.e is not.
+query I
+SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep'}}}));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.b.c" STRUCT("value" VARCHAR, complete TINYINT), a STRUCT("value" BIGINT, complete TINYINT))))
+
+# Losslessness holds for the un-shredded deep leaf too: $.b.d.e round-trips through the residual.
+query I
+SELECT to_json(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep'}}}))::VARCHAR;
+----
+{"a":1,"b":{"c":"x","d":{"e":"deep"}}}
+
+# Nested auto-shred is lossless: the reconstructed document equals the plain parse, nesting intact.
+query I
+SELECT to_json(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}))::VARCHAR;
+----
+{"commit":{"collection":"coll","operation":"create"},"did":"d1","kind":"k"}
+
+# A nested NULL scalar stays an explicit null in the residual (NULL shred = value-in-residual);
+# the typed nested shred captures the present value.
+query III
+SELECT j.jsono.shreds."$.commit.collection".value, j.jsono.shreds."$.commit.n".value, to_json(j)::VARCHAR
+FROM (
+    SELECT jsono({'commit': {'collection': c, 'n': n}}) AS j
+    FROM (VALUES ('post', 1::BIGINT), (NULL, NULL::BIGINT)) v(c, n)
+) ORDER BY ALL;
+----
+post	1	{"commit":{"collection":"post","n":1}}
+NULL	NULL	{"commit":{"collection":null,"n":null}}
+
+# A nested key carrying a path-structural character is emitted as a quoted path step and round-trips.
+query I
+SELECT to_json(jsono({'nest': {'a.b': 'v', 'c': 'plain'}}))::VARCHAR;
+----
+{"nest":{"a.b":"v","c":"plain"}}
+
+# A bare top-level $.path read on a nested auto-shred resolves to the typed shred subcolumn (the
+# optimizer's transparency rewrite matches the shred by its parsed path, not by field name string).
+statement ok
+CREATE TABLE nested_shred AS
+SELECT jsono({'did': did, 'commit': {'collection': coll}}) AS j
+FROM (VALUES ('d1', 'app.bsky.feed.post'), ('d2', 'app.bsky.feed.like'), ('d1', 'app.bsky.feed.post')) v(did, coll);
+
+query II
+SELECT j ->> '$.commit.collection' AS c, count(*) FROM nested_shred GROUP BY c ORDER BY c;
+----
+app.bsky.feed.like	1
+app.bsky.feed.post	2
+
+# Shred-name collision: a literal top-level key spelled as a JSON path ('$.commit.collection')
+# and a nested scalar lifted to that same path would both want one shred field name. A shredded
+# STRUCT cannot carry duplicate children (struct_extract would bind one and make the other value
+# unreachable via ->>), so both colliding shreds stay in the residual and the type is plain. The
+# residual keeps every value losslessly. (Astronomically rare: a JSON key literally spelled '$.a.b'.)
+query I
+SELECT typeof(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested'}}));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+
+# Both colliding values round-trip through the residual.
+query I
+SELECT to_json(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested'}}))::VARCHAR;
+----
+{"$.commit.collection":"flat","commit":{"collection":"nested"}}
+
+# Path resolution stays correct: $.commit.collection resolves the real nested path, while the
+# literal top-level key is addressable via its escaped path step.
+query II
+SELECT j ->> '$.commit.collection' AS path_resolved, j ->> '$."$.commit.collection"' AS literal_key
+FROM (SELECT jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested'}}) AS j);
+----
+nested	flat
+
+# A non-colliding sibling next to the collision is still lifted normally: only the two colliding
+# names drop to the residual, the unambiguous nested scalar keeps its typed shred.
+query I
+SELECT typeof(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested', 'operation': 'create'}}));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.commit.operation" STRUCT("value" VARCHAR, complete TINYINT))))
+
+# Type-driven auto-shred is always complete: a shred's type IS its field's type, so a present
+# value always fits and a NULL is only an absent field, never a residual diversion. A typed shred
+# with absent (NULL) rows is therefore read COALESCE-free — the per-shred totality fast path that gives
+# jsono(struct, shredding) the zone-map pushdown on read-back.
+statement ok
+CREATE TABLE sc_value_complete AS
+SELECT jsono({'x': CASE WHEN i % 3 = 0 THEN NULL ELSE i END :: BIGINT, 'k': 'a'}) AS j
+FROM range(3000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM sc_value_complete;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# 2000 of 3000 rows carry $.x (the others are NULL); MIN/MAX over the present integers.
+query III
+SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)), COUNT(CAST(j->>'$.x' AS BIGINT)) FROM sc_value_complete;
+----
+1	2999	2000
