@@ -615,12 +615,7 @@ struct OwnedJsonoBlob {
 void SerializeBuilderToBlob(const JsonoBuilder &builder, OwnedJsonoBlob &out) {
 	auto slots_bytes = builder.slots.size() * sizeof(uint64_t);
 	out.slots.resize(JSONO_HEADER_SIZE + slots_bytes);
-	JsonoHeader header;
-	header.magic = MAGIC;
-	header.version = VERSION;
-	header.flags = flags::SORTED_KEYS;
-	header.reserved = 0;
-	std::memcpy(&out.slots[0], &header, JSONO_HEADER_SIZE);
+	WriteJsonoHeaderInto(reinterpret_cast<uint8_t *>(&out.slots[0]), flags::SORTED_KEYS);
 	if (slots_bytes > 0) {
 		std::memcpy(&out.slots[JSONO_HEADER_SIZE], builder.slots.data(), slots_bytes);
 	}
@@ -2208,23 +2203,14 @@ nonstd::string_view LWWLaneSortKey(const GroupMergeLWWState &state, uint32_t sor
 
 void WriteScalarLeafHeader(OwnedJsonoBlob &out, uint64_t slot) {
 	out.slots.resize(JSONO_HEADER_SIZE + sizeof(uint64_t));
-	JsonoHeader header;
-	header.magic = MAGIC;
-	header.version = VERSION;
-	header.flags = flags::SORTED_KEYS;
-	header.reserved = 0;
-	std::memcpy(&out.slots[0], &header, JSONO_HEADER_SIZE);
+	WriteJsonoHeaderInto(reinterpret_cast<uint8_t *>(&out.slots[0]), flags::SORTED_KEYS);
 	std::memcpy(&out.slots[JSONO_HEADER_SIZE], &slot, sizeof(uint64_t));
 	out.key_heap.clear();
 	out.string_heap.clear();
 	out.lengths.clear();
 	out.nums.clear();
 	out.skips.resize(sizeof(ContainerMetadataHeader));
-	ContainerMetadataHeader meta;
-	meta.span_count = 0;
-	meta.checkpoint_index_count = 0;
-	meta.checkpoint_count = 0;
-	std::memcpy(&out.skips[0], &meta, sizeof(meta));
+	WriteEmptyMetadataInto(reinterpret_cast<uint8_t *>(&out.skips[0]));
 }
 
 void StoreScalarLeafBlob(const JsonoView &view, JsonoCursor &cursor, OwnedJsonoBlob &out) {

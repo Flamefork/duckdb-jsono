@@ -315,18 +315,31 @@ inline string_t WriteBlobInto(Vector &vec, const char *data, size_t size) {
 	return s;
 }
 
+// Stamp the 8-byte JsonoHeader at the start of a slots buffer. `flags` differs per
+// caller (SORTED_KEYS vs 0), so it is explicit — a wrong flag silently corrupts read ordering.
+inline void WriteJsonoHeaderInto(uint8_t *slots_buf, uint8_t flags) {
+	JsonoHeader header;
+	header.magic = MAGIC;
+	header.version = VERSION;
+	header.flags = flags;
+	header.reserved = 0;
+	std::memcpy(slots_buf, &header, JSONO_HEADER_SIZE);
+}
+
+// Stamp an empty ContainerMetadataHeader {0,0,0} at the start of a skips buffer (no spans,
+// no checkpoints) — for scalar/leaf rows whose skips blob is the header alone.
+inline void WriteEmptyMetadataInto(uint8_t *skips_buf) {
+	ContainerMetadataHeader header {0, 0, 0};
+	std::memcpy(skips_buf, &header, sizeof(header));
+}
+
 inline string_t WriteJsonoBlobInto(Vector &vec, const JsonoBuilder &builder) {
 	auto slots_bytes = builder.slots.size() * sizeof(uint64_t);
 	auto slots_total = JSONO_HEADER_SIZE + slots_bytes;
 	auto slots_str = StringVector::EmptyString(vec, slots_total);
 	auto slots_dst = slots_str.GetDataWriteable();
 
-	JsonoHeader header;
-	header.magic = MAGIC;
-	header.version = VERSION;
-	header.flags = flags::SORTED_KEYS;
-	header.reserved = 0;
-	std::memcpy(slots_dst, &header, JSONO_HEADER_SIZE);
+	WriteJsonoHeaderInto(reinterpret_cast<uint8_t *>(slots_dst), flags::SORTED_KEYS);
 	if (slots_bytes > 0) {
 		std::memcpy(slots_dst + JSONO_HEADER_SIZE, builder.slots.data(), slots_bytes);
 	}

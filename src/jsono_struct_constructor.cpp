@@ -987,12 +987,7 @@ void WriteConstructorStringObjectDirect(const JsonoStructVectorData &data, idx_t
 	auto slots_str = StringVector::EmptyString(writer.Slots(), slots_total);
 	auto slots_dst = slots_str.GetDataWriteable();
 
-	JsonoHeader header;
-	header.magic = MAGIC;
-	header.version = VERSION;
-	header.flags = flags::SORTED_KEYS;
-	header.reserved = 0;
-	std::memcpy(slots_dst, &header, JSONO_HEADER_SIZE);
+	WriteJsonoHeaderInto(reinterpret_cast<uint8_t *>(slots_dst), flags::SORTED_KEYS);
 	std::memcpy(slots_dst + JSONO_HEADER_SIZE, plan.string_object_slot_template.data(),
 	            plan.string_object_slot_template.size() * sizeof(uint64_t));
 

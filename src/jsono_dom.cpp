@@ -727,12 +727,7 @@ void EmitDomRowDirect(yyjson_val *root, DomDirectState &state, JsonoBodyWriter &
 	auto nums_str = StringVector::EmptyString(writer.Nums(), nums_total);
 
 	auto slots_dst = slots_str.GetDataWriteable();
-	JsonoHeader header;
-	header.magic = MAGIC;
-	header.version = VERSION;
-	header.flags = flags::SORTED_KEYS;
-	header.reserved = 0;
-	std::memcpy(slots_dst, &header, JSONO_HEADER_SIZE);
+	WriteJsonoHeaderInto(reinterpret_cast<uint8_t *>(slots_dst), flags::SORTED_KEYS);
 
 	auto skips_dst = skips_str.GetDataWriteable();
 	ContainerMetadataHeader metadata_header;

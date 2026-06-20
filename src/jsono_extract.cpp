@@ -412,19 +412,14 @@ void WriteScalarExtractRow(JsonoBodyWriter &writer, idx_t row, const JsonoView &
 		break;
 	}
 	char slots_buf[JSONO_HEADER_SIZE + sizeof(uint64_t)];
-	JsonoHeader header;
-	header.magic = MAGIC;
-	header.version = VERSION;
-	header.flags = flags::SORTED_KEYS;
-	header.reserved = 0;
-	std::memcpy(slots_buf, &header, JSONO_HEADER_SIZE);
+	WriteJsonoHeaderInto(reinterpret_cast<uint8_t *>(slots_buf), flags::SORTED_KEYS);
 	std::memcpy(slots_buf + JSONO_HEADER_SIZE, &slot, sizeof(slot));
-	static constexpr ContainerMetadataHeader EMPTY_METADATA {0, 0, 0};
+	char skips_buf[sizeof(ContainerMetadataHeader)];
+	WriteEmptyMetadataInto(reinterpret_cast<uint8_t *>(skips_buf));
 	writer.data[BODY_SLOTS][row] = WriteBlobInto(writer.Slots(), slots_buf, sizeof(slots_buf));
 	writer.data[BODY_KEY_HEAP][row] = WriteBlobInto(writer.KeyHeap(), nullptr, 0);
 	writer.data[BODY_STRING_HEAP][row] = WriteBlobInto(writer.StringHeap(), text.data(), text.size());
-	writer.data[BODY_SKIPS][row] =
-	    WriteBlobInto(writer.Skips(), reinterpret_cast<const char *>(&EMPTY_METADATA), sizeof(EMPTY_METADATA));
+	writer.data[BODY_SKIPS][row] = WriteBlobInto(writer.Skips(), skips_buf, sizeof(skips_buf));
 	if (has_text) {
 		auto len = uint32_t(text.size());
 		writer.data[BODY_LENGTHS][row] =
