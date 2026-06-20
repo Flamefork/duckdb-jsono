@@ -44,16 +44,7 @@ struct ExtractPathBindData : public FunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<ExtractPathBindData>();
-		if (path != other.path || steps.size() != other.steps.size()) {
-			return false;
-		}
-		for (idx_t i = 0; i < steps.size(); i++) {
-			if (steps[i].kind != other.steps[i].kind || steps[i].index != other.steps[i].index ||
-			    steps[i].key != other.steps[i].key) {
-				return false;
-			}
-		}
-		return true;
+		return path == other.path && PathStepsEqual(steps, other.steps);
 	}
 };
 
@@ -69,18 +60,6 @@ struct ExtractLocalState : public FunctionLocalState {
 		return make_uniq<ExtractLocalState>();
 	}
 };
-
-vector<PathStep> LiteralKeyPath(nonstd::string_view name) {
-	vector<PathStep> path;
-	path.push_back(PathStep {PathStepKind::Key, string(name), 0});
-	return path;
-}
-
-vector<PathStep> ArrayIndexPath(idx_t index) {
-	vector<PathStep> path;
-	path.push_back(PathStep {PathStepKind::Index, string(), index});
-	return path;
-}
 
 unique_ptr<FunctionData> JsonoExtractBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments) {

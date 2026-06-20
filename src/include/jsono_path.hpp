@@ -123,4 +123,34 @@ inline vector<PathStep> ParseJsonoPath(const string &path, const char *function_
 	return steps;
 }
 
+// A bare key names a literal top-level object key, not a JSONPath expression: dots in the
+// key (e.g. analytics "utm.source") must not be read as nesting.
+inline vector<PathStep> LiteralKeyPath(const string &name) {
+	vector<PathStep> path;
+	path.push_back(PathStep {PathStepKind::Key, name, 0});
+	return path;
+}
+
+inline vector<PathStep> ArrayIndexPath(idx_t index) {
+	vector<PathStep> path;
+	path.push_back(PathStep {PathStepKind::Index, string(), index});
+	return path;
+}
+
+inline bool PathStepEquals(const PathStep &left, const PathStep &right) {
+	return left.kind == right.kind && left.key == right.key && left.index == right.index;
+}
+
+inline bool PathStepsEqual(const vector<PathStep> &left, const vector<PathStep> &right) {
+	if (left.size() != right.size()) {
+		return false;
+	}
+	for (idx_t step_index = 0; step_index < left.size(); step_index++) {
+		if (!PathStepEquals(left[step_index], right[step_index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 } // namespace duckdb

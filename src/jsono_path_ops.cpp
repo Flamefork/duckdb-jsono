@@ -76,16 +76,7 @@ struct JsonoPathBindData : public FunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<JsonoPathBindData>();
-		if (steps.size() != other.steps.size()) {
-			return false;
-		}
-		for (idx_t i = 0; i < steps.size(); i++) {
-			if (steps[i].kind != other.steps[i].kind || steps[i].index != other.steps[i].index ||
-			    steps[i].key != other.steps[i].key) {
-				return false;
-			}
-		}
-		return true;
+		return PathStepsEqual(steps, other.steps);
 	}
 };
 

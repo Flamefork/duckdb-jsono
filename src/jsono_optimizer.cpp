@@ -98,15 +98,8 @@ struct JsonoMatchBindData : public FunctionData {
 			auto &left = predicates[predicate_index];
 			auto &right = other.predicates[predicate_index];
 			if (left.path != right.path || left.step_base != right.step_base || left.values != right.values ||
-			    left.steps.size() != right.steps.size()) {
+			    !PathStepsEqual(left.steps, right.steps)) {
 				return false;
-			}
-			for (idx_t step_index = 0; step_index < left.steps.size(); step_index++) {
-				if (left.steps[step_index].kind != right.steps[step_index].kind ||
-				    left.steps[step_index].key != right.steps[step_index].key ||
-				    left.steps[step_index].index != right.steps[step_index].index) {
-					return false;
-				}
 			}
 		}
 		return true;
@@ -139,15 +132,8 @@ struct JsonoProjectBindData : public FunctionData {
 			auto &left = fields[field_index];
 			auto &right = other.fields[field_index];
 			if (left.name != right.name || left.path != right.path || left.step_base != right.step_base ||
-			    left.steps.size() != right.steps.size()) {
+			    !PathStepsEqual(left.steps, right.steps)) {
 				return false;
-			}
-			for (idx_t step_index = 0; step_index < left.steps.size(); step_index++) {
-				if (left.steps[step_index].kind != right.steps[step_index].kind ||
-				    left.steps[step_index].key != right.steps[step_index].key ||
-				    left.steps[step_index].index != right.steps[step_index].index) {
-					return false;
-				}
 			}
 		}
 		return true;
@@ -203,34 +189,6 @@ struct JsonoRewriteGroup {
 	vector<JsonoMatchPredicate> predicates;
 	vector<idx_t> expression_indexes;
 };
-
-vector<PathStep> LiteralKeyPath(nonstd::string_view name) {
-	vector<PathStep> path;
-	path.push_back(PathStep {PathStepKind::Key, string(name), 0});
-	return path;
-}
-
-vector<PathStep> ArrayIndexPath(idx_t index) {
-	vector<PathStep> path;
-	path.push_back(PathStep {PathStepKind::Index, string(), index});
-	return path;
-}
-
-bool PathStepEquals(const PathStep &left, const PathStep &right) {
-	return left.kind == right.kind && left.key == right.key && left.index == right.index;
-}
-
-bool PathStepsEqual(const vector<PathStep> &left, const vector<PathStep> &right) {
-	if (left.size() != right.size()) {
-		return false;
-	}
-	for (idx_t step_index = 0; step_index < left.size(); step_index++) {
-		if (!PathStepEquals(left[step_index], right[step_index])) {
-			return false;
-		}
-	}
-	return true;
-}
 
 // True if `prefix` is a proper prefix of the object-key path `full`. A json-valued read at
 // `prefix` would return a subtree that holds `full`'s leaf — which the shredded writer may

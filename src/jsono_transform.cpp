@@ -501,16 +501,8 @@ TransformField MakeField(nonstd::string_view name, TransformPrimitive primitive,
 	return field;
 }
 
-// A bare shorthand/wrapper key names a literal top-level object key, not a JSONPath
-// expression: dots in the key (e.g. analytics "utm.source") must not be read as nesting.
-vector<PathStep> LiteralKeyPath(nonstd::string_view name) {
-	vector<PathStep> path;
-	path.push_back(PathStep {PathStepKind::Key, string(name), 0});
-	return path;
-}
-
 TransformField ParseScalarShorthand(nonstd::string_view name, nonstd::string_view type_name) {
-	return MakeField(name, ParsePrimitiveType(string(type_name)), TransformMode::Scalar, LiteralKeyPath(name),
+	return MakeField(name, ParsePrimitiveType(string(type_name)), TransformMode::Scalar, LiteralKeyPath(string(name)),
 	                 LiteralKeyPathText(name), string());
 }
 
@@ -576,7 +568,7 @@ TransformField ParseWrapperField(nonstd::string_view name, const Value &wrapper)
 		}
 		mode = TransformMode::Join;
 	}
-	auto steps = has_path ? ParseJsonoPath(path, "jsono_transform") : LiteralKeyPath(name);
+	auto steps = has_path ? ParseJsonoPath(path, "jsono_transform") : LiteralKeyPath(string(name));
 	return MakeField(name, primitive, mode, std::move(steps), has_path ? path : LiteralKeyPathText(name),
 	                 std::move(join_separator));
 }
@@ -704,24 +696,6 @@ unique_ptr<TransformBindData> ParseTransformSpec(const Value &spec) {
 	bind_data->return_type = LogicalType::STRUCT(std::move(children));
 	BuildTransformTrie(*bind_data);
 	return bind_data;
-}
-
-bool PathStepsEqual(const vector<PathStep> &left, const vector<PathStep> &right) {
-	if (left.size() != right.size()) {
-		return false;
-	}
-	for (idx_t i = 0; i < left.size(); i++) {
-		if (left[i].kind != right[i].kind) {
-			return false;
-		}
-		if (left[i].kind == PathStepKind::Key && left[i].key != right[i].key) {
-			return false;
-		}
-		if (left[i].kind == PathStepKind::Index && left[i].index != right[i].index) {
-			return false;
-		}
-	}
-	return true;
 }
 
 // Bind a shredded input's shred columns to the scalar fields they back: a scalar field whose

@@ -123,13 +123,6 @@ struct ShredLocalState : public FunctionLocalState {
 	}
 };
 
-// A bare key names a literal top-level object key, not a JSONPath expression.
-vector<PathStep> LiteralKeyPath(const string &name) {
-	vector<PathStep> path;
-	path.push_back(PathStep {PathStepKind::Key, name, 0});
-	return path;
-}
-
 vector<PathStep> ParseShredFieldPath(const string &path) {
 	auto steps = path.size() > 0 && path[0] == '$' ? ParseJsonoPath(path, "jsono shred") : LiteralKeyPath(path);
 	for (auto &step : steps) {
