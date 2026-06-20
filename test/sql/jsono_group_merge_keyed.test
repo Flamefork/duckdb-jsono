@@ -395,7 +395,9 @@ x	5	{"a":"x","n":5}
 statement error
 SELECT jsono_group_merge_max(jsono('{"a":1}'));
 ----
+No function matches
 
 statement error
 SELECT jsono_group_merge_max('not json', 1);
 ----
+value argument must be JSONO
