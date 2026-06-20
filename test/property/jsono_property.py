@@ -1003,12 +1003,12 @@ def test_narrowing_fails_loud(doc: dict[str, Any], data: Any) -> None:
     # The narrowed row must fail LOUD — a raised SQL error, not a partial document and not a silent
     # NULL (which read() reports distinctly from an error). Pin the error to the manifest-guard's
     # real message so a regression that swaps the throw for a NULL/empty result is caught.
-    assert isinstance(result, JsonoSession.Errored), (
-        f"narrowed row did not fail loud: {text!r} dropped {dropped!r} -> {result!r}"
-    )
-    assert "was narrowed by a raw struct cast and cannot be read losslessly" in result.message, (
-        f"narrowed row errored with an unexpected message: {text!r} dropped {dropped!r} -> {result.message!r}"
-    )
+    assert isinstance(
+        result, JsonoSession.Errored
+    ), f"narrowed row did not fail loud: {text!r} dropped {dropped!r} -> {result!r}"
+    assert (
+        "was narrowed by a raw struct cast and cannot be read losslessly" in result.message
+    ), f"narrowed row errored with an unexpected message: {text!r} dropped {dropped!r} -> {result.message!r}"
 
 
 manifest_mutations = st.sampled_from(
@@ -1230,9 +1230,7 @@ def test_transform_walk_parity(generated: tuple[dict[str, Any], int]) -> None:
     shred_spec = "{'$.a': 'VARCHAR', '$.b': 'BIGINT', '$.c': 'DOUBLE', '$.d': 'BOOLEAN'}"
     shredded = f"jsono({sql_literal(text)}, shredding := {shred_spec})"
     transformed_shredded = f"jsono_transform({shredded}, {spec})"
-    leg_a = SESSION.value(
-        f"SELECT (to_json({transformed_shredded}) IS NOT DISTINCT FROM to_json({transformed_plain}))"
-    )
+    leg_a = SESSION.value(f"SELECT (to_json({transformed_shredded}) IS NOT DISTINCT FROM to_json({transformed_plain}))")
     assert leg_a == "true", f"transform shredded != plain: {text!r}"
 
     # Leg B: each VARCHAR field matches the independent single-path `->>` extraction on the same value.
