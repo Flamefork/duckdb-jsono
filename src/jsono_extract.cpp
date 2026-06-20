@@ -1,5 +1,6 @@
 #include "jsono_extract.hpp"
 #include "jsono.hpp"
+#include "jsono_copy.hpp"
 #include "jsono_locate.hpp"
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
@@ -359,56 +360,26 @@ void BulkEmitSubtree(const JsonoView &view, const JsonoCursor &start, JsonoBuild
 }
 
 // Write a scalar extract result directly into the row's six body blobs, skipping the
-// JsonoBuilder: slots are the header plus one tag word, skips is the constant empty
-// metadata header, and the value's single stream entry comes straight from the source
-// view. Tag selection mirrors JsonoBuilder::Emit*, so the bytes match a re-emit.
+// JsonoBuilder: slots are the header plus the source tag word copied verbatim, skips is the
+// constant empty metadata header, and the value's single stream entry comes straight from the
+// source view. The source slot already carries the correct tag, so copying it (rather than
+// re-deriving via JsonoBuilder::Emit*) yields the same bytes with none of the decode work.
 void WriteScalarExtractRow(JsonoBodyWriter &writer, idx_t row, const JsonoView &view, JsonoCursor cursor) {
-	auto scalar = DecodeScalarAt(view, cursor);
-	uint64_t slot = 0;
+	auto slot = view.SlotAt(cursor.pos);
 	uint64_t num_word = 0;
 	bool has_num = false;
 	nonstd::string_view text;
 	bool has_text = false;
-	switch (scalar.kind) {
-	case JsonoScalarKind::String:
-		slot = MakeSlot(tag::VAL_STR_HEAP, 0);
-		text = scalar.text;
+	switch (ClassifyRawScalarSlot(slot)) {
+	case RawScalarValueKind::LengthHeap:
+		text = view.StringAt(cursor.string_cursor, view.LengthAt(cursor.length_cursor));
 		has_text = true;
 		break;
-	case JsonoScalarKind::NumberText:
-		slot = MakeExtSlot(ext_subtype::NUMBER);
-		text = scalar.text;
-		has_text = true;
-		break;
-	case JsonoScalarKind::Int64:
-		slot = FitsInt60(scalar.int_value) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64);
-		num_word = uint64_t(scalar.int_value);
+	case RawScalarValueKind::Number:
+		num_word = view.NumAt(cursor.num_cursor);
 		has_num = true;
 		break;
-	case JsonoScalarKind::UInt64:
-		slot =
-		    scalar.uint_value <= uint64_t(INT60_MAX) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::UINT64);
-		num_word = scalar.uint_value;
-		has_num = true;
-		break;
-	case JsonoScalarKind::Double:
-		if (!std::isfinite(scalar.double_value)) {
-			throw InvalidInputException("jsono: cannot store non-finite double value (NaN/Infinity)");
-		}
-		slot = MakeExtSlot(ext_subtype::DOUBLE);
-		std::memcpy(&num_word, &scalar.double_value, sizeof(num_word));
-		has_num = true;
-		break;
-	case JsonoScalarKind::Dec60:
-		slot = MakeSlot(tag::VAL_DEC60, 0);
-		num_word = MakeDec60Payload(scalar.dec_negative, scalar.dec_mantissa, scalar.dec_scale);
-		has_num = true;
-		break;
-	case JsonoScalarKind::Bool:
-		slot = MakeSlot(scalar.bool_value ? tag::VAL_TRUE : tag::VAL_FALSE, 0);
-		break;
-	case JsonoScalarKind::Null:
-		slot = MakeSlot(tag::VAL_NULL, 0);
+	case RawScalarValueKind::Literal:
 		break;
 	}
 	char slots_buf[JSONO_HEADER_SIZE + sizeof(uint64_t)];
