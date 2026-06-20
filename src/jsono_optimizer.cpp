@@ -1743,17 +1743,18 @@ private:
 	// per-row shred manifest stripped out of its skips blob, so downstream reads see a manifest-free
 	// residual. Used only by the soft residual reinterpret (the shred-lane read fallback).
 	unique_ptr<Expression> StripManifestBody(const Expression &body_struct) {
-		static const char *const body_fields[] = {"slots", "key_heap", "string_heap", "skips", "lengths", "nums"};
 		FunctionBinder function_binder(context);
+		auto body_type = JsonoBodyStructType();
 		vector<unique_ptr<Expression>> body_children;
-		for (idx_t i = 0; i < 6; i++) {
-			auto field = StructExtractAt(body_struct.Copy(), int64_t(i) + 1);
-			if (i == 3) {
+		idx_t i = 0;
+		for (auto &body_field : StructType::GetChildTypes(body_type)) {
+			auto field = StructExtractAt(body_struct.Copy(), int64_t(++i));
+			if (body_field.first == "skips") {
 				vector<unique_ptr<Expression>> strip_children;
 				strip_children.push_back(std::move(field));
 				field = function_binder.BindScalarFunction(JsonoStripManifestFunction(), std::move(strip_children));
 			}
-			field->SetAlias(body_fields[i]);
+			field->SetAlias(body_field.first);
 			body_children.push_back(std::move(field));
 		}
 		return function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(body_children));
