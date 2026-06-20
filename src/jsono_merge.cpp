@@ -4108,16 +4108,24 @@ static void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cur
 		}
 		return view.KeyAt(SlotPayload(key_slot));
 	};
+	// Cache the per-member keep decision once. AnyPathTerminatesOnKey scans the path set,
+	// so recomputing it across the count/key/value passes is wasteful. A stack mask avoids a
+	// per-object heap alloc; objects wider than it (rare) fall back to recomputing the predicate.
+	static constexpr size_t MASK_STACK = 128;
+	char keep[MASK_STACK];
+	bool cached = layout.key_count <= MASK_STACK;
 	size_t surviving = 0;
 	for (size_t i = 0; i < layout.key_count; i++) {
-		if (!AnyPathTerminatesOnKey(scalar_paths, depth, key_at(i))) {
-			surviving++;
+		bool survives = !AnyPathTerminatesOnKey(scalar_paths, depth, key_at(i));
+		if (cached) {
+			keep[i] = survives ? 1 : 0;
 		}
+		surviving += survives ? 1 : 0;
 	}
 	builder.EmitObjectStart(surviving);
 	for (size_t i = 0; i < layout.key_count; i++) {
 		auto key = key_at(i);
-		if (!AnyPathTerminatesOnKey(scalar_paths, depth, key)) {
+		if (cached ? keep[i] != 0 : !AnyPathTerminatesOnKey(scalar_paths, depth, key)) {
 			builder.EmitKeySlot(key);
 		}
 	}
@@ -4125,7 +4133,7 @@ static void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cur
 	value_cursor.pos = layout.value_start;
 	for (size_t i = 0; i < layout.key_count; i++) {
 		auto key = key_at(i);
-		if (AnyPathTerminatesOnKey(scalar_paths, depth, key)) {
+		if (cached ? keep[i] == 0 : AnyPathTerminatesOnKey(scalar_paths, depth, key)) {
 			SkipValueFast(view, value_cursor);
 			continue;
 		}
