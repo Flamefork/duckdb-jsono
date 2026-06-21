@@ -1,0 +1,76 @@
+# name: test/sql/jsono_negative_index.test
+# description: Negative array indexes are rejected fail-loud at bind in every consumer
+# group: [sql]
+
+require jsono
+
+require json
+
+# ->> with a negative JSONPath index fails at bind.
+statement error
+SELECT jsono('{"a":[1,2,3]}') ->> '$.a[-1]';
+----
+negative array index
+
+# -> with a negative JSONPath index fails at bind.
+statement error
+SELECT jsono('{"a":[1,2,3]}') -> '$.a[-1]';
+----
+negative array index
+
+# Bare BIGINT negative index fails at bind (own message).
+statement error
+SELECT jsono('[10,20,30]') ->> -1;
+----
+array index must be non-negative
+
+# jsono_extract_string with a negative JSONPath index fails at bind.
+statement error
+SELECT jsono_extract_string(jsono('{"a":[1,2,3]}'), '$.a[-1]');
+----
+negative array index
+
+# jsono_extract with a negative JSONPath index fails at bind.
+statement error
+SELECT jsono_extract(jsono('{"a":[1,2,3]}'), '$.a[-1]');
+----
+negative array index
+
+# jsono_transform with a negative JSONPath index fails at bind (no silent forward-index result).
+statement error
+SELECT jsono_transform(jsono('{"arr":[10,20,30]}'), {x:{type:'VARCHAR',path:'$.arr[-1]'}});
+----
+negative array index
+
+# jsono_type with a negative JSONPath index fails at bind.
+statement error
+SELECT jsono_type(jsono('{"a":[1,2,3]}'), '$.a[-1]');
+----
+negative array index
+
+# jsono_keys with a negative JSONPath index fails at bind.
+statement error
+SELECT jsono_keys(jsono('{"a":[1,2,3]}'), '$.a[-1]');
+----
+negative array index
+
+# [-0] is also rejected: any '-' after '[' is forbidden.
+statement error
+SELECT jsono('{"a":[1,2,3]}') ->> '$.a[-0]';
+----
+negative array index
+
+# A bare '-' with no magnitude after '[' is likewise rejected.
+statement error
+SELECT jsono('{"items":[1]}') ->> '$.items[-]';
+----
+negative array index
+
+# Positive-index resolution is unchanged.
+query III
+SELECT
+  jsono('{"items":[10,20,30]}') ->> '$.items[0]',
+  jsono('{"items":[10,20,30]}') ->> '$.items[2]',
+  jsono('[10,20,30]') ->> 1;
+----
+10	30	20

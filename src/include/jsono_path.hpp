@@ -99,6 +99,9 @@ inline vector<PathStep> ParseJsonoPath(const string &path, const char *function_
 				steps.push_back(PathStep {PathStepKind::Wildcard, string(), 0});
 				continue;
 			}
+			if (path[i] == '-') {
+				throw BinderException("%s: negative array index is not supported", function_name);
+			}
 			if (!std::isdigit(static_cast<unsigned char>(path[i]))) {
 				ThrowInvalidPath(function_name, path);
 			}
