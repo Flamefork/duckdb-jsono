@@ -649,3 +649,122 @@ SELECT count(*) FROM jsono_matcher_narrow
 WHERE (jsono_extract_string(j, '$.b') = 'v2') AND (jsono_extract_string(j, '$.c') = 'v3');
 ----
 narrowed by a raw struct cast
+
+# --- P-trie: the fused projector walks one trie per row instead of N independent locate descents.
+#     This pins "trie projector == locate oracle": for every shape the fuse admits (flat keys,
+#     shared-prefix nesting, a forward array index, a missing key, a JSON-null value, a present
+#     container), the fused __jsono_internal_project STRUCT must be byte-identical to the same paths
+#     read one-by-one via jsono_extract_string (the single-path locate reader). The jsono-named
+#     extract keeps the oracle off core json's STRUCT->JSON ->>, which the unittest binary does not
+#     autoload.
+statement ok
+CREATE TABLE jsono_project_trie_probe AS
+SELECT row_id, jsono(payload) AS j
+FROM (
+  VALUES
+    (1, '{"kind":"commit","a":{"b":{"x":"bx1","y":"by1"}},"arr":["e0","e1"],"o":{"k":1},"n":null}'),
+    (2, '{"kind":"identity","a":{"b":{"x":"bx2"}},"arr":["z0"],"o":{"k":2},"n":"present"}'),
+    (3, '{"kind":"commit","a":{"b":{"y":"by3"}},"o":{"k":3}}'),
+    (4, '{"kind":"commit","a":"scalar","arr":[],"n":null}'),
+    (5, '{"kind":null,"a":{"b":{"x":"bx5","y":"by5"}},"arr":["q0","q1","q2"],"o":{"k":5},"n":7}')
+) t(row_id, payload);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# The select-after projection fuses the six distinct ->> paths into one __jsono_internal_project.
+query II
+EXPLAIN SELECT row_id,
+               jsono_extract_string(j, '$.kind') AS kind,
+               jsono_extract_string(j, '$.a.b.x') AS abx,
+               jsono_extract_string(j, '$.a.b.y') AS aby,
+               jsono_extract_string(j, '$.arr[1]') AS arr1,
+               jsono_extract_string(j, '$.o') AS obj,
+               jsono_extract_string(j, '$.n') AS nval,
+               jsono_extract_string(j, '$.missing') AS miss
+FROM jsono_project_trie_probe;
+----
+physical_plan	<REGEX>:.*__jsono_internal_project.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Locate oracle: the same paths read one-by-one with the extension optimizer disabled, so each
+# extract is a standalone single-path locate descent (no trie fuse).
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE jsono_project_trie_oracle AS
+SELECT row_id,
+       jsono_extract_string(j, '$.kind') AS kind,
+       jsono_extract_string(j, '$.a.b.x') AS abx,
+       jsono_extract_string(j, '$.a.b.y') AS aby,
+       jsono_extract_string(j, '$.arr[1]') AS arr1,
+       jsono_extract_string(j, '$.o') AS obj,
+       jsono_extract_string(j, '$.n') AS nval,
+       jsono_extract_string(j, '$.missing') AS miss
+FROM jsono_project_trie_probe;
+
+statement ok
+RESET disabled_optimizers;
+
+# The trie projector (optimizer on) must match the locate oracle on every row and column, NULLs
+# included: symmetric EXCEPT over the full projected tuple is empty.
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_project_trie_oracle EXCEPT
+   SELECT row_id,
+          jsono_extract_string(j, '$.kind') AS kind,
+          jsono_extract_string(j, '$.a.b.x') AS abx,
+          jsono_extract_string(j, '$.a.b.y') AS aby,
+          jsono_extract_string(j, '$.arr[1]') AS arr1,
+          jsono_extract_string(j, '$.o') AS obj,
+          jsono_extract_string(j, '$.n') AS nval,
+          jsono_extract_string(j, '$.missing') AS miss
+   FROM jsono_project_trie_probe)
+  UNION ALL
+  (SELECT row_id,
+          jsono_extract_string(j, '$.kind') AS kind,
+          jsono_extract_string(j, '$.a.b.x') AS abx,
+          jsono_extract_string(j, '$.a.b.y') AS aby,
+          jsono_extract_string(j, '$.arr[1]') AS arr1,
+          jsono_extract_string(j, '$.o') AS obj,
+          jsono_extract_string(j, '$.n') AS nval,
+          jsono_extract_string(j, '$.missing') AS miss
+   FROM jsono_project_trie_probe
+   EXCEPT SELECT * FROM jsono_project_trie_oracle)
+);
+----
+0
+
+# Explicit row-by-row values, so a divergence shows the offending shape (a present container
+# serializes the whole subtree; a missing key and a JSON null both read NULL; a scalar at an
+# object-key prefix nulls the subtree below it).
+query IIIIIIII
+SELECT row_id,
+       jsono_extract_string(j, '$.kind') AS kind,
+       jsono_extract_string(j, '$.a.b.x') AS abx,
+       jsono_extract_string(j, '$.a.b.y') AS aby,
+       jsono_extract_string(j, '$.arr[1]') AS arr1,
+       jsono_extract_string(j, '$.o') AS obj,
+       jsono_extract_string(j, '$.n') AS nval,
+       jsono_extract_string(j, '$.missing') AS miss
+FROM jsono_project_trie_probe
+ORDER BY row_id;
+----
+1	commit	bx1	by1	e1	{"k":1}	NULL	NULL
+2	identity	bx2	NULL	NULL	{"k":2}	present	NULL
+3	commit	NULL	by3	NULL	{"k":3}	NULL	NULL
+4	commit	NULL	NULL	NULL	NULL	NULL	NULL
+5	NULL	bx5	by5	q1	{"k":5}	7	NULL
+
+# The trie projector honours the shred manifest exactly like the N-locate loop did: a row narrowed
+# by a raw struct cast (the dropped shred's value is gone from the residual) fails loud on the fused
+# projector's residual read, not a silent NULL. Reuses the narrowed fixture above; selecting >=2
+# stripped paths fuses into __jsono_internal_project, whose CheckPathMiss must throw.
+statement error
+SELECT jsono_extract_string(j, '$.b') AS b, jsono_extract_string(j, '$.c') AS c FROM jsono_matcher_narrow;
+----
+narrowed by a raw struct cast

@@ -1021,6 +1021,23 @@ void WriteScalarField(const TransformField &field, const JsonoView &view, const 
 	WriteScalarValue(field, mode, scalar, result, row);
 }
 
+// What the trie walk does at a matched (or missing) scalar leaf, factored out of the walk so a
+// second leaf output (the `->>` text projector) can ride the same trie/walk/shape-plan engine.
+// The walk and edge structure are shared; only the per-leaf value write differs. Hooks are
+// JSONO_ALWAYS_INLINE so the single transform instantiation monomorphizes to the prior code.
+struct TypedValuePolicy {
+	static JSONO_ALWAYS_INLINE void WriteScalarLeaf(const TransformBindData &bind_data, idx_t field_index,
+	                                                const JsonoView &view, const JsonoCursor &cursor,
+	                                                vector<unique_ptr<Vector>> &children, idx_t row) {
+		WriteScalarField(bind_data.fields[field_index], view, Location {cursor, true}, *children[field_index], row,
+		                 bind_data.mismatch_mode);
+	}
+
+	static JSONO_ALWAYS_INLINE void NullScalarLeaf(vector<unique_ptr<Vector>> &children, idx_t field_index, idx_t row) {
+		FlatVector::SetNull(*children[field_index], row, true);
+	}
+};
+
 void EnsureListCapacity(Vector &result, idx_t needed) {
 	if (needed <= ListVector::GetListCapacity(result)) {
 		return;
@@ -1033,24 +1050,15 @@ void AppendListNullValue(Vector &result, idx_t child_row) {
 	FlatVector::SetNull(child, child_row, true);
 }
 
+template <class LEAF>
 void ApplyTrieNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                    const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children, idx_t row,
                    vector<string> &join_buffers, vector<idx_t> &join_counts);
 
+template <class LEAF>
 void ApplyWildcardElement(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                           const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children,
                           idx_t row, vector<string> &join_buffers, vector<idx_t> &join_counts);
-
-int CompareTrieKeyToJsonKey(const string &trie_key, nonstd::string_view json_key) {
-	if (!trie_key.empty() && !json_key.empty()) {
-		auto trie_first = static_cast<unsigned char>(trie_key[0]);
-		auto json_first = static_cast<unsigned char>(json_key[0]);
-		if (trie_first != json_first) {
-			return trie_first < json_first ? -1 : 1;
-		}
-	}
-	return nonstd::string_view(trie_key).compare(json_key);
-}
 
 // Walk Key/Index steps to a leaf in the residual tape. Used for shred-backed scalar fields:
 // the residual is authoritative, so a found leaf wins; only when the residual lacks the path
@@ -1135,11 +1143,12 @@ const TransformRankCacheEntry &GetObjectRankCacheEntry(TransformLocalState &lsta
 	return entry;
 }
 
+template <class LEAF>
 void SetTrieNodeOutputsNull(const TransformBindData &bind_data, idx_t node_index, vector<unique_ptr<Vector>> &children,
                             idx_t row) {
 	auto &node = bind_data.trie[node_index];
 	for (auto field_index : node.scalar_leaves) {
-		FlatVector::SetNull(*children[field_index], row, true);
+		LEAF::NullScalarLeaf(children, field_index, row);
 	}
 	for (auto field_index : node.list_leaves) {
 		FlatVector::SetNull(*children[field_index], row, true);
@@ -1149,13 +1158,13 @@ void SetTrieNodeOutputsNull(const TransformBindData &bind_data, idx_t node_index
 		FlatVector::SetNull(*children[field_index], row, true);
 	}
 	for (auto &edge : node.key_edges) {
-		SetTrieNodeOutputsNull(bind_data, edge.child, children, row);
+		SetTrieNodeOutputsNull<LEAF>(bind_data, edge.child, children, row);
 	}
 	for (auto &edge : node.index_edges) {
-		SetTrieNodeOutputsNull(bind_data, edge.child, children, row);
+		SetTrieNodeOutputsNull<LEAF>(bind_data, edge.child, children, row);
 	}
 	if (node.wildcard_child != DConstants::INVALID_INDEX) {
-		SetTrieNodeOutputsNull(bind_data, node.wildcard_child, children, row);
+		SetTrieNodeOutputsNull<LEAF>(bind_data, node.wildcard_child, children, row);
 	}
 }
 
@@ -1225,26 +1234,27 @@ void AppendWildcardMissing(const TransformBindData &bind_data, idx_t node_index,
 // A trie edge whose child key is absent: a simple scalar leaf nulls its own output column, any
 // other child nulls its whole subtree. The caller passes the already-resolved simple_scalar_leaf
 // so the shared dispatch costs no extra trie load on the apply hot path.
+template <class LEAF>
 void NullScalarEdge(const TransformBindData &bind_data, idx_t simple_scalar_leaf, idx_t child,
                     vector<unique_ptr<Vector>> &children, idx_t row) {
 	if (simple_scalar_leaf == DConstants::INVALID_INDEX) {
-		SetTrieNodeOutputsNull(bind_data, child, children, row);
+		SetTrieNodeOutputsNull<LEAF>(bind_data, child, children, row);
 	} else {
-		FlatVector::SetNull(*children[simple_scalar_leaf], row, true);
+		LEAF::NullScalarLeaf(children, simple_scalar_leaf, row);
 	}
 }
 
 // The present-value twin of NullScalarEdge: a simple scalar leaf writes its column directly, any
 // other child recurses into ApplyTrieNode.
+template <class LEAF>
 void ApplyScalarEdge(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t simple_scalar_leaf,
                      idx_t child, const JsonoView &view, const JsonoCursor &value_cursor,
                      vector<unique_ptr<Vector>> &children, idx_t row, vector<string> &join_buffers,
                      vector<idx_t> &join_counts) {
 	if (simple_scalar_leaf == DConstants::INVALID_INDEX) {
-		ApplyTrieNode(lstate, bind_data, child, view, value_cursor, children, row, join_buffers, join_counts);
+		ApplyTrieNode<LEAF>(lstate, bind_data, child, view, value_cursor, children, row, join_buffers, join_counts);
 	} else {
-		WriteScalarField(bind_data.fields[simple_scalar_leaf], view, Location {value_cursor, true},
-		                 *children[simple_scalar_leaf], row, bind_data.mismatch_mode);
+		LEAF::WriteScalarLeaf(bind_data, simple_scalar_leaf, view, value_cursor, children, row);
 	}
 }
 
@@ -1255,6 +1265,7 @@ void ApplyScalarEdge(TransformLocalState &lstate, const TransformBindData &bind_
 // core monomorphizes per policy with no runtime branch on the hot path. Policy hooks take all loop
 // state by argument and never capture it, keeping edge_index/value_cursor as by-value locals in the
 // core (a captured accumulator would spill to the stack and regress the inner loop).
+template <class LEAF>
 struct NormalEdgePolicy {
 	static constexpr bool emit_index_tail = false;
 
@@ -1262,18 +1273,19 @@ struct NormalEdgePolicy {
 	                                          idx_t child, const JsonoView &view, const JsonoCursor &value_cursor,
 	                                          vector<unique_ptr<Vector>> &children, idx_t row,
 	                                          vector<string> &join_buffers, vector<idx_t> &join_counts) {
-		NullScalarEdge(bind_data, bind_data.trie[child].simple_scalar_leaf, child, children, row);
+		NullScalarEdge<LEAF>(bind_data, bind_data.trie[child].simple_scalar_leaf, child, children, row);
 	}
 
 	static JSONO_ALWAYS_INLINE void OnPresent(TransformLocalState &lstate, const TransformBindData &bind_data,
 	                                          idx_t child, const JsonoView &view, const JsonoCursor &value_cursor,
 	                                          vector<unique_ptr<Vector>> &children, idx_t row,
 	                                          vector<string> &join_buffers, vector<idx_t> &join_counts) {
-		ApplyScalarEdge(lstate, bind_data, bind_data.trie[child].simple_scalar_leaf, child, view, value_cursor,
-		                children, row, join_buffers, join_counts);
+		ApplyScalarEdge<LEAF>(lstate, bind_data, bind_data.trie[child].simple_scalar_leaf, child, view, value_cursor,
+		                      children, row, join_buffers, join_counts);
 	}
 };
 
+template <class LEAF>
 struct WildcardEdgePolicy {
 	static constexpr bool emit_index_tail = true;
 
@@ -1288,7 +1300,8 @@ struct WildcardEdgePolicy {
 	                                          idx_t child, const JsonoView &view, const JsonoCursor &value_cursor,
 	                                          vector<unique_ptr<Vector>> &children, idx_t row,
 	                                          vector<string> &join_buffers, vector<idx_t> &join_counts) {
-		ApplyWildcardElement(lstate, bind_data, child, view, value_cursor, children, row, join_buffers, join_counts);
+		ApplyWildcardElement<LEAF>(lstate, bind_data, child, view, value_cursor, children, row, join_buffers,
+		                           join_counts);
 	}
 };
 
@@ -1424,13 +1437,15 @@ void WalkTransformObject(TransformLocalState &lstate, const TransformBindData &b
 	}
 }
 
+template <class LEAF>
 void ApplyObjectNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                      const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children, idx_t row,
                      vector<string> &join_buffers, vector<idx_t> &join_counts) {
-	WalkTransformObject<NormalEdgePolicy>(lstate, bind_data, node_index, view, cursor, children, row, join_buffers,
-	                                      join_counts);
+	WalkTransformObject<NormalEdgePolicy<LEAF>>(lstate, bind_data, node_index, view, cursor, children, row,
+	                                            join_buffers, join_counts);
 }
 
+template <class LEAF>
 void ApplyArrayNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                     const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children, idx_t row,
                     vector<string> &join_buffers, vector<idx_t> &join_counts) {
@@ -1443,37 +1458,39 @@ void ApplyArrayNode(TransformLocalState &lstate, const TransformBindData &bind_d
 
 	while (value_cursor.pos < end_pos) {
 		while (fixed_edge_index < node.index_edges.size() && node.index_edges[fixed_edge_index].index < element_index) {
-			SetTrieNodeOutputsNull(bind_data, node.index_edges[fixed_edge_index].child, children, row);
+			SetTrieNodeOutputsNull<LEAF>(bind_data, node.index_edges[fixed_edge_index].child, children, row);
 			fixed_edge_index++;
 		}
 		if (fixed_edge_index < node.index_edges.size() && node.index_edges[fixed_edge_index].index == element_index) {
-			ApplyTrieNode(lstate, bind_data, node.index_edges[fixed_edge_index].child, view, value_cursor, children,
-			              row, join_buffers, join_counts);
+			ApplyTrieNode<LEAF>(lstate, bind_data, node.index_edges[fixed_edge_index].child, view, value_cursor,
+			                    children, row, join_buffers, join_counts);
 			fixed_edge_index++;
 		}
 		if (fixed_edge_index >= node.index_edges.size() && node.wildcard_child == DConstants::INVALID_INDEX) {
 			return;
 		}
 		if (node.wildcard_child != DConstants::INVALID_INDEX) {
-			ApplyWildcardElement(lstate, bind_data, node.wildcard_child, view, value_cursor, children, row,
-			                     join_buffers, join_counts);
+			ApplyWildcardElement<LEAF>(lstate, bind_data, node.wildcard_child, view, value_cursor, children, row,
+			                           join_buffers, join_counts);
 		}
 		SkipValueFast(view, value_cursor);
 		element_index++;
 	}
 	while (fixed_edge_index < node.index_edges.size()) {
-		SetTrieNodeOutputsNull(bind_data, node.index_edges[fixed_edge_index].child, children, row);
+		SetTrieNodeOutputsNull<LEAF>(bind_data, node.index_edges[fixed_edge_index].child, children, row);
 		fixed_edge_index++;
 	}
 }
 
+template <class LEAF>
 void ApplyWildcardObjectNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                              const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children,
                              idx_t row, vector<string> &join_buffers, vector<idx_t> &join_counts) {
-	WalkTransformObject<WildcardEdgePolicy>(lstate, bind_data, node_index, view, cursor, children, row, join_buffers,
-	                                        join_counts);
+	WalkTransformObject<WildcardEdgePolicy<LEAF>>(lstate, bind_data, node_index, view, cursor, children, row,
+	                                              join_buffers, join_counts);
 }
 
+template <class LEAF>
 void ApplyWildcardArrayNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                             const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children,
                             idx_t row, vector<string> &join_buffers, vector<idx_t> &join_counts) {
@@ -1493,8 +1510,8 @@ void ApplyWildcardArrayNode(TransformLocalState &lstate, const TransformBindData
 			fixed_edge_index++;
 		}
 		if (fixed_edge_index < node.index_edges.size() && node.index_edges[fixed_edge_index].index == element_index) {
-			ApplyWildcardElement(lstate, bind_data, node.index_edges[fixed_edge_index].child, view, value_cursor,
-			                     children, row, join_buffers, join_counts);
+			ApplyWildcardElement<LEAF>(lstate, bind_data, node.index_edges[fixed_edge_index].child, view, value_cursor,
+			                           children, row, join_buffers, join_counts);
 			fixed_edge_index++;
 		}
 		if (fixed_edge_index >= node.index_edges.size() && node.wildcard_child == DConstants::INVALID_INDEX) {
@@ -1509,17 +1526,20 @@ void ApplyWildcardArrayNode(TransformLocalState &lstate, const TransformBindData
 	}
 }
 
+template <class LEAF>
 void ApplyWildcardElement(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                           const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children,
                           idx_t row, vector<string> &join_buffers, vector<idx_t> &join_counts) {
 	MaterializeWildcardLeaves(bind_data, node_index, view, cursor, children, row, join_buffers, join_counts);
 	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
 	if (slot_tag == tag::OBJ_START) {
-		ApplyWildcardObjectNode(lstate, bind_data, node_index, view, cursor, children, row, join_buffers, join_counts);
+		ApplyWildcardObjectNode<LEAF>(lstate, bind_data, node_index, view, cursor, children, row, join_buffers,
+		                              join_counts);
 		return;
 	}
 	if (slot_tag == tag::ARR_START) {
-		ApplyWildcardArrayNode(lstate, bind_data, node_index, view, cursor, children, row, join_buffers, join_counts);
+		ApplyWildcardArrayNode<LEAF>(lstate, bind_data, node_index, view, cursor, children, row, join_buffers,
+		                             join_counts);
 		return;
 	}
 	auto &node = bind_data.trie[node_index];
@@ -1531,33 +1551,34 @@ void ApplyWildcardElement(TransformLocalState &lstate, const TransformBindData &
 	}
 }
 
+template <class LEAF>
 void ApplyTrieNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
                    const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children, idx_t row,
                    vector<string> &join_buffers, vector<idx_t> &join_counts) {
 	auto &node = bind_data.trie[node_index];
 	for (auto field_index : node.scalar_leaves) {
-		WriteScalarField(bind_data.fields[field_index], view, Location {cursor, true}, *children[field_index], row,
-		                 bind_data.mismatch_mode);
+		LEAF::WriteScalarLeaf(bind_data, field_index, view, cursor, children, row);
 	}
 	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
 	if (!node.key_edges.empty()) {
 		if (slot_tag == tag::OBJ_START) {
-			ApplyObjectNode(lstate, bind_data, node_index, view, cursor, children, row, join_buffers, join_counts);
+			ApplyObjectNode<LEAF>(lstate, bind_data, node_index, view, cursor, children, row, join_buffers,
+			                      join_counts);
 		} else {
 			for (auto &edge : node.key_edges) {
-				SetTrieNodeOutputsNull(bind_data, edge.child, children, row);
+				SetTrieNodeOutputsNull<LEAF>(bind_data, edge.child, children, row);
 			}
 		}
 	}
 	if (!node.index_edges.empty() || node.wildcard_child != DConstants::INVALID_INDEX) {
 		if (slot_tag == tag::ARR_START) {
-			ApplyArrayNode(lstate, bind_data, node_index, view, cursor, children, row, join_buffers, join_counts);
+			ApplyArrayNode<LEAF>(lstate, bind_data, node_index, view, cursor, children, row, join_buffers, join_counts);
 		} else {
 			for (auto &edge : node.index_edges) {
-				SetTrieNodeOutputsNull(bind_data, edge.child, children, row);
+				SetTrieNodeOutputsNull<LEAF>(bind_data, edge.child, children, row);
 			}
 			if (node.wildcard_child != DConstants::INVALID_INDEX) {
-				SetTrieNodeOutputsNull(bind_data, node.wildcard_child, children, row);
+				SetTrieNodeOutputsNull<LEAF>(bind_data, node.wildcard_child, children, row);
 			}
 		}
 	}
@@ -1842,7 +1863,7 @@ void ApplyShapePlan(TransformLocalState &lstate, const TransformBindData &bind_d
 		FlatVector::SetNull(*children[field_index], row, true);
 	}
 	for (auto node : plan.null_subtree_nodes) {
-		SetTrieNodeOutputsNull(bind_data, node, children, row);
+		SetTrieNodeOutputsNull<TypedValuePolicy>(bind_data, node, children, row);
 	}
 	for (auto &action : plan.scalars) {
 		JsonoScalar scalar;
@@ -1891,7 +1912,8 @@ void ApplyShapePlan(TransformLocalState &lstate, const TransformBindData &bind_d
 		cursor.string_cursor = offsets[walk.offset_slot];
 		cursor.length_cursor = walk.length_cursor;
 		cursor.num_cursor = walk.num_cursor;
-		ApplyTrieNode(lstate, bind_data, walk.node_index, view, cursor, children, row, join_buffers, join_counts);
+		ApplyTrieNode<TypedValuePolicy>(lstate, bind_data, walk.node_index, view, cursor, children, row, join_buffers,
+		                                join_counts);
 	}
 	for (auto k : plan.shred_reads) {
 		auto field_index = bind_data.shred_fields[k];
@@ -1975,7 +1997,8 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 		if (plan) {
 			ApplyShapePlan(lstate, bind_data, *plan, view, children, row, join_buffers, join_counts, shred_fmt);
 		} else {
-			ApplyTrieNode(lstate, bind_data, 0, view, JsonoCursor(), children, row, join_buffers, join_counts);
+			ApplyTrieNode<TypedValuePolicy>(lstate, bind_data, 0, view, JsonoCursor(), children, row, join_buffers,
+			                                join_counts);
 			for (idx_t k = 0; k < bind_data.shred_fields.size(); k++) {
 				auto field_index = bind_data.shred_fields[k];
 				auto &field = bind_data.fields[field_index];

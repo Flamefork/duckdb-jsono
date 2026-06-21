@@ -3,6 +3,7 @@
 #include "jsono_locate.hpp"
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
+#include "jsono_projection.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
@@ -116,10 +117,18 @@ struct JsonoProjectField {
 
 struct JsonoProjectBindData : public FunctionData {
 	vector<JsonoProjectField> fields;
+	// The trie the fused projector walks once per row. Built from `fields` after they are
+	// finalized (BuildTrie), it is bind-time constant and shared by every row's walk.
+	ProjectTrie trie;
+
+	void BuildTrie() {
+		trie.Build(fields);
+	}
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<JsonoProjectBindData>();
 		result->fields = fields;
+		result->trie = trie;
 		return std::move(result);
 	}
 
@@ -161,6 +170,9 @@ struct JsonoPathLocalState : public FunctionLocalState {
 	vector<JsonoLayoutCacheEntry> layout_cache;
 	uint64_t layout_generation = 0;
 	std::string scratch;
+	// Per-node rank cache for the fused projector's trie walk; sized lazily to the bind's trie on
+	// first project execute (the matcher shares this local state but never touches it).
+	ProjectRankCache project_rank_cache;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -836,11 +848,41 @@ void SetProjectRowNull(Vector &result, vector<unique_ptr<Vector>> &children, idx
 	}
 }
 
+// The leaf output the projector's trie walk dispatches to: render the located value as `->>` text
+// (WriteLocatedExtractString, the same renderer the old N-locate loop used), and on a miss apply
+// the manifest-aware guard before nulling — byte-identical to the per-field locate loop, just one
+// trie pass instead of N descents. The trie walk positions the cursor at a present leaf; a missing
+// leaf reaches NullLeaf, which still owns the manifest CheckPathMiss the locate loop ran on a miss.
+struct TextOutputPolicy {
+	struct State {
+		JsonoPathLocalState &lstate;
+		JsonoRowReader &reader;
+		const vector<JsonoProjectField> &fields;
+		vector<unique_ptr<Vector>> &children;
+	};
+
+	static JSONO_ALWAYS_INLINE void WriteLeaf(State &state, idx_t field_index, const JsonoView &view,
+	                                          const JsonoCursor &cursor, idx_t row) {
+		WriteLocatedExtractString(state.lstate, state.reader, state.fields[field_index], *state.children[field_index],
+		                          row, view, JsonoMatchLocation {cursor});
+	}
+
+	static JSONO_ALWAYS_INLINE void NullLeaf(State &state, idx_t field_index, const JsonoView &view, idx_t row) {
+		// A miss covered by the row's shred manifest must not project a silent NULL.
+		state.reader.CheckPathMiss(view, state.fields[field_index].steps);
+		FlatVector::SetNull(*state.children[field_index], row, true);
+	}
+};
+
 void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = expr.bind_info->Cast<JsonoProjectBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoPathLocalState>();
 	auto count = args.size();
+
+	if (lstate.project_rank_cache.entries.empty()) {
+		lstate.project_rank_cache.Init(bind_data.trie);
+	}
 
 	JsonoRowReader reader;
 	reader.InitPointRead(args.data[0], count);
@@ -853,6 +895,7 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 		StringVector::AddHeapReference(*child, reader.StringHeapVector());
 	}
 
+	TextOutputPolicy::State policy_state {lstate, reader, bind_data.fields, children};
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		lstate.layout_generation++;
@@ -862,18 +905,7 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 			continue;
 		}
 		FlatVector::Validity(result).SetValid(row);
-		for (idx_t field_index = 0; field_index < bind_data.fields.size(); field_index++) {
-			auto &field = bind_data.fields[field_index];
-			JsonoMatchLocation location;
-			if (!LocateByCompiledPathOrSteps(lstate, field.compiled_path, field.step_base, field.steps, view,
-			                                 location)) {
-				// A miss covered by the row's shred manifest must not project a silent NULL.
-				reader.CheckPathMiss(view, field.steps);
-				FlatVector::SetNull(*children[field_index], row, true);
-				continue;
-			}
-			WriteLocatedExtractString(lstate, reader, field, *children[field_index], row, view, location);
-		}
+		WalkProjectTrie<TextOutputPolicy>(bind_data.trie, lstate.project_rank_cache, policy_state, view, row);
 	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -1252,6 +1284,7 @@ unique_ptr<Expression> MakeJsonoInternalProjectExpression(JsonoProjectRewriteSta
 		step_base += field.steps.size();
 		bind_data->fields.push_back(std::move(field));
 	}
+	bind_data->BuildTrie();
 	child_list_t<LogicalType> child_types;
 	for (auto &field : bind_data->fields) {
 		child_types.push_back(make_pair(field.name, LogicalType::VARCHAR));

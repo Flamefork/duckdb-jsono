@@ -22,6 +22,20 @@ namespace jsono {
 // fallback, shred writer, jsono_type/jsono_keys). One implementation so the lookup policy
 // cannot drift between call sites.
 
+// Order a trie's stored object key against a document key the same way the sorted key block is
+// ordered (first byte then full compare). The sorted-merge walk both the transform and projector
+// tries use relies on this ordering to advance edge and key cursors in lockstep.
+inline int CompareTrieKeyToJsonKey(const string &trie_key, nonstd::string_view json_key) {
+	if (!trie_key.empty() && !json_key.empty()) {
+		auto trie_first = static_cast<unsigned char>(trie_key[0]);
+		auto json_first = static_cast<unsigned char>(json_key[0]);
+		if (trie_first != json_first) {
+			return trie_first < json_first ? -1 : 1;
+		}
+	}
+	return nonstd::string_view(trie_key).compare(json_key);
+}
+
 inline nonstd::string_view ObjectKeyAtRank(const JsonoView &view, const ObjectLayout &layout, size_t rank) {
 	if (rank >= layout.key_count) {
 		throw InternalException("JSONO object key rank out of bounds");
