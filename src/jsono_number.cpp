@@ -57,6 +57,9 @@ bool AccumulateUIntPair(nonstd::string_view int_digits, nonstd::string_view frac
 // decimal rendering (AppendDec60Text wraps this). Bounds: mantissa < 2^53
 // (≤16 digits), scale ≤ 22 → padded ≤ 23, total ≤ 25; out must hold ≥ 26 bytes.
 size_t BuildDec60Canonical(char *out, bool negative, uint64_t abs_mantissa, uint64_t scale) {
+	if (scale > DEC60_SCALE_MAX) {
+		throw InvalidInputException("malformed JSONO: invalid DEC60 payload");
+	}
 	char digits[24];
 	size_t d = 0;
 	if (abs_mantissa == 0) {

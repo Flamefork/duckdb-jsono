@@ -723,6 +723,9 @@ inline uint64_t Dec60Scale(uint64_t payload) {
 // 10^-scale): mantissa and 10^scale are exact, IEEE division is
 // correctly-rounded, so the result is bit-equal to parse("<text>").
 inline double Dec60ToDouble(bool negative, uint64_t mantissa, uint64_t scale) {
+	if (scale > DEC60_SCALE_MAX) {
+		throw InvalidInputException("malformed JSONO: invalid DEC60 payload");
+	}
 	double value = double(mantissa);
 	if (negative) {
 		value = -value;

@@ -1,0 +1,34 @@
+# name: test/sql/jsono_dec60_corrupt.test
+# description: a header-valid blob carrying a DEC60 value with an out-of-range scale (>22) must
+# group: [sql]
+
+# fail loud on every read path, not OOB-read DEC60_POW10 / overflow the render buffer
+
+require jsono
+
+require json
+
+# nums word = (scale 25 << 54) | mantissa 5 = 0x0640000000000005, little-endian.
+# to_json renders the DEC60 as text -> BuildDec60Canonical (the stack overflow path).
+statement error
+WITH src AS (SELECT jsono('{"d":0.5}').jsono.body AS b)
+SELECT to_json({'jsono': {'body': {'slots': b.slots, 'key_heap': b.key_heap,
+  'string_heap': b.string_heap, 'skips': b.skips, 'lengths': b.lengths,
+  'nums': '\x05\x00\x00\x00\x00\x00\x40\x06'::BLOB}}}) FROM src;
+----
+invalid DEC60 payload
+
+# jsono_transform to DOUBLE goes through Dec60ToDouble (the DEC60_POW10 OOB read path).
+statement error
+WITH src AS (SELECT jsono('{"d":0.5}').jsono.body AS b)
+SELECT jsono_transform({'jsono': {'body': {'slots': b.slots, 'key_heap': b.key_heap,
+  'string_heap': b.string_heap, 'skips': b.skips, 'lengths': b.lengths,
+  'nums': '\x05\x00\x00\x00\x00\x00\x40\x06'::BLOB}}}, {'d': 'DOUBLE'}) FROM src;
+----
+invalid DEC60 payload
+
+# A legitimate DEC60 (scale 1) still round-trips unchanged.
+query I
+SELECT to_json(jsono('{"d":0.5}'));
+----
+{"d":0.5}
