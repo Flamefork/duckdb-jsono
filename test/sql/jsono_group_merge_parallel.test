@@ -1,0 +1,55 @@
+# name: test/sql/jsono_group_merge_parallel.test
+# description: the ordered jsono_group_merge(... ORDER BY ...) Combine path runs across worker
+# group: [sql]
+
+# threads; its multi-thread result must equal the single-threaded fold for both plain and
+# shredded inputs (a regression in the parallel partial-state merge would silently change results)
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE hits AS
+  SELECT (i % 200) AS g, i AS ts,
+         jsono('{"f' || (i % 7) || '":' || i || ',"common":' || (i % 200) || '}') AS j,
+         jsono('{"f' || (i % 7) || '":' || i || ',"common":' || (i % 200) || '}',
+               shredding := {'common':'BIGINT'}) AS js
+  FROM range(20000) t(i);
+
+# Single-threaded reference for the ordered fold (plain and shredded).
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE ref AS
+  SELECT g,
+         to_json(jsono_group_merge(j  ORDER BY ts)) AS plain,
+         to_json(jsono_group_merge(js ORDER BY ts)) AS shredded
+  FROM hits GROUP BY g;
+
+# Recompute under 4 threads; every group's output must match the reference exactly.
+statement ok
+SET threads = 4;
+
+query I
+SELECT count(*)
+FROM ( SELECT g,
+              to_json(jsono_group_merge(j  ORDER BY ts)) AS plain,
+              to_json(jsono_group_merge(js ORDER BY ts)) AS shredded
+       FROM hits GROUP BY g ) cur
+JOIN ref USING (g)
+WHERE cur.plain IS DISTINCT FROM ref.plain
+   OR cur.shredded IS DISTINCT FROM ref.shredded;
+----
+0
+
+# The shredded fold also stays shredded (reads back from its shred column under threads).
+query I
+SELECT count(*) FILTER (WHERE typeof(m) <> jsono_storage_type('common BIGINT'))
+FROM ( SELECT jsono_group_merge(js ORDER BY ts) AS m FROM hits GROUP BY g );
+----
+0
+
+statement ok
+RESET threads;

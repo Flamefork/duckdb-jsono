@@ -1,0 +1,37 @@
+# name: test/sql/jsono_dupkey_shredded.test
+# description: duplicate object keys collapse to last-wins (RFC 8259 §4); when the key is a shred,
+# group: [sql]
+
+# the shred lane and the reconstructed document must agree on the surviving last value
+
+require jsono
+
+require json
+
+# Plain last-wins baseline (mirrors jsono_roundtrip.test): {"a":1,"a":2} keeps 2.
+query I
+SELECT to_json(jsono('{"a":1,"a":2}'));
+----
+{"a":2}
+
+# Shredded on $.a: the lane reads the surviving value, and to_json reconstructs it identically.
+query II
+SELECT v ->> '$.a', to_json(v)
+FROM (SELECT jsono('{"a":1,"a":2}', shredding := {'$.a':'BIGINT'}) AS v);
+----
+2	{"a":2}
+
+# Typed pruning read of the shred agrees too (BIGINT comparison on the lane).
+query I
+SELECT count(*)
+FROM (SELECT jsono('{"a":1,"a":2}', shredding := {'$.a':'BIGINT'}) AS v)
+WHERE CAST(v ->> '$.a' AS BIGINT) = 2;
+----
+1
+
+# A duplicate key whose later value does NOT fit the shred type stays in the residual,
+# last-wins, and still reconstructs correctly (lossless gate).
+query I
+SELECT to_json(jsono('{"a":1,"a":"two"}', shredding := {'$.a':'BIGINT'}));
+----
+{"a":"two"}
