@@ -46,6 +46,7 @@ Inspect:
 - [`jsono_validate(value)`](#introspection) — strict current-format validation as `BOOLEAN`.
 - [`jsono_storage_size(value)`](#introspection) — physical byte sizes (body blobs, shreds, total) as a `STRUCT`.
 - [`jsono_storage_type()`](#introspection) — DDL of the physical `STRUCT` backing a JSONO value.
+- [`jsono_shred_manifest(value)`](#introspection) — paths stripped into shred columns and their types as a `LIST<STRUCT(path, type)>`.
 
 ## Quick Start
 
@@ -466,6 +467,7 @@ jsono_keys(value[, path])     -> VARCHAR[]  -- object keys
 jsono_validate(value)         -> BOOLEAN    -- strict current-format validation
 jsono_storage_size(value)     -> STRUCT     -- physical byte sizes (body blobs + shreds + total)
 jsono_storage_type()          -> VARCHAR    -- DDL of the physical STRUCT backing JSONO
+jsono_shred_manifest(value)   -> STRUCT[]   -- paths stripped into shred columns, with their types
 ```
 
 `jsono_type` and `jsono_keys` inspect the shape of unknown JSON before extracting it with `jsono_transform`. The optional `path` is a constant JSONPath (same grammar as `jsono_transform`, without wildcards) that points at a nested position; a missing path yields `NULL`.
@@ -488,6 +490,13 @@ SELECT jsono_storage_type();
 -- STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 ```
 
+`jsono_shred_manifest` returns a `LIST<STRUCT(path VARCHAR, type VARCHAR)>` of the paths a shredded value stripped out of its residual into shred columns, each with the shred type it was written as, in canonical (sorted) order. A plain value returns an empty list (nothing was stripped); a SQL `NULL` returns `NULL`. It reads the row's own manifest claim and, unlike the other readers, does not raise on a narrowed row — pair it with `jsono_validate` to debug shredding, layout, or migration questions (which paths got lifted, did a cast drop one). A shred value that did not round-trip its declared type stays in the residual and is correctly absent from the manifest, so a short manifest is not "shredding did not happen".
+
+```sql
+SELECT jsono_shred_manifest(jsono('{"a":"x","b":1}', shredding := {'a':'VARCHAR','b':'BIGINT'}));
+-- [{'path': a, 'type': VARCHAR}, {'path': b, 'type': BIGINT}]
+```
+
 These helpers are primarily used by the JSONO workflows and tests. Treat their exact surface as less stable than `jsono_transform`, `jsono`, and `to_json`.
 
 ## Benchmarks
@@ -501,6 +510,14 @@ uv run --frozen python bench/bench.py --filter group_merge/1k --runs 1
 The operation set, version/core-json comparisons, field-sample scenarios, and result-reading contract are documented in [bench/README.md](bench/README.md); profiling is in [bench/PROFILING.md](bench/PROFILING.md).
 
 ## Development
+
+Run the full local pre-PR gate (build + tests + format check) in one command:
+
+```bash
+uv run make verify
+```
+
+Or run the gates individually:
 
 ```bash
 uv run make release
@@ -559,7 +576,7 @@ Contributions and feedback are welcome. Please:
 
 1. Open an issue first to discuss proposed changes.
 2. Add or update SQLLogic tests in `test/sql/` for new behavior.
-3. Run `uv run make release && uv run make test` before submitting a pull request.
+3. Run `uv run make verify` (build + tests + format check) before submitting a pull request. CI additionally runs `uv run make tidy-check`, which needs a local clang-tidy + compile-database setup.
 
 See [GitHub Issues](https://github.com/Flamefork/duckdb-jsono/issues) for current tasks and feature requests.
 
