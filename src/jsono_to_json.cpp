@@ -81,17 +81,22 @@ bool JsonoShreddedToVarcharCast(Vector &source, Vector &result, idx_t count, Cas
 	return true;
 }
 
-// Wildcard STRUCT(any)->VARCHAR bind: a shredded JSONO value serializes to JSON text; any other
-// struct declines (a null-function BoundCastInfo), so the cast set falls through to the default
-// struct->VARCHAR text cast — byte-identical to stock DuckDB for non-jsono structs. The exact
-// plain-JSONO->VARCHAR entry (registered below) is matched before this wildcard, so a plain value
-// is unaffected. There is no equivalent for ->JSON: core json owns STRUCT(any)->JSON and the cast
-// registry keeps the first registration, so shredded ::JSON / to_json stay the optimizer's job.
+// Wildcard STRUCT(any)->VARCHAR bind: any JSONO value serializes to JSON text — shredded values
+// reconstruct first, plain values serialize the six BLOBs directly. Both branches are handled here,
+// so correctness no longer depends on the exact plain-JSONO->VARCHAR entry resolving before this
+// wildcard. A genuinely non-JSONO struct declines (a null-function BoundCastInfo) and falls through
+// to the default struct->VARCHAR text cast — byte-identical to stock DuckDB. IsJsonoType is true for
+// shredded too, so the shredded branch must be checked first. There is no equivalent for ->JSON:
+// core json owns STRUCT(any)->JSON and the cast registry keeps the first registration, so shredded
+// ::JSON / to_json stay the optimizer's job.
 BoundCastInfo JsonoStructToVarcharCastBind(BindCastInput &input, const LogicalType &source, const LogicalType &target) {
 	(void)input;
 	(void)target;
 	if (IsShreddedJsonoType(source)) {
 		return BoundCastInfo(JsonoShreddedToVarcharCast);
+	}
+	if (IsJsonoType(source)) {
+		return BoundCastInfo(JsonoCastToJson);
 	}
 	return BoundCastInfo(nullptr);
 }

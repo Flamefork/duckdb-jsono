@@ -175,6 +175,13 @@ SELECT
 ----
 {"a":1}	{"a":1}
 
+# A plain JSONO value ::VARCHAR must serialize to JSON text, not a struct/blob rendering. The bind
+# handles the plain case explicitly, so this holds regardless of cast-registry resolution order.
+query II
+SELECT jsono('{"a":1,"b":2}')::VARCHAR, jsono('{"a":1,"b":2}')::JSON;
+----
+{"a":1,"b":2}	{"a":1,"b":2}
+
 # to_json on a STRUCT with wrong magic bytes is non-JSONO data bound to a jsono op, not an
 # absent value: it must fail loud, not silently read as NULL (same class as the bad metadata
 # case below). Only a slots blob too short to hold a header reads as NULL.
