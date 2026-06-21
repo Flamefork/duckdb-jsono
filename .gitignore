@@ -7,3 +7,4 @@ testext
 __pycache__
 .Rhistory
 bench/optimization-log/
+plans
