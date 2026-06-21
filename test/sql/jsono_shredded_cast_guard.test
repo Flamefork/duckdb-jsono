@@ -226,6 +226,74 @@ SELECT jsono_group_merge(p) FROM plain_narrowed;
 ----
 narrowed by a raw struct cast
 
+# --- A structurally-present row whose `body` layout field is NULL (not the whole struct) is the
+# trace of a by-name struct cast / set-op / CASE that NULL-fills a layout field. This is distinct
+# from the shred-narrowing case above (body intact, shreds dropped): here `body` itself is absent,
+# so the strict row reader (ReadJsonoRowStrict -> ThrowCorruptJsonoRow) fails loud BEFORE any
+# value decode. Every reader inherits that throw; a NULL-body row must never read as `{}` / SQL
+# NULL. A genuine all-NULL row (the whole struct is NULL) is a legal NULL and must stay NULL. ---
+
+statement ok
+CREATE TABLE null_body AS
+SELECT struct_pack("jsono" := struct_pack(body := NULL::STRUCT(
+  slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))) AS p;
+
+statement error
+SELECT to_json(p) FROM null_body;
+----
+body is NULL
+
+statement error
+SELECT p ->> 'a' FROM null_body;
+----
+body is NULL
+
+statement error
+SELECT jsono_keys(p) FROM null_body;
+----
+body is NULL
+
+statement error
+SELECT jsono_validate(p) FROM null_body;
+----
+body is NULL
+
+# Same loud failure with the extension optimizer disabled (the no-optimizer read path).
+statement ok
+SET disabled_optimizers='extension';
+
+statement error
+SELECT to_json(p) FROM null_body;
+----
+body is NULL
+
+statement ok
+RESET disabled_optimizers;
+
+# A set operation that NULL-fills a body branch produces the same NULL-body row and fails loud.
+statement error
+WITH u AS (
+  SELECT jsono('{"a":"v1"}', shredding := {'a':'VARCHAR'}) AS e
+  UNION ALL
+  SELECT struct_pack("jsono" := struct_pack(body := NULL::STRUCT(
+    slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+)
+SELECT to_json(e) FROM u;
+----
+body is NULL
+
+# A genuine all-NULL row (the whole JSONO struct is NULL) is a legal SQL NULL, not corruption:
+# the strict reader treats a NULL top-level struct as an absent value and every reader yields NULL.
+statement ok
+CREATE TABLE genuine_null AS
+SELECT NULL::STRUCT("jsono" STRUCT(body STRUCT(
+  slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))) AS p;
+
+query III
+SELECT to_json(p), p ->> 'a', jsono_validate(p) FROM genuine_null;
+----
+NULL	NULL	NULL
+
 # The all-shredded merge fast path must verify each input's manifest against that input's own
 # shreds: the narrowed row's manifest lists 'b VARCHAR' which no input carries, so the merge
 # throws instead of re-emitting a manifest without it (laundering the loss).

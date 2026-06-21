@@ -1545,7 +1545,11 @@ bool JsonoStructCastToJsono(Vector &source, Vector &result, idx_t count, CastPar
 // A plain JSONO value reaching the wildcard STRUCT(any)->JSONO cast: source and target are the
 // same nested type, so reference it through. The corrupt check first: a valid top-level row whose
 // layout/body/blobs are absent is the trace of a by-name struct cast NULL-filling a layout field
-// (a set operation over differently-shredded values), which must throw rather than read as SQL NULL.
+// (a set operation over differently-shredded values). ReadJsonoRowStrict owns that fail-loud:
+// ReadJsonoRowImpl<true> raises ThrowCorruptJsonoRow ("body is NULL") on a present row with an
+// absent body, so the strict read below throws on such a row rather than reading it as SQL NULL.
+// The loop body is empty on purpose — its only job is to trigger that strict-read throw per row
+// before the bytes are referenced through (a genuine all-NULL row reads false and is skipped).
 bool JsonoPrefixReinterpretCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	(void)parameters;
 	jsono::JsonoVectorData residual;
