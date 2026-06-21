@@ -1,0 +1,96 @@
+# name: test/sql/jsono_shred_manifest.test
+# description: jsono_shred_manifest exposes the per-row residual shred manifest (stripped paths + types)
+# group: [sql]
+
+require jsono
+
+require json
+
+# Return type is LIST(STRUCT(path VARCHAR, type VARCHAR)).
+query I
+SELECT typeof(jsono_shred_manifest(jsono('{"a":1}')));
+----
+STRUCT(path VARCHAR, "type" VARCHAR)[]
+
+# A shredded value lists every path the writer stripped into a shred column, with its shred type,
+# in canonical (sorted) manifest order. Unnest + sort for a deterministic comparison.
+query II
+SELECT m.path, m.type
+FROM (
+  SELECT unnest(jsono_shred_manifest(
+    jsono('{"a":"x","b":1,"c":true}', shredding := {'a':'VARCHAR','b':'BIGINT','c':'BOOLEAN'})
+  )) m
+)
+ORDER BY m.path;
+----
+a	VARCHAR
+b	BIGINT
+c	BOOLEAN
+
+# A plain value (no shredding) stripped nothing: the manifest is an EMPTY list, not NULL.
+query I
+SELECT len(jsono_shred_manifest(jsono('{"a":1}')));
+----
+0
+
+# An empty list is not NULL.
+query I
+SELECT jsono_shred_manifest(jsono('{"a":1}')) IS NULL;
+----
+false
+
+# A SQL NULL row yields NULL (distinct from the empty-list answer for a plain value).
+statement ok
+CREATE TABLE nullrow AS SELECT jsono('{"a":1}', shredding := {'a':'BIGINT'}) AS e WHERE 1=0;
+
+statement ok
+INSERT INTO nullrow VALUES (NULL);
+
+query I
+SELECT jsono_shred_manifest(e) IS NULL FROM nullrow;
+----
+true
+
+# A shred value that did NOT round-trip its declared type stays in the residual and is therefore
+# ABSENT from the manifest: the string "notanum" can't live in a BIGINT shred, so only `b` is listed.
+# This demonstrates the lossless gate — the manifest records only paths actually stripped.
+query II
+SELECT m.path, m.type
+FROM (
+  SELECT unnest(jsono_shred_manifest(
+    jsono('{"a":"notanum","b":2}', shredding := {'a':'BIGINT','b':'BIGINT'})
+  )) m
+)
+ORDER BY m.path;
+----
+b	BIGINT
+
+# jsono_shred_manifest reads the row's own claim and does NOT raise on a narrowed row: even a value
+# whose manifest lists more shreds than the inspected type carries reads its raw manifest tail. Here a
+# fully shredded value lists both paths without error.
+query I
+SELECT len(jsono_shred_manifest(
+  jsono('{"a":"x","b":1}', shredding := {'a':'VARCHAR','b':'BIGINT'})
+));
+----
+2
+
+# The manifest survives a Parquet round-trip: written shredded, read back, the per-row claim is intact.
+require parquet
+
+statement ok
+COPY (
+  SELECT jsono('{"a":"x","b":1,"c":true}', shredding := {'a':'VARCHAR','b':'BIGINT','c':'BOOLEAN'}) AS v
+) TO '__TEST_DIR__/jsono_shred_manifest.parquet';
+
+query II
+SELECT m.path, m.type
+FROM (
+  SELECT unnest(jsono_shred_manifest(v)) m
+  FROM '__TEST_DIR__/jsono_shred_manifest.parquet'
+)
+ORDER BY m.path;
+----
+a	VARCHAR
+b	BIGINT
+c	BOOLEAN

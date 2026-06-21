@@ -11,6 +11,9 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression.hpp"
 
+#include <algorithm>
+#include <vector>
+
 namespace duckdb {
 
 namespace {
@@ -162,6 +165,71 @@ unique_ptr<FunctionData> JsonoStorageSizeBind(ClientContext &context, ScalarFunc
 	return nullptr;
 }
 
+void EnsureListCapacity(Vector &result, idx_t needed) {
+	if (needed <= ListVector::GetListCapacity(result)) {
+		return;
+	}
+	auto next = std::max<idx_t>(needed, std::max<idx_t>(ListVector::GetListCapacity(result) * 2, 1));
+	ListVector::Reserve(result, next);
+}
+
+// jsono_shred_manifest reads the residual's OWN manifest claim raw (ManifestTail walked with the
+// bounds-safe collect sink), NOT through the verifying reader: introspection must show what a row
+// claims it stripped — including a narrowed row — without raising, which the verifying read would do
+// on exactly the rows a user most wants to inspect. A plain value (no manifest) yields an empty list,
+// not NULL: "no paths were stripped" is a true answer. Only a SQL NULL / absent body row is NULL.
+void JsonoShredManifestExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)state;
+	auto count = args.size();
+	auto &input_vec = args.data[0];
+	JsonoVectorData body;
+	InitJsonoVectorData(input_vec, count, body);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	ListVector::SetListSize(result, 0);
+	auto &child = ListVector::GetEntry(result);
+	auto &child_entries = StructVector::GetEntries(child);
+	auto &path_vector = *child_entries[0];
+	auto &type_vector = *child_entries[1];
+
+	std::vector<ShredManifestEntry> entries;
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob;
+		if (!ReadJsonoRowStrict(body, row, blob)) {
+			FlatVector::SetNull(result, row, true);
+			ListVector::GetData(result)[row] = {0, 0};
+			continue;
+		}
+		view = MakeJsonoView(blob);
+		view.ParseHeader();
+		auto start = ListVector::GetListSize(result);
+		idx_t length = 0;
+		if (view.HasShredManifest()) {
+			entries.clear();
+			ShredManifestCollectSink sink {entries};
+			auto tail = view.ManifestTail();
+			WalkShredManifestBytes(tail.data(), tail.size(), sink);
+			length = entries.size();
+			EnsureListCapacity(result, start + length);
+			auto path_data = FlatVector::GetData<string_t>(path_vector);
+			auto type_data = FlatVector::GetData<string_t>(type_vector);
+			for (idx_t i = 0; i < length; i++) {
+				auto child_row = start + i;
+				path_data[child_row] =
+				    StringVector::AddString(path_vector, entries[i].path.data(), entries[i].path.size());
+				type_data[child_row] =
+				    StringVector::AddString(type_vector, entries[i].type.data(), entries[i].type.size());
+			}
+		}
+		ListVector::GetData(result)[row] = {start, length};
+		ListVector::SetListSize(result, start + length);
+	}
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
 } // namespace
 
 void RegisterJsonoStorageSize(ExtensionLoader &loader) {
@@ -180,6 +248,12 @@ void RegisterJsonoStorageSize(ExtensionLoader &loader) {
 	ScalarFunction fun("jsono_storage_size", {LogicalType::ANY}, storage_size_type, JsonoStorageSizeExecute,
 	                   JsonoStorageSizeBind);
 	loader.RegisterFunction(fun);
+
+	auto manifest_type =
+	    LogicalType::LIST(LogicalType::STRUCT({{"path", LogicalType::VARCHAR}, {"type", LogicalType::VARCHAR}}));
+	ScalarFunction manifest_fun("jsono_shred_manifest", {LogicalType::ANY}, manifest_type, JsonoShredManifestExecute,
+	                            JsonoStorageSizeBind);
+	loader.RegisterFunction(manifest_fun);
 }
 
 } // namespace duckdb
