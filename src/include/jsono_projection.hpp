@@ -47,73 +47,9 @@ struct ProjectTrie : JsonoTrie {
 	}
 };
 
-// Per-node set-associative rank cache, one way per recently seen object shape class at each trie
-// node. Mirrors transform's TransformRankCacheEntry: a matching stored shape_hash proves the cached
-// ranks of every edge by one int compare. Sized to the trie at construction; nodes never resize, so
-// a held reference survives the recursive descent.
-constexpr idx_t PROJECT_RANK_WAYS = 8;
-
-struct ProjectRankCacheEntry {
-	bool valid = false;
-	size_t key_count = 0;
-	uint64_t shape_hash = 0;
-	bool has_shape_hash = false;
-	vector<size_t> ranks;
-	vector<uint8_t> found;
-};
-
-inline idx_t ProjectRankWay(const ObjectLayout &layout) {
-	return idx_t((uint64_t(layout.key_count) * 0x9E3779B97F4A7C15ULL ^ layout.shape_hash) >> 61);
-}
-
-struct ProjectRankCache {
-	vector<ProjectRankCacheEntry> entries;
-
-	void Init(const ProjectTrie &trie) {
-		entries.assign(trie.nodes.size() * PROJECT_RANK_WAYS, ProjectRankCacheEntry {});
-		for (idx_t node_index = 0; node_index < trie.nodes.size(); node_index++) {
-			auto edge_count = trie.nodes[node_index].key_edges.size();
-			for (idx_t way = 0; way < PROJECT_RANK_WAYS; way++) {
-				auto &entry = entries[node_index * PROJECT_RANK_WAYS + way];
-				entry.ranks.resize(edge_count);
-				entry.found.resize(edge_count);
-			}
-		}
-	}
-
-	const ProjectRankCacheEntry &Get(const ProjectTrie &trie, idx_t node_index, const JsonoView &view,
-	                                 const ObjectLayout &layout) {
-		auto &node = trie.nodes[node_index];
-		auto &entry = entries[node_index * PROJECT_RANK_WAYS + ProjectRankWay(layout)];
-		auto cache_valid = entry.valid && entry.key_count == layout.key_count;
-		if (cache_valid) {
-			if (TrustShapeHash() && layout.has_span && entry.has_shape_hash) {
-				cache_valid = entry.shape_hash == layout.shape_hash;
-			} else {
-				for (idx_t edge_index = 0; edge_index < node.key_edges.size(); edge_index++) {
-					if (!ValidateCachedObjectRank(view, layout, node.key_edges[edge_index].key, entry.ranks[edge_index],
-					                              entry.found[edge_index])) {
-						cache_valid = false;
-						break;
-					}
-				}
-			}
-		}
-		if (cache_valid) {
-			return entry;
-		}
-		entry.valid = true;
-		entry.key_count = layout.key_count;
-		entry.shape_hash = layout.shape_hash;
-		entry.has_shape_hash = layout.has_span;
-		for (idx_t edge_index = 0; edge_index < node.key_edges.size(); edge_index++) {
-			size_t rank = 0;
-			entry.found[edge_index] = FindObjectKeyRank(view, layout, node.key_edges[edge_index].key, rank);
-			entry.ranks[edge_index] = rank;
-		}
-		return entry;
-	}
-};
+// The projector's per-node rank cache is the shared JsonoTrieRankCache (src/include/jsono_trie.hpp),
+// keyed by this trie's node vector. It carries its own copy (not transform's) only because the two
+// engines run from separate local states; the cache machinery itself is one definition.
 
 // The projection walk context: the trie (bind-time constant), the per-row rank cache, and the
 // POLICY's own state (carried by reference so the leaf hooks reach the reader/result without the
@@ -121,7 +57,7 @@ struct ProjectRankCache {
 template <class POLICY>
 struct ProjectWalkContext {
 	const ProjectTrie &trie;
-	ProjectRankCache &rank_cache;
+	JsonoTrieRankCache &rank_cache;
 	typename POLICY::State &state;
 };
 
@@ -174,7 +110,7 @@ void ApplyProjectObjectCheckpoints(ProjectWalkContext<POLICY> &ctx, idx_t node_i
 	value_block_base.pos = layout.value_start;
 	JsonoCursor value_cursor = value_block_base;
 
-	auto &entry = ctx.rank_cache.Get(ctx.trie, node_index, view, layout);
+	auto &entry = ctx.rank_cache.Get(ctx.trie.nodes, node_index, view, layout);
 	for (idx_t edge_index = 0; edge_index < node.key_edges.size(); edge_index++) {
 		auto &edge = node.key_edges[edge_index];
 		if (!entry.found[edge_index]) {
@@ -296,7 +232,7 @@ void ApplyProjectNode(ProjectWalkContext<POLICY> &ctx, idx_t node_index, const J
 // Walk the trie once over one document root, dispatching every field to POLICY. The root is always
 // the whole value at the JsonoCursor() origin.
 template <class POLICY>
-JSONO_ALWAYS_INLINE void WalkProjectTrie(const ProjectTrie &trie, ProjectRankCache &rank_cache,
+JSONO_ALWAYS_INLINE void WalkProjectTrie(const ProjectTrie &trie, JsonoTrieRankCache &rank_cache,
                                          typename POLICY::State &state, const JsonoView &view, idx_t row) {
 	ProjectWalkContext<POLICY> ctx {trie, rank_cache, state};
 	ApplyProjectNode(ctx, 0, view, JsonoCursor(), row);

@@ -172,7 +172,7 @@ struct JsonoPathLocalState : public FunctionLocalState {
 	std::string scratch;
 	// Per-node rank cache for the fused projector's trie walk; sized lazily to the bind's trie on
 	// first project execute (the matcher shares this local state but never touches it).
-	ProjectRankCache project_rank_cache;
+	JsonoTrieRankCache project_rank_cache;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -881,7 +881,7 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 	auto count = args.size();
 
 	if (lstate.project_rank_cache.entries.empty()) {
-		lstate.project_rank_cache.Init(bind_data.trie);
+		lstate.project_rank_cache.Init(bind_data.trie.nodes);
 	}
 
 	JsonoRowReader reader;

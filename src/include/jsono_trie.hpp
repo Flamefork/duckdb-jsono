@@ -1,6 +1,7 @@
 #pragma once
 
 #include "jsono.hpp"
+#include "jsono_locate.hpp"
 #include "jsono_path.hpp"
 
 #include "duckdb/common/constants.hpp"
@@ -139,6 +140,82 @@ struct JsonoTrie {
 				          return left.index < right.index;
 			          });
 		}
+	}
+};
+
+// Per-node set-associative rank cache shared by both walks. Rows interleave several object shapes
+// per node (event archetypes), so each trie node keeps a small set of ways: one per recently seen
+// shape class. A matching stored shape_hash proves the cached ranks of every edge with one int
+// compare; otherwise the per-edge ValidateCachedObjectRank check (or a full re-resolve) runs.
+//
+// Slots are per trie node (the trie is bind-time constant), sized to the node's key edges at Init.
+// No aliasing across nodes and no resizing means a held entry reference survives the recursive
+// descent: recursion only touches descendant nodes. The cache is keyed by the node vector, so both
+// engines pass their own node storage (transform's bind-data vector, the projector's JsonoTrie).
+constexpr idx_t JSONO_TRIE_RANK_WAYS = 8;
+
+struct JsonoTrieRankCacheEntry {
+	bool valid = false;
+	size_t key_count = 0;
+	uint64_t shape_hash = 0;
+	bool has_shape_hash = false;
+	vector<size_t> ranks;
+	vector<uint8_t> found;
+};
+
+inline idx_t JsonoTrieRankWay(const ObjectLayout &layout) {
+	return idx_t((uint64_t(layout.key_count) * 0x9E3779B97F4A7C15ULL ^ layout.shape_hash) >> 61);
+}
+
+struct JsonoTrieRankCache {
+	vector<JsonoTrieRankCacheEntry> entries;
+
+	void Init(const vector<JsonoTrieNode> &nodes) {
+		entries.assign(nodes.size() * JSONO_TRIE_RANK_WAYS, JsonoTrieRankCacheEntry {});
+		for (idx_t node_index = 0; node_index < nodes.size(); node_index++) {
+			auto edge_count = nodes[node_index].key_edges.size();
+			for (idx_t way = 0; way < JSONO_TRIE_RANK_WAYS; way++) {
+				auto &entry = entries[node_index * JSONO_TRIE_RANK_WAYS + way];
+				entry.ranks.resize(edge_count);
+				entry.found.resize(edge_count);
+			}
+		}
+	}
+
+	const JsonoTrieRankCacheEntry &Get(const vector<JsonoTrieNode> &nodes, idx_t node_index, const JsonoView &view,
+	                                   const ObjectLayout &layout) {
+		auto &node = nodes[node_index];
+		auto &entry = entries[node_index * JSONO_TRIE_RANK_WAYS + JsonoTrieRankWay(layout)];
+		auto cache_valid = entry.valid && entry.key_count == layout.key_count;
+		if (cache_valid) {
+			// A matching stored shape_hash proves the object's sorted key sequence, validating every
+			// edge's cached rank with one int compare. The slot is per node, so the (bind-time
+			// constant) key set needs no re-check.
+			if (TrustShapeHash() && layout.has_span && entry.has_shape_hash) {
+				cache_valid = entry.shape_hash == layout.shape_hash;
+			} else {
+				for (idx_t edge_index = 0; edge_index < node.key_edges.size(); edge_index++) {
+					if (!ValidateCachedObjectRank(view, layout, node.key_edges[edge_index].key, entry.ranks[edge_index],
+					                              entry.found[edge_index])) {
+						cache_valid = false;
+						break;
+					}
+				}
+			}
+		}
+		if (cache_valid) {
+			return entry;
+		}
+		entry.valid = true;
+		entry.key_count = layout.key_count;
+		entry.shape_hash = layout.shape_hash;
+		entry.has_shape_hash = layout.has_span;
+		for (idx_t edge_index = 0; edge_index < node.key_edges.size(); edge_index++) {
+			size_t rank = 0;
+			entry.found[edge_index] = FindObjectKeyRank(view, layout, node.key_edges[edge_index].key, rank);
+			entry.ranks[edge_index] = rank;
+		}
+		return entry;
 	}
 };
 
