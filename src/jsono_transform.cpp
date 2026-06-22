@@ -6,6 +6,7 @@
 #include "jsono_shred.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
+#include "jsono_trie.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/constants.hpp"
@@ -52,33 +53,10 @@ struct TransformField {
 	TransformPrimitive shred_primitive = TransformPrimitive::Varchar;
 };
 
-struct TrieEdge {
-	TrieEdge() = default;
-	TrieEdge(string key_p, idx_t child_p) : key(std::move(key_p)), child(child_p) {
-	}
-
-	string key;
-	idx_t child = DConstants::INVALID_INDEX;
-};
-
-struct TrieIndexEdge {
-	TrieIndexEdge() = default;
-	TrieIndexEdge(idx_t index_p, idx_t child_p) : index(index_p), child(child_p) {
-	}
-
-	idx_t index = 0;
-	idx_t child = DConstants::INVALID_INDEX;
-};
-
-struct TransformTrieNode {
-	vector<TrieEdge> key_edges;
-	vector<TrieIndexEdge> index_edges;
-	idx_t wildcard_child = DConstants::INVALID_INDEX;
-	vector<idx_t> scalar_leaves;
-	vector<idx_t> list_leaves;
-	vector<idx_t> join_leaves;
-	idx_t simple_scalar_leaf = DConstants::INVALID_INDEX;
-};
+// Transform's trie reuses the shared skeleton (src/include/jsono_trie.hpp). The node carries
+// transform-only leaf kinds (list/join) and the wildcard child the projector never populates; the
+// walk below stays transform-specific.
+using TransformTrieNode = jsono::JsonoTrieNode;
 
 struct TransformBindData : public FunctionData {
 	string spec;
@@ -573,64 +551,12 @@ TransformField ParseWrapperField(nonstd::string_view name, const Value &wrapper)
 	                 std::move(join_separator));
 }
 
-idx_t GetOrAddKeyChild(TransformBindData &bind_data, idx_t node_index, const string &key) {
-	auto &edges = bind_data.trie[node_index].key_edges;
-	for (auto &edge : edges) {
-		if (edge.key == key) {
-			return edge.child;
-		}
-	}
-	auto child = bind_data.trie.size();
-	bind_data.trie.emplace_back();
-	bind_data.trie[node_index].key_edges.push_back(TrieEdge {key, child});
-	return child;
-}
-
-idx_t GetOrAddIndexChild(TransformBindData &bind_data, idx_t node_index, idx_t index) {
-	auto &edges = bind_data.trie[node_index].index_edges;
-	for (auto &edge : edges) {
-		if (edge.index == index) {
-			return edge.child;
-		}
-	}
-	auto child = bind_data.trie.size();
-	bind_data.trie.emplace_back();
-	bind_data.trie[node_index].index_edges.push_back(TrieIndexEdge {index, child});
-	return child;
-}
-
-idx_t GetOrAddWildcardChild(TransformBindData &bind_data, idx_t node_index) {
-	auto &node = bind_data.trie[node_index];
-	if (node.wildcard_child != DConstants::INVALID_INDEX) {
-		return node.wildcard_child;
-	}
-	auto child = bind_data.trie.size();
-	bind_data.trie.emplace_back();
-	bind_data.trie[node_index].wildcard_child = child;
-	return child;
-}
-
-void InsertFieldIntoTrie(TransformBindData &bind_data, idx_t field_index) {
-	idx_t node_index = 0;
-	auto &field = bind_data.fields[field_index];
+void InsertFieldIntoTrie(JsonoTrie &trie, const TransformField &field, idx_t field_index) {
 	if (field.shred_child_index != DConstants::INVALID_INDEX) {
 		// Shred-backed scalar: read directly from the shred/residual, never via the trie.
 		return;
 	}
-	for (auto &step : field.path) {
-		switch (step.kind) {
-		case PathStepKind::Key:
-			node_index = GetOrAddKeyChild(bind_data, node_index, step.key);
-			break;
-		case PathStepKind::Index:
-			node_index = GetOrAddIndexChild(bind_data, node_index, step.index);
-			break;
-		case PathStepKind::Wildcard:
-			node_index = GetOrAddWildcardChild(bind_data, node_index);
-			break;
-		}
-	}
-	auto &node = bind_data.trie[node_index];
+	auto &node = trie.nodes[trie.WalkToLeaf(field.path)];
 	switch (field.mode) {
 	case TransformMode::Scalar:
 		node.scalar_leaves.push_back(field_index);
@@ -645,21 +571,19 @@ void InsertFieldIntoTrie(TransformBindData &bind_data, idx_t field_index) {
 }
 
 void BuildTransformTrie(TransformBindData &bind_data) {
-	bind_data.trie.clear();
-	bind_data.trie.emplace_back();
+	JsonoTrie trie;
+	trie.Reset();
 	for (idx_t field_index = 0; field_index < bind_data.fields.size(); field_index++) {
-		InsertFieldIntoTrie(bind_data, field_index);
+		InsertFieldIntoTrie(trie, bind_data.fields[field_index], field_index);
 	}
-	for (auto &node : bind_data.trie) {
-		std::sort(node.key_edges.begin(), node.key_edges.end(),
-		          [](const TrieEdge &left, const TrieEdge &right) { return left.key < right.key; });
-		std::sort(node.index_edges.begin(), node.index_edges.end(),
-		          [](const TrieIndexEdge &left, const TrieIndexEdge &right) { return left.index < right.index; });
+	trie.SortEdges();
+	for (auto &node : trie.nodes) {
 		if (node.scalar_leaves.size() == 1 && node.list_leaves.empty() && node.join_leaves.empty() &&
 		    node.key_edges.empty() && node.index_edges.empty() && node.wildcard_child == DConstants::INVALID_INDEX) {
 			node.simple_scalar_leaf = node.scalar_leaves[0];
 		}
 	}
+	bind_data.trie = std::move(trie.nodes);
 }
 
 // The spec is a constant STRUCT mapping each output field to its type: a type string

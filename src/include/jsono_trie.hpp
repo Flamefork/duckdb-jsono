@@ -1,0 +1,146 @@
+#pragma once
+
+#include "jsono.hpp"
+#include "jsono_path.hpp"
+
+#include "duckdb/common/constants.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string.hpp"
+#include "duckdb/common/vector.hpp"
+
+#include <algorithm>
+
+namespace duckdb {
+namespace jsono {
+
+// Shared trie skeleton for the two path-set engines: jsono_transform's per-row STRUCT build and
+// the optimizer's fused `->>` projector. Both merge their N paths into one trie, then walk the
+// document once dispatching every leaf. This header owns only the trie's STRUCTURAL parts — the
+// edge/node layout, the prefix-merge build (GetOrAdd* + the per-node edge sort), and the
+// simple-scalar-leaf shortcut. It is bind-time machinery; nothing here runs per row.
+//
+// INVARIANT (do NOT relax in a follow-up): the two recursive WALKS stay separate. Transform's walk
+// handles wildcard / list / join leaves and a shape-plan cache; the projector's walk is a scalar-
+// text subset (TryReadExtractPath rejects wildcards and negative indexes). They have different
+// access patterns and merging them was measured and rejected as false generality. Only this
+// non-walk skeleton is shared.
+
+struct JsonoTrieEdge {
+	JsonoTrieEdge() = default;
+	JsonoTrieEdge(string key_p, idx_t child_p) : key(std::move(key_p)), child(child_p) {
+	}
+
+	string key;
+	idx_t child = DConstants::INVALID_INDEX;
+};
+
+struct JsonoTrieIndexEdge {
+	JsonoTrieIndexEdge() = default;
+	JsonoTrieIndexEdge(idx_t index_p, idx_t child_p) : index(index_p), child(child_p) {
+	}
+
+	idx_t index = 0;
+	idx_t child = DConstants::INVALID_INDEX;
+};
+
+// One node type carries every leaf kind. The projector only ever populates `scalar_leaves` and
+// `simple_scalar_leaf` and leaves the transform-only fields (`list_leaves`/`join_leaves`/
+// `wildcard_child`) at their defaults; a single struct keeps each walk's node-field accesses
+// byte-for-byte identical to before the share (no base/derived dispatch), and the default-empty
+// vectors cost only bind-time, never a per-row branch.
+struct JsonoTrieNode {
+	vector<JsonoTrieEdge> key_edges;        // sorted object-key edges
+	vector<JsonoTrieIndexEdge> index_edges; // sorted forward array-index edges
+	idx_t wildcard_child = DConstants::INVALID_INDEX;
+	vector<idx_t> scalar_leaves;
+	vector<idx_t> list_leaves;
+	vector<idx_t> join_leaves;
+	// A leaf node holding exactly one scalar field and no child edges: the edge dispatch can
+	// write/null it directly without re-loading the child node. Set by the caller's leaf-finalize
+	// hook (the predicate differs between engines: the projector only has scalar leaves, transform
+	// must also confirm no list/join/wildcard).
+	idx_t simple_scalar_leaf = DConstants::INVALID_INDEX;
+};
+
+// The merge-build over a path set. The caller drives it: insert each field's steps to reach its
+// leaf node, attach the leaf there (its own leaf-kind policy), then sort. GetOrAdd* dedups shared
+// prefixes; the sort gives every node's edges the sorted order the lockstep walk relies on.
+struct JsonoTrie {
+	vector<JsonoTrieNode> nodes;
+
+	void Reset() {
+		nodes.clear();
+		nodes.emplace_back();
+	}
+
+	idx_t GetOrAddKeyChild(idx_t node_index, const string &key) {
+		for (auto &edge : nodes[node_index].key_edges) {
+			if (edge.key == key) {
+				return edge.child;
+			}
+		}
+		auto child = nodes.size();
+		nodes.emplace_back();
+		nodes[node_index].key_edges.push_back(JsonoTrieEdge {key, child});
+		return child;
+	}
+
+	idx_t GetOrAddIndexChild(idx_t node_index, idx_t index) {
+		for (auto &edge : nodes[node_index].index_edges) {
+			if (edge.index == index) {
+				return edge.child;
+			}
+		}
+		auto child = nodes.size();
+		nodes.emplace_back();
+		nodes[node_index].index_edges.push_back(JsonoTrieIndexEdge {index, child});
+		return child;
+	}
+
+	idx_t GetOrAddWildcardChild(idx_t node_index) {
+		auto &node = nodes[node_index];
+		if (node.wildcard_child != DConstants::INVALID_INDEX) {
+			return node.wildcard_child;
+		}
+		auto child = nodes.size();
+		nodes.emplace_back();
+		nodes[node_index].wildcard_child = child;
+		return child;
+	}
+
+	// Descend the steps from the root, materializing edges, and return the leaf node index the
+	// caller attaches its leaf to. The caller decides whether a wildcard step is admissible.
+	idx_t WalkToLeaf(const vector<PathStep> &steps) {
+		idx_t node_index = 0;
+		for (auto &step : steps) {
+			switch (step.kind) {
+			case PathStepKind::Key:
+				node_index = GetOrAddKeyChild(node_index, step.key);
+				break;
+			case PathStepKind::Index:
+				node_index = GetOrAddIndexChild(node_index, step.index);
+				break;
+			case PathStepKind::Wildcard:
+				node_index = GetOrAddWildcardChild(node_index);
+				break;
+			}
+		}
+		return node_index;
+	}
+
+	// Sort every node's edges; the lockstep object/array walk advances edge and key cursors in
+	// sorted order. The simple-scalar-leaf shortcut is caller-finalized (see JsonoTrieNode).
+	void SortEdges() {
+		for (auto &node : nodes) {
+			std::sort(node.key_edges.begin(), node.key_edges.end(),
+			          [](const JsonoTrieEdge &left, const JsonoTrieEdge &right) { return left.key < right.key; });
+			std::sort(node.index_edges.begin(), node.index_edges.end(),
+			          [](const JsonoTrieIndexEdge &left, const JsonoTrieIndexEdge &right) {
+				          return left.index < right.index;
+			          });
+		}
+	}
+};
+
+} // namespace jsono
+} // namespace duckdb

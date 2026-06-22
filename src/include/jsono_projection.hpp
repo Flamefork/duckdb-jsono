@@ -4,12 +4,11 @@
 #include "jsono_locate.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_trie.hpp"
 
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector.hpp"
-
-#include <algorithm>
 
 namespace duckdb {
 
@@ -23,85 +22,24 @@ namespace duckdb {
 
 namespace jsono {
 
-struct ProjectTrieEdge {
-	ProjectTrieEdge(string key_p, idx_t child_p) : key(std::move(key_p)), child(child_p) {
-	}
-	string key;
-	idx_t child;
-};
-
-struct ProjectTrieIndexEdge {
-	ProjectTrieIndexEdge(idx_t index_p, idx_t child_p) : index(index_p), child(child_p) {
-	}
-	idx_t index;
-	idx_t child;
-};
-
-struct ProjectTrieNode {
-	vector<ProjectTrieEdge> key_edges;        // sorted object-key edges
-	vector<ProjectTrieIndexEdge> index_edges; // sorted forward array-index edges
-	vector<idx_t> scalar_leaves;
-	// A leaf node holding exactly one field and no child edges: the edge dispatch can write/null it
-	// directly without re-loading the child node, the same fast path transform uses.
-	idx_t simple_scalar_leaf = DConstants::INVALID_INDEX;
-};
-
-// The trie built from a field set. `FIELD` must expose `const vector<PathStep> &steps`. Built once
-// at bind time; the walk reads it as a constant.
-struct ProjectTrie {
-	vector<ProjectTrieNode> nodes;
-
-	idx_t GetOrAddKeyChild(idx_t node_index, const string &key) {
-		for (auto &edge : nodes[node_index].key_edges) {
-			if (edge.key == key) {
-				return edge.child;
-			}
-		}
-		auto child = nodes.size();
-		nodes.emplace_back();
-		nodes[node_index].key_edges.emplace_back(key, child);
-		return child;
-	}
-
-	idx_t GetOrAddIndexChild(idx_t node_index, idx_t index) {
-		for (auto &edge : nodes[node_index].index_edges) {
-			if (edge.index == index) {
-				return edge.child;
-			}
-		}
-		auto child = nodes.size();
-		nodes.emplace_back();
-		nodes[node_index].index_edges.emplace_back(index, child);
-		return child;
-	}
-
+// The trie built from a field set, on the shared JsonoTrie skeleton. `FIELD` must expose
+// `const vector<PathStep> &steps`. Built once at bind time; the walk reads it as a constant. The
+// projector admits only scalar leaves over key/index edges — wildcards are rejected upstream by
+// TryReadExtractPath, so a wildcard step here is an internal invariant break.
+struct ProjectTrie : JsonoTrie {
 	template <class FIELD>
 	void Build(const vector<FIELD> &fields) {
-		nodes.clear();
-		nodes.emplace_back();
+		Reset();
 		for (idx_t field_index = 0; field_index < fields.size(); field_index++) {
-			idx_t node_index = 0;
 			for (auto &step : fields[field_index].steps) {
-				switch (step.kind) {
-				case PathStepKind::Key:
-					node_index = GetOrAddKeyChild(node_index, step.key);
-					break;
-				case PathStepKind::Index:
-					node_index = GetOrAddIndexChild(node_index, step.index);
-					break;
-				case PathStepKind::Wildcard:
+				if (step.kind == PathStepKind::Wildcard) {
 					throw InternalException("jsono projector trie: wildcard step is not projectable");
 				}
 			}
-			nodes[node_index].scalar_leaves.push_back(field_index);
+			nodes[WalkToLeaf(fields[field_index].steps)].scalar_leaves.push_back(field_index);
 		}
+		SortEdges();
 		for (auto &node : nodes) {
-			std::sort(node.key_edges.begin(), node.key_edges.end(),
-			          [](const ProjectTrieEdge &left, const ProjectTrieEdge &right) { return left.key < right.key; });
-			std::sort(node.index_edges.begin(), node.index_edges.end(),
-			          [](const ProjectTrieIndexEdge &left, const ProjectTrieIndexEdge &right) {
-				          return left.index < right.index;
-			          });
 			if (node.scalar_leaves.size() == 1 && node.key_edges.empty() && node.index_edges.empty()) {
 				node.simple_scalar_leaf = node.scalar_leaves[0];
 			}
