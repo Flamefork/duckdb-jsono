@@ -18,10 +18,10 @@ namespace duckdb {
 // build these via InitShredLanes, so the list walk and shred-type classification live in one place.
 struct ShredLane {
 	ShredKind kind = ShredKind::Scalar;
-	ShredPrimitive scalar_kind = ShredPrimitive::Varchar; // valid when kind == Scalar
+	jsono::JsonoScalarPrimitive scalar_kind = jsono::JsonoScalarPrimitive::Varchar; // valid when kind == Scalar
 	UnifiedVectorFormat fmt;
-	vector<ShredPrimitive> sub_kind;     // element value lanes; valid when kind == Array / ScalarArray
-	vector<UnifiedVectorFormat> sub_fmt; // element value lanes; valid when kind == Array / ScalarArray
+	vector<jsono::JsonoScalarPrimitive> sub_kind; // element value lanes; valid when kind == Array / ScalarArray
+	vector<UnifiedVectorFormat> sub_fmt;          // element value lanes; valid when kind == Array / ScalarArray
 };
 
 // Build the reading lanes for every shred of a shredded jsono `input` vector, in shred order (shred
@@ -38,7 +38,7 @@ inline void InitShredLanes(Vector &input, idx_t count, const child_list_t<Logica
 		lane.kind = ClassifyShredKind(shreds[f].second);
 		switch (lane.kind) {
 		case ShredKind::Scalar:
-			TypeToShredPrimitive(shreds[f].second, lane.scalar_kind);
+			lane.scalar_kind = jsono::JsonoScalarPrimitiveFromType(shreds[f].second, "jsono shred lane reader");
 			break;
 		case ShredKind::Array: {
 			auto &element_struct = ListVector::GetEntry(shred_vec);
@@ -49,7 +49,8 @@ inline void InitShredLanes(Vector &input, idx_t count, const child_list_t<Logica
 			lane.sub_kind.resize(subfield_vecs.size());
 			for (idx_t j = 0; j < subfield_vecs.size(); j++) {
 				subfield_vecs[j]->ToUnifiedFormat(element_count, lane.sub_fmt[j]);
-				TypeToShredPrimitive(element_fields[j].second, lane.sub_kind[j]);
+				lane.sub_kind[j] =
+				    jsono::JsonoScalarPrimitiveFromType(element_fields[j].second, "jsono shred lane reader");
 			}
 			break;
 		}
@@ -60,7 +61,8 @@ inline void InitShredLanes(Vector &input, idx_t count, const child_list_t<Logica
 			lane.sub_fmt.resize(1);
 			lane.sub_kind.resize(1);
 			ListVector::GetEntry(shred_vec).ToUnifiedFormat(element_count, lane.sub_fmt[0]);
-			TypeToShredPrimitive(ListType::GetChildType(shreds[f].second), lane.sub_kind[0]);
+			lane.sub_kind[0] = jsono::JsonoScalarPrimitiveFromType(ListType::GetChildType(shreds[f].second),
+			                                                       "jsono shred lane reader");
 			break;
 		}
 		}

@@ -3,11 +3,13 @@
 #include "jsono_locate.hpp"
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
+#include "jsono_path_bind.hpp"
 #include "jsono_projection.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
 #include "jsono_shred.hpp"
+#include "jsono_trie_shape_plan.hpp"
 
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
@@ -74,8 +76,7 @@ struct JsonoCompiledPath {
 };
 
 struct JsonoMatchPredicate {
-	string path;
-	vector<PathStep> steps;
+	JsonoPathSpec path;
 	JsonoCompiledPath compiled_path;
 	vector<string> values;
 	idx_t step_base = 0;
@@ -98,8 +99,8 @@ struct JsonoMatchBindData : public FunctionData {
 		for (idx_t predicate_index = 0; predicate_index < predicates.size(); predicate_index++) {
 			auto &left = predicates[predicate_index];
 			auto &right = other.predicates[predicate_index];
-			if (left.path != right.path || left.step_base != right.step_base || left.values != right.values ||
-			    !PathStepsEqual(left.steps, right.steps)) {
+			if (!JsonoPathSpecEqual(left.path, right.path) || left.step_base != right.step_base ||
+			    left.values != right.values) {
 				return false;
 			}
 		}
@@ -109,25 +110,27 @@ struct JsonoMatchBindData : public FunctionData {
 
 struct JsonoProjectField {
 	string name;
-	string path;
-	vector<PathStep> steps;
-	JsonoCompiledPath compiled_path;
-	idx_t step_base = 0;
+	JsonoPathSpec path;
 };
+
+constexpr idx_t PROJECT_SHAPE_PLAN_MIN_FIELDS = 3;
 
 struct JsonoProjectBindData : public FunctionData {
 	vector<JsonoProjectField> fields;
+	bool shape_plan_eligible = false;
+	vector<JsonoTrieShapeCoverCandidate> shape_cover_nodes;
 	// The trie the fused projector walks once per row. Built from `fields` after they are
 	// finalized (BuildTrie), it is bind-time constant and shared by every row's walk.
-	ProjectTrie trie;
+	JsonoTrie trie;
 
-	void BuildTrie() {
-		trie.Build(fields);
-	}
+	void BuildTrie();
+	void BuildShapeCoverNodes();
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<JsonoProjectBindData>();
 		result->fields = fields;
+		result->shape_plan_eligible = shape_plan_eligible;
+		result->shape_cover_nodes = shape_cover_nodes;
 		result->trie = trie;
 		return std::move(result);
 	}
@@ -140,8 +143,7 @@ struct JsonoProjectBindData : public FunctionData {
 		for (idx_t field_index = 0; field_index < fields.size(); field_index++) {
 			auto &left = fields[field_index];
 			auto &right = other.fields[field_index];
-			if (left.name != right.name || left.path != right.path || left.step_base != right.step_base ||
-			    !PathStepsEqual(left.steps, right.steps)) {
+			if (left.name != right.name || !JsonoPathSpecEqual(left.path, right.path)) {
 				return false;
 			}
 		}
@@ -149,30 +151,27 @@ struct JsonoProjectBindData : public FunctionData {
 	}
 };
 
-// Per-row ObjectLayout cache. A row's matcher/projector resolves several paths that
-// share a container (e.g. every root-key predicate re-reads the root object's layout;
-// every commit.* predicate re-reads commit's). ReadObjectLayout was the top JSONO
-// hotspot after H1 (~10% self-time on Q5), so cache it keyed by (generation, pos): a
-// generation bump per row invalidates the whole cache in O(1) without clearing.
-struct JsonoLayoutCacheEntry {
-	uint64_t generation = 0;
-	size_t pos = 0;
-	ObjectLayout layout {};
-};
+void JsonoProjectBindData::BuildShapeCoverNodes() {
+	JsonoTrieShapePlanBuildScalarCoverNodes(trie, shape_cover_nodes);
+}
 
-constexpr idx_t LAYOUT_CACHE_SIZE = 16;
+void JsonoProjectBindData::BuildTrie() {
+	BuildProjectTrie(trie, fields);
+	shape_plan_eligible = fields.size() >= PROJECT_SHAPE_PLAN_MIN_FIELDS;
+	BuildShapeCoverNodes();
+}
 
 struct JsonoPathLocalState : public FunctionLocalState {
-	JsonoPathLocalState() : layout_cache(LAYOUT_CACHE_SIZE) {
+	JsonoPathLocalState() : project_shape_plans("jsono project shape-plan") {
 	}
 
-	RankCache rank_cache;
-	vector<JsonoLayoutCacheEntry> layout_cache;
-	uint64_t layout_generation = 0;
+	JsonoPathLocateState locate_state;
 	std::string scratch;
 	// Per-node rank cache for the fused projector's trie walk; sized lazily to the bind's trie on
 	// first project execute (the matcher shares this local state but never touches it).
 	JsonoTrieRankCache project_rank_cache;
+	JsonoTrieShapePlanCache<JsonoTrieShapePlan> project_shape_plans;
+	vector<uint64_t> project_shape_offsets;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -296,39 +295,9 @@ bool TryReadStringListValue(ClientContext &context, Expression &expr, vector<str
 	return !result.empty();
 }
 
-bool TryReadExtractPath(ClientContext &context, Expression &expr, string &path, vector<PathStep> &steps) {
-	Value value;
-	if (!TryReadFoldableValue(context, expr, value)) {
+bool TryReadExtractPath(ClientContext &context, Expression &expr, JsonoPathSpec &path) {
+	if (!TryReadJsonoPathSpec(context, expr, "__jsono_internal_match", JsonoPathDialect::Extract, path)) {
 		return false;
-	}
-	if (expr.return_type.IsIntegral()) {
-		if (!value.DefaultTryCastAs(LogicalType::BIGINT)) {
-			return false;
-		}
-		auto index = value.GetValue<int64_t>();
-		if (index < 0) {
-			return false;
-		}
-		path = std::to_string(index);
-		steps = ArrayIndexPath(idx_t(index));
-		return true;
-	}
-	if (!value.DefaultTryCastAs(LogicalType::VARCHAR)) {
-		return false;
-	}
-	path = StringValue::Get(value);
-	if (path.empty()) {
-		return false;
-	}
-	if (path[0] == '$') {
-		steps = ParseJsonoPath(path, "__jsono_internal_match");
-	} else {
-		steps = LiteralKeyPath(path);
-	}
-	for (auto &step : steps) {
-		if (step.kind == PathStepKind::Wildcard) {
-			return false;
-		}
 	}
 	return true;
 }
@@ -350,15 +319,13 @@ bool TryReadJsonoExtractSource(ClientContext &context, Expression &expr, Express
 	if (function.children.size() != 2 || !IsJsonoType(function.children[0]->return_type)) {
 		return false;
 	}
-	string path;
-	vector<PathStep> steps;
-	if (!TryReadExtractPath(context, *function.children[1], path, steps)) {
+	JsonoPathSpec path;
+	if (!TryReadExtractPath(context, *function.children[1], path)) {
 		return false;
 	}
 	source = function.children[0].get();
 	predicate.path = std::move(path);
-	predicate.steps = std::move(steps);
-	predicate.compiled_path = CompileJsonoPath(predicate.steps);
+	predicate.compiled_path = CompileJsonoPath(predicate.path.steps);
 	return true;
 }
 
@@ -441,39 +408,9 @@ bool TryReadPredicate(ClientContext &context, Expression &expr, JsonoRewritePred
 	}
 }
 
-bool LocateObjectKey(JsonoPathLocalState &lstate, idx_t step_index, const JsonoView &view, const string &key,
-                     JsonoCursor &cursor) {
-	if (cursor.pos >= view.Slots()) {
-		return false;
-	}
-	// On a per-row cache hit the entry was stored only after a successful OBJ_START
-	// read, so both the tag check and ReadObjectLayout are skipped.
-	auto &entry = lstate.layout_cache[cursor.pos & (LAYOUT_CACHE_SIZE - 1)];
-	if (entry.generation != lstate.layout_generation || entry.pos != cursor.pos) {
-		if (SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_START) {
-			return false;
-		}
-		entry.generation = lstate.layout_generation;
-		entry.pos = cursor.pos;
-		entry.layout = ReadObjectLayout(view, cursor.pos, true);
-	}
-	const auto &layout = entry.layout;
-	size_t rank = 0;
-	if (!lstate.rank_cache.Find(step_index, view, layout, key, rank)) {
-		return false;
-	}
-	MoveCursorToObjectValueRank(view, layout, rank, cursor);
-	return true;
-}
-
 bool LocateOneStep(JsonoPathLocalState &lstate, idx_t step_index, const JsonoView &view, const PathStep &step,
                    JsonoCursor &cursor) {
-	if (step.kind == PathStepKind::Key) {
-		// Not the shared LocatePathStep: the matcher/projector resolves several paths per
-		// row, so the Key step goes through the per-row ObjectLayout cache.
-		return LocateObjectKey(lstate, step_index, view, step.key, cursor);
-	}
-	return LocatePathStep(&lstate.rank_cache, step_index, view, step, cursor);
+	return LocatePathStep(lstate.locate_state, step_index, view, step, cursor);
 }
 
 bool LocateCompiledPath(JsonoPathLocalState &lstate, const JsonoCompiledPath &compiled_path, idx_t step_base,
@@ -481,13 +418,13 @@ bool LocateCompiledPath(JsonoPathLocalState &lstate, const JsonoCompiledPath &co
 	JsonoCursor cursor;
 	switch (compiled_path.kind) {
 	case JsonoCompiledPathKind::RootKey:
-		if (!LocateObjectKey(lstate, step_base, view, compiled_path.first_key, cursor)) {
+		if (!LocateObjectKeyCached(lstate.locate_state, step_base, view, compiled_path.first_key, cursor)) {
 			return false;
 		}
 		break;
 	case JsonoCompiledPathKind::RootKeyKey:
-		if (!LocateObjectKey(lstate, step_base, view, compiled_path.first_key, cursor) ||
-		    !LocateObjectKey(lstate, step_base + 1, view, compiled_path.second_key, cursor)) {
+		if (!LocateObjectKeyCached(lstate.locate_state, step_base, view, compiled_path.first_key, cursor) ||
+		    !LocateObjectKeyCached(lstate.locate_state, step_base + 1, view, compiled_path.second_key, cursor)) {
 			return false;
 		}
 		break;
@@ -547,17 +484,17 @@ struct JsonoMatchSink {
 bool LocatedValueMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoMatchPredicate &predicate,
                          const JsonoView &view, const JsonoMatchLocation &location) {
 	JsonoMatchSink sink {predicate.values, false};
-	EmitLocatedText(reader, view, predicate.steps, location.cursor, lstate.scratch, sink);
+	EmitLocatedText(reader, view, predicate.path.steps, location.cursor, lstate.scratch, sink);
 	return sink.matched;
 }
 
 bool PredicateMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoMatchPredicate &predicate,
                       const JsonoView &view) {
 	JsonoMatchLocation location;
-	if (!LocateByCompiledPathOrSteps(lstate, predicate.compiled_path, predicate.step_base, predicate.steps, view,
+	if (!LocateByCompiledPathOrSteps(lstate, predicate.compiled_path, predicate.step_base, predicate.path.steps, view,
 	                                 location)) {
 		// A miss covered by the row's shred manifest must not read as a silent non-match.
-		reader.CheckPathMiss(view, predicate.steps);
+		reader.CheckPathMiss(view, predicate.path.steps);
 		return false;
 	}
 	return LocatedValueMatches(lstate, reader, predicate, view, location);
@@ -566,7 +503,7 @@ bool PredicateMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const
 void WriteLocatedExtractString(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoProjectField &field,
                                Vector &result, idx_t row, const JsonoView &view, const JsonoMatchLocation &location) {
 	JsonoExtractStringSink sink {result, FlatVector::GetData<string_t>(result), row};
-	EmitLocatedText(reader, view, field.steps, location.cursor, lstate.scratch, sink);
+	EmitLocatedText(reader, view, field.path.steps, location.cursor, lstate.scratch, sink);
 }
 
 enum class JsonoExtremaKind : uint8_t { Min, Max };
@@ -869,10 +806,61 @@ struct TextOutputPolicy {
 
 	static JSONO_ALWAYS_INLINE void NullLeaf(State &state, idx_t field_index, const JsonoView &view, idx_t row) {
 		// A miss covered by the row's shred manifest must not project a silent NULL.
-		state.reader.CheckPathMiss(view, state.fields[field_index].steps);
+		state.reader.CheckPathMiss(view, state.fields[field_index].path.steps);
 		FlatVector::SetNull(*state.children[field_index], row, true);
 	}
 };
+
+struct ProjectShapeFieldPolicy {
+	const JsonoProjectBindData &bind_data;
+
+	bool IncludeField(idx_t field_index) {
+		(void)field_index;
+		return true;
+	}
+
+	void Missing(JsonoTrieShapePlan &plan, idx_t field_index) {
+		plan.null_fields.push_back(field_index);
+	}
+
+	void Found(JsonoTrieShapePlan &plan, const JsonoView &view, const JsonoCursor &cursor, idx_t field_index,
+	           vector<idx_t> &walked_nodes) {
+		(void)view;
+		auto node_index = bind_data.trie.field_leaf_nodes[field_index];
+		if (node_index == DConstants::INVALID_INDEX) {
+			throw InternalException("jsono projector: missing trie leaf metadata");
+		}
+		if (std::find(walked_nodes.begin(), walked_nodes.end(), node_index) != walked_nodes.end()) {
+			return;
+		}
+		walked_nodes.push_back(node_index);
+		plan.walks.push_back(JsonoTrieShapeWalk {node_index, cursor.pos, cursor.length_cursor, cursor.num_cursor, 0});
+	}
+};
+
+unique_ptr<JsonoTrieShapePlan> BuildProjectShapePlan(const JsonoProjectBindData &bind_data, const JsonoView &view) {
+	auto plan = make_uniq<JsonoTrieShapePlan>();
+	ProjectShapeFieldPolicy field_policy {bind_data};
+	JsonoTrieShapePlanAddReads(*plan, bind_data.trie, bind_data.fields, bind_data.shape_cover_nodes, view,
+	                           field_policy);
+	JsonoTrieShapePlanFinalize(*plan);
+	return plan;
+}
+
+void ApplyProjectShapePlan(JsonoPathLocalState &lstate, const JsonoProjectBindData &bind_data,
+                           const JsonoTrieShapePlan &plan, TextOutputPolicy::State &policy_state, const JsonoView &view,
+                           idx_t row) {
+	JsonoTrieShapePlanScanLengthOffsets(plan, view, lstate.project_shape_offsets);
+	auto &offsets = lstate.project_shape_offsets;
+	for (auto field_index : plan.null_fields) {
+		TextOutputPolicy::NullLeaf(policy_state, field_index, view, row);
+	}
+
+	using WalkPolicy = ProjectTrieWalkPolicy<TextOutputPolicy>;
+	JsonoTrieShapePlanApplyNullSubtrees<WalkPolicy>(bind_data.trie.nodes, policy_state, plan, view, row);
+	JsonoTrieShapePlanApplyWalks<WalkPolicy>(bind_data.trie.nodes, lstate.project_rank_cache, policy_state, plan, view,
+	                                         offsets, row);
+}
 
 void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
@@ -898,14 +886,27 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 	TextOutputPolicy::State policy_state {lstate, reader, bind_data.fields, children};
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
-		lstate.layout_generation++;
 		JsonoBlobRow blob;
 		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			SetProjectRowNull(result, children, row);
 			continue;
 		}
 		FlatVector::Validity(result).SetValid(row);
-		WalkProjectTrie<TextOutputPolicy>(bind_data.trie, lstate.project_rank_cache, policy_state, view, row);
+		lstate.project_shape_plans.EndOfWindowCheck();
+		const JsonoTrieShapePlan *plan = nullptr;
+		if (bind_data.shape_plan_eligible && !lstate.project_shape_plans.disabled &&
+		    blob.slots.GetSize() + blob.key_heap.GetSize() <= JSONO_TRIE_SHAPE_PLAN_MAX_SHAPE_BYTES) {
+			auto hash = JsonoTrieShapeBlobHash(blob);
+			plan = lstate.project_shape_plans.Find(hash, blob);
+			if (!plan) {
+				plan = lstate.project_shape_plans.Insert(hash, blob, BuildProjectShapePlan(bind_data, view));
+			}
+		}
+		if (plan) {
+			ApplyProjectShapePlan(lstate, bind_data, *plan, policy_state, view, row);
+		} else {
+			WalkProjectTrie<TextOutputPolicy>(bind_data.trie, lstate.project_rank_cache, policy_state, view, row);
+		}
 	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -964,7 +965,7 @@ ScalarFunction MakeJsonoInternalDoubleTextFunction() {
 }
 
 idx_t ConservativePredicateRank(const JsonoMatchPredicate &predicate) {
-	auto root_path = predicate.steps.size() <= 1;
+	auto root_path = predicate.path.steps.size() <= 1;
 	auto multi_value = predicate.values.size() > 1;
 	if (!root_path && !multi_value) {
 		return 0;
@@ -989,10 +990,10 @@ void ApplyConservativePredicateOrder(vector<JsonoMatchPredicate> &predicates) {
 		                 if (left_rank != right_rank) {
 			                 return left_rank < right_rank;
 		                 }
-		                 if (left.steps.size() != right.steps.size()) {
-			                 return left.steps.size() > right.steps.size();
+		                 if (left.path.steps.size() != right.path.steps.size()) {
+			                 return left.path.steps.size() > right.path.steps.size();
 		                 }
-		                 return left.path < right.path;
+		                 return left.path.text < right.path.text;
 	                 });
 }
 
@@ -1009,7 +1010,7 @@ void JsonoInternalMatchExecute(DataChunk &args, ExpressionState &state, Vector &
 	auto result_data = FlatVector::GetData<bool>(result);
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
-		lstate.layout_generation++;
+		lstate.locate_state.NextRow();
 		result_data[row] = false;
 		JsonoBlobRow blob;
 		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
@@ -1046,7 +1047,7 @@ unique_ptr<Expression> MakeJsonoInternalMatchExpression(const JsonoRewriteGroup 
 	idx_t step_base = 0;
 	for (auto predicate : predicates) {
 		predicate.step_base = step_base;
-		step_base += predicate.steps.size();
+		step_base += predicate.path.steps.size();
 		bind_data->predicates.push_back(std::move(predicate));
 	}
 	vector<unique_ptr<Expression>> children;
@@ -1110,13 +1111,9 @@ void RewriteFilter(ClientContext &context, LogicalFilter &filter) {
 	filter.expressions = std::move(expressions);
 }
 
-bool ProjectPathEquals(const vector<PathStep> &left, const vector<PathStep> &right) {
-	return PathStepsEqual(left, right);
-}
-
-idx_t FindProjectField(const vector<JsonoProjectField> &fields, const vector<PathStep> &steps) {
+idx_t FindProjectField(const vector<JsonoProjectField> &fields, const JsonoPathSpec &path) {
 	for (idx_t field_index = 0; field_index < fields.size(); field_index++) {
-		if (ProjectPathEquals(fields[field_index].steps, steps)) {
+		if (JsonoPathSpecEqual(fields[field_index].path, path)) {
 			return field_index;
 		}
 	}
@@ -1151,12 +1148,10 @@ void CollectProjectSources(ClientContext &context, Expression &expr, vector<Json
 			    JsonoProjectSource {column_ref.binding, column_ref.return_type, column_ref.GetAlias(), {}});
 			source = &sources.back();
 		}
-		if (FindProjectField(source->fields, predicate.steps) == DConstants::INVALID_INDEX) {
+		if (FindProjectField(source->fields, predicate.path) == DConstants::INVALID_INDEX) {
 			JsonoProjectField field;
 			field.name = "p" + std::to_string(source->fields.size());
 			field.path = std::move(predicate.path);
-			field.steps = std::move(predicate.steps);
-			field.compiled_path = std::move(predicate.compiled_path);
 			source->fields.push_back(std::move(field));
 		}
 		return;
@@ -1255,9 +1250,10 @@ void RewriteProjectExpression(unique_ptr<Expression> &expr, JsonoProjectRewriteS
 	if (TryReadJsonoExtractSource(state.context, *expr, extract_source, predicate) &&
 	    extract_source->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 	    extract_source->Cast<BoundColumnRefExpression>().binding == state.source_binding) {
-		auto field_index = FindProjectField(state.fields, predicate.steps);
+		auto field_index = FindProjectField(state.fields, predicate.path);
 		if (field_index == DConstants::INVALID_INDEX) {
-			throw InternalException("JSONO projector rewrite missing collected field for path '%s'", predicate.path);
+			throw InternalException("JSONO projector rewrite missing collected field for path '%s'",
+			                        predicate.path.text);
 		}
 		auto alias = expr->GetAlias();
 		expr = MakeStructExtractAtExpression(state, field_index, alias);
@@ -1278,10 +1274,7 @@ void RewriteProjectExpression(unique_ptr<Expression> &expr, JsonoProjectRewriteS
 
 unique_ptr<Expression> MakeJsonoInternalProjectExpression(JsonoProjectRewriteState &state) {
 	auto bind_data = make_uniq<JsonoProjectBindData>();
-	idx_t step_base = 0;
 	for (auto field : state.fields) {
-		field.step_base = step_base;
-		step_base += field.steps.size();
 		bind_data->fields.push_back(std::move(field));
 	}
 	bind_data->BuildTrie();
@@ -1670,9 +1663,8 @@ private:
 	// serialize containers, so they need the leaf as much as json-valued ones.
 	unique_ptr<Expression> RewriteShreddedExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast) {
 		bool string_fn = IsStringExtractFunction(expr.function.name);
-		string path;
-		vector<PathStep> steps;
-		if (!TryReadExtractPath(context, *expr.children[1], path, steps)) {
+		JsonoPathSpec path;
+		if (!TryReadExtractPath(context, *expr.children[1], path)) {
 			// Non-constant (or otherwise unreadable) path: leave the plan untouched. The
 			// core-named extracts support per-row paths over the reconstruct cast, and the
 			// jsono-named extracts already refused such a path at their own bind.
@@ -1685,14 +1677,14 @@ private:
 		// a json-valued extract of a shred, an array shred, and a read of a subtree holding a stripped
 		// leaf. The exact-scalar read below is then reached only when no shred forces reconstruct.
 		for (auto &shred : shreds) {
-			if (ReadNeedsReconstruct(steps, shred, string_fn)) {
+			if (ReadNeedsReconstruct(path.steps, shred, string_fn)) {
 				return MakeReconstructExtract(expr, shredded_cast, string_fn);
 			}
 		}
 		// An exact match on a scalar (non-list) shred under a string-valued extract reads the shred
 		// lane directly (with the residual COALESCE fallback, dropped when the shred is total).
 		for (auto &shred : shreds) {
-			if (PathStepsEqual(shred.steps, steps) && string_fn && !IsShredListType(shred.type)) {
+			if (PathStepsEqual(shred.steps, path.steps) && string_fn && !IsShredListType(shred.type)) {
 				auto alias = expr.GetAlias();
 				return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
 			}
@@ -1720,14 +1712,13 @@ private:
 			}
 			return;
 		}
-		string path;
-		vector<PathStep> steps;
-		if (!TryReadExtractPath(context, *expr.children[1], path, steps)) {
+		JsonoPathSpec path;
+		if (!TryReadExtractPath(context, *expr.children[1], path)) {
 			return;
 		}
 		for (auto &shred : CollectShreddedShreds(shredded_cast->child->return_type)) {
-			if (PathStepsEqual(shred.steps, steps) || PathStepsObjectKeyPrefix(steps, shred.steps) ||
-			    ReadDescendsIntoArrayShred(shred.type, shred.steps, steps)) {
+			if (PathStepsEqual(shred.steps, path.steps) || PathStepsObjectKeyPrefix(path.steps, shred.steps) ||
+			    ReadDescendsIntoArrayShred(shred.type, shred.steps, path.steps)) {
 				return;
 			}
 		}
@@ -1905,16 +1896,15 @@ private:
 		if (!shredded_cast) {
 			return nullptr;
 		}
-		string path;
-		vector<PathStep> steps;
-		if (!TryReadExtractPath(context, *fn.children[1], path, steps)) {
+		JsonoPathSpec path;
+		if (!TryReadExtractPath(context, *fn.children[1], path)) {
 			return nullptr;
 		}
 		for (auto &shred : CollectShreddedShreds(shredded_cast->child->return_type)) {
 			// MakeTypedShredRead navigates the scalar pair STRUCT(value, complete) via ShredExtract; a
 			// list shred stays a bare LIST (no pair), so folding it crashes the extract. Leave the inner
 			// `->>` to RewriteShreddedExtract (which reconstructs for list shreds) and the cast on top.
-			if (!PathStepsEqual(shred.steps, steps) || shred.type != target || IsShredListType(shred.type)) {
+			if (!PathStepsEqual(shred.steps, path.steps) || shred.type != target || IsShredListType(shred.type)) {
 				continue;
 			}
 			return MakeTypedShredRead(std::move(shredded_cast->child), shred, std::move(fn.children[1]), target,

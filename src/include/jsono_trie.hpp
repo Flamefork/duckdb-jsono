@@ -19,12 +19,6 @@ namespace jsono {
 // document once dispatching every leaf. This header owns only the trie's STRUCTURAL parts — the
 // edge/node layout, the prefix-merge build (GetOrAdd* + the per-node edge sort), and the
 // simple-scalar-leaf shortcut. It is bind-time machinery; nothing here runs per row.
-//
-// INVARIANT (do NOT relax in a follow-up): the two recursive WALKS stay separate. Transform's walk
-// handles wildcard / list / join leaves and a shape-plan cache; the projector's walk is a scalar-
-// text subset (TryReadExtractPath rejects wildcards and negative indexes). They have different
-// access patterns and merging them was measured and rejected as false generality. Only this
-// non-walk skeleton is shared.
 
 struct JsonoTrieEdge {
 	JsonoTrieEdge() = default;
@@ -68,10 +62,19 @@ struct JsonoTrieNode {
 // prefixes; the sort gives every node's edges the sorted order the lockstep walk relies on.
 struct JsonoTrie {
 	vector<JsonoTrieNode> nodes;
+	vector<idx_t> field_leaf_nodes;
+	vector<vector<idx_t>> field_node_chains;
 
 	void Reset() {
 		nodes.clear();
 		nodes.emplace_back();
+		field_leaf_nodes.clear();
+		field_node_chains.clear();
+	}
+
+	void PrepareFieldMetadata(idx_t field_count) {
+		field_leaf_nodes.assign(field_count, DConstants::INVALID_INDEX);
+		field_node_chains.assign(field_count, vector<idx_t>());
 	}
 
 	idx_t GetOrAddKeyChild(idx_t node_index, const string &key) {
@@ -112,7 +115,16 @@ struct JsonoTrie {
 	// Descend the steps from the root, materializing edges, and return the leaf node index the
 	// caller attaches its leaf to. The caller decides whether a wildcard step is admissible.
 	idx_t WalkToLeaf(const vector<PathStep> &steps) {
+		vector<idx_t> *chain = nullptr;
+		return WalkToLeaf(steps, chain);
+	}
+
+	idx_t WalkToLeaf(const vector<PathStep> &steps, vector<idx_t> *chain) {
 		idx_t node_index = 0;
+		if (chain) {
+			chain->clear();
+			chain->push_back(node_index);
+		}
 		for (auto &step : steps) {
 			switch (step.kind) {
 			case PathStepKind::Key:
@@ -125,8 +137,20 @@ struct JsonoTrie {
 				node_index = GetOrAddWildcardChild(node_index);
 				break;
 			}
+			if (chain) {
+				chain->push_back(node_index);
+			}
 		}
 		return node_index;
+	}
+
+	idx_t WalkFieldToLeaf(idx_t field_index, const vector<PathStep> &steps) {
+		if (field_index >= field_leaf_nodes.size()) {
+			throw InternalException("jsono trie: field metadata not prepared");
+		}
+		auto leaf = WalkToLeaf(steps, &field_node_chains[field_index]);
+		field_leaf_nodes[field_index] = leaf;
+		return leaf;
 	}
 
 	// Sort every node's edges; the lockstep object/array walk advances edge and key cursors in

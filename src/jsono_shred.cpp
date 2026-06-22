@@ -7,6 +7,7 @@
 #include "jsono_reader.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
+#include "jsono_scalar_write.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -51,23 +52,19 @@ using namespace duckdb_yyjson;
 // One subfield lifted out of each array element into the LIST<STRUCT> shred column.
 struct ShredArraySubfield {
 	string name; // element subfield key (= struct field name)
-	ShredPrimitive primitive;
-	LogicalType logical_type;
+	JsonoScalarPrimitive primitive;
 };
 
 struct ShredField {
-	string path_name; // canonical path; also the shred struct field name
-	vector<PathStep> steps;
-	LogicalType logical_type; // the shred column type (scalar, LIST<STRUCT>, or LIST<scalar>)
+	JsonoPathSpec path; // canonical path; also the shred struct field name
 	// kind == Scalar: one leaf scalar lifted at `steps` (use `primitive`). kind == Array: `steps`
 	// addresses a regular array; `subfields` are the element leaves lifted into a parallel LIST<STRUCT>
 	// column. kind == ScalarArray: `steps` addresses a regular array; each whole scalar element lifts
-	// into a parallel LIST<element_type> column (use `element_type`/`element_primitive`).
+	// into a parallel LIST<element_type> column (use `element_primitive`).
 	ShredKind kind = ShredKind::Scalar;
-	ShredPrimitive primitive;             // valid when kind == Scalar
-	vector<ShredArraySubfield> subfields; // valid when kind == Array, element-struct order
-	LogicalType element_type;             // valid when kind == ScalarArray
-	ShredPrimitive element_primitive;     // valid when kind == ScalarArray
+	JsonoScalarPrimitive primitive;         // valid when kind == Scalar
+	vector<ShredArraySubfield> subfields;   // valid when kind == Array, element-struct order
+	JsonoScalarPrimitive element_primitive; // valid when kind == ScalarArray
 	// True when a VARCHAR scalar shred may inline a container's `->>` text into its lane (a read copy)
 	// so a bare lane read equals `->>`. False when another shred lives strictly inside this path: that
 	// nested shred is stripped from the residual, so the lane cannot hold the full container and the
@@ -123,14 +120,14 @@ struct ShredLocalState : public FunctionLocalState {
 	}
 };
 
-vector<PathStep> ParseShredFieldPath(const string &path) {
+JsonoPathSpec ParseShredPathSpec(const string &path) {
 	auto steps = path.size() > 0 && path[0] == '$' ? ParseJsonoPath(path, "jsono shred") : LiteralKeyPath(path);
 	for (auto &step : steps) {
 		if (step.kind == PathStepKind::Wildcard) {
 			throw BinderException("jsono shred: wildcard paths are not supported ('%s')", path);
 		}
 	}
-	return steps;
+	return JsonoPathSpec(path, std::move(steps));
 }
 
 // A path may be stripped from the residual only if it is a pure object-key sequence: the
@@ -168,12 +165,29 @@ void MarkContainerRenderSafety(vector<ShredField> &fields) {
 	for (idx_t i = 0; i < fields.size(); i++) {
 		fields[i].container_render_safe = true;
 		for (idx_t j = 0; j < fields.size(); j++) {
-			if (i != j && IsStrictObjectKeyPrefix(fields[i].steps, fields[j].steps)) {
+			if (i != j && IsStrictObjectKeyPrefix(fields[i].path.steps, fields[j].path.steps)) {
 				fields[i].container_render_safe = false;
 				break;
 			}
 		}
 	}
+}
+
+LogicalType ShredFieldType(const ShredField &field) {
+	switch (field.kind) {
+	case ShredKind::Scalar:
+		return JsonoScalarPrimitiveLogicalType(field.primitive);
+	case ShredKind::Array: {
+		child_list_t<LogicalType> children;
+		for (auto &subfield : field.subfields) {
+			children.emplace_back(subfield.name, JsonoScalarPrimitiveLogicalType(subfield.primitive));
+		}
+		return LogicalType::LIST(LogicalType::STRUCT(std::move(children)));
+	}
+	case ShredKind::ScalarArray:
+		return LogicalType::LIST(JsonoScalarPrimitiveLogicalType(field.element_primitive));
+	}
+	throw InternalException("jsono: unhandled shred kind");
 }
 
 struct YyjsonDoc {
@@ -194,8 +208,7 @@ struct YyjsonDoc {
 // logical type. Returns false when the type is not a recognizable shred type — the caller raises
 // the exception that fits its context. The object-key-path gate likewise stays caller-side.
 bool FillShredFieldFromType(const LogicalType &type, ShredField &field) {
-	field.logical_type = type;
-	if (TypeToShredPrimitive(type, field.primitive)) {
+	if (TypeToJsonoScalarPrimitive(type, field.primitive)) {
 		field.kind = ShredKind::Scalar;
 		return true;
 	}
@@ -205,16 +218,14 @@ bool FillShredFieldFromType(const LogicalType &type, ShredField &field) {
 		for (auto &sub : StructType::GetChildTypes(element)) {
 			ShredArraySubfield subfield;
 			subfield.name = sub.first;
-			subfield.logical_type = sub.second;
-			TypeToShredPrimitive(sub.second, subfield.primitive);
+			subfield.primitive = JsonoScalarPrimitiveFromType(sub.second, "jsono shred bind");
 			field.subfields.push_back(std::move(subfield));
 		}
 		return true;
 	}
 	if (IsShredScalarArrayType(type)) {
 		field.kind = ShredKind::ScalarArray;
-		field.element_type = ListType::GetChildType(type);
-		TypeToShredPrimitive(field.element_type, field.element_primitive);
+		field.element_primitive = JsonoScalarPrimitiveFromType(ListType::GetChildType(type), "jsono shred bind");
 		return true;
 	}
 	return false;
@@ -232,7 +243,8 @@ void BindShredFieldType(const string &type_name, ClientContext &context, const s
 	if (!FillShredFieldFromType(type, field)) {
 		throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
 	}
-	if ((field.kind == ShredKind::Array || field.kind == ShredKind::ScalarArray) && !IsObjectKeyPath(field.steps)) {
+	if ((field.kind == ShredKind::Array || field.kind == ShredKind::ScalarArray) &&
+	    !IsObjectKeyPath(field.path.steps)) {
 		throw BinderException("jsono shred: array shred '%s' must address an array by an object-key path "
 		                      "(no array index or wildcard)",
 		                      path);
@@ -263,8 +275,7 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 		auto type_name = StringValue::Get(type_value);
 		JsonoValidateShredFieldName(path);
 		ShredField field;
-		field.path_name = path;
-		field.steps = ParseShredFieldPath(path);
+		field.path = ParseShredPathSpec(path);
 		BindShredFieldType(type_name, context, path, field);
 		bind_data->fields.push_back(std::move(field));
 	}
@@ -275,11 +286,11 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 	// not of spec order: the execution writes shreds by index, so the field write order and the type's
 	// shred order must agree — sort both here. The shred-set marker hash is order-independent regardless.
 	std::sort(bind_data->fields.begin(), bind_data->fields.end(),
-	          [](const ShredField &a, const ShredField &b) { return a.path_name < b.path_name; });
+	          [](const ShredField &a, const ShredField &b) { return a.path.text < b.path.text; });
 	MarkContainerRenderSafety(bind_data->fields);
 	child_list_t<LogicalType> shreds;
 	for (auto &field : bind_data->fields) {
-		shreds.emplace_back(field.path_name, field.logical_type);
+		shreds.emplace_back(field.path.text, ShredFieldType(field));
 	}
 	// JsonoShreddedStructType builds the canonical layout type purely from the shred set, so a column
 	// declared from the same shreds is byte-identical and a mismatched cast fails loud via the manifest.
@@ -295,12 +306,12 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 			bind_data->one_pass_text = false;
 			continue;
 		}
-		if (!IsObjectKeyPath(field.steps)) {
+		if (!IsObjectKeyPath(field.path.steps)) {
 			bind_data->residual_fill_fields.push_back(f);
 			continue;
 		}
 		uint32_t node = 0;
-		for (auto &step : field.steps) {
+		for (auto &step : field.path.steps) {
 			uint32_t next = std::numeric_limits<uint32_t>::max();
 			for (auto &edge : bind_data->trie[node].children) {
 				if (edge.first == step.key) {
@@ -358,9 +369,10 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 			bind_data->keep_src.assign(bind_data->fields.size(), DConstants::INVALID_INDEX);
 			vector<bool> src_kept(src_layout.shreds.size(), false);
 			for (idx_t f = 0; f < bind_data->fields.size(); f++) {
+				auto field_type = ShredFieldType(bind_data->fields[f]);
 				for (idx_t k = 0; k < src_layout.shreds.size(); k++) {
-					if (src_layout.shreds[k].first == bind_data->fields[f].path_name &&
-					    src_layout.shreds[k].second == bind_data->fields[f].logical_type) {
+					if (src_layout.shreds[k].first == bind_data->fields[f].path.text &&
+					    src_layout.shreds[k].second == field_type) {
 						bind_data->keep_src[f] = k;
 						src_kept[k] = true;
 						break;
@@ -399,23 +411,6 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 	return std::move(bind_data);
 }
 
-struct Location {
-	Location() = default;
-	Location(const JsonoCursor &cursor_p, bool found_p) : cursor(cursor_p), found(found_p) {
-	}
-
-	JsonoCursor cursor;
-	bool found = false;
-};
-
-Location LocatePath(const JsonoView &view, const vector<PathStep> &steps) {
-	JsonoCursor cursor;
-	if (!LocatePathSteps(nullptr, 0, steps, view, cursor)) {
-		return {};
-	}
-	return Location {cursor, true};
-}
-
 // Write a scalar shred's VALUE lane for a field and return whether the original value is losslessly
 // captured by the shred type (so the path may be stripped from the residual). A VARCHAR shred stores
 // the `->>` text for any scalar but strips only a real JSON string; a typed shred stores the value
@@ -425,8 +420,8 @@ Location LocatePath(const JsonoView &view, const vector<PathStep> &steps) {
 // when the lane holds the full `->>` answer (absent path, explicit null, a fitting/read-copy scalar,
 // a render-safe container text), false when the value spilled to the residual (typed-divert, or a
 // typed/render-unsafe container) and the read must fall back to the residual / reconstruct.
-bool WriteShred(const ShredField &field, const JsonoView &view, const Location &location, Vector &shred, idx_t row,
-                std::string &scratch, bool *complete = nullptr) {
+bool WriteShred(const ShredField &field, const JsonoView &view, const JsonoPathLocation &location, Vector &shred,
+                idx_t row, std::string &scratch, bool *complete = nullptr) {
 	auto set_complete = [&](bool value) {
 		if (complete) {
 			*complete = value;
@@ -440,15 +435,14 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const Location &
 	}
 	auto value_tag = SlotTag(view.SlotAt(location.cursor.pos));
 	if (value_tag == tag::OBJ_START || value_tag == tag::ARR_START) {
-		if (field.primitive == ShredPrimitive::Varchar && field.container_render_safe) {
+		if (field.primitive == JsonoScalarPrimitive::Varchar && field.container_render_safe) {
 			// Render the container's sorted `->>` text into the lane as a read copy (the container
 			// stays in the residual; reconstruct's residual-authoritative overlay ignores the copy).
 			// Byte-identical to the residual COALESCE fallback — both go through AppendJsonValueText.
 			scratch.clear();
 			JsonoCursor cursor = location.cursor;
 			AppendJsonValueText(view, cursor, scratch, 0);
-			FlatVector::Validity(shred).SetValid(row);
-			FlatVector::GetData<string_t>(shred)[row] = StringVector::AddString(shred, scratch.data(), scratch.size());
+			WriteJsonoStringLane(shred, row, nonstd::string_view(scratch.data(), scratch.size()));
 			set_complete(true);
 			return false; // read copy: not stripped from the residual
 		}
@@ -466,35 +460,15 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const Location &
 		set_complete(true);
 		return false;
 	}
-	bool fits = JsonoScalarFitsShredType(scalar, field.logical_type);
-	if (field.primitive == ShredPrimitive::Varchar) {
+	bool fits = JsonoScalarFitsPrimitive(scalar, field.primitive);
+	if (field.primitive == JsonoScalarPrimitive::Varchar) {
 		// A VARCHAR shred renders any scalar's ->> text (a read copy) but strips only a real JSON string.
-		scratch.clear();
-		RenderExtractText(scalar, scratch); // non-null scalar always renders text
-		FlatVector::Validity(shred).SetValid(row);
-		FlatVector::GetData<string_t>(shred)[row] = StringVector::AddString(shred, scratch.data(), scratch.size());
+		WriteJsonoRenderedTextLane(shred, row, scalar, scratch);
 		set_complete(true);
 		return fits; // fits == (kind == String)
 	}
 	if (fits) {
-		FlatVector::Validity(shred).SetValid(row);
-		switch (field.primitive) {
-		case ShredPrimitive::Bigint:
-			FlatVector::GetData<int64_t>(shred)[row] = scalar.int_value;
-			break;
-		case ShredPrimitive::Ubigint:
-			FlatVector::GetData<uint64_t>(shred)[row] =
-			    scalar.kind == JsonoScalarKind::UInt64 ? scalar.uint_value : uint64_t(scalar.int_value);
-			break;
-		case ShredPrimitive::Double:
-			FlatVector::GetData<double>(shred)[row] = scalar.double_value;
-			break;
-		case ShredPrimitive::Boolean:
-			FlatVector::GetData<bool>(shred)[row] = scalar.bool_value;
-			break;
-		case ShredPrimitive::Varchar:
-			break; // handled above
-		}
+		WriteJsonoFittingScalarLane(shred, row, scalar, field.primitive, scratch);
 		set_complete(true);
 		return true;
 	}
@@ -514,8 +488,8 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const Location &
 // FLAT setup is lane-specific — LIST<STRUCT> must flatten every subfield, LIST<scalar> only the one
 // child). The caller's NULL-slot handling for non-conforming elements lives inside write_element.
 template <class Setup, class WriteElement>
-bool WriteArrayLaneShred(const JsonoView &view, const Location &location, Vector &list_vec, idx_t row, Setup setup,
-                         WriteElement write_element) {
+bool WriteArrayLaneShred(const JsonoView &view, const JsonoPathLocation &location, Vector &list_vec, idx_t row,
+                         Setup setup, WriteElement write_element) {
 	if (!location.found || SlotTag(view.SlotAt(location.cursor.pos)) != tag::ARR_START) {
 		SetListRowNull(list_vec, row);
 		return false;
@@ -547,9 +521,9 @@ bool WriteArrayLaneShred(const JsonoView &view, const Location &location, Vector
 // residual). Each array element becomes one struct row: an object element's lifted subfields are
 // written typed (NULL where absent/diverted/type-mismatched), a non-object/null element a NULL
 // struct. The skeleton residual emit (jsono_merge.cpp) strips exactly the subfields whose write
-// here reports strippable, since both gate on JsonoScalarFitsShredType.
-bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Location &location, Vector &list_vec,
-                     idx_t row, std::string &scratch) {
+// here reports strippable, since both gate on JsonoScalarFitsPrimitive.
+bool WriteArrayShred(const ShredField &field, const JsonoView &view, const JsonoPathLocation &location,
+                     Vector &list_vec, idx_t row, std::string &scratch) {
 	auto &struct_vec = ListVector::GetEntry(list_vec);
 	auto &subfield_vecs = StructVector::GetEntries(struct_vec);
 	return WriteArrayLaneShred(
@@ -574,52 +548,21 @@ bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Locat
 		    for (idx_t j = 0; j < field.subfields.size(); j++) {
 			    auto &sub = field.subfields[j];
 			    ShredField subfield;
-			    subfield.steps.push_back(PathStep {PathStepKind::Key, sub.name, 0});
+			    subfield.path.steps.push_back(PathStep {PathStepKind::Key, sub.name, 0});
 			    subfield.primitive = sub.primitive;
-			    subfield.logical_type = sub.logical_type;
 			    // An array-element subfield has no per-shred completeness and is always reconstructed,
 			    // so it never inlines a container read copy (that lane is never bare-read): a container
 			    // subfield stays a NULL lane and lives in the skeleton residual.
 			    subfield.container_render_safe = false;
 			    JsonoCursor probe = elem;
-			    Location subloc;
-			    if (LocatePathStep(nullptr, 0, view, subfield.steps[0], probe)) {
-				    subloc = Location {probe, true};
+			    JsonoPathLocation subloc;
+			    if (LocatePathStep(nullptr, 0, view, subfield.path.steps[0], probe)) {
+				    subloc = JsonoPathLocation {probe, true};
 			    }
 			    stripped |= WriteShred(subfield, view, subloc, *subfield_vecs[j], child, scratch);
 		    }
 		    return stripped;
 	    });
-}
-
-// Write one fitting scalar into a flat shred vector at `idx`. The caller has already checked the
-// value fits `primitive` (JsonoScalarFitsShredType), so this strips the value into the typed column
-// unconditionally — unlike WriteShred, a scalar-array element NEVER keeps a VARCHAR read-copy of a
-// non-string: the shred-slot validity disambiguates a lifted element from a kept one, so writing a
-// read-copy would make a non-conforming element look lifted on reconstruct.
-void WriteFittingScalarElement(Vector &out, idx_t idx, const JsonoScalar &scalar, ShredPrimitive primitive,
-                               std::string &scratch) {
-	FlatVector::Validity(out).SetValid(idx);
-	switch (primitive) {
-	case ShredPrimitive::Varchar:
-		scratch.clear();
-		RenderExtractText(scalar, scratch); // a real JSON string renders its content (fits == String)
-		FlatVector::GetData<string_t>(out)[idx] = StringVector::AddString(out, scratch.data(), scratch.size());
-		return;
-	case ShredPrimitive::Bigint:
-		FlatVector::GetData<int64_t>(out)[idx] = scalar.int_value;
-		return;
-	case ShredPrimitive::Ubigint:
-		FlatVector::GetData<uint64_t>(out)[idx] =
-		    scalar.kind == JsonoScalarKind::UInt64 ? scalar.uint_value : uint64_t(scalar.int_value);
-		return;
-	case ShredPrimitive::Double:
-		FlatVector::GetData<double>(out)[idx] = scalar.double_value;
-		return;
-	case ShredPrimitive::Boolean:
-		FlatVector::GetData<bool>(out)[idx] = scalar.bool_value;
-		return;
-	}
 }
 
 // Write the LIST<scalar> shred column for one row's array at `location` and return whether any
@@ -628,9 +571,9 @@ void WriteFittingScalarElement(Vector &out, idx_t idx, const JsonoScalar &scalar
 // Each array element becomes one list slot: a scalar that fits the lane type is written typed and
 // reported lifted; a non-conforming scalar, a null/object/array element, or a type mismatch writes a
 // NULL slot and stays verbatim in the residual skeleton. The skeleton emit (jsono_merge.cpp) drops
-// exactly the elements lifted here, since both gate on JsonoScalarFitsShredType.
-bool WriteScalarArrayShred(const ShredField &field, const JsonoView &view, const Location &location, Vector &list_vec,
-                           idx_t row, std::string &scratch) {
+// exactly the elements lifted here, since both gate on JsonoScalarFitsPrimitive.
+bool WriteScalarArrayShred(const ShredField &field, const JsonoView &view, const JsonoPathLocation &location,
+                           Vector &list_vec, idx_t row, std::string &scratch) {
 	auto &child_vec = ListVector::GetEntry(list_vec);
 	return WriteArrayLaneShred(
 	    view, location, list_vec, row, [&]() { child_vec.SetVectorType(VectorType::FLAT_VECTOR); },
@@ -639,8 +582,8 @@ bool WriteScalarArrayShred(const ShredField &field, const JsonoView &view, const
 		    if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
 			    JsonoCursor probe = elem;
 			    auto scalar = DecodeScalarAt(view, probe);
-			    if (JsonoScalarFitsShredType(scalar, field.element_type)) {
-				    WriteFittingScalarElement(child_vec, child, scalar, field.element_primitive, scratch);
+			    if (JsonoScalarFitsPrimitive(scalar, field.element_primitive)) {
+				    WriteJsonoFittingScalarLane(child_vec, child, scalar, field.element_primitive, scratch);
 				    return true;
 			    }
 		    }
@@ -693,12 +636,12 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 	// sorted order, so the manifest is too).
 	vector<JsonoShredManifestEntryBytes> manifest_entries(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
-		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
+		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path.text, ShredFieldType(fields[f]));
 	}
 
 	// Array shred specs (path + lifted-element description), built once for the residual skeleton
 	// emit. The skeleton emit strips, per array element, exactly what the WriteArrayShred /
-	// WriteScalarArrayShred pass reports lifted (both gate on JsonoScalarFitsShredType), keeping the
+	// WriteScalarArrayShred pass reports lifted (both gate on JsonoScalarFitsPrimitive), keeping the
 	// array as the position carrier.
 	bool has_array = false;
 	vector<JsonoArrayShredSpec> array_specs;
@@ -708,13 +651,13 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		}
 		has_array = true;
 		JsonoArrayShredSpec spec;
-		spec.path = field.steps;
+		spec.path = field.path.steps;
 		spec.kind = field.kind;
 		if (field.kind == ShredKind::ScalarArray) {
-			spec.element_type = field.element_type;
+			spec.element_primitive = field.element_primitive;
 		} else {
 			for (auto &sub : field.subfields) {
-				spec.subfields.emplace_back(sub.name, sub.logical_type);
+				spec.subfields.emplace_back(sub.name, sub.primitive);
 			}
 		}
 		array_specs.push_back(std::move(spec));
@@ -741,7 +684,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		stripped_fields.clear();
 		for (idx_t f = 0; f < fields.size(); f++) {
 			auto &field = fields[f];
-			auto location = LocatePath(view, field.steps);
+			auto location = LocatePath(view, field.path.steps);
 			if (field.kind != ShredKind::Scalar) {
 				// Array shreds carry no completeness flag: a per-element diversion has no
 				// bare-struct_extract fast path to invalidate (the array is always reconstructed).
@@ -756,8 +699,8 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 			bool complete = true;
 			bool strippable = WriteShred(field, view, location, *shred_children[f], row, lstate.text, &complete);
 			FlatVector::GetData<int8_t>(*complete_children[f])[row] = complete ? 1 : 0;
-			if (strippable && IsObjectKeyPath(field.steps)) {
-				lstate.strip_paths.push_back(&field.steps);
+			if (strippable && IsObjectKeyPath(field.path.steps)) {
+				lstate.strip_paths.push_back(&field.path.steps);
 				stripped_fields.push_back(f);
 			}
 		}
@@ -847,7 +790,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 
 	vector<JsonoShredManifestEntryBytes> manifest_entries(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
-		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
+		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path.text, ShredFieldType(fields[f]));
 	}
 
 	const std::vector<ShredManifestEntry> *old_manifest = nullptr;
@@ -904,20 +847,20 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			if (bind_data.keep_src[f] != DConstants::INVALID_INDEX) {
 				// The kept shred's stripped-or-not state, and its per-row completeness, carry over from
 				// the input row (the manifest, and the copied `complete` lane).
-				if (manifest_has_path(fields[f].path_name)) {
+				if (manifest_has_path(fields[f].path.text)) {
 					stripped_fields.push_back(f);
 				}
 				continue;
 			}
 			auto &field = fields[f];
-			auto location = LocatePath(view, field.steps);
+			auto location = LocatePath(view, field.path.steps);
 			bool complete = true;
 			bool strippable = WriteShred(field, view, location, *shred_out[f], row, lstate.text, &complete);
 			if (complete_out[f]) {
 				FlatVector::GetData<int8_t>(*complete_out[f])[row] = complete ? 1 : 0;
 			}
-			if (strippable && IsObjectKeyPath(field.steps)) {
-				lstate.strip_paths.push_back(&field.steps);
+			if (strippable && IsObjectKeyPath(field.path.steps)) {
+				lstate.strip_paths.push_back(&field.path.steps);
 				stripped_fields.push_back(f);
 			}
 		}
@@ -1024,7 +967,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	ctx.manifest_entries = &manifest_entries;
 	ctx.kinds.resize(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
-		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path_name, fields[f].logical_type);
+		manifest_entries[f] = JsonoShredManifestEntry(fields[f].path.text, ShredFieldType(fields[f]));
 		ctx.kinds[f] = fields[f].primitive;
 	}
 
@@ -1035,7 +978,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	// render path applies verbatim — and reports the per-shred completeness (a render-safe container
 	// inlines its text here; a typed/render-unsafe one leaves the lane NULL and `complete` false).
 	auto fill_from_residual = [&](const JsonoView &view, idx_t f, idx_t row) {
-		auto location = LocatePath(view, fields[f].steps);
+		auto location = LocatePath(view, fields[f].path.steps);
 		bool complete = true;
 		WriteShred(fields[f], view, location, *shred_out[f], row, lstate.text, &complete);
 		FlatVector::GetData<int8_t>(*complete_out[f])[row] = complete ? 1 : 0;
@@ -1076,17 +1019,16 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 					FlatVector::SetNull(*shred_out[f], row, true);
 					break;
 				case jsono_dom::DomShredCapture::State::String:
-					FlatVector::GetData<string_t>(*shred_out[f])[row] =
-					    StringVector::AddString(*shred_out[f], cap.text.data(), cap.text.size());
+					WriteJsonoStringLane(*shred_out[f], row, cap.text);
 					break;
 				case jsono_dom::DomShredCapture::State::Int:
-					FlatVector::GetData<int64_t>(*shred_out[f])[row] = cap.int_value;
+					WriteJsonoBigintLane(*shred_out[f], row, cap.int_value);
 					break;
 				case jsono_dom::DomShredCapture::State::Uint:
-					FlatVector::GetData<uint64_t>(*shred_out[f])[row] = cap.uint_value;
+					WriteJsonoUbigintLane(*shred_out[f], row, cap.uint_value);
 					break;
 				case jsono_dom::DomShredCapture::State::Bool:
-					FlatVector::GetData<bool>(*shred_out[f])[row] = cap.bool_value;
+					WriteJsonoBooleanLane(*shred_out[f], row, cap.bool_value);
 					break;
 				case jsono_dom::DomShredCapture::State::ResidualFill:
 					needs_residual_fill = true;
@@ -1123,41 +1065,14 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 
 } // namespace
 
-bool TypeToShredPrimitive(const LogicalType &type, ShredPrimitive &out) {
-	switch (type.id()) {
-	case LogicalTypeId::VARCHAR:
-		// A JSON-aliased VARCHAR carries a JSON document (object/array/number), not a string
-		// scalar; it embeds as a sub-tree in the residual and must not be lifted into a shred.
-		if (type.HasAlias() && type.GetAlias() == LogicalType::JSON_TYPE_NAME) {
-			return false;
-		}
-		out = ShredPrimitive::Varchar;
-		return true;
-	case LogicalTypeId::BIGINT:
-		out = ShredPrimitive::Bigint;
-		return true;
-	case LogicalTypeId::UBIGINT:
-		out = ShredPrimitive::Ubigint;
-		return true;
-	case LogicalTypeId::DOUBLE:
-		out = ShredPrimitive::Double;
-		return true;
-	case LogicalTypeId::BOOLEAN:
-		out = ShredPrimitive::Boolean;
-		return true;
-	default:
-		return false;
-	}
-}
-
 bool IsShredValueType(const LogicalType &type) {
-	ShredPrimitive primitive;
-	return TypeToShredPrimitive(type, primitive);
+	JsonoScalarPrimitive primitive;
+	return TypeToJsonoScalarPrimitive(type, primitive);
 }
 
 ShredKind ClassifyShredKind(const LogicalType &type) {
-	ShredPrimitive primitive;
-	if (TypeToShredPrimitive(type, primitive)) {
+	JsonoScalarPrimitive primitive;
+	if (TypeToJsonoScalarPrimitive(type, primitive)) {
 		return ShredKind::Scalar;
 	}
 	if (IsShredArrayType(type)) {
@@ -1167,12 +1082,6 @@ ShredKind ClassifyShredKind(const LogicalType &type) {
 		return ShredKind::ScalarArray;
 	}
 	throw InternalException("jsono: shred column type '%s' is neither a scalar nor an array shred", type.ToString());
-}
-
-bool ShredPrimitiveStoresReadCopy(ShredPrimitive kind) {
-	// Only a VARCHAR shred renders the `->>` text of any scalar (a read-copy) while stripping just a
-	// real JSON string; the typed shreds set a cell valid only when they capture (strip) the value.
-	return kind == ShredPrimitive::Varchar;
 }
 
 bool IsShredArrayType(const LogicalType &type) {
@@ -1204,27 +1113,6 @@ bool IsShredScalarArrayType(const LogicalType &type) {
 
 bool IsShredListType(const LogicalType &type) {
 	return IsShredArrayType(type) || IsShredScalarArrayType(type);
-}
-
-bool JsonoScalarFitsShredType(const jsono::JsonoScalar &scalar, const LogicalType &type) {
-	using jsono::JsonoScalarKind;
-	switch (type.id()) {
-	case LogicalTypeId::VARCHAR:
-		// A JSON-aliased VARCHAR shred never reaches here (IsShredValueType rejects it); a plain
-		// VARCHAR shred strips only a real JSON string (a number/bool/null keeps its residual copy).
-		return scalar.kind == JsonoScalarKind::String;
-	case LogicalTypeId::BIGINT:
-		return scalar.kind == JsonoScalarKind::Int64;
-	case LogicalTypeId::UBIGINT:
-		return scalar.kind == JsonoScalarKind::UInt64 ||
-		       (scalar.kind == JsonoScalarKind::Int64 && scalar.int_value >= 0);
-	case LogicalTypeId::DOUBLE:
-		return scalar.kind == JsonoScalarKind::Double;
-	case LogicalTypeId::BOOLEAN:
-		return scalar.kind == JsonoScalarKind::Bool;
-	default:
-		return false;
-	}
 }
 
 bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b) {
@@ -1325,8 +1213,7 @@ void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<strin
 	fields.reserve(shreds.size());
 	for (auto &shred : shreds) {
 		ShredField field;
-		field.path_name = shred.first;
-		field.steps = ParseShredFieldPath(shred.first);
+		field.path = ParseShredPathSpec(shred.first);
 		if (!FillShredFieldFromType(shred.second, field)) {
 			throw InternalException("jsono shred field '%s' has a non-shred type", shred.first);
 		}

@@ -692,30 +692,8 @@ struct ReconShred {
 };
 
 void EmitReconShredScalar(JsonoBuilder &builder, const LogicalType &type, const UnifiedVectorFormat &fmt, idx_t idx) {
-	ShredPrimitive kind;
-	if (!TypeToShredPrimitive(type, kind)) {
-		throw InternalException("jsono reconstruct: non-scalar shred type '%s'", type.ToString());
-	}
-	// Exhaustive over the closed scalar shred set, so a new scalar shred type fails to compile here.
-	switch (kind) {
-	case ShredPrimitive::Varchar: {
-		auto value = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
-		builder.EmitString(nonstd::string_view(value.GetData(), value.GetSize()));
-		return;
-	}
-	case ShredPrimitive::Bigint:
-		builder.EmitInt(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx]);
-		return;
-	case ShredPrimitive::Ubigint:
-		builder.EmitUInt(UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx]);
-		return;
-	case ShredPrimitive::Double:
-		builder.EmitDouble(UnifiedVectorFormat::GetData<double>(fmt)[idx]);
-		return;
-	case ShredPrimitive::Boolean:
-		builder.EmitBool(UnifiedVectorFormat::GetData<bool>(fmt)[idx]);
-		return;
-	}
+	auto kind = JsonoScalarPrimitiveFromType(type, "jsono reconstruct");
+	EmitJsonoPrimitiveVectorValue(builder, kind, fmt, idx);
 }
 
 // True if a pure object-key path ends at / continues past `key` when matched at `depth`. The
@@ -2187,30 +2165,27 @@ void SerializeLWWScalarValueToBlob(const LWWScalarValue &value, nonstd::string_v
 
 void EmitLWWScalarValue(const LWWScalarValue &value, nonstd::string_view text, const LogicalType &type,
                         JsonoBuilder &builder) {
-	ShredPrimitive primitive;
-	if (!TypeToShredPrimitive(type, primitive)) {
-		throw InternalException("jsono_group_merge direct list lane: non-scalar element type '%s'", type.ToString());
-	}
+	auto primitive = JsonoScalarPrimitiveFromType(type, "jsono_group_merge direct list lane");
 	switch (primitive) {
-	case ShredPrimitive::Varchar:
+	case JsonoScalarPrimitive::Varchar:
 		builder.EmitString(text);
 		return;
-	case ShredPrimitive::Bigint: {
+	case JsonoScalarPrimitive::Bigint: {
 		int64_t v;
 		std::memcpy(&v, &value.num, sizeof(v));
 		builder.EmitInt(v);
 		return;
 	}
-	case ShredPrimitive::Ubigint:
+	case JsonoScalarPrimitive::Ubigint:
 		builder.EmitUInt(value.num);
 		return;
-	case ShredPrimitive::Double: {
+	case JsonoScalarPrimitive::Double: {
 		double v;
 		std::memcpy(&v, &value.num, sizeof(v));
 		builder.EmitDouble(v);
 		return;
 	}
-	case ShredPrimitive::Boolean:
+	case JsonoScalarPrimitive::Boolean:
 		builder.EmitBool(SlotTag(value.slot) == tag::VAL_TRUE);
 		return;
 	}
@@ -2543,27 +2518,23 @@ nonstd::string_view LWWScalarTextView(const string *text) {
 }
 
 LWWScalarValue LWWScalarValueFromShredBits(const LogicalType &type, uint64_t value_bits, nonstd::string_view text) {
-	ShredPrimitive kind;
-	if (!TypeToShredPrimitive(type, kind)) {
-		throw InternalException("jsono_group_merge direct shredded update: non-scalar shred type '%s'",
-		                        type.ToString());
-	}
+	auto kind = JsonoScalarPrimitiveFromType(type, "jsono_group_merge direct shredded update");
 	LWWScalarValue result;
 	switch (kind) {
-	case ShredPrimitive::Varchar:
+	case JsonoScalarPrimitive::Varchar:
 		if (text.size() > std::numeric_limits<uint32_t>::max()) {
 			throw InvalidInputException("jsono: string value exceeds storage limits");
 		}
 		result.slot = MakeSlot(tag::VAL_STR_HEAP, 0);
 		result.length = uint32_t(text.size());
 		return result;
-	case ShredPrimitive::Bigint: {
+	case JsonoScalarPrimitive::Bigint: {
 		auto value = int64_t(value_bits);
 		result.slot = FitsInt60(value) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64);
 		result.num = value_bits;
 		return result;
 	}
-	case ShredPrimitive::Ubigint:
+	case JsonoScalarPrimitive::Ubigint:
 		if (value_bits <= uint64_t(std::numeric_limits<int64_t>::max())) {
 			auto signed_value = int64_t(value_bits);
 			result.slot = FitsInt60(signed_value) ? MakeSlot(tag::VAL_INT60, 0) : MakeExtSlot(ext_subtype::INT64);
@@ -2572,11 +2543,11 @@ LWWScalarValue LWWScalarValueFromShredBits(const LogicalType &type, uint64_t val
 		}
 		result.num = value_bits;
 		return result;
-	case ShredPrimitive::Double:
+	case JsonoScalarPrimitive::Double:
 		result.slot = MakeExtSlot(ext_subtype::DOUBLE);
 		result.num = value_bits;
 		return result;
-	case ShredPrimitive::Boolean:
+	case JsonoScalarPrimitive::Boolean:
 		result.slot = MakeSlot(value_bits != 0 ? tag::VAL_TRUE : tag::VAL_FALSE, 0);
 		return result;
 	}
@@ -2801,12 +2772,8 @@ vector<idx_t> LWWScalarTextLaneIndices(const vector<ReconShred> &shreds) {
 	result.reserve(shreds.size());
 	idx_t text_count = 0;
 	for (auto &shred : shreds) {
-		ShredPrimitive primitive;
-		if (!TypeToShredPrimitive(shred.type, primitive)) {
-			throw InternalException("jsono_group_merge direct lanes: non-scalar shred type '%s'",
-			                        shred.type.ToString());
-		}
-		if (primitive == ShredPrimitive::Varchar) {
+		auto primitive = JsonoScalarPrimitiveFromType(shred.type, "jsono_group_merge direct lanes");
+		if (primitive == JsonoScalarPrimitive::Varchar) {
 			result.push_back(text_count++);
 		} else {
 			result.push_back(DConstants::INVALID_INDEX);
@@ -2865,39 +2832,8 @@ void EnsureLWWListLanes(GroupMergeLWWState &state, idx_t count) {
 
 void StorePrimitiveLaneValueBits(const LogicalType &type, const UnifiedVectorFormat &fmt, idx_t idx, uint64_t &out,
                                  string *text_out) {
-	ShredPrimitive kind;
-	if (!TypeToShredPrimitive(type, kind)) {
-		throw InternalException("jsono_group_merge direct shredded update: non-scalar shred type '%s'",
-		                        type.ToString());
-	}
-	out = 0;
-	switch (kind) {
-	case ShredPrimitive::Varchar: {
-		auto value = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
-		if (value.GetSize() > std::numeric_limits<uint32_t>::max()) {
-			throw InvalidInputException("jsono: string value exceeds storage limits");
-		}
-		text_out->assign(value.GetData(), value.GetSize());
-		return;
-	}
-	case ShredPrimitive::Bigint:
-		out = uint64_t(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx]);
-		return;
-	case ShredPrimitive::Ubigint:
-		out = UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx];
-		return;
-	case ShredPrimitive::Double: {
-		auto value = UnifiedVectorFormat::GetData<double>(fmt)[idx];
-		if (!std::isfinite(value)) {
-			throw InvalidInputException("jsono: cannot store non-finite double value (NaN/Infinity)");
-		}
-		std::memcpy(&out, &value, sizeof(out));
-		return;
-	}
-	case ShredPrimitive::Boolean:
-		out = UnifiedVectorFormat::GetData<bool>(fmt)[idx] ? 1 : 0;
-		return;
-	}
+	auto kind = JsonoScalarPrimitiveFromType(type, "jsono_group_merge direct shredded update");
+	out = JsonoPrimitiveVectorValueBits(kind, fmt, idx, text_out);
 }
 
 void StorePrimitiveLaneValue(const LogicalType &type, const UnifiedVectorFormat &fmt, idx_t idx, LWWScalarValue &out,
@@ -3439,31 +3375,28 @@ int CompareLWWListLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWListL
 
 void WriteLWWScalarLaneValue(const LWWScalarValue &value, nonstd::string_view text, const LogicalType &type,
                              Vector &out, idx_t rid) {
-	ShredPrimitive primitive;
-	if (!TypeToShredPrimitive(type, primitive)) {
-		throw InternalException("jsono_group_merge direct finalize: non-scalar type '%s'", type.ToString());
-	}
+	auto primitive = JsonoScalarPrimitiveFromType(type, "jsono_group_merge direct finalize");
 	FlatVector::Validity(out).SetValid(rid);
 	switch (primitive) {
-	case ShredPrimitive::Varchar:
+	case JsonoScalarPrimitive::Varchar:
 		FlatVector::GetData<string_t>(out)[rid] = StringVector::AddString(out, text.data(), text.size());
 		return;
-	case ShredPrimitive::Bigint: {
+	case JsonoScalarPrimitive::Bigint: {
 		int64_t v;
 		std::memcpy(&v, &value.num, sizeof(v));
 		FlatVector::GetData<int64_t>(out)[rid] = v;
 		return;
 	}
-	case ShredPrimitive::Ubigint:
+	case JsonoScalarPrimitive::Ubigint:
 		FlatVector::GetData<uint64_t>(out)[rid] = value.num;
 		return;
-	case ShredPrimitive::Double: {
+	case JsonoScalarPrimitive::Double: {
 		double v;
 		std::memcpy(&v, &value.num, sizeof(v));
 		FlatVector::GetData<double>(out)[rid] = v;
 		return;
 	}
-	case ShredPrimitive::Boolean:
+	case JsonoScalarPrimitive::Boolean:
 		FlatVector::GetData<bool>(out)[rid] = SlotTag(value.slot) == tag::VAL_TRUE;
 		return;
 	}
@@ -3517,11 +3450,8 @@ bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, 
 	}
 	JsonoCursor cursor;
 	auto scalar = DecodeScalarAt(value_view, cursor);
-	ShredPrimitive primitive;
-	if (!TypeToShredPrimitive(shred.type, primitive)) {
-		throw InternalException("jsono_group_merge direct finalize: non-scalar shred type '%s'", shred.type.ToString());
-	}
-	if (primitive == ShredPrimitive::Varchar) {
+	auto primitive = JsonoScalarPrimitiveFromType(shred.type, "jsono_group_merge direct finalize");
+	if (primitive == JsonoScalarPrimitive::Varchar) {
 		if (scalar.kind != JsonoScalarKind::String) {
 			// A non-string scalar (number/bool) renders to `->>` text but is not captured here, so it
 			// stays in the residual; an explicit JSON null reads NULL either way.
@@ -3532,7 +3462,7 @@ bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, 
 		FlatVector::GetData<string_t>(out)[rid] = StringVector::AddString(out, scalar.text.data(), scalar.text.size());
 		return true;
 	}
-	if (!JsonoScalarFitsShredType(scalar, shred.type)) {
+	if (!JsonoScalarFitsPrimitive(scalar, primitive)) {
 		// A present scalar that does not fit the typed lane stays in the residual; an explicit JSON
 		// null reads NULL either way, so a bare read of the NULL lane is correct.
 		diverted = scalar.kind != JsonoScalarKind::Null;
@@ -3540,20 +3470,20 @@ bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, 
 	}
 	FlatVector::Validity(out).SetValid(rid);
 	switch (primitive) {
-	case ShredPrimitive::Bigint:
+	case JsonoScalarPrimitive::Bigint:
 		FlatVector::GetData<int64_t>(out)[rid] = scalar.int_value;
 		return true;
-	case ShredPrimitive::Ubigint:
+	case JsonoScalarPrimitive::Ubigint:
 		FlatVector::GetData<uint64_t>(out)[rid] =
 		    scalar.kind == JsonoScalarKind::UInt64 ? scalar.uint_value : uint64_t(scalar.int_value);
 		return true;
-	case ShredPrimitive::Double:
+	case JsonoScalarPrimitive::Double:
 		FlatVector::GetData<double>(out)[rid] = scalar.double_value;
 		return true;
-	case ShredPrimitive::Boolean:
+	case JsonoScalarPrimitive::Boolean:
 		FlatVector::GetData<bool>(out)[rid] = scalar.bool_value;
 		return true;
-	case ShredPrimitive::Varchar:
+	case JsonoScalarPrimitive::Varchar:
 		break;
 	}
 	return false;
@@ -4020,12 +3950,12 @@ void JsonoEmitObjectStrippingPaths(const JsonoView &view, const std::vector<cons
 // The array stays in the residual as a skeleton: each object element keeps its tail keys but loses
 // the subfields lifted into the LIST<STRUCT> shred column. Length, element order, and non-object/
 // null elements carry the lossless reconstruct (the parallel shred LIST overlays back). The strip
-// gate is JsonoScalarFitsShredType — the same one WriteArrayShred uses — so write and skeleton agree.
+// gate is JsonoScalarFitsPrimitive — the same one WriteArrayShred uses — so write and skeleton agree.
 
-// True if `name` is present in the element object at `element_cursor` as a scalar that fits `type`
+// True if `name` is present in the element object at `element_cursor` as a scalar that fits `primitive`
 // byte-for-byte (so its shred captured it and the skeleton drops it). Mirrors WriteShred's gate.
 static bool ElementSubfieldStrippable(const JsonoView &view, const JsonoCursor &element_cursor, const string &name,
-                                      const LogicalType &type) {
+                                      JsonoScalarPrimitive primitive) {
 	JsonoCursor probe = element_cursor;
 	if (!LocatePathStep(nullptr, 0, view, PathStep {PathStepKind::Key, name, 0}, probe)) {
 		return false;
@@ -4035,16 +3965,16 @@ static bool ElementSubfieldStrippable(const JsonoView &view, const JsonoCursor &
 		return false;
 	}
 	auto scalar = DecodeScalarAt(view, probe);
-	return JsonoScalarFitsShredType(scalar, type);
+	return JsonoScalarFitsPrimitive(scalar, primitive);
 }
 
 // Emit the skeleton array (cursor at ARR_START) for either array shred kind. `spec.kind` is fixed
 // per array, so the lane dispatch hoists out of the element loop.
 //
-// ScalarArray lane: each element the lane lifts (a scalar fitting `spec.element_type`) becomes a
+// ScalarArray lane: each element the lane lifts (a scalar fitting `spec.element_primitive`) becomes a
 // VAL_NULL placeholder — it carries no value, the parallel LIST<element_type> shred does — every
 // other element (a non-conforming scalar, a null, an object or array) stays verbatim. The lift gate
-// is JsonoScalarFitsShredType, the same one WriteScalarArrayShred uses, so the placeholder positions
+// is JsonoScalarFitsPrimitive, the same one WriteScalarArrayShred uses, so the placeholder positions
 // match the shred's non-NULL slots exactly. On reconstruct the placeholder is never read: a non-NULL
 // shred slot overrides it, a NULL slot means the element was kept (and a kept element is never a
 // placeholder), so a placeholder and an explicit JSON null never collide.
@@ -4065,7 +3995,7 @@ static void EmitSkeletonArray(const JsonoView &view, const JsonoCursor &array_cu
 			if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
 				JsonoCursor probe = cursor;
 				auto scalar = DecodeScalarAt(view, probe);
-				if (JsonoScalarFitsShredType(scalar, spec.element_type)) {
+				if (JsonoScalarFitsPrimitive(scalar, spec.element_primitive)) {
 					builder.EmitNull(); // lifted: placeholder; the shred holds the value
 					SkipValueFast(view, cursor);
 					continue;

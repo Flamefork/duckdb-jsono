@@ -25,26 +25,11 @@ struct StorageSizeSource {
 	vector<ShredLane> shreds;
 };
 
-// Logical payload bytes a scalar shred leaf occupies (a NULL leaf is 0). Mirrors the BLOB fields,
-// which report payload bytes, not vector/validity overhead. Reused for both top-level scalar shreds
-// and the per-element subfields of a LIST<STRUCT> array shred. The switch is exhaustive over the
-// closed scalar shred set, so a new scalar shred type fails to compile here rather than at runtime.
-uint64_t ShredValueBytes(const UnifiedVectorFormat &fmt, ShredPrimitive kind, idx_t row) {
+uint64_t ShredValueBytes(const UnifiedVectorFormat &fmt, JsonoScalarPrimitive kind, idx_t row) {
 	if (!RowIsValid(fmt, row)) {
 		return 0;
 	}
-	auto idx = RowIndex(fmt, row);
-	switch (kind) {
-	case ShredPrimitive::Varchar:
-		return UnifiedVectorFormat::GetData<string_t>(fmt)[idx].GetSize();
-	case ShredPrimitive::Bigint:
-	case ShredPrimitive::Ubigint:
-	case ShredPrimitive::Double:
-		return 8;
-	case ShredPrimitive::Boolean:
-		return 1;
-	}
-	return 0;
+	return JsonoPrimitiveVectorPayloadBytes(kind, fmt, RowIndex(fmt, row));
 }
 
 // Payload bytes an array shred occupies for one row, summed over the row's list span: a LIST<STRUCT>
@@ -165,14 +150,6 @@ unique_ptr<FunctionData> JsonoStorageSizeBind(ClientContext &context, ScalarFunc
 	return nullptr;
 }
 
-void EnsureListCapacity(Vector &result, idx_t needed) {
-	if (needed <= ListVector::GetListCapacity(result)) {
-		return;
-	}
-	auto next = std::max<idx_t>(needed, std::max<idx_t>(ListVector::GetListCapacity(result) * 2, 1));
-	ListVector::Reserve(result, next);
-}
-
 // jsono_shred_manifest reads the residual's OWN manifest claim raw (ManifestTail walked with the
 // bounds-safe collect sink), NOT through the verifying reader: introspection must show what a row
 // claims it stripped — including a narrowed row — without raising, which the verifying read would do
@@ -197,8 +174,7 @@ void JsonoShredManifestExecute(DataChunk &args, ExpressionState &state, Vector &
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
 		if (!ReadJsonoRowStrict(body, row, blob)) {
-			FlatVector::SetNull(result, row, true);
-			ListVector::GetData(result)[row] = {0, 0};
+			SetListRowNull(result, row);
 			continue;
 		}
 		view = MakeJsonoView(blob);
@@ -222,8 +198,7 @@ void JsonoShredManifestExecute(DataChunk &args, ExpressionState &state, Vector &
 				    StringVector::AddString(type_vector, entries[i].type.data(), entries[i].type.size());
 			}
 		}
-		ListVector::GetData(result)[row] = {start, length};
-		ListVector::SetListSize(result, start + length);
+		FinishListRow(result, row, start, length);
 	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);

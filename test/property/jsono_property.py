@@ -1099,15 +1099,15 @@ def test_group_merge_keyed_parity(rows: list[dict[str, Any]], data: Any) -> None
     assert keyed_max == keyed_reordered, f"order-dependent: {rows!r} -> {keyed_max!r} vs {keyed_reordered!r}"
 
 
-# jsono_transform parity: the multi-field one-pass object walk (WalkTransformObject /
-# WalkTransformObjectCheckpoints, with NormalEdgePolicy for named fields and WildcardEdgePolicy for
-# the list field) must agree, value-by-value, with two independent oracles: (A) running the same
-# spec over the SAME document once shredded and once plain (the shred-lane read and the residual walk
-# are different code paths) and (B) the equivalent single-path `->>` extraction per VARCHAR field
-# (the operator path, not the multi-field walk). The generated cross-product spans the branches the
-# walk dispatches on: named AND wildcard fields in one spec; objects both <=16 keys (linear walk) and
-# >16 keys (checkpoint walk); present AND absent keys (NullScalarEdge / AppendWildcardMissing);
-# nested-path AND top-level fields; typed coercion AND lenient string extraction.
+# jsono_transform parity: the shared JsonoTrieWalk path (normal edges for named fields and wildcard
+# edges for the list field) must agree, value-by-value, with two independent oracles: (A) running
+# the same spec over the SAME document once shredded and once plain (the shred-lane read and the
+# residual walk are different code paths) and (B) the equivalent single-path `->>` extraction per
+# VARCHAR field (the operator path, not the multi-field walk). The generated cross-product spans
+# the branches the walk dispatches on: named AND wildcard fields in one spec; objects both <=16 keys
+# (linear walk) and >16 keys (checkpoint walk); present AND absent keys (JsonoTrieNullEdge /
+# JsonoTrieAppendWildcardMissing); nested-path AND top-level fields; typed coercion AND lenient
+# string extraction.
 transform_leaf_keys = ["a", "b", "c", "d"]
 transform_nest_keys = ["x", "y"]
 transform_scalars = st.one_of(
@@ -1139,7 +1139,7 @@ def transform_documents(draw: Any) -> tuple[dict[str, Any], int]:
         doc["items"] = draw(st.lists(transform_item, max_size=5))
     # Padding keys straddle OBJECT_CHECKPOINT_STRIDE (16): with the up-to-6 semantic keys above, a
     # width of 0..18 puts the top-level object both at or below 16 keys (the linear merge walk) and
-    # above 16 (WalkTransformObjectCheckpoints). The pad keys are never named by the spec, so they
+    # above 16 (JsonoTrieWalkObjectCheckpoints). The pad keys are never named by the spec, so they
     # only change the object width the walk traverses, not the expected field values.
     width = draw(st.integers(min_value=0, max_value=18))
     for i in range(width):
@@ -1160,10 +1160,10 @@ TRANSFORM_VARCHAR_FIELDS = [
 
 
 def transform_spec_sql() -> str:
-    # One spec mixing: explicit-path VARCHAR fields (NormalEdgePolicy), a present and an absent key
-    # (NullScalarEdge fires on the absent one), a nested-path field, typed coercion targets
-    # (BIGINT/DOUBLE/BOOLEAN), and a wildcard list field over '$.items[*].v' (WildcardEdgePolicy +
-    # emit_index_tail; AppendWildcardMissing fires on items lacking 'v'). The 'd_flag' field uses bare
+    # One spec mixing: explicit-path VARCHAR fields, a present and an absent key, a nested-path
+    # field, typed coercion targets (BIGINT/DOUBLE/BOOLEAN), and a wildcard list field over
+    # '$.items[*].v' (JsonoTrieWildcardEdgePolicy + emit_index_tail;
+    # JsonoTrieAppendWildcardMissing fires on items lacking 'v'). The 'd_flag' field uses bare
     # scalar shorthand so the literal-top-level-key resolution (the simple_scalar_leaf fast edge) is
     # exercised alongside the path wrappers.
     return (
@@ -1212,7 +1212,7 @@ def transform_varchar_oracle_sql(plain: str, transformed: str) -> str:
 )
 # A <=16-key object (linear merge walk) with the same field shapes.
 @example(generated=({"a": "x", "b": 2, "nest": {"x": "n"}, "items": [{"v": "q"}]}, 0))
-# Empty wildcard array and a fully absent items container both exercise AppendWildcardMissing.
+# Empty wildcard array and a fully absent items container both exercise JsonoTrieAppendWildcardMissing.
 @example(generated=({"a": "y", "items": []}, 0))
 @example(generated=({"a": "z"}, 0))
 @given(generated=transform_documents())

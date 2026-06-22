@@ -275,7 +275,7 @@ struct DomShredTrieNode {
 
 struct DomShredContext {
 	const std::vector<DomShredTrieNode> *nodes = nullptr;
-	std::vector<ShredPrimitive> kinds; // per shred field
+	std::vector<JsonoScalarPrimitive> kinds; // per shred field
 	const vector<JsonoShredManifestEntryBytes> *manifest_entries = nullptr;
 	// Per-row outputs: captures parallel to the shred fields, manifest = the row's serialized
 	// shred-manifest tail (empty when nothing was stripped).

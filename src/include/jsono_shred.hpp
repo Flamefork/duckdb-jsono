@@ -1,6 +1,7 @@
 #pragma once
 
 #include "jsono_path.hpp"
+#include "jsono_scalar_write.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
@@ -14,36 +15,16 @@ namespace duckdb {
 class ExtensionLoader;
 class ScalarFunction;
 
-namespace jsono {
-struct JsonoScalar;
-}
-
-// The scalar types a shred column can hold. The single closed set, shared by the shred writer and
-// every native shred-lane reader (storage_size, entries, reconstruct). Readers switch over it with
-// no `default`, so adding a scalar shred type is a compile error in each reader, not a runtime throw.
-enum class ShredPrimitive : uint8_t { Varchar, Bigint, Ubigint, Double, Boolean };
-
 // The category of a shred column: one scalar value, a LIST<STRUCT> array shred (every element an
 // object whose subfields lift), or a LIST<scalar> array shred (every element a scalar that lifts as
 // a whole). Readers switch over it with no `default`, so adding a future shred category (e.g. a map
 // shred) is a compile error in each native reader rather than a silently-swallowed runtime `default`.
 enum class ShredKind : uint8_t { Scalar, Array, ScalarArray };
 
-// Classify a scalar shred type into its ShredPrimitive; false if `type` is not a scalar a shred can
-// hold (a JSON-aliased VARCHAR carrying a document, or any non-scalar). The single owner of the
-// scalar shred set — every writer and reader classifies through here, never re-listing the type ids.
-bool TypeToShredPrimitive(const LogicalType &type, ShredPrimitive &out);
-
 // Classify a shred column type into its category. Throws InternalException if `type` is neither a
 // scalar nor an array shred — the single fail-loud point, so readers carry no swallowing `default`.
 // Bind validates shred types up front, so a miss here is a broken invariant, not user input.
 ShredKind ClassifyShredKind(const LogicalType &type);
-
-// True if a shred of this kind keeps a read-copy of a value that ALSO stays in the residual: only
-// VARCHAR, which renders the `->>` text of any scalar for a fast typed read but strips just a real
-// JSON string. A reader that enumerates logical leaves (jsono_entries) must treat such a cell as the
-// residual's and not emit it twice. The single owner of the read-copy rule; see WriteShred.
-bool ShredPrimitiveStoresReadCopy(ShredPrimitive kind);
 
 void RegisterJsonoShred(ExtensionLoader &loader);
 
@@ -75,23 +56,15 @@ bool IsShredScalarArrayType(const LogicalType &type);
 // through the two-pass materialize-then-shred writer. The single owner of "is this a list shred".
 bool IsShredListType(const LogicalType &type);
 
-// The lossless strip gate for one located scalar against a shred column type: true iff the
-// value round-trips through the shred type byte-for-byte (a JSON string in a VARCHAR shred, an
-// integer in a BIGINT shred), so it may be removed from the residual. The single owner of the
-// per-type kind gate, shared by the scalar shred writer (WriteShred) and the array residual
-// skeleton emit so the strip decision cannot drift between write and skeleton.
-bool JsonoScalarFitsShredType(const jsono::JsonoScalar &scalar, const LogicalType &type);
-
-// One array shred for the residual-skeleton emit (write) and the reconstruct overlay (read): the
-// object-key chain to the array, plus the lifted-element description. An object array
-// (kind == Array) lifts the element subfields (name, scalar shred type) into a LIST<STRUCT> column,
-// in element-struct order. A scalar array (kind == ScalarArray) lifts each whole element into a
+// One array shred for the residual-skeleton emit: the object-key chain to the array, plus the
+// lifted-element primitive description. An object array (kind == Array) lifts element subfields into
+// a LIST<STRUCT> column; a scalar array (kind == ScalarArray) lifts each whole element into a
 // LIST<element_type> column. The two carry disjoint extra fields; `kind` selects which is valid.
 struct JsonoArrayShredSpec {
 	vector<PathStep> path;
 	ShredKind kind = ShredKind::Array;
-	vector<std::pair<string, LogicalType>> subfields; // kind == Array
-	LogicalType element_type;                         // kind == ScalarArray
+	vector<std::pair<string, jsono::JsonoScalarPrimitive>> subfields; // kind == Array
+	jsono::JsonoScalarPrimitive element_primitive;                    // kind == ScalarArray
 };
 
 // True if two shred paths overlap structurally: every step they share is the same object key, so

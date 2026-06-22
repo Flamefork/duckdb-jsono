@@ -7,6 +7,7 @@
 
 #include <cctype>
 #include <limits>
+#include <utility>
 
 namespace duckdb {
 
@@ -23,6 +24,15 @@ struct PathStep {
 	PathStepKind kind;
 	string key;
 	idx_t index = 0;
+};
+
+struct JsonoPathSpec {
+	JsonoPathSpec() = default;
+	JsonoPathSpec(string text_p, vector<PathStep> steps_p) : text(std::move(text_p)), steps(std::move(steps_p)) {
+	}
+
+	string text;
+	vector<PathStep> steps;
 };
 
 [[noreturn]] inline void ThrowInvalidPath(const char *function_name, const string &path) {
@@ -154,6 +164,10 @@ inline bool PathStepsEqual(const vector<PathStep> &left, const vector<PathStep> 
 		}
 	}
 	return true;
+}
+
+inline bool JsonoPathSpecEqual(const JsonoPathSpec &left, const JsonoPathSpec &right) {
+	return left.text == right.text && PathStepsEqual(left.steps, right.steps);
 }
 
 } // namespace duckdb

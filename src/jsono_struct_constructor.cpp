@@ -96,7 +96,7 @@ struct JsonoStructBindData : public FunctionData {
 	// One-pass shredded write (ExecuteStructConstructorShredded): shred values copy straight
 	// from the typed input children and the residual emits only the non-shred fields, so the
 	// full plain value is never materialized. Eligible when every shred name is a literal
-	// top-level key; a '$...'-named field addresses a nested path (ParseShredFieldPath) and
+	// top-level key; a '$...'-named field addresses a nested path (ParseShredPathSpec) and
 	// keeps the locate-and-strip path. `shred_fields` maps each shred to its input child,
 	// `residual_fields` lists the non-shred children in input order, and `residual_plan`
 	// is a constructor plan over just those fields (unset when every field is a shred).

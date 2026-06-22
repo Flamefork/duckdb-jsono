@@ -166,10 +166,10 @@ void SizeDomElement(yyjson_val *element, DomDirectState &s, size_t depth);
 // match, ResidualFill for a VARCHAR shred over a non-string scalar (the `->>` text needs
 // the decoded value, so it is filled from the written residual), nothing otherwise (the
 // shred stays NULL and the value stays in the residual).
-void CaptureShredLeaf(yyjson_val *value, ShredPrimitive kind, DomShredCapture &cap) {
+void CaptureShredLeaf(yyjson_val *value, JsonoScalarPrimitive kind, DomShredCapture &cap) {
 	switch (yyjson_get_type(value)) {
 	case YYJSON_TYPE_STR:
-		if (kind == ShredPrimitive::Varchar) {
+		if (kind == JsonoScalarPrimitive::Varchar) {
 			cap.state = DomShredCapture::State::String;
 			cap.stripped = true;
 			cap.text = nonstd::string_view(yyjson_get_str(value), yyjson_get_len(value));
@@ -179,11 +179,11 @@ void CaptureShredLeaf(yyjson_val *value, ShredPrimitive kind, DomShredCapture &c
 		}
 		return;
 	case YYJSON_TYPE_RAW: {
-		if (kind == ShredPrimitive::Varchar) {
+		if (kind == JsonoScalarPrimitive::Varchar) {
 			cap.state = DomShredCapture::State::ResidualFill;
 			return;
 		}
-		if (kind != ShredPrimitive::Bigint && kind != ShredPrimitive::Ubigint) {
+		if (kind != JsonoScalarPrimitive::Bigint && kind != JsonoScalarPrimitive::Ubigint) {
 			// A text number is never stored as kind Double; DOUBLE/BOOLEAN shreds stay NULL —
 			// a present number they did not capture is a residual-diverted scalar (case B).
 			cap.diverted_scalar = true;
@@ -193,15 +193,15 @@ void CaptureShredLeaf(yyjson_val *value, ShredPrimitive kind, DomShredCapture &c
 		bool int64_kind =
 		    classified.slot == MakeSlot(tag::VAL_INT60, 0) || classified.slot == MakeExtSlot(ext_subtype::INT64);
 		auto int_value = int64_t(classified.num);
-		if (kind == ShredPrimitive::Bigint && int64_kind) {
+		if (kind == JsonoScalarPrimitive::Bigint && int64_kind) {
 			cap.state = DomShredCapture::State::Int;
 			cap.stripped = true;
 			cap.int_value = int_value;
-		} else if (kind == ShredPrimitive::Ubigint && classified.slot == MakeExtSlot(ext_subtype::UINT64)) {
+		} else if (kind == JsonoScalarPrimitive::Ubigint && classified.slot == MakeExtSlot(ext_subtype::UINT64)) {
 			cap.state = DomShredCapture::State::Uint;
 			cap.stripped = true;
 			cap.uint_value = classified.num;
-		} else if (kind == ShredPrimitive::Ubigint && int64_kind && int_value >= 0) {
+		} else if (kind == JsonoScalarPrimitive::Ubigint && int64_kind && int_value >= 0) {
 			cap.state = DomShredCapture::State::Uint;
 			cap.stripped = true;
 			cap.uint_value = uint64_t(int_value);
@@ -213,11 +213,11 @@ void CaptureShredLeaf(yyjson_val *value, ShredPrimitive kind, DomShredCapture &c
 		return;
 	}
 	case YYJSON_TYPE_BOOL:
-		if (kind == ShredPrimitive::Boolean) {
+		if (kind == JsonoScalarPrimitive::Boolean) {
 			cap.state = DomShredCapture::State::Bool;
 			cap.stripped = true;
 			cap.bool_value = yyjson_get_bool(value);
-		} else if (kind == ShredPrimitive::Varchar) {
+		} else if (kind == JsonoScalarPrimitive::Varchar) {
 			cap.state = DomShredCapture::State::ResidualFill;
 		} else {
 			// Present boolean at a numeric shred path: stays in the residual, shred NULL (case B).
@@ -230,7 +230,7 @@ void CaptureShredLeaf(yyjson_val *value, ShredPrimitive kind, DomShredCapture &c
 			// container's `->>` text into the lane (complete) or leaves it NULL+incomplete when
 			// render-unsafe; for a typed shred the lane cannot hold it, so the value stays in the
 			// residual and a bare typed read would miss the `->>` container text (not complete).
-			if (kind == ShredPrimitive::Varchar) {
+			if (kind == JsonoScalarPrimitive::Varchar) {
 				cap.state = DomShredCapture::State::ResidualFill;
 			} else {
 				cap.diverted_scalar = true;

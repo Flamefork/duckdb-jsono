@@ -152,6 +152,44 @@ struct RankCache {
 	}
 };
 
+struct JsonoLayoutCacheEntry {
+	uint64_t generation = 0;
+	size_t pos = 0;
+	ObjectLayout layout {};
+};
+
+constexpr idx_t JSONO_LAYOUT_CACHE_SIZE = 16;
+
+struct JsonoLayoutCache {
+	JsonoLayoutCache() : entries(JSONO_LAYOUT_CACHE_SIZE) {
+	}
+
+	vector<JsonoLayoutCacheEntry> entries;
+	uint64_t generation = 0;
+
+	void NextRow() {
+		generation++;
+	}
+};
+
+struct JsonoPathLocateState {
+	RankCache rank_cache;
+	JsonoLayoutCache layout_cache;
+
+	void NextRow() {
+		layout_cache.NextRow();
+	}
+};
+
+struct JsonoPathLocation {
+	JsonoPathLocation() = default;
+	JsonoPathLocation(const JsonoCursor &cursor_p, bool found_p) : cursor(cursor_p), found(found_p) {
+	}
+
+	JsonoCursor cursor;
+	bool found = false;
+};
+
 // Move `cursor` (at an OBJ_START whose `layout` was read off it) into the value at `rank`,
 // jumping through the object's value-block checkpoints when it has them.
 inline void MoveCursorToObjectValueRank(const JsonoView &view, const ObjectLayout &layout, size_t rank,
@@ -174,6 +212,28 @@ inline bool LocateArrayIndex(const JsonoView &view, idx_t index, JsonoCursor &cu
 		current++;
 	}
 	return cursor.pos < end_pos && current == index;
+}
+
+inline bool LocateObjectKeyCached(JsonoPathLocateState &state, idx_t step_index, const JsonoView &view,
+                                  const string &key, JsonoCursor &cursor) {
+	if (cursor.pos >= view.Slots()) {
+		return false;
+	}
+	auto &entry = state.layout_cache.entries[cursor.pos & (JSONO_LAYOUT_CACHE_SIZE - 1)];
+	if (entry.generation != state.layout_cache.generation || entry.pos != cursor.pos) {
+		if (SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_START) {
+			return false;
+		}
+		entry.generation = state.layout_cache.generation;
+		entry.pos = cursor.pos;
+		entry.layout = ReadObjectLayout(view, cursor.pos, true);
+	}
+	size_t rank = 0;
+	if (!state.rank_cache.Find(step_index, view, entry.layout, key, rank)) {
+		return false;
+	}
+	MoveCursorToObjectValueRank(view, entry.layout, rank, cursor);
+	return true;
 }
 
 // One Key/Index step from the value at `cursor`. `cache` may be null: point readers that
@@ -213,14 +273,53 @@ inline bool LocatePathStep(RankCache *cache, idx_t step_index, const JsonoView &
 	return false;
 }
 
-inline bool LocatePathSteps(RankCache *cache, idx_t step_base, const vector<PathStep> &steps, const JsonoView &view,
-                            JsonoCursor &cursor) {
-	for (idx_t step_index = 0; step_index < steps.size(); step_index++) {
+inline bool LocatePathStep(JsonoPathLocateState &state, idx_t step_index, const JsonoView &view, const PathStep &step,
+                           JsonoCursor &cursor) {
+	if (cursor.pos >= view.Slots()) {
+		return false;
+	}
+	if (step.kind == PathStepKind::Key) {
+		return LocateObjectKeyCached(state, step_index, view, step.key, cursor);
+	}
+	return LocatePathStep(&state.rank_cache, step_index, view, step, cursor);
+}
+
+inline bool LocatePathPrefix(RankCache *cache, idx_t step_base, const vector<PathStep> &steps, idx_t step_count,
+                             const JsonoView &view, JsonoCursor &cursor) {
+	for (idx_t step_index = 0; step_index < step_count; step_index++) {
 		if (!LocatePathStep(cache, step_base + step_index, view, steps[step_index], cursor)) {
 			return false;
 		}
 	}
 	return true;
+}
+
+inline bool LocatePathPrefix(JsonoPathLocateState &state, idx_t step_base, const vector<PathStep> &steps,
+                             idx_t step_count, const JsonoView &view, JsonoCursor &cursor) {
+	for (idx_t step_index = 0; step_index < step_count; step_index++) {
+		if (!LocatePathStep(state, step_base + step_index, view, steps[step_index], cursor)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+inline bool LocatePathSteps(RankCache *cache, idx_t step_base, const vector<PathStep> &steps, const JsonoView &view,
+                            JsonoCursor &cursor) {
+	return LocatePathPrefix(cache, step_base, steps, steps.size(), view, cursor);
+}
+
+inline bool LocatePathSteps(JsonoPathLocateState &state, idx_t step_base, const vector<PathStep> &steps,
+                            const JsonoView &view, JsonoCursor &cursor) {
+	return LocatePathPrefix(state, step_base, steps, steps.size(), view, cursor);
+}
+
+inline JsonoPathLocation LocatePath(const JsonoView &view, const vector<PathStep> &steps) {
+	JsonoCursor cursor;
+	if (!LocatePathSteps(nullptr, 0, steps, view, cursor)) {
+		return {};
+	}
+	return JsonoPathLocation {cursor, true};
 }
 
 } // namespace jsono

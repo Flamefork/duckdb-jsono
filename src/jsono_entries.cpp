@@ -307,33 +307,9 @@ struct EntriesWalkSink {
 	}
 };
 
-// Render a shredded shred's typed value as the text an entry carries. The switch is exhaustive over
-// the closed scalar shred set (so a new scalar shred type fails to compile here); VARCHAR returns the
-// heap string in place, the rest format into `scratch`.
-nonstd::string_view FormatShredValue(const UnifiedVectorFormat &fmt, idx_t idx, ShredPrimitive kind,
+nonstd::string_view FormatShredValue(const UnifiedVectorFormat &fmt, idx_t idx, JsonoScalarPrimitive kind,
                                      std::string &scratch) {
-	switch (kind) {
-	case ShredPrimitive::Varchar: {
-		auto &s = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
-		return nonstd::string_view(s.GetData(), s.GetSize());
-	}
-	case ShredPrimitive::Bigint:
-		scratch.clear();
-		AppendSignedText(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx], scratch);
-		return scratch;
-	case ShredPrimitive::Ubigint:
-		scratch.clear();
-		AppendUnsignedText(UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx], scratch);
-		return scratch;
-	case ShredPrimitive::Double:
-		scratch.clear();
-		EmitDouble(UnifiedVectorFormat::GetData<double>(fmt)[idx], scratch);
-		return scratch;
-	case ShredPrimitive::Boolean:
-		scratch = UnifiedVectorFormat::GetData<bool>(fmt)[idx] ? "true" : "false";
-		return scratch;
-	}
-	return nonstd::string_view();
+	return JsonoPrimitiveVectorText(kind, fmt, idx, scratch);
 }
 
 void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -362,17 +338,17 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 	// the shred holds the `->>` text for a fast typed read). Such a value would be emitted twice — once
 	// by the residual walk, once by the shred overlay — so when any VARCHAR shred is present, the
 	// residual leaf paths are recorded and the overlay skips a path the residual already carries
-	// (residual is authoritative, matching the reconstruct overlay). ShredPrimitiveStoresReadCopy is
+	// (residual is authoritative, matching the reconstruct overlay). JsonoScalarPrimitiveStoresReadCopy is
 	// the single owner of which kinds read-copy.
 	bool has_varchar_shred = false;
 	for (auto &lane : lanes) {
 		switch (lane.kind) {
 		case ShredKind::Scalar:
-			has_varchar_shred = has_varchar_shred || ShredPrimitiveStoresReadCopy(lane.scalar_kind);
+			has_varchar_shred = has_varchar_shred || JsonoScalarPrimitiveStoresReadCopy(lane.scalar_kind);
 			break;
 		case ShredKind::Array:
 			for (auto sub_kind : lane.sub_kind) {
-				has_varchar_shred = has_varchar_shred || ShredPrimitiveStoresReadCopy(sub_kind);
+				has_varchar_shred = has_varchar_shred || JsonoScalarPrimitiveStoresReadCopy(sub_kind);
 			}
 			break;
 		case ShredKind::ScalarArray:
@@ -470,7 +446,7 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 			switch (lane.kind) {
 			case ShredKind::Scalar: {
 				// A VARCHAR read-copy the residual still carries is the residual's to emit, not ours.
-				if (ShredPrimitiveStoresReadCopy(lane.scalar_kind) && residual_paths.count(base_key)) {
+				if (JsonoScalarPrimitiveStoresReadCopy(lane.scalar_kind) && residual_paths.count(base_key)) {
 					break;
 				}
 				auto value = FormatShredValue(lane.fmt, idx, lane.scalar_kind, shred_scratch);
@@ -498,7 +474,7 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 						AppendKeySegment(path, nonstd::string_view(sub_name.data(), sub_name.size()), style);
 						// A VARCHAR subfield read-copy the residual element still carries is the
 						// residual's to emit (the walk above already did), so skip it here.
-						if (ShredPrimitiveStoresReadCopy(lane.sub_kind[j]) && residual_paths.count(path)) {
+						if (JsonoScalarPrimitiveStoresReadCopy(lane.sub_kind[j]) && residual_paths.count(path)) {
 							path.resize(saved_key);
 							continue;
 						}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "jsono.hpp"
+#include "jsono_locate.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_render.hpp"
@@ -277,6 +278,29 @@ private:
 // NumberText value, zero-copyable straight out of string_heap), OnRenderedText sees transient
 // `scratch` bytes (a serialized container or a rendered numeric/bool, must be copied), OnNull is the
 // SQL-NULL outcome (JSON null, or — for the matcher — a non-match).
+struct JsonoScalarText {
+	nonstd::string_view value;
+	bool inline_text = false;
+};
+
+inline bool TryGetScalarExtractText(const JsonoScalar &scalar, std::string &scratch, JsonoScalarText &text) {
+	if (scalar.kind == JsonoScalarKind::Null) {
+		return false;
+	}
+	if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
+		text.value = scalar.text;
+		text.inline_text = true;
+		return true;
+	}
+	scratch.clear();
+	if (RenderExtractText(scalar, scratch)) {
+		return false;
+	}
+	text.value = nonstd::string_view(scratch.data(), scratch.size());
+	text.inline_text = false;
+	return true;
+}
+
 template <class SINK>
 JSONO_ALWAYS_INLINE void EmitLocatedText(JsonoRowReader &reader, const JsonoView &view, const vector<PathStep> &steps,
                                          const JsonoCursor &located_cursor, std::string &scratch, SINK &sink) {
@@ -292,20 +316,16 @@ JSONO_ALWAYS_INLINE void EmitLocatedText(JsonoRowReader &reader, const JsonoView
 	}
 	auto cursor = located_cursor;
 	auto scalar = DecodeScalarAt(view, cursor);
-	if (scalar.kind == JsonoScalarKind::Null) {
+	JsonoScalarText text;
+	if (!TryGetScalarExtractText(scalar, scratch, text)) {
 		sink.OnNull();
 		return;
 	}
-	if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
-		sink.OnInlineText(scalar.text);
+	if (text.inline_text) {
+		sink.OnInlineText(text.value);
 		return;
 	}
-	scratch.clear();
-	if (RenderExtractText(scalar, scratch)) {
-		sink.OnNull();
-		return;
-	}
-	sink.OnRenderedText(nonstd::string_view(scratch.data(), scratch.size()));
+	sink.OnRenderedText(text.value);
 }
 
 // EmitLocatedText sink that writes `->>` text into a FLAT string result vector (the optimizer's
@@ -329,6 +349,29 @@ struct JsonoExtractStringSink {
 		FlatVector::SetNull(result, row, true);
 	}
 };
+
+template <class POLICY>
+void JsonoPointReadRows(JsonoRowReader &reader, idx_t count, const vector<PathStep> *steps,
+                        JsonoPathLocateState &locate_state, POLICY &policy) {
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		locate_state.NextRow();
+		JsonoBlobRow blob;
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			policy.Null(row);
+			continue;
+		}
+		JsonoCursor cursor;
+		if (steps) {
+			if (!LocatePathSteps(locate_state, 0, *steps, view, cursor)) {
+				reader.CheckPathMiss(view, *steps);
+				policy.Null(row);
+				continue;
+			}
+		}
+		policy.Found(reader, view, steps, cursor, row);
+	}
+}
 
 } // namespace jsono
 } // namespace duckdb

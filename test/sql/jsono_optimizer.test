@@ -456,6 +456,62 @@ FROM (
 ----
 0
 
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE jsono_prefix_project_expected AS
+SELECT j->>'$.commit' AS commit_json,
+       j->>'$.commit.operation' AS operation,
+       j->>'$.commit.collection' AS collection
+FROM jsono_optimizer_probe;
+
+statement ok
+CREATE TEMP TABLE jsono_root_project_expected AS
+SELECT j->>'$' AS document_json,
+       j->>'$.kind' AS kind,
+       j->>'$.commit.operation' AS operation
+FROM jsono_optimizer_probe;
+
+statement ok
+RESET disabled_optimizers;
+
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_prefix_project_expected EXCEPT ALL
+   SELECT j->>'$.commit' AS commit_json,
+          j->>'$.commit.operation' AS operation,
+          j->>'$.commit.collection' AS collection
+   FROM jsono_optimizer_probe)
+  UNION ALL
+  (SELECT j->>'$.commit' AS commit_json,
+          j->>'$.commit.operation' AS operation,
+          j->>'$.commit.collection' AS collection
+   FROM jsono_optimizer_probe
+   EXCEPT ALL SELECT * FROM jsono_prefix_project_expected)
+);
+----
+0
+
+query I
+SELECT count(*)
+FROM (
+  (SELECT * FROM jsono_root_project_expected EXCEPT ALL
+   SELECT j->>'$' AS document_json,
+          j->>'$.kind' AS kind,
+          j->>'$.commit.operation' AS operation
+   FROM jsono_optimizer_probe)
+  UNION ALL
+  (SELECT j->>'$' AS document_json,
+          j->>'$.kind' AS kind,
+          j->>'$.commit.operation' AS operation
+   FROM jsono_optimizer_probe
+   EXCEPT ALL SELECT * FROM jsono_root_project_expected)
+);
+----
+0
+
 query TI
 SELECT j->>'$.kind' AS kind,
        count(j->>'$.commit.collection') AS with_collection

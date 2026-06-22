@@ -4,6 +4,7 @@
 #include "jsono_locate.hpp"
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
+#include "jsono_path_function.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
@@ -31,25 +32,7 @@ namespace {
 
 using namespace jsono;
 
-struct ExtractPathBindData : public FunctionData {
-	ExtractPathBindData(string path_p, vector<PathStep> steps_p) : path(std::move(path_p)), steps(std::move(steps_p)) {
-	}
-
-	string path;
-	vector<PathStep> steps;
-
-	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<ExtractPathBindData>(path, steps);
-	}
-
-	bool Equals(const FunctionData &other_p) const override {
-		auto &other = other_p.Cast<ExtractPathBindData>();
-		return path == other.path && PathStepsEqual(steps, other.steps);
-	}
-};
-
-struct ExtractLocalState : public FunctionLocalState {
-	RankCache rank_cache;
+struct ExtractLocalState : public JsonoSinglePathLocalState {
 	JsonoBuilder builder;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
@@ -63,46 +46,7 @@ struct ExtractLocalState : public FunctionLocalState {
 
 unique_ptr<FunctionData> JsonoExtractBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments) {
-	auto function_name = bound_function.name;
-	if (arguments[1]->HasParameter()) {
-		throw ParameterNotResolvedException();
-	}
-	if (!arguments[1]->IsFoldable()) {
-		throw BinderException("%s: path must be constant", function_name);
-	}
-	auto path_value = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
-	if (path_value.IsNull()) {
-		throw BinderException("%s: path must not be NULL", function_name);
-	}
-	if (arguments[1]->return_type.IsIntegral()) {
-		if (!path_value.DefaultTryCastAs(LogicalType::BIGINT)) {
-			throw BinderException("%s: path must be BIGINT", function_name);
-		}
-		auto index = path_value.GetValue<int64_t>();
-		if (index < 0) {
-			throw BinderException("%s: array index must be non-negative", function_name);
-		}
-		return make_uniq<ExtractPathBindData>(std::to_string(index), ArrayIndexPath(idx_t(index)));
-	}
-	if (!path_value.DefaultTryCastAs(LogicalType::VARCHAR)) {
-		throw BinderException("%s: path must be VARCHAR", function_name);
-	}
-	auto path = StringValue::Get(path_value);
-	if (path.empty()) {
-		ThrowInvalidPath(function_name.c_str(), path);
-	}
-	vector<PathStep> steps;
-	if (path[0] == '$') {
-		steps = ParseJsonoPath(path, function_name.c_str());
-	} else {
-		steps = LiteralKeyPath(path);
-	}
-	for (auto &step : steps) {
-		if (step.kind == PathStepKind::Wildcard) {
-			throw BinderException("%s: wildcard paths are not supported", function_name);
-		}
-	}
-	return make_uniq<ExtractPathBindData>(std::move(path), std::move(steps));
+	return BindJsonoSinglePath(context, *arguments[1], bound_function.name.c_str(), JsonoPathDialect::Extract);
 }
 
 // Copy the container subtree at `start` into `builder` as a standalone value. The subtree
@@ -385,9 +329,47 @@ void WriteScalarExtractRow(JsonoBodyWriter &writer, idx_t row, const JsonoView &
 	}
 }
 
+struct JsonoExtractPolicy {
+	JsonoBodyWriter &writer;
+	JsonoBuilder &builder;
+
+	void Null(idx_t row) {
+		writer.SetRowNull(row);
+	}
+
+	void Found(JsonoRowReader &reader, const JsonoView &view, const vector<PathStep> *steps, const JsonoCursor &cursor,
+	           idx_t row) {
+		auto found_tag = SlotTag(view.SlotAt(cursor.pos));
+		if (found_tag == tag::OBJ_START || found_tag == tag::ARR_START) {
+			reader.CheckContainerRead(view, *steps);
+			builder.Reset();
+			BulkEmitSubtree(view, cursor, builder);
+			writer.WriteRow(row, builder);
+		} else {
+			WriteScalarExtractRow(writer, row, view, cursor);
+		}
+	}
+};
+
+struct JsonoExtractStringPolicy {
+	Vector &result;
+	string_t *result_data;
+	std::string &scratch;
+
+	void Null(idx_t row) {
+		FlatVector::SetNull(result, row, true);
+	}
+
+	void Found(JsonoRowReader &reader, const JsonoView &view, const vector<PathStep> *steps, const JsonoCursor &cursor,
+	           idx_t row) {
+		JsonoExtractStringSink sink {result, result_data, row};
+		EmitLocatedText(reader, view, *steps, cursor, scratch, sink);
+	}
+};
+
 void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<ExtractPathBindData>();
+	auto &bind_data = expr.bind_info->Cast<JsonoSinglePathBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ExtractLocalState>();
 	auto count = args.size();
 
@@ -397,29 +379,8 @@ void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result
 	JsonoBodyWriter writer;
 	writer.Init(result);
 
-	JsonoView view;
-	for (idx_t row = 0; row < count; row++) {
-		JsonoBlobRow blob;
-		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
-			writer.SetRowNull(row);
-			continue;
-		}
-		JsonoCursor cursor;
-		if (!LocatePathSteps(&lstate.rank_cache, 0, bind_data.steps, view, cursor)) {
-			reader.CheckPathMiss(view, bind_data.steps);
-			writer.SetRowNull(row);
-			continue;
-		}
-		auto found_tag = SlotTag(view.SlotAt(cursor.pos));
-		if (found_tag == tag::OBJ_START || found_tag == tag::ARR_START) {
-			reader.CheckContainerRead(view, bind_data.steps);
-			lstate.builder.Reset();
-			BulkEmitSubtree(view, cursor, lstate.builder);
-			writer.WriteRow(row, lstate.builder);
-		} else {
-			WriteScalarExtractRow(writer, row, view, cursor);
-		}
-	}
+	JsonoExtractPolicy policy {writer, lstate.builder};
+	JsonoPointReadRows(reader, count, &bind_data.path.steps, lstate.locate_state, policy);
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
@@ -427,7 +388,7 @@ void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result
 
 void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<ExtractPathBindData>();
+	auto &bind_data = expr.bind_info->Cast<JsonoSinglePathBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ExtractLocalState>();
 	auto count = args.size();
 
@@ -439,22 +400,8 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 	// Zero-copy text values point into the input string_heap; keep its buffer alive for them.
 	StringVector::AddHeapReference(result, reader.StringHeapVector());
 	std::string scratch;
-	JsonoView view;
-	for (idx_t row = 0; row < count; row++) {
-		JsonoBlobRow blob;
-		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		JsonoCursor cursor;
-		if (!LocatePathSteps(&lstate.rank_cache, 0, bind_data.steps, view, cursor)) {
-			reader.CheckPathMiss(view, bind_data.steps);
-			FlatVector::SetNull(result, row, true);
-			continue;
-		}
-		JsonoExtractStringSink sink {result, result_data, row};
-		EmitLocatedText(reader, view, bind_data.steps, cursor, scratch, sink);
-	}
+	JsonoExtractStringPolicy policy {result, result_data, scratch};
+	JsonoPointReadRows(reader, count, &bind_data.path.steps, lstate.locate_state, policy);
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
