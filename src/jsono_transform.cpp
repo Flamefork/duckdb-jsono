@@ -56,12 +56,10 @@ struct TransformField {
 // Transform's trie reuses the shared skeleton (src/include/jsono_trie.hpp). The node carries
 // transform-only leaf kinds (list/join) and the wildcard child the projector never populates; the
 // walk below stays transform-specific.
-using TransformTrieNode = jsono::JsonoTrieNode;
-
 struct TransformBindData : public FunctionData {
 	string spec;
 	vector<TransformField> fields;
-	vector<TransformTrieNode> trie;
+	vector<jsono::JsonoTrieNode> trie;
 	LogicalType return_type;
 	// Scalar fields backed by a shredded shred (field.shred_child_index set); handled directly
 	// from the shred/residual rather than the trie. Empty for a plain JSONO input.
