@@ -17,6 +17,15 @@ inline bool TryReadJsonoPathSpec(ClientContext &context, Expression &expr, const
 	if (expr.HasParameter() || !expr.IsFoldable()) {
 		return false;
 	}
+	// A LIST-typed argument is the batch/list extract overload's path vector, not a scalar path.
+	// DefaultTryCastAs(VARCHAR) below would stringify it (list_value('$.k') -> "[$.k]") and accept it as
+	// a literal key, so the optimizer would rewrite a LIST extract into a scalar one — a VARCHAR result
+	// vector under a declared LIST(VARCHAR) type that crashes materialization. Decline so the list
+	// extract is left to core json's list overload (its STRUCT->JSON arg cast is reconstructed
+	// independently, exactly like a non-constant scalar path).
+	if (expr.return_type.id() == LogicalTypeId::LIST) {
+		return false;
+	}
 	auto value = ExpressionExecutor::EvaluateScalar(context, expr);
 	if (value.IsNull()) {
 		return false;

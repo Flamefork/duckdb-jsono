@@ -1,0 +1,118 @@
+# name: test/sql/jsono_extract_list_path.test
+# description: Batch/list path overload of json_extract(_string) over a JSONO value.
+# group: [sql]
+
+#   json_extract_string(JSONO, VARCHAR[]) binds to core json's list overload through the
+#   STRUCT->JSON cast on the JSONO argument. The extension optimizer must leave that list extract
+#   alone so its STRUCT->JSON arg cast is reconstructed to real JSON independently — exactly like a
+#   non-constant scalar path. It previously stringified list_value('$.k') to the literal key "[$.k]"
+#   and rewrote the list extract into a scalar one, producing a VARCHAR result vector under a declared
+#   LIST(VARCHAR) type: an internal error that invalidated the connection on materialization.
+
+require jsono
+
+require json
+
+# ---------------------------------------------------------------------------
+# Minimal repro: single-element list path, then list_extract downstream.
+# ---------------------------------------------------------------------------
+query I
+select list_extract(
+    json_extract_string(jsono({'clientID': 'CID-1'}), list_value('$.clientID')),
+    1
+) as client_id;
+----
+CID-1
+
+# The list extract on its own yields a real VARCHAR[].
+query I
+select json_extract_string(jsono({'clientID': 'CID-1'}), list_value('$.clientID')) as v;
+----
+[CID-1]
+
+# ---------------------------------------------------------------------------
+# Multiple paths, including a missing one (NULL element).
+# ---------------------------------------------------------------------------
+query I
+select json_extract_string(
+    jsono({'clientID': 'CID-1', 'counterUserIDHash': 'H-1'}),
+    list_value('$.clientID', '$.counterUserIDHash', '$.missing')
+) as vals;
+----
+[CID-1, H-1, NULL]
+
+# ---------------------------------------------------------------------------
+# Nested JSONPath elements.
+# ---------------------------------------------------------------------------
+query I
+select json_extract_string(
+    jsono({'params': {'UserID': 'U-1'}, 'event_json': {'adjust_id': 'A-1'}}),
+    list_value('$.params.UserID', '$.event_json.adjust_id')
+) as vals;
+----
+[U-1, A-1]
+
+# ---------------------------------------------------------------------------
+# Materialization (the original crash path: a LIST column append).
+# ---------------------------------------------------------------------------
+statement ok
+create table extracted as
+select json_extract_string(jsono({'clientID': 'CID-1'}), list_value('$.clientID')) as v;
+
+query I
+select v from extracted;
+----
+[CID-1]
+
+# ---------------------------------------------------------------------------
+# Downstream list operations on the list result.
+# ---------------------------------------------------------------------------
+query II
+select unnest(json_extract_string(
+    jsono({'clientID': 'CID-1', 'counterUserIDHash': 'H-1'}),
+    list_value('$.clientID', '$.counterUserIDHash')
+)) as v, 1 as one
+order by v;
+----
+CID-1	1
+H-1	1
+
+query I
+select len(json_extract_string(
+    jsono({'clientID': 'CID-1', 'counterUserIDHash': 'H-1'}),
+    list_value('$.clientID', '$.counterUserIDHash', '$.missing')
+)) as n;
+----
+3
+
+# ---------------------------------------------------------------------------
+# json-valued list extract returns JSON[] (shredded value: a plain JSONO struct has no
+# implicit STRUCT->JSON cast, so it binds to core json's list overload only when shredded).
+# ---------------------------------------------------------------------------
+query I
+select json_extract(
+    jsono('{"a":1,"b":2}', shredding := {'$.a': 'BIGINT', '$.b': 'BIGINT'}),
+    list_value('$.a', '$.b')
+) as vals;
+----
+[1, 2]
+
+# ---------------------------------------------------------------------------
+# A real shredded column (explicit shredding spec) goes the same route.
+# ---------------------------------------------------------------------------
+statement ok
+create table docs as
+select jsono('{"clientID":"CID-1","counterUserIDHash":"H-1"}',
+             shredding := {'$.clientID': 'VARCHAR', '$.counterUserIDHash': 'VARCHAR'}) e;
+
+query I
+select json_extract_string(e, list_value('$.clientID', '$.counterUserIDHash', '$.missing')) as vals
+from docs;
+----
+[CID-1, H-1, NULL]
+
+query I
+select list_extract(json_extract_string(e, list_value('$.clientID')), 1) as client_id
+from docs;
+----
+CID-1
