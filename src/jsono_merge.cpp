@@ -696,6 +696,46 @@ void EmitReconShredScalar(JsonoBuilder &builder, const LogicalType &type, const 
 	EmitJsonoPrimitiveVectorValue(builder, kind, fmt, idx);
 }
 
+// Build ONE JSONO object patch covering all shreds in present[lo,hi) — a sorted, contiguous run
+// sharing the same first `depth` path steps — recursing on shared key prefixes so the whole shred set
+// folds into a single overlay instead of one merge per shred. A top-level scalar is a terminal leaf at
+// depth 0; a nested path recurses. Every shred in the run has steps.size() > depth; the shred
+// invariant makes a key either a terminal leaf (a single shred) or an object container (a deeper run),
+// never both. `present` is sorted by path, so equal keys at a depth are contiguous and the emitted
+// object keys come out ascending (the sorted-key invariant MergeTwoObjects requires).
+void EmitShredPatchObject(JsonoBuilder &builder, const vector<ReconShred> &shreds, const vector<idx_t> &present,
+                          const vector<UnifiedVectorFormat> &shred_fmt, idx_t row, idx_t lo, idx_t hi, idx_t depth) {
+	auto run_end = [&](idx_t i) {
+		auto &key = shreds[present[i]].steps[depth].key;
+		idx_t j = i + 1;
+		while (j < hi && shreds[present[j]].steps[depth].key == key) {
+			j++;
+		}
+		return j;
+	};
+	idx_t distinct = 0;
+	for (idx_t i = lo; i < hi; i = run_end(i)) {
+		distinct++;
+	}
+	builder.EmitObjectStart(distinct);
+	for (idx_t i = lo; i < hi; i = run_end(i)) {
+		builder.EmitKeySlot(shreds[present[i]].steps[depth].key);
+	}
+	for (idx_t i = lo; i < hi;) {
+		idx_t j = run_end(i);
+		builder.EmitObjectChildStart();
+		if (shreds[present[i]].steps.size() == depth + 1) {
+			// Terminal leaf — a single shred on this key by the invariant.
+			idx_t k = present[i];
+			EmitReconShredScalar(builder, shreds[k].type, shred_fmt[k], RowIndex(shred_fmt[k], row));
+		} else {
+			EmitShredPatchObject(builder, shreds, present, shred_fmt, row, i, j, depth + 1);
+		}
+		i = j;
+	}
+	builder.EmitObjectEnd();
+}
+
 // True if a pure object-key path ends at / continues past `key` when matched at `depth`. The
 // size check precedes the [depth] read, so a path shorter than depth+1 never indexes OOB. The
 // path ref is std::vector so duckdb::vector<PathStep> binds too (derived-to-base). Shared by the
@@ -915,7 +955,6 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 	TryParseJsonoLayoutType(input.GetType(), layout);
 	vector<ReconShred> shreds;
 	vector<ArrayReconShred> array_shreds;
-	bool all_top_level = true;
 	for (idx_t i = 0; i < layout.shreds.size(); i++) {
 		if (shred_filter && std::find(shred_filter->begin(), shred_filter->end(), i) == shred_filter->end()) {
 			continue;
@@ -954,9 +993,6 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			array_shreds.push_back(std::move(ars));
 			continue;
 		}
-		if (steps.size() != 1) {
-			all_top_level = false;
-		}
 		shreds.push_back(ReconShred {i, layout.shreds[i].second, std::move(steps)});
 	}
 	std::sort(shreds.begin(), shreds.end(), [](const ReconShred &a, const ReconShred &b) {
@@ -968,6 +1004,19 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		}
 		return a.steps.size() < b.steps.size();
 	});
+	// Whether any shred is a nested path (steps.size() > 1) decides the per-row strategy ONCE, off the
+	// hot path. The common case — all shreds top-level — keeps the direct two-pass flat patch (one merge,
+	// no per-row index vector, no grouping). Only a type that actually carries a nested shred pays the
+	// general patch-tree path, which folds top-level + nested into one tree applied in a single overlay
+	// (replacing the old per-shred re-serialize loop that went super-linear in shred count).
+	bool has_nested_shred = false;
+	for (auto &shred : shreds) {
+		if (shred.steps.size() > 1) {
+			has_nested_shred = true;
+			break;
+		}
+	}
+	vector<idx_t> present_shreds; // reused per row by the patch-tree path only
 
 	// The row reader verifies each row's shred manifest against the shreds this type carries
 	// (the manifest is checked against ALL of them even under a shred_filter).
@@ -1015,7 +1064,6 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 	JsonoBuilder out_builder;
 	JsonoBuilder final_builder;
 	OwnedJsonoBlob patch_storage;
-	OwnedJsonoBlob acc_storage;
 	OwnedJsonoBlob scalar_storage;
 	ArrayOverlayScratch overlay_scratch;
 	JsonoView residual_view;
@@ -1057,13 +1105,21 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			finish_row(row, out_builder);
 			continue;
 		}
-		if (all_top_level) {
-			// One flat patch object of the present shreds, overlaid in a single pass.
-			patch_builder.Reset();
+		if (!has_nested_shred) {
+			// Hot path: every shred is top-level. Build the flat patch directly — count present, emit keys
+			// then values — with no per-row index vector and no grouping scan.
 			idx_t present = 0;
 			for (idx_t k = 0; k < shreds.size(); k++) {
 				present += RowIsValid(shred_fmt[k], row) ? 1 : 0;
 			}
+			if (present == 0) {
+				out_builder.Reset();
+				JsonoCursor cursor;
+				EmitValueVerbatim(residual_view, cursor, out_builder, 0);
+				finish_row(row, out_builder);
+				continue;
+			}
+			patch_builder.Reset();
 			patch_builder.EmitObjectStart(present);
 			for (idx_t k = 0; k < shreds.size(); k++) {
 				if (RowIsValid(shred_fmt[k], row)) {
@@ -1087,39 +1143,29 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			finish_row(row, out_builder);
 			continue;
 		}
-		// Nested shreds: overlay one single-path chain at a time onto the accumulator. The
-		// residual is authoritative; each disjoint shred path fills in where it was stripped.
-		const JsonoView *acc = &residual_view;
-		JsonoView acc_view = residual_view;
-		bool any = false;
+		// A nested shred is present: fold ALL present object-key shreds into ONE patch tree applied in a
+		// SINGLE overlay. The residual is authoritative; the overlay refills only the stripped leaves,
+		// recursing into a shared key so a nested shred never drops the residual's other subkeys.
+		present_shreds.clear();
 		for (idx_t k = 0; k < shreds.size(); k++) {
-			if (!RowIsValid(shred_fmt[k], row)) {
-				continue;
+			if (RowIsValid(shred_fmt[k], row)) {
+				present_shreds.push_back(k);
 			}
-			patch_builder.Reset();
-			for (auto &step : shreds[k].steps) {
-				patch_builder.EmitObjectStart(1);
-				patch_builder.EmitKeySlot(step.key);
-				patch_builder.EmitObjectChildStart();
-			}
-			EmitReconShredScalar(patch_builder, shreds[k].type, shred_fmt[k], RowIndex(shred_fmt[k], row));
-			for (idx_t s = 0; s < shreds[k].steps.size(); s++) {
-				patch_builder.EmitObjectEnd();
-			}
-			SerializeBuilderToBlob(patch_builder, patch_storage);
-			JsonoView patch_view = ViewOfBlob(patch_storage);
-			patch_view.ParseHeader();
-			out_builder.Reset();
-			MergeTwoObjects(*acc, JsonoCursor(), patch_view, JsonoCursor(), out_builder, MergeMode::Overlay, 0);
-			SerializeBuilderToBlob(out_builder, acc_storage);
-			acc_view = ViewOfBlob(acc_storage);
-			acc_view.ParseHeader();
-			acc = &acc_view;
-			any = true;
 		}
+		if (present_shreds.empty()) {
+			out_builder.Reset();
+			JsonoCursor cursor;
+			EmitValueVerbatim(residual_view, cursor, out_builder, 0);
+			finish_row(row, out_builder);
+			continue;
+		}
+		patch_builder.Reset();
+		EmitShredPatchObject(patch_builder, shreds, present_shreds, shred_fmt, row, 0, present_shreds.size(), 0);
+		SerializeBuilderToBlob(patch_builder, patch_storage);
+		JsonoView patch_view = ViewOfBlob(patch_storage);
+		patch_view.ParseHeader();
 		out_builder.Reset();
-		JsonoCursor cursor;
-		EmitValueVerbatim(any ? *acc : residual_view, cursor, out_builder, 0);
+		MergeTwoObjects(residual_view, JsonoCursor(), patch_view, JsonoCursor(), out_builder, MergeMode::Overlay, 0);
 		finish_row(row, out_builder);
 	}
 }

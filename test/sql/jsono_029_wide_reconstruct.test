@@ -1,0 +1,212 @@
+# name: test/sql/jsono_029_wide_reconstruct.test
+# description: plan 029 — wide shredded reconstruction. A) a nested-struct shred must not drag the
+# group: [sql]
+
+# flat top-level shreds onto the super-linear per-shred overlay (byte-identical output preserved).
+# B) an array shred must not force jsono_transform to reconstruct the whole value when the read
+# fields never touch the array (sibling-scalar fast path), while reads that DO touch it stay correct
+# and manifest fail-loud is preserved.
+
+require jsono
+
+require json
+
+# A wide value: 6 flat scalar fields, one nested struct ($.url.*, absent on every 4th row), a
+# scalar array ($.goals) and an object array ($.items). Keys are reconstructed byte-identically by
+# comparing the shredded reconstruct against the plain (un-shredded) jsono of the same JSON.
+statement ok
+CREATE TABLE wide AS
+SELECT i, json_object(
+    'f0', i, 'f1', i + 1, 'f2', i + 2, 'f3', i + 3, 'f4', i + 4, 'f5', i + 5,
+    'url', CASE WHEN i % 4 = 0 THEN NULL
+           ELSE json_object('scheme', 'sc' || i, 'host', 'h' || i, 'path', '/p' || i) END,
+    'goals', json_array(i, i + 1, i + 2),
+    'items', json_array(json_object('name', 'n' || i, 'cat', 'c' || (i % 3)))
+)::VARCHAR AS j
+FROM range(64) t(i);
+
+# ---------------------------------------------------------------------------
+# A — nested-struct shred + many flat shreds reconstruct byte-identically.
+# Oracle: the shredded value's reconstruct must equal the plain value's reconstruct.
+# ---------------------------------------------------------------------------
+
+# to_json render path (ReconstructShreddedToJson).
+query I
+SELECT count(*) FROM wide
+WHERE to_json(jsono(j, shredding := {
+        'f0': 'BIGINT', 'f1': 'BIGINT', 'f2': 'BIGINT', 'f3': 'BIGINT', 'f4': 'BIGINT', 'f5': 'BIGINT',
+        '$.url.scheme': 'VARCHAR', '$.url.host': 'VARCHAR', '$.url.path': 'VARCHAR'}))
+   IS DISTINCT FROM to_json(jsono(j));
+----
+0
+
+# ::varchar render path (ReconstructShreddedToPlainImpl — the partition fix lives here).
+query I
+SELECT count(*) FROM wide
+WHERE jsono(j, shredding := {
+        'f0': 'BIGINT', 'f1': 'BIGINT', 'f2': 'BIGINT', 'f3': 'BIGINT', 'f4': 'BIGINT', 'f5': 'BIGINT',
+        '$.url.scheme': 'VARCHAR', '$.url.host': 'VARCHAR', '$.url.path': 'VARCHAR'})::varchar
+   IS DISTINCT FROM jsono(j)::varchar;
+----
+0
+
+# A — several DISTINCT nested paths (no flat shreds): the chain-overlay subset alone stays lossless.
+query I
+SELECT count(*) FROM wide
+WHERE jsono(j, shredding := {
+        '$.url.scheme': 'VARCHAR', '$.url.host': 'VARCHAR', '$.url.path': 'VARCHAR'})::varchar
+   IS DISTINCT FROM jsono(j)::varchar;
+----
+0
+
+# A — multiple DISTINCT nested containers (depth-0 fan-out of the patch tree) plus a shared residual
+# key ($.a.z survives beside the shredded $.a.x) and a flat shred, all reconstruct byte-identically.
+query I
+SELECT to_json(jsono('{"a":{"x":1,"z":9},"b":{"y":2},"c":3}',
+                     shredding := {'$.a.x': 'BIGINT', '$.b.y': 'BIGINT', 'c': 'BIGINT'}))
+     = to_json(jsono('{"a":{"x":1,"z":9},"b":{"y":2},"c":3}'));
+----
+true
+
+# A — flat-only (top-level partition only, no nested) is unchanged.
+query I
+SELECT count(*) FROM wide
+WHERE jsono(j, shredding := {'f0': 'BIGINT', 'f3': 'BIGINT', 'f5': 'BIGINT'})::varchar
+   IS DISTINCT FROM jsono(j)::varchar;
+----
+0
+
+# A — a single nested shred mixed with flat shreds (minimal contamination trigger), to_json.
+query I
+SELECT count(*) FROM wide
+WHERE to_json(jsono(j, shredding := {
+        'f0': 'BIGINT', 'f1': 'BIGINT', 'f2': 'BIGINT', '$.url.scheme': 'VARCHAR'}))
+   IS DISTINCT FROM to_json(jsono(j));
+----
+0
+
+# ---------------------------------------------------------------------------
+# B — array shred present, transform reads ONLY sibling scalars: fast path, equal to plain.
+# ---------------------------------------------------------------------------
+
+# scalar-array sibling.
+query I
+SELECT count(*) FROM wide
+WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'}), {'f0': 'BIGINT'})
+   IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT'});
+----
+0
+
+# object-array sibling.
+query I
+SELECT count(*) FROM wide
+WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.items': 'STRUCT(name VARCHAR, cat VARCHAR)[]'}),
+                      {'f0': 'BIGINT', 'f1': 'BIGINT'})
+   IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT', 'f1': 'BIGINT'});
+----
+0
+
+# both array kinds present, sibling scalars only.
+query I
+SELECT count(*) FROM wide
+WHERE jsono_transform(jsono(j, shredding := {
+        'f0': 'BIGINT', '$.goals': 'BIGINT[]', '$.items': 'STRUCT(name VARCHAR, cat VARCHAR)[]'}),
+        {'f0': 'BIGINT', 'f2': 'BIGINT'})
+   IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT', 'f2': 'BIGINT'});
+----
+0
+
+# ---------------------------------------------------------------------------
+# B — reads that DO touch the array still reconstruct correctly (descend / equal / wildcard).
+# ---------------------------------------------------------------------------
+
+# A field descending into the scalar array ($.goals[0]) alongside a sibling scalar: both correct.
+query I
+SELECT count(*) FROM wide
+WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'}),
+                      {'f0': 'BIGINT', 'g0': {'path': '$.goals[0]', 'type': 'BIGINT'}})
+   IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT', 'g0': {'path': '$.goals[0]', 'type': 'BIGINT'}});
+----
+0
+
+# A field descending into the object array ($.items[0].name).
+query I
+SELECT count(*) FROM wide
+WHERE jsono_transform(jsono(j, shredding := {'$.items': 'STRUCT(name VARCHAR, cat VARCHAR)[]'}),
+                      {'n0': {'path': '$.items[0].name', 'type': 'VARCHAR'}})
+   IS DISTINCT FROM jsono_transform(jsono(j), {'n0': {'path': '$.items[0].name', 'type': 'VARCHAR'}});
+----
+0
+
+# A wildcard (list-mode) field over the object array — descends, must reconstruct, stays correct.
+query I
+SELECT count(*) FROM wide
+WHERE jsono_transform(jsono(j, shredding := {'$.items': 'STRUCT(name VARCHAR, cat VARCHAR)[]'}),
+                      {'names': {'type': ['VARCHAR'], 'path': '$.items[*].name'}})
+   IS DISTINCT FROM jsono_transform(jsono(j), {'names': {'type': ['VARCHAR'], 'path': '$.items[*].name'}});
+----
+0
+
+# A wildcard (list-mode) field over the scalar array.
+query I
+SELECT count(*) FROM wide
+WHERE jsono_transform(jsono(j, shredding := {'$.goals': 'BIGINT[]'}),
+                      {'gs': {'type': ['BIGINT'], 'path': '$.goals[*]'}})
+   IS DISTINCT FROM jsono_transform(jsono(j), {'gs': {'type': ['BIGINT'], 'path': '$.goals[*]'}});
+----
+0
+
+# A wildcard array field AND a sibling scalar in one spec: the array-touching field reconstructs,
+# the sibling stays correct, both produced together.
+query I
+SELECT count(*) FROM wide
+WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'}),
+                      {'f0': 'BIGINT', 'gs': {'type': ['BIGINT'], 'path': '$.goals[*]'}})
+   IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT', 'gs': {'type': ['BIGINT'], 'path': '$.goals[*]'}});
+----
+0
+
+# ---------------------------------------------------------------------------
+# B — plan-lock: the per-field gate keeps the transform argument a bare column for a sibling-scalar
+# read, and only wraps it in a reconstruct CAST when a field actually descends into the array.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE arr AS SELECT jsono('{"f0":7,"goals":[1,2,3]}', shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'}) AS e;
+
+# Sibling scalar f0: fast path, argument is the bare column (no reconstruct CAST).
+query II
+EXPLAIN SELECT jsono_transform(e, {'f0': 'BIGINT'}) FROM arr;
+----
+physical_plan	<!REGEX>:.*jsono_transform\(CAST.*
+
+# A field descending into the array: the argument IS wrapped in a reconstruct CAST.
+query II
+EXPLAIN SELECT jsono_transform(e, {'g0': {'path': '$.goals[0]', 'type': 'BIGINT'}}) FROM arr;
+----
+physical_plan	<REGEX>:.*jsono_transform\(CAST.*
+
+# ---------------------------------------------------------------------------
+# B — manifest fail-loud is preserved under the per-field gate. A raw by-name struct cast (extension
+# optimizer disabled, so it is NOT rewritten into a lossless reconstruct+reshred) narrows a row by
+# dropping the f0 shred while KEEPING the goals array shred in the type. The manifest still records
+# f0 as stripped, so a sibling-scalar transform — which the per-field gate now serves on the fast
+# path (f0 does not touch the goals array) — must still fail loud per row, not return a silent NULL.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE narrow_goals AS
+SELECT jsono('{}', shredding := {'$.goals': 'BIGINT[]'}) AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO narrow_goals
+SELECT jsono('{"f0":7,"goals":[1,2,3]}', shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'});
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT jsono_transform(e, {'f0': 'BIGINT'}) FROM narrow_goals;
+----
+narrowed by a raw struct cast

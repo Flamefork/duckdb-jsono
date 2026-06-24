@@ -170,4 +170,21 @@ inline bool JsonoPathSpecEqual(const JsonoPathSpec &left, const JsonoPathSpec &r
 	return left.text == right.text && PathStepsEqual(left.steps, right.steps);
 }
 
+// True unless `read` and the object-key path `key_path` provably diverge — i.e. on some
+// shared-depth step both are object keys that differ. A wildcard or index at a shared step is
+// treated as a possible match (not provably disjoint), and one path being a prefix of the other
+// also shares a branch. Used to decide, conservatively, whether a read could touch a shredded
+// array path (read it, descend into it, or sit on a container subtree that holds it) — whose
+// lifted element values are stripped from the residual and so demand a reconstruct.
+inline bool PathStepsMayShareBranch(const vector<PathStep> &read, const vector<PathStep> &key_path) {
+	idx_t shared = read.size() < key_path.size() ? read.size() : key_path.size();
+	for (idx_t i = 0; i < shared; i++) {
+		if (read[i].kind == PathStepKind::Key && key_path[i].kind == PathStepKind::Key &&
+		    read[i].key != key_path[i].key) {
+			return false;
+		}
+	}
+	return true;
+}
+
 } // namespace duckdb

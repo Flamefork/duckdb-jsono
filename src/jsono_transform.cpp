@@ -419,17 +419,30 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 	// from its name.
 	bind_data->spec = spec_value.ToString() + ":" + std::to_string(uint8_t(bind_data->mismatch_mode));
 	auto &input_type = arguments[0]->return_type;
-	// An array shred (object or scalar) strips values out of the residual into a list column the
-	// transform's residual navigation cannot see, so a shredded value carrying one is reconstructed
-	// whole (scalar shreds in it fold back through the same reconstruct). A scalar-only shred set keeps
-	// the native residual-first / shred-fallback fast path via AssignShreddedShreds.
+	// An array shred (object or scalar) lifts element values out of the residual into a LIST column the
+	// transform's residual navigation cannot read. Only a field that could touch that array — read it,
+	// descend into it, or sit on a container subtree that holds it — needs the whole value reconstructed;
+	// a sibling scalar like $.f0 stays on the native residual-first / shred-fallback fast path. So the
+	// gate is per read field, not the mere presence of an array shred. A scalar shred in the value folds
+	// back through that same reconstruct when one is forced.
 	bool reconstruct_shredded = false;
 	if (IsShreddedJsonoType(input_type)) {
 		JsonoLayoutType layout;
 		TryParseJsonoLayoutType(input_type, layout);
 		for (auto &shred : layout.shreds) {
-			if (IsShredListType(shred.second)) {
-				reconstruct_shredded = true;
+			if (!IsShredListType(shred.second)) {
+				continue;
+			}
+			auto &name = shred.first;
+			auto shred_steps =
+			    !name.empty() && name[0] == '$' ? ParseJsonoPath(name, "jsono_transform") : LiteralKeyPath(name);
+			for (auto &field : bind_data->fields) {
+				if (PathStepsMayShareBranch(field.path.steps, shred_steps)) {
+					reconstruct_shredded = true;
+					break;
+				}
+			}
+			if (reconstruct_shredded) {
 				break;
 			}
 		}
