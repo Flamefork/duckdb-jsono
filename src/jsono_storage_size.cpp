@@ -178,7 +178,10 @@ void JsonoShredManifestExecute(DataChunk &args, ExpressionState &state, Vector &
 			continue;
 		}
 		view = MakeJsonoView(blob);
-		view.ParseHeader();
+		if (!view.ParseHeader()) {
+			SetListRowNull(result, row);
+			continue;
+		}
 		auto start = ListVector::GetListSize(result);
 		idx_t length = 0;
 		if (view.HasShredManifest()) {

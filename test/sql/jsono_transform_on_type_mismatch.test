@@ -16,6 +16,23 @@ SELECT jsono_transform(jsono({'s': '12345', 'u': 12345::UBIGINT, 'n': 12345::UBI
 ----
 {'s': NULL, 'u': NULL, 'n': NULL, 'b': NULL, 'd': 42.0}
 
+# Raw numeric text is still a JSON number, so null mode must not treat it as VARCHAR.
+query II
+SELECT
+  jsono_transform(jsono('{"n":1e2}'), {'n':'VARCHAR'}, 'null'),
+  jsono_transform(jsono('{"n":18446744073709551616}'), {'n':'VARCHAR'}, 'null');
+----
+{'n': NULL}	{'n': NULL}
+
+# Contrast: the fix only changed null mode. Default convert mode still renders the same raw numeric
+# text as VARCHAR (a number coerced to string), so the scalar convert path must not regress to NULL.
+query II
+SELECT
+  jsono_transform(jsono('{"n":1e2}'), {'n':'VARCHAR'}),
+  jsono_transform(jsono('{"n":18446744073709551616}'), {'n':'VARCHAR'});
+----
+{'n': 1e2}	{'n': 18446744073709551616}
+
 # fail performs the same coercions as convert but throws instead of returning NULL when coercion fails.
 query I
 SELECT jsono_transform(jsono({'s': '12345', 'u': 12345::UBIGINT, 'n': 12345::UBIGINT, 'b': true, 'd': 42}), {'s':'UBIGINT','u':'BIGINT','n':'VARCHAR','b':'BIGINT','d':'DOUBLE'}, on_type_mismatch := 'fail');
@@ -85,7 +102,7 @@ cannot convert value at $.items[*].v from VARCHAR to UBIGINT
 # keeps only values that already match the requested scalar projection.
 query II
 SELECT
-  jsono_transform(jsono('{"items":[{"v":2},{"v":true},{"v":"s"}]}'), {'values':{'type':['VARCHAR'],'path':'$.items[*].v'}}),
-  jsono_transform(jsono('{"items":[{"v":2},{"v":true},{"v":"s"}]}'), {'values':{'type':['VARCHAR'],'path':'$.items[*].v'}}, 'null');
+  jsono_transform(jsono('{"items":[{"v":2},{"v":true},{"v":"s"},{"v":1e2},{"v":18446744073709551616}]}'), {'values':{'type':['VARCHAR'],'path':'$.items[*].v'}}),
+  jsono_transform(jsono('{"items":[{"v":2},{"v":true},{"v":"s"},{"v":1e2},{"v":18446744073709551616}]}'), {'values':{'type':['VARCHAR'],'path':'$.items[*].v'}}, 'null');
 ----
-{'values': [2, true, s]}	{'values': [NULL, NULL, s]}
+{'values': [2, true, s, 1e2, 18446744073709551616]}	{'values': [NULL, NULL, s, NULL, NULL]}

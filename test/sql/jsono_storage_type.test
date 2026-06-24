@@ -119,8 +119,37 @@ SELECT jsono_storage_type('body BIGINT');
 ----
 cannot be named 'body'
 
+# Unsupported shred types are rejected here, not only later by the constructor.
+statement error
+SELECT jsono_storage_type('a INTEGER');
+----
+unsupported shred type
+
+statement error
+SELECT jsono_storage_type('a JSON');
+----
+unsupported shred type
+
 # The path form '$.body' is a different field name and stays allowed (matches the constructor).
 query I
 SELECT jsono_storage_type('"$.body" BIGINT') = typeof(jsono('{"body":1}', shredding := {'$.body':'BIGINT'}));
+----
+true
+
+# Array shreds must address the array by an object-key path, matching the constructor.
+statement error
+SELECT jsono_storage_type('"$.a[0]" STRUCT(id BIGINT)[]');
+----
+must address an array by an object-key path
+
+query I
+SELECT jsono_storage_type('"$.a" STRUCT(id BIGINT)[]')
+     = typeof(jsono('{"a":[{"id":1}]}', shredding := {'$.a':'STRUCT(id BIGINT)[]'}));
+----
+true
+
+query I
+SELECT jsono_storage_type('"$.ids" UBIGINT[]')
+     = typeof(jsono('{"ids":[1,2]}', shredding := {'$.ids':'UBIGINT[]'}));
 ----
 true

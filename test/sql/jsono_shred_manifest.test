@@ -51,6 +51,15 @@ SELECT jsono_shred_manifest(e) IS NULL FROM nullrow;
 ----
 true
 
+# An absent body row stays NULL even if other body blobs contain bytes that a present row would parse.
+query I
+SELECT jsono_shred_manifest(
+  {'jsono': {'body': {'slots': '\x4A\x53'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': '\x01'::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}
+) IS NULL;
+----
+true
+
 # A shred value that did NOT round-trip its declared type stays in the residual and is therefore
 # ABSENT from the manifest: the string "notanum" can't live in a BIGINT shred, so only `b` is listed.
 # This demonstrates the lossless gate — the manifest records only paths actually stripped.

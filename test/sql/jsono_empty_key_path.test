@@ -1,0 +1,36 @@
+# name: test/sql/jsono_empty_key_path.test
+# description: quoted empty object keys round-trip through JSONPath APIs
+# group: [sql]
+
+require jsono
+
+query I
+SELECT jsono_extract_string(jsono('{"":1}'), '$.""');
+----
+1
+
+query I
+SELECT jsono_type(jsono('{"":1}'), '$.""');
+----
+BIGINT
+
+query II
+SELECT
+  (jsono_entries(jsono('{"":1}'), key_style := 'jsonpath'))[1].key,
+  jsono_extract_string(
+    jsono('{"":1}'),
+    (jsono_entries(jsono('{"":1}'), key_style := 'jsonpath'))[1].key
+  );
+----
+$.""	1
+
+statement error
+SELECT jsono_extract_string(jsono('{"":1}'), '$.');
+----
+invalid path
+
+# The quoted empty key is position-independent: it resolves as a nested segment, not only at the root.
+query I
+SELECT jsono_extract_string(jsono('{"a":{"":1}}'), '$.a.""');
+----
+1

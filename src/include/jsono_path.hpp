@@ -71,7 +71,7 @@ inline vector<PathStep> ParseJsonoPath(const string &path, const char *function_
 					}
 					key.push_back(c);
 				}
-				if (!closed || key.empty()) {
+				if (!closed) {
 					ThrowInvalidPath(function_name, path);
 				}
 				steps.push_back(PathStep {PathStepKind::Key, std::move(key), 0});

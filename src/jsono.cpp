@@ -57,8 +57,8 @@ void JsonoVersionExecute(DataChunk &args, ExpressionState &state, Vector &result
 // given shred columns, so a schema can declare a shredded jsono column from a readable shred spec
 // (e.g. 'event_name VARCHAR, n BIGINT'). The shred DDL is parsed into (name, type) and re-emitted
 // through JsonoShreddedStructType, so the declared column is byte-identical to a value built from
-// the same shreds. Reserved shred names are rejected the same way the constructor rejects them, so a
-// declared column always matches some value the constructor can produce.
+// the same shreds. Shred specs are rejected by the same validation the constructor uses, so a declared
+// column always matches some value the constructor can produce.
 void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	// Parser::ParseColumnList parses the DDL but leaves binder-resolved type aliases (UBIGINT and the
 	// other unsigned ints, nested ones included) as unresolved USER types; bind each shred type so a
@@ -68,9 +68,9 @@ void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, 
 		auto columns = Parser::ParseColumnList(shreds.GetString());
 		child_list_t<LogicalType> shred_types;
 		for (auto &col : columns.Logical()) {
-			JsonoValidateShredFieldName(col.Name());
 			auto type = col.Type();
 			binder->BindLogicalType(type);
+			JsonoValidateShredField(col.Name(), type);
 			shred_types.emplace_back(col.Name(), type);
 		}
 		// Canonical shred order (sorted by name) so the DDL matches a value built from the same shreds

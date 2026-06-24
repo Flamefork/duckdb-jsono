@@ -231,15 +231,9 @@ bool FillShredFieldFromType(const LogicalType &type, ShredField &field) {
 	return false;
 }
 
-// Resolve one spec entry's type string into a shred field: a scalar leaf shred, or a
-// LIST<STRUCT<...>> array shred lifting the element subfields of the array at `path`.
-void BindShredFieldType(const string &type_name, ClientContext &context, const string &path, ShredField &field) {
-	LogicalType type;
-	try {
-		type = TransformStringToLogicalType(type_name, context);
-	} catch (const std::exception &) {
-		throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
-	}
+void BindShredField(const string &path, const LogicalType &type, const string &type_name, ShredField &field) {
+	JsonoValidateShredFieldName(path);
+	field.path = ParseShredPathSpec(path);
 	if (!FillShredFieldFromType(type, field)) {
 		throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
 	}
@@ -249,6 +243,18 @@ void BindShredFieldType(const string &type_name, ClientContext &context, const s
 		                      "(no array index or wildcard)",
 		                      path);
 	}
+}
+
+// Resolve one spec entry's type string into a shred field: a scalar leaf shred, or a
+// LIST<STRUCT<...>> array shred lifting the element subfields of the array at `path`.
+void BindShredFieldType(const string &type_name, ClientContext &context, const string &path, ShredField &field) {
+	LogicalType type;
+	try {
+		type = TransformStringToLogicalType(type_name, context);
+	} catch (const std::exception &) {
+		throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
+	}
+	BindShredField(path, type, type_name, field);
 }
 
 // The shredding spec is a constant STRUCT mapping each path to its shred type string, e.g.
@@ -273,9 +279,7 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 			throw BinderException("jsono shred: type for '%s' must be a type string", path);
 		}
 		auto type_name = StringValue::Get(type_value);
-		JsonoValidateShredFieldName(path);
 		ShredField field;
-		field.path = ParseShredPathSpec(path);
 		BindShredFieldType(type_name, context, path, field);
 		bind_data->fields.push_back(std::move(field));
 	}
@@ -1123,6 +1127,11 @@ bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b) {
 		}
 	}
 	return true;
+}
+
+void JsonoValidateShredField(const string &path, const LogicalType &type) {
+	ShredField field;
+	BindShredField(path, type, type.ToString(), field);
 }
 
 namespace {

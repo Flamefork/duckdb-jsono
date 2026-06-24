@@ -567,7 +567,7 @@ bool TryWriteScalarValue(const TransformField &field, TransformMismatchMode mode
 		break;
 	}
 	case JsonoScalarPrimitive::Varchar: {
-		if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
+		if (scalar.kind == JsonoScalarKind::String) {
 			WriteJsonoStringLane(result, row, scalar.text);
 			return true;
 		}
@@ -694,7 +694,7 @@ bool TryGetJoinText(const TransformField &field, TransformMismatchMode mode, con
 		return false;
 	}
 	if (mode == TransformMismatchMode::Null) {
-		if (scalar.kind == JsonoScalarKind::String || scalar.kind == JsonoScalarKind::NumberText) {
+		if (scalar.kind == JsonoScalarKind::String) {
 			value = scalar.text;
 			return true;
 		}

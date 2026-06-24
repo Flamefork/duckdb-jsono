@@ -56,6 +56,8 @@ bool IsShredScalarArrayType(const LogicalType &type);
 // through the two-pass materialize-then-shred writer. The single owner of "is this a list shred".
 bool IsShredListType(const LogicalType &type);
 
+void JsonoValidateShredField(const string &path, const LogicalType &type);
+
 // One array shred for the residual-skeleton emit: the object-key chain to the array, plus the
 // lifted-element primitive description. An object array (kind == Array) lifts element subfields into
 // a LIST<STRUCT> column; a scalar array (kind == ScalarArray) lifts each whole element into a
