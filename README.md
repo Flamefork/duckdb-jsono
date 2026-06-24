@@ -144,7 +144,7 @@ SELECT to_json(jsono({'b': 2, 'a': 'x', 'n': NULL, 'arr': ['c', NULL, 'd']}));
 
 `STRUCT` fields become JSON object keys, `LIST` values become arrays, `JSON` children are parsed as JSON subtrees, and `VARCHAR` children remain JSON strings. Exact integer and decimal values are preserved; non-finite `DOUBLE` values are rejected because JSON has no NaN/Infinity representation. SQL `NULL` object fields are serialized as JSON nulls.
 
-Because the input `STRUCT` already carries its field names and types, `jsono(struct)` shreds automatically — there is no `shredding` argument to pass. Every top-level field whose type is a shred type (`BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`, or `VARCHAR`) is lifted into a typed shred column named by the field, exactly as the [`shredding`](#jsonovalue-shredding) constructor does for text. Top-level fields of any other type — narrower integers like `INTEGER`, `DECIMAL`, `NULL`, `JSON` subtrees, nested objects, and lists — stay in the residual; cast a field to its shred type (`x::BIGINT`, `x::DOUBLE`) to lift it.
+Because the input `STRUCT` already carries its field names and types, `jsono(struct)` shreds automatically — there is no `shredding` argument to pass. Every top-level field whose type is a scalar shred type (`BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`, or `VARCHAR`) is lifted into a typed shred column named by the field, exactly as the [`shredding`](#jsonovalue-shredding) constructor does for text. Top-level `LIST<TYPE>` fields also become scalar-array shreds when `TYPE` is one of those scalar shred types, and top-level `LIST<STRUCT<...>>` fields become array shreds when the struct children are supported scalar shred types. One nested `STRUCT` level is eligible too, with shred leaves named by JSONPath-style paths such as `$.parent.child`. Unsupported lists, narrower integers like `INTEGER`, `DECIMAL`, `NULL`, `JSON` subtrees, and deeper or unsupported nested structures stay in the residual; cast a field to its shred type (`x::BIGINT`, `x::DOUBLE`) to lift it.
 
 ```sql
 SELECT typeof(jsono({'kind': 'commit', 'time_us': 1700::BIGINT}));
@@ -278,7 +278,7 @@ The field names `type`, `path`, and `join_separator` are reserved inside a wrapp
 
 The `shredding` named argument turns `jsono()` into a *shredding* constructor: it produces a *shredded* `STRUCT` — the six-BLOB JSONO residual plus a `shreds` struct carrying one typed shred per path in `spec`. The primary form takes JSON **text** and parses + shreds in one pass; passing an existing **JSONO** value shreds it directly. Those are the two accepted `value` inputs — there is no `jsono(struct, shredding := …)` overload, because a `STRUCT` built with [`jsono(struct)`](#jsonostruct) is already shredded by that constructor (so to shred a struct-built value, build it with `jsono({…})` directly rather than wrapping it). Reads stay transparent — `->>`, `jsono_extract_string`, `to_json`, and casts work on the shredded value exactly as on a plain JSONO column — but extracting a shredded path becomes a direct read of its typed shred instead of a per-row parse, which the planner can push down and prune on.
 
-`spec` is a constant `STRUCT` mapping each path to its shred type string (the same shape as Parquet's `SHREDDING` option and `read_json`'s `columns`; same path grammar as `jsono_transform`, no wildcards; shred types `VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`):
+`spec` is a constant `STRUCT` mapping each path to its shred type string (the same shape as Parquet's `SHREDDING` option and `read_json`'s `columns`; same path grammar as `jsono_transform`, no wildcards). Scalar shreds use `VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, or `BOOLEAN`; scalar-array shreds use `VARCHAR[]`, `BIGINT[]`, `UBIGINT[]`, `DOUBLE[]`, or `BOOLEAN[]`; object-array shreds use `STRUCT(<supported scalar children>)[]`:
 
 ```sql
 CREATE TABLE events AS
@@ -290,6 +290,14 @@ SELECT payload ->> '$.kind' AS kind, count(*) AS n
 FROM events GROUP BY kind;
 
 SELECT max(CAST(payload ->> '$.time_us' AS BIGINT)) FROM events;
+```
+
+Array-shred specs name the array's object-key path, not an indexed or wildcard element path. Elements or subfields that do not fit the requested shred type stay in the residual skeleton, so reconstruction never loses or coerces data.
+
+```sql
+SELECT to_json(jsono('{"products":[{"id":1,"name":"a"}]}',
+                     shredding := {'$.products': 'STRUCT(id UBIGINT, name VARCHAR)[]'}));
+-- {"products":[{"id":1,"name":"a"}]}
 ```
 
 The conversion is lossless: `to_json(payload)` reconstructs the original document, and any path not in `spec` still reads from the residual. A value that does not fit its shred type (a string in a `BIGINT` shred, an explicit JSON `null`, a missing key) is kept in the residual unchanged, so reconstruction never loses or coerces data. Top-level shredded paths are stored once — in the shred rather than duplicated in the residual — so the shredded column is typically smaller than the plain JSONO column for the same data while answering hot-path queries from narrow typed columns.

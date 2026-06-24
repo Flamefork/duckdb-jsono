@@ -22,7 +22,7 @@ EXTENSION_DIR = BUILD_DIR / "extension" / "jsono"
 DEFAULT_BINARY = BUILD_DIR / "duckdb"
 DEFAULT_EXTENSION = EXTENSION_DIR / "jsono.duckdb_extension"
 JSONO_HEADER_SIZE = 8
-BlobHex = tuple[str, str, str, str]
+BlobHex = tuple[str, str, str, str, str, str]
 
 # Statement boundaries are marked by a sentinel SELECT, not a `.print`: the CLI's
 # dot-command output is not ordered against the result renderer, so a `.print`
@@ -201,7 +201,7 @@ def sql_literal(text: str) -> str:
     return "(" + " || chr(0) || ".join(runs) + ")"
 
 
-BLOB_FIELDS = ["slots", "key_heap", "string_heap", "skips"]
+BLOB_FIELDS = ["slots", "key_heap", "string_heap", "skips", "lengths", "nums"]
 
 
 def blob_hex_expr(body_expr: str) -> str:
@@ -214,12 +214,14 @@ def jsono_blob_hex_expr(text: str) -> str:
 
 
 def jsono_struct_sql(blobs: BlobHex) -> str:
-    slots, key_heap, string_heap, skips = blobs
+    slots, key_heap, string_heap, skips, lengths, nums = blobs
     body_fields = [
         f"'slots': unhex('{slots}')",
         f"'key_heap': unhex('{key_heap}')",
         f"'string_heap': unhex('{string_heap}')",
         f"'skips': unhex('{skips}')",
+        f"'lengths': unhex('{lengths}')",
+        f"'nums': unhex('{nums}')",
     ]
     body = "{" + ", ".join(body_fields) + "}"
     return "{'jsono': {'body': " + body + "}}"
@@ -230,6 +232,8 @@ def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
     key_heap = bytearray(bytes.fromhex(blobs[1]))
     string_heap = bytearray(bytes.fromhex(blobs[2]))
     skips = bytearray(bytes.fromhex(blobs[3]))
+    lengths = bytearray(bytes.fromhex(blobs[4]))
+    nums = bytearray(bytes.fromhex(blobs[5]))
 
     def fallback() -> None:
         if len(slots) > 4:
@@ -279,6 +283,24 @@ def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
             skips = skips[:-1]
         else:
             fallback()
+    elif mutation == "lengths_truncate":
+        if lengths:
+            lengths = lengths[:-1]
+        else:
+            fallback()
+    elif mutation == "lengths_extra_entry":
+        lengths.extend(b"\x00\x00\x00\x00")
+    elif mutation == "lengths_misalign":
+        lengths.append(0)
+    elif mutation == "nums_truncate":
+        if nums:
+            nums = nums[:-1]
+        else:
+            fallback()
+    elif mutation == "nums_extra_entry":
+        nums.extend(b"\x00\x00\x00\x00\x00\x00\x00\x00")
+    elif mutation == "nums_misalign":
+        nums.append(0)
     elif mutation == "span_zero":
         if len(skips) >= 16:
             skips[12:16] = b"\x00\x00\x00\x00"
@@ -302,7 +324,9 @@ def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
     key_heap_hex = key_heap.hex().upper()
     string_heap_hex = string_heap.hex().upper()
     skips_hex = skips.hex().upper()
-    return (slots_hex, key_heap_hex, string_heap_hex, skips_hex)
+    lengths_hex = lengths.hex().upper()
+    nums_hex = nums.hex().upper()
+    return (slots_hex, key_heap_hex, string_heap_hex, skips_hex, lengths_hex, nums_hex)
 
 
 def shredded_blob_hex_expr(text: str, spec_sql: str) -> str:
@@ -423,6 +447,12 @@ validish_mutations = st.sampled_from(
         "string_heap_truncate",
         "string_heap_bad_number",
         "skips_truncate",
+        "lengths_truncate",
+        "lengths_extra_entry",
+        "lengths_misalign",
+        "nums_truncate",
+        "nums_extra_entry",
+        "nums_misalign",
         "span_zero",
         "checkpoint_stride",
     ]
@@ -496,18 +526,28 @@ hex_blob = st.text(alphabet="0123456789ABCDEF", min_size=0, max_size=48).map(
 
 
 @settings(PROPERTY_SETTINGS)
-@given(slots=hex_blob, key=hex_blob, string=hex_blob, skips=hex_blob)
-def test_fuzz_blob_no_crash(slots: str, key: str, string: str, skips: str) -> None:
+@given(
+    slots=hex_blob,
+    key=hex_blob,
+    string=hex_blob,
+    skips=hex_blob,
+    lengths=hex_blob,
+    nums=hex_blob,
+)
+def test_fuzz_blob_no_crash(slots: str, key: str, string: str, skips: str, lengths: str, nums: str) -> None:
     # The six-BLOB physical shape is reachable from Parquet, so arbitrary bytes
     # must be rejected by the reader's bound checks, not dereferenced blindly.
-    struct = (
-        f"{{'jsono': {{'body': {{'slots': unhex('{slots}'), 'key_heap': unhex('{key}'), "
-        f"'string_heap': unhex('{string}'), 'skips': unhex('{skips}')}}}}}}"
-    )
+    struct = jsono_struct_sql((slots, key, string, skips, lengths, nums))
     SESSION.value(f"to_json({struct})")
 
 
 @settings(VALIDISH_PROPERTY_SETTINGS)
+@example(text='{"s":"abcdefghijklmnopqrstuvwxyz"}', mutation="lengths_truncate")
+@example(text='{"s":"abcdefghijklmnopqrstuvwxyz"}', mutation="lengths_extra_entry")
+@example(text='{"s":"abcdefghijklmnopqrstuvwxyz"}', mutation="lengths_misalign")
+@example(text='{"u":18446744073709551615}', mutation="nums_truncate")
+@example(text='{"u":18446744073709551615}', mutation="nums_extra_entry")
+@example(text='{"u":18446744073709551615}', mutation="nums_misalign")
 @example(text=wide_object_text, mutation="checkpoint_stride")
 @example(text='{"n":1e3}', mutation="string_heap_bad_number")
 @given(text=validish_json_documents, mutation=validish_mutations)
@@ -515,8 +555,8 @@ def test_fuzz_validish_blob_no_crash(text: str, mutation: str) -> None:
     encoded = SESSION.value(jsono_blob_hex_expr(text))
     assert encoded is not None
     parts = encoded.split("|")
-    assert len(parts) == 4
-    blobs = (parts[0], parts[1], parts[2], parts[3])
+    assert len(parts) == 6
+    blobs = (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
     struct = jsono_struct_sql(mutate_jsono_blobs(blobs, mutation))
     SESSION.value(f"jsono_validate({struct})")
     SESSION.value(f"to_json({struct})")
@@ -587,16 +627,26 @@ def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
 # patch that replaces the whole document. The plain-base fold is the RFC 7396 reference.
 merge_patch_keys = st.sampled_from(["a", "b", "c", "d", "e"])
 merge_patch_scalars = st.one_of(
-    st.none(), st.booleans(), st.integers(min_value=-100, max_value=100), st.text(max_size=4)
+    st.none(),
+    st.booleans(),
+    st.integers(min_value=-100, max_value=100),
+    st.text(max_size=4),
 )
 merge_patch_objects = st.dictionaries(
     merge_patch_keys,
-    st.one_of(merge_patch_scalars, st.dictionaries(merge_patch_keys, merge_patch_scalars, max_size=2)),
+    st.one_of(
+        merge_patch_scalars,
+        st.dictionaries(merge_patch_keys, merge_patch_scalars, max_size=2),
+    ),
     min_size=0,
     max_size=4,
 )
 merge_patch_args = st.lists(
-    st.one_of(merge_patch_objects, merge_patch_scalars, st.lists(merge_patch_scalars, max_size=3)),
+    st.one_of(
+        merge_patch_objects,
+        merge_patch_scalars,
+        st.lists(merge_patch_scalars, max_size=3),
+    ),
     min_size=1,
     max_size=3,
 )
@@ -759,13 +809,25 @@ ARRAY_READER_PARITY = [
 
 
 @settings(PROPERTY_SETTINGS)
-@example(doc={"items": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(
+    doc={"items": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]},
+    schema="STRUCT(id BIGINT, name VARCHAR)[]",
+)
 @example(doc={"items": []}, schema="STRUCT(id BIGINT)[]")
 @example(doc={"items": [None, {"id": 1}, 5, "x"]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
-@example(doc={"items": [{"id": 1, "name": None, "sku": "s"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(
+    doc={"items": [{"id": 1, "name": None, "sku": "s"}]},
+    schema="STRUCT(id BIGINT, name VARCHAR)[]",
+)
 @example(doc={"items": [{"qty": 2, "sku": "s1"}]}, schema="STRUCT(sku VARCHAR, qty BIGINT)[]")
-@example(doc={"items": [{"id": 1, "name": "a", "sku": "tail"}, None, 5]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
-@example(doc={"items": [{"id": None, "name": "b"}, {"id": "x"}]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
+@example(
+    doc={"items": [{"id": 1, "name": "a", "sku": "tail"}, None, 5]},
+    schema="STRUCT(id BIGINT, name VARCHAR)[]",
+)
+@example(
+    doc={"items": [{"id": None, "name": "b"}, {"id": "x"}]},
+    schema="STRUCT(id BIGINT, name VARCHAR)[]",
+)
 @example(doc={"items": [{"id": False}]}, schema="STRUCT(id VARCHAR)[]")
 @example(doc={"items": [{"price": 1e16}]}, schema="STRUCT(price DOUBLE)[]")
 @given(doc=array_documents, schema=array_element_schemas)
@@ -838,8 +900,14 @@ def test_scalar_array_reader_parity(doc: dict[str, Any], schema: str) -> None:
 # Typed scalars for the STRUCT-input auto-shred test: each carries an explicit DuckDB type so the
 # constructor's bind sees the same eligibility it would from a read_json_auto-detected schema.
 typed_struct_scalars = st.one_of(
-    st.builds(lambda value: (value, "VARCHAR"), st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", max_size=8)),
-    st.builds(lambda value: (value, "BIGINT"), st.integers(min_value=-(2**62), max_value=2**62)),
+    st.builds(
+        lambda value: (value, "VARCHAR"),
+        st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", max_size=8),
+    ),
+    st.builds(
+        lambda value: (value, "BIGINT"),
+        st.integers(min_value=-(2**62), max_value=2**62),
+    ),
     st.builds(lambda value: (value, "BOOLEAN"), st.booleans()),
 )
 typed_struct_documents = st.recursive(
@@ -873,7 +941,12 @@ def typed_struct_json(doc: dict[str, Any]) -> Any:
 
 
 @settings(PROPERTY_SETTINGS)
-@example(doc={"did": ("d1", "VARCHAR"), "commit": {"collection": ("coll", "VARCHAR"), "rev": (1, "BIGINT")}})
+@example(
+    doc={
+        "did": ("d1", "VARCHAR"),
+        "commit": {"collection": ("coll", "VARCHAR"), "rev": (1, "BIGINT")},
+    }
+)
 @example(doc={"a": ("x", "VARCHAR"), "b": {"c": (1, "BIGINT"), "d": ("y", "VARCHAR")}})
 @given(doc=typed_struct_documents)
 def test_struct_auto_shred_lossless(doc: dict[str, Any]) -> None:
@@ -910,7 +983,7 @@ def array_struct_sql(elements: list[Any]) -> str:
         else:
             flag = "true" if el["flag"] else "false"
             parts.append(f"{{'id': {el['id']}::BIGINT, 'name': {sql_literal(el['name'])}, 'flag': {flag}}}")
-    return "[" + ", ".join(parts) + "]::STRUCT(id BIGINT, \"name\" VARCHAR, flag BOOLEAN)[]"
+    return "[" + ", ".join(parts) + ']::STRUCT(id BIGINT, "name" VARCHAR, flag BOOLEAN)[]'
 
 
 @settings(PROPERTY_SETTINGS)
@@ -921,7 +994,7 @@ def test_struct_array_auto_shred_lossless(elements: list[Any]) -> None:
     list_sql = array_struct_sql(elements)
     from_struct = SESSION.value(f"to_json(jsono({{'items': {list_sql}}}))")
     json_doc = {
-        "items": [None if el is None else {"id": el["id"], "name": el["name"], "flag": el["flag"]} for el in elements]
+        "items": [(None if el is None else {"id": el["id"], "name": el["name"], "flag": el["flag"]}) for el in elements]
     }
     plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps(json_doc))}))")
     assert from_struct == plain, f"struct array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
@@ -1045,8 +1118,17 @@ def test_fuzz_manifest_no_crash(doc: tuple[str, str], mutation: str) -> None:
     encoded = SESSION.value(shredded_blob_hex_expr(text, spec_sql))
     assert encoded is not None
     parts = encoded.split("|")
-    assert len(parts) == 4
-    struct = jsono_struct_sql((parts[0], parts[1], parts[2], mutate_manifest(parts[3], mutation)))
+    assert len(parts) == 6
+    struct = jsono_struct_sql(
+        (
+            parts[0],
+            parts[1],
+            parts[2],
+            mutate_manifest(parts[3], mutation),
+            parts[4],
+            parts[5],
+        )
+    )
     SESSION.value(f"jsono_validate({struct})")
     SESSION.value(f"jsono_extract_string({struct}, '$.no_such_key')")
     SESSION.value(f"to_json({struct})")
@@ -1064,7 +1146,10 @@ lww_scalars = st.one_of(
 lww_leaf_keys = st.sampled_from(["a", "b", "c"])
 lww_rows = st.lists(
     st.builds(
-        lambda flat, nested, has_nested: {**flat, **({"n": nested} if has_nested else {})},
+        lambda flat, nested, has_nested: {
+            **flat,
+            **({"n": nested} if has_nested else {}),
+        },
         st.dictionaries(lww_leaf_keys, lww_scalars, max_size=3),
         st.dictionaries(lww_leaf_keys, lww_scalars, max_size=3),
         st.booleans(),
@@ -1133,7 +1218,12 @@ def transform_documents(draw: Any) -> tuple[dict[str, Any], int]:
     doc: dict[str, Any] = draw(st.dictionaries(st.sampled_from(transform_leaf_keys), transform_scalars, max_size=4))
     if draw(st.booleans()):
         doc["nest"] = draw(
-            st.dictionaries(st.sampled_from(transform_nest_keys), transform_scalars, min_size=1, max_size=2)
+            st.dictionaries(
+                st.sampled_from(transform_nest_keys),
+                transform_scalars,
+                min_size=1,
+                max_size=2,
+            )
         )
     if draw(st.booleans()):
         doc["items"] = draw(st.lists(transform_item, max_size=5))
