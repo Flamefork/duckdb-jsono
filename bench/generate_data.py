@@ -536,8 +536,7 @@ def generate_data(size_name: str, num_rows: int, seed: int) -> None:
         batch_rows = min(batch_size, num_rows - rows_generated)
         batch = [generate_row(rows_generated + i, seed) for i in range(batch_rows)]
 
-        conn.execute(
-            """
+        conn.execute("""
             CREATE OR REPLACE TEMP TABLE batch (
                 json_nested JSON,
                 json_flat JSON,
@@ -545,8 +544,7 @@ def generate_data(size_name: str, num_rows: int, seed: int) -> None:
                 g1e3 VARCHAR,
                 g1e4 VARCHAR
             )
-            """
-        )
+            """)
         conn.executemany(
             "INSERT INTO batch VALUES (?, ?, ?, ?, ?)",
             [
@@ -565,8 +563,7 @@ def generate_data(size_name: str, num_rows: int, seed: int) -> None:
         print(f"  {rows_generated:,} / {num_rows:,}")
 
     generated_at = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        f"""
+    conn.execute(f"""
         COPY data TO '{output_path}' (
             FORMAT PARQUET,
             KV_METADATA {{
@@ -577,8 +574,7 @@ def generate_data(size_name: str, num_rows: int, seed: int) -> None:
                 schema_version: 'marketing_telemetry_v2_archetypes'
             }}
         )
-        """
-    )
+        """)
     conn.close()
 
     print(f"  Saved to {output_path}")
@@ -641,14 +637,12 @@ def generate_numbers_data(size_name: str, num_rows: int, seed: int) -> None:
             generate_numbers_row(rows_generated + i, seed) for i in range(batch_rows)
         ]
 
-        conn.execute(
-            """
+        conn.execute("""
             CREATE OR REPLACE TEMP TABLE batch (
                 json_numbers VARCHAR,
                 g1e1 VARCHAR
             )
-            """
-        )
+            """)
         conn.executemany(
             "INSERT INTO batch VALUES (?, ?)",
             [(r["json_numbers"], r["g1e1"]) for r in batch],
@@ -664,8 +658,7 @@ def generate_numbers_data(size_name: str, num_rows: int, seed: int) -> None:
         print(f"  {rows_generated:,} / {num_rows:,}")
 
     generated_at = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        f"""
+    conn.execute(f"""
         COPY data TO '{output_path}' (
             FORMAT PARQUET,
             KV_METADATA {{
@@ -676,8 +669,7 @@ def generate_numbers_data(size_name: str, num_rows: int, seed: int) -> None:
                 schema_version: 'numbers_ladder_v1'
             }}
         )
-        """
-    )
+        """)
     conn.close()
 
     print(f"  Saved to {output_path}")
@@ -756,15 +748,13 @@ def generate_wide_flat_data(size_name: str, num_rows: int, seed: int) -> None:
             generate_wide_flat_row(rows_generated + i, seed) for i in range(batch_rows)
         ]
 
-        conn.execute(
-            """
+        conn.execute("""
             CREATE OR REPLACE TEMP TABLE batch (
                 json_wide_flat JSON,
                 g1e1 VARCHAR,
                 g1e4 VARCHAR
             )
-            """
-        )
+            """)
         conn.executemany(
             "INSERT INTO batch VALUES (?, ?, ?)",
             [(r["json_wide_flat"], r["g1e1"], r["g1e4"]) for r in batch],
@@ -780,8 +770,7 @@ def generate_wide_flat_data(size_name: str, num_rows: int, seed: int) -> None:
         print(f"  {rows_generated:,} / {num_rows:,}")
 
     generated_at = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        f"""
+    conn.execute(f"""
         COPY data TO '{output_path}' (
             FORMAT PARQUET,
             KV_METADATA {{
@@ -792,8 +781,7 @@ def generate_wide_flat_data(size_name: str, num_rows: int, seed: int) -> None:
                 schema_version: 'wide_flat_pageview_v1'
             }}
         )
-        """
-    )
+        """)
     conn.close()
 
     print(f"  Saved to {output_path}")
@@ -834,15 +822,13 @@ def group_rows_sql(group_column: str, segments: list[tuple[int, int]]) -> str:
     start_row = 0
     selects = []
     for group_count, group_size in segments:
-        selects.append(
-            f"""
+        selects.append(f"""
             SELECT
                 row_num: {start_row}::UBIGINT + group_offset * {group_size} + row_offset,
                 {group_column}: {start_group}::UBIGINT + group_offset
             FROM range({group_count}) group_offsets(group_offset)
             CROSS JOIN range({group_size}) row_offsets(row_offset)
-            """
-        )
+            """)
         start_group += group_count
         start_row += group_count * group_size
     return "\nUNION ALL\n".join(selects)
@@ -898,8 +884,7 @@ def generate_keyed_pair_data(size_name: str, num_rows: int, seed: int) -> None:
         (2_900, 9),
         (100, 39),
     ]
-    conn.execute(
-        f"""
+    conn.execute(f"""
         COPY (
             WITH
             page_rows AS (
@@ -932,8 +917,7 @@ def generate_keyed_pair_data(size_name: str, num_rows: int, seed: int) -> None:
                 schema_version: 'keyed_pair_v1'
             }}
         )
-        """
-    )
+        """)
     conn.close()
 
     print(f"  Saved to {output_path}")
@@ -1032,16 +1016,14 @@ def generate_url_data(size_name: str, num_rows: int, seed: int) -> None:
         batch_rows = min(batch_size, num_rows - rows_generated)
         batch = [generate_url_row(rows_generated + i, seed) for i in range(batch_rows)]
 
-        conn.execute(
-            """
+        conn.execute("""
             CREATE OR REPLACE TEMP TABLE batch (
                 url_short VARCHAR,
                 url_marketing VARCHAR,
                 url_wide_query VARCHAR,
                 url_mixed VARCHAR
             )
-            """
-        )
+            """)
         conn.executemany(
             "INSERT INTO batch VALUES (?, ?, ?, ?)",
             [
@@ -1065,8 +1047,7 @@ def generate_url_data(size_name: str, num_rows: int, seed: int) -> None:
         print(f"  {rows_generated:,} / {num_rows:,}")
 
     generated_at = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        f"""
+    conn.execute(f"""
         COPY data TO '{output_path}' (
             FORMAT PARQUET,
             KV_METADATA {{
@@ -1077,8 +1058,7 @@ def generate_url_data(size_name: str, num_rows: int, seed: int) -> None:
                 schema_version: 'url_bench_v1'
             }}
         )
-        """
-    )
+        """)
     conn.close()
 
     print(f"  Saved to {output_path}")

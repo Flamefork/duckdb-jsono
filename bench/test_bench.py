@@ -3,7 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 BENCH_DIR = Path(__file__).parent
 sys.path.insert(0, str(BENCH_DIR))
@@ -129,6 +129,43 @@ class ProfileDriverCaseResolutionTest(unittest.TestCase):
 
         self.assertEqual(size, "245760")
         self.assertEqual(scenario_config["scenario"], "retail_sample_nested")
+
+    def test_profile_loop_shape_plan_recovery_does_not_require_events_parquet(
+        self,
+    ) -> None:
+        target = profile_driver.Target(
+            "current", "jsono", Path("jsono.duckdb_extension")
+        )
+        scenario_config = {
+            "operation": "shape_plan_recovery_transform",
+            "scenario": "stable_only",
+            "size": "100k",
+            "row_count": 100_000,
+            "shape_stream": "stable_only",
+            "targets": ["jsono"],
+        }
+        conn = Mock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(run_benchmarks, "DATA_DIR", Path(temp_dir)),
+            patch.object(
+                profile_driver,
+                "resolve_profile_case",
+                return_value=(target, "100k", scenario_config),
+            ),
+            patch.object(profile_driver, "create_connection", return_value=conn),
+            patch.object(profile_driver, "prepare_case") as prepare_case,
+        ):
+            profile_driver.run_profile_loop(
+                Path("jsono.duckdb_extension"),
+                "shape_plan_recovery_transform",
+                1,
+                1,
+                False,
+            )
+
+        prepare_case.assert_called_once()
 
 
 class ExtractBenchmarkQueryTest(unittest.TestCase):
@@ -359,6 +396,45 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
             "SELECT json_extract_string(json_extract(json_nested, '$.ec_items'), 0) AS r",
             query.timed_sql,
         )
+
+
+class RunBenchmarksDataPathTest(unittest.TestCase):
+    def test_shape_plan_recovery_transform_does_not_require_events_parquet(
+        self,
+    ) -> None:
+        target = run_benchmarks.Target(
+            "current", "jsono", Path("jsono.duckdb_extension")
+        )
+        scenario_config = {
+            "operation": "shape_plan_recovery_transform",
+            "scenario": "stable_only",
+            "size": "100k",
+            "row_count": 100_000,
+            "shape_stream": "stable_only",
+            "targets": ["jsono"],
+        }
+        conn = Mock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(run_benchmarks, "DATA_DIR", Path(temp_dir)),
+            patch.object(run_benchmarks, "create_connection", return_value=conn),
+            patch.object(
+                run_benchmarks,
+                "run_single_benchmark",
+                return_value={"min_ms": 1.0, "median_ms": 1.0, "max_ms": 1.0},
+            ),
+        ):
+            results = run_benchmarks.run_benchmarks(
+                [target],
+                [(target, "100k", scenario_config)],
+                runs=1,
+                thread_modes=[1],
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["operation"], "shape_plan_recovery_transform")
+        self.assertEqual(results[0]["row_count"], 100_000)
 
 
 class CompareResultsCompatibilityTest(unittest.TestCase):

@@ -44,10 +44,14 @@ fi
 
 # (Optionally) Sign binary
 if [ "$DUCKDB_EXTENSION_SIGNING_PK" != "" ]; then
-  echo "$DUCKDB_EXTENSION_SIGNING_PK" > private.pem
+  signing_key_file="$(mktemp)"
+  trap 'rm -f "$signing_key_file"' EXIT
+  chmod 600 "$signing_key_file"
+  echo "$DUCKDB_EXTENSION_SIGNING_PK" > "$signing_key_file"
   $script_dir/../duckdb/scripts/compute-extension-hash.sh $ext.append > $ext.hash
-  openssl pkeyutl -sign -in $ext.hash -inkey private.pem -pkeyopt digest:sha256 -out $ext.sign
-  rm -f private.pem
+  openssl pkeyutl -sign -in $ext.hash -inkey "$signing_key_file" -pkeyopt digest:sha256 -out $ext.sign
+  rm -f "$signing_key_file"
+  trap - EXIT
 fi
 
 # Signature is always there, potentially defaulting to 256 zeros

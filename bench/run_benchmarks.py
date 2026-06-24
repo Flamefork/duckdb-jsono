@@ -61,6 +61,10 @@ def get_data_path(size: str, scenario_config: dict) -> Path:
     return DATA_DIR / f"events_{size}.parquet"
 
 
+def case_uses_data_path(scenario_config: dict) -> bool:
+    return scenario_config["operation"] != "shape_plan_recovery_transform"
+
+
 def get_scenario_sizes(scenario_config: dict) -> list[str]:
     if "size" in scenario_config:
         return [scenario_config["size"]]
@@ -563,6 +567,52 @@ def build_jsono_transform_query(
     )
 
 
+def build_jsono_shape_plan_recovery_transform_query(
+    scenario_config: dict, _data_path: Path
+) -> BenchmarkQuery:
+    row_count = scenario_config["row_count"]
+    shape_stream = scenario_config["shape_stream"]
+
+    match shape_stream:
+        case "stable_only":
+            unique_key_sql = "0"
+        case "flood_tail":
+            prefix_rows = scenario_config["prefix_rows"]
+            unique_key_sql = f"CASE WHEN i < {prefix_rows} THEN i + 1 ELSE 0 END"
+        case "flood_only":
+            unique_key_sql = "i + 1"
+        case _:
+            raise ValueError(f"unsupported shape-plan recovery stream: {shape_stream}")
+
+    spec = {
+        "a": "BIGINT",
+        "b": "VARCHAR",
+        "c": "BOOLEAN",
+        "e": {"type": "BIGINT", "path": "$.d.e"},
+        "missing": "VARCHAR",
+    }
+    payload_sql = f"""
+        '{{"a":' || i ||
+        ',"b":"s' || i ||
+        '","c":true,"d":{{"e":' || (i * 2) ||
+        '}},"u' || {unique_key_sql} || '":' || i || '}}'
+    """
+    return BenchmarkQuery(
+        prepare_sql=(
+            f"""
+            CREATE OR REPLACE TEMP TABLE _bench_in AS
+            SELECT jsono({payload_sql}) AS t
+            FROM range({row_count}) AS r(i)
+            """,
+        ),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono_transform(t, {sql_typed_literal(spec)}) AS r
+            FROM _bench_in
+        """,
+    )
+
+
 def build_jsono_group_merge_query(
     scenario_config: dict, data_path: Path
 ) -> BenchmarkQuery:
@@ -774,6 +824,8 @@ def merge_patch_one_patch_sql(patch: object) -> str:
 
 
 def merge_patch_patches_sql(scenario_config: dict) -> list[str]:
+    if "patches_sql" in scenario_config:
+        return scenario_config["patches_sql"]
     patches = scenario_config.get("patches", [scenario_config.get("patch_object")])
     return [merge_patch_one_patch_sql(patch) for patch in patches]
 
@@ -786,11 +838,16 @@ def build_jsono_merge_patch_query(
     # shredded executor (fast path or reshred fallback). Patches are tagged plain vs
     # shredded so the scenario controls which executor path the merge takes.
     patch_args = ", ".join(merge_patch_patches_sql(scenario_config))
+    row_number_sql = (
+        ", row_number() OVER () AS bench_row_number"
+        if scenario_config.get("bench_row_number")
+        else ""
+    )
     return BenchmarkQuery(
         prepare_sql=(
             f"""
             CREATE OR REPLACE TEMP TABLE _bench_in AS
-            SELECT {jsono_value_sql(scenario_config)} AS base
+            SELECT {jsono_value_sql(scenario_config)} AS base{row_number_sql}
             FROM {table_sql(data_path)}
             """,
         ),
@@ -919,6 +976,10 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_storage_size_query(scenario_config, data_path)
         case "transform":
             return build_jsono_transform_query(scenario_config, data_path)
+        case "shape_plan_recovery_transform":
+            return build_jsono_shape_plan_recovery_transform_query(
+                scenario_config, data_path
+            )
         case "group_merge":
             return build_jsono_group_merge_query(scenario_config, data_path)
         case "group_merge_jsono":
@@ -1231,8 +1292,10 @@ def run_benchmarks(
 
     try:
         for target, size, scenario_config in cases_to_run:
+            operation = scenario_config["operation"]
+            scenario = scenario_config["scenario"]
             data_path = get_data_path(size, scenario_config)
-            if not data_path.exists():
+            if case_uses_data_path(scenario_config) and not data_path.exists():
                 print(f"FAILED: benchmark data file not found: {data_path}")
                 if "data_file" in scenario_config:
                     print(
@@ -1244,8 +1307,6 @@ def run_benchmarks(
                     )
                 raise SystemExit(2)
 
-            operation = scenario_config["operation"]
-            scenario = scenario_config["scenario"]
             case_id = get_case_id(target, operation, size, scenario)
 
             conn = connections.get(target.label)
@@ -1406,8 +1467,7 @@ def show_results(results_path: Path) -> None:
             )
             for r in results
         ]
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE results (
                 target VARCHAR,
                 operation VARCHAR,
@@ -1419,13 +1479,11 @@ def show_results(results_path: Path) -> None:
                 row_count BIGINT,
                 rows_per_second BIGINT
             )
-            """
-        )
+            """)
         conn.executemany("INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
 
         if len(thread_modes) < 2:
-            conn.sql(
-                """
+            conn.sql("""
                 SELECT target, operation, scenario, size, threads,
                        round(min_ms, 1) AS min_ms,
                        round(median_ms, 1) AS median_ms,
@@ -1433,8 +1491,7 @@ def show_results(results_path: Path) -> None:
                        rows_per_second
                 FROM results
                 ORDER BY operation, scenario, size, target, threads
-                """
-            ).show(max_width=160)
+                """).show(max_width=160)
             return
 
         # Pivot min_ms per thread mode plus a scaling speedup. speedup > 1 means
@@ -1445,8 +1502,7 @@ def show_results(results_path: Path) -> None:
             f"round(max(min_ms) FILTER (threads = {n}), 1) AS t{n}_ms"
             for n in thread_modes
         )
-        conn.sql(
-            f"""
+        conn.sql(f"""
             SELECT target, operation, scenario, size,
                    max(row_count) AS rows,
                    ceil(max(row_count)::DOUBLE / {duckdb_vector_size})::BIGINT AS chunks,
@@ -1469,8 +1525,7 @@ def show_results(results_path: Path) -> None:
             FROM results
             GROUP BY target, operation, scenario, size
             ORDER BY operation, scenario, size, target
-            """
-        ).show(max_width=200)
+            """).show(max_width=200)
     finally:
         conn.close()
 

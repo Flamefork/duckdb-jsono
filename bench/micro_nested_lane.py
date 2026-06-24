@@ -75,8 +75,7 @@ def connect() -> duckdb.DuckDBPyConnection:
 
 def build(conn: duckdb.DuckDBPyConnection) -> None:
     PARQUET.parent.mkdir(parents=True, exist_ok=True)
-    conn.execute(
-        f"""
+    conn.execute(f"""
         COPY (
             SELECT jsono(
                 json::VARCHAR,
@@ -97,8 +96,7 @@ def build(conn: duckdb.DuckDBPyConnection) -> None:
                 FROM range({ROWS}) t(i)
             )
         ) TO '{PARQUET}' (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 8);
-        """
-    )
+        """)
 
 
 def is_bare_lane(conn: duckdb.DuckDBPyConnection, predicate: str) -> bool:

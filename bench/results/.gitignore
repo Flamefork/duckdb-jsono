@@ -4,5 +4,6 @@
 *.png
 *.svg
 *.parquet
+*.log
 profiles/
 samply/

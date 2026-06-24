@@ -5,6 +5,7 @@ from run_benchmarks import (
     Target,
     build_cases,
     build_query,
+    case_uses_data_path,
     create_connection,
     get_case_id,
     get_data_path,
@@ -58,7 +59,7 @@ def run_profile_loop(
         target, filter_text, include_field_sample
     )
     data_path = get_data_path(size, scenario_config)
-    if not data_path.exists():
+    if case_uses_data_path(scenario_config) and not data_path.exists():
         raise FileNotFoundError(f"benchmark data file not found: {data_path}")
 
     query = build_query(case_target, scenario_config, data_path)

@@ -6,6 +6,7 @@ each jsono operation produces output semantically equal to its core DuckDB json
 baseline before any timing happens. The gate compares normalized output over the
 full dataset and fails loudly with a sample diff on any mismatch.
 """
+
 import sys
 from pathlib import Path
 

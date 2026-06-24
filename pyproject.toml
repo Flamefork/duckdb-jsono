@@ -5,10 +5,13 @@ description = "venv for formatting etc"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "black==24.10.0",
+    "black==26.5.1",
     "clang-format==11.0.1",
     "clang-tidy>=22.1.0.1",
     "cmake-format>=0.6.13",
     "duckdb>=1.5.4",
     "hypothesis>=6.100",
 ]
+
+[tool.black]
+target-version = ["py313"]

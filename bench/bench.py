@@ -162,16 +162,14 @@ def field_sample_jsono_is_current() -> bool:
 
     conn = duckdb.connect()
     try:
-        rows, max_row_group_size, compression = conn.execute(
-            f"""
+        rows, max_row_group_size, compression = conn.execute(f"""
             SELECT
                 count(DISTINCT row_group_id),
                 max(row_group_num_rows),
                 string_agg(DISTINCT compression, ',')
             FROM parquet_metadata({sql_string(str(FIELD_SAMPLE_JSONO_EVENTS_PATH))})
             WHERE starts_with(path_in_schema, 'event_properties')
-            """
-        ).fetchone()
+            """).fetchone()
         row_count = conn.execute(
             f"SELECT count(*) FROM read_parquet({sql_string(str(FIELD_SAMPLE_JSONO_EVENTS_PATH))})"
         ).fetchone()[0]
@@ -209,8 +207,7 @@ def ensure_field_sample_jsono_exists(args: list[str]) -> None:
     conn = duckdb.connect(config={"allow_unsigned_extensions": True})
     try:
         conn.execute(f"LOAD {sql_string(str(JSONO_EXTENSION_PATH))}")
-        conn.execute(
-            f"""
+        conn.execute(f"""
             COPY (
                 SELECT
                     part_id,
@@ -228,8 +225,7 @@ def ensure_field_sample_jsono_exists(args: list[str]) -> None:
                 ROW_GROUP_SIZE {FIELD_SAMPLE_JSONO_ROW_GROUP_SIZE},
                 OVERWRITE_OR_IGNORE true
             )
-            """
-        )
+            """)
         write_field_sample_jsono_metadata(source_path)
     finally:
         conn.close()
