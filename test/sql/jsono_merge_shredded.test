@@ -232,8 +232,26 @@ ORDER BY g;
 1024	{"event_name":"e1024","params":{"n":1024},"seq":"1024"}
 2049	{"event_name":"e2049","params":{"n":2049},"seq":"2049"}
 
-# Vector-scale with a poisoned row: one row's plain patch deletes a lane, forcing the whole
-# vector to the fallback — the other rows must still be correct.
+# Vector-scale all-conflict: every row's plain patch nulls a lane, so conflict_rows == count in each
+# chunk and the whole vector takes the reshred fallback directly (no scatter compaction of a subset).
+query II
+SELECT g, to_json(m)
+FROM (
+  SELECT g, jsono_merge_patch(j, jsono('{"event_name":null}')) AS m
+  FROM (
+    SELECT i AS g, jsono('{"event_name":"e' || i || '","seq":"' || i || '"}',
+                         shredding := {'event_name':'VARCHAR','seq':'VARCHAR'}) AS j
+    FROM range(2050) t(i)
+  )
+) WHERE g IN (0, 1024, 2049)
+ORDER BY g;
+----
+0	{"seq":"0"}
+1024	{"seq":"1024"}
+2049	{"seq":"2049"}
+
+# Vector-scale with a poisoned row: one row's plain patch deletes a lane, while
+# adjacent non-conflicting rows keep the fast result and the conflict row is scattered back.
 query II
 SELECT g, to_json(m)
 FROM (
@@ -245,10 +263,12 @@ FROM (
            CASE WHEN i = 5 THEN jsono('{"event_name":null}') ELSE jsono('{"kept":1}') END AS patch
     FROM range(2050) t(i)
   )
-) WHERE g IN (5, 1024)
+) WHERE g IN (4, 5, 6, 1024)
 ORDER BY g;
 ----
+4	{"event_name":"e4","kept":1,"seq":"4"}
 5	{"seq":"5"}
+6	{"event_name":"e6","kept":1,"seq":"6"}
 1024	{"event_name":"e1024","kept":1,"seq":"1024"}
 
 # --- Fast path with NESTED object-key shreds (jsono({'params':{...}}) auto-shreds nested scalars

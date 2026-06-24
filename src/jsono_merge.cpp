@@ -1347,11 +1347,11 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	// input carries none, so any manifest entry on it fails loud). jsono_overlay is exempt: it
 	// is the optimizer's reconstruction primitive and its residual argument legitimately
 	// carries a manifest already verified by __jsono_internal_checked_residual.
-	auto init_input = [&](JsonoRowReader &reader, Vector &input) {
+	auto init_input = [&](JsonoRowReader &reader, Vector &input, idx_t row_count) {
 		if (mode == MergeMode::Overlay) {
-			reader.InitTrusted(input, count);
+			reader.InitTrusted(input, row_count);
 		} else {
-			reader.Init(input, count);
+			reader.Init(input, row_count);
 		}
 	};
 
@@ -1359,7 +1359,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		// Plain merge: fold straight into the result.
 		vector<JsonoRowReader> inputs(ncols);
 		for (idx_t i = 0; i < ncols; i++) {
-			init_input(inputs[i], args.data[i]);
+			init_input(inputs[i], args.data[i], count);
 		}
 		RunResidualFold(mode, inputs, ncols, count, result, lstate);
 		if (args.AllConstant()) {
@@ -1428,19 +1428,47 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		}
 	}
 
+	auto run_reshred_fallback = [&](const vector<Vector *> &fallback_args, idx_t fallback_count,
+	                                Vector &fallback_result) {
+		vector<unique_ptr<Vector>> reconstructed;
+		vector<JsonoRowReader> inputs(ncols);
+		for (idx_t i = 0; i < ncols; i++) {
+			auto &input = *fallback_args[i];
+			if (IsShreddedJsonoType(input.GetType())) {
+				// The reconstruction verifies the shredded input's manifest itself; its plain
+				// output never carries one.
+				auto plain = make_uniq<Vector>(JsonoType(), fallback_count);
+				ReconstructShreddedToPlainImpl(input, fallback_count, *plain);
+				init_input(inputs[i], *plain, fallback_count);
+				reconstructed.push_back(std::move(plain));
+			} else {
+				init_input(inputs[i], input, fallback_count);
+			}
+		}
+		Vector fold_out(JsonoType(), fallback_count);
+		RunResidualFold(mode, inputs, ncols, fallback_count, fold_out, lstate);
+		vector<std::pair<string, LogicalType>> shred_specs;
+		shred_specs.reserve(bind_data.shreds.size());
+		for (auto &shred : bind_data.shreds) {
+			shred_specs.emplace_back(shred.name, shred.type);
+		}
+		JsonoShredFromSpec(fold_out, fallback_count, shred_specs, fallback_result);
+	};
+
 	if (fast_viable) {
 		vector<JsonoRowReader> raw(ncols);
 		for (idx_t i = 0; i < ncols; i++) {
-			init_input(raw[i], args.data[i]);
+			init_input(raw[i], args.data[i], count);
 		}
 		Vector fast_residual(JsonoType(), count);
 		RunResidualFold(mode, raw, ncols, count, fast_residual, lstate);
 		JsonoVectorData fr;
 		InitJsonoVectorData(fast_residual, count, fr);
-		bool conflict = false;
+		vector<idx_t> conflict_rows;
 		JsonoView pview;
 		JsonoBlobRow pblob {};
-		for (idx_t row = 0; row < count && !conflict; row++) {
+		for (idx_t row = 0; row < count; row++) {
+			bool row_conflict = false;
 			JsonoBlobRow blob {};
 			if (!ReadJsonoRowStrict(fr, row, blob)) {
 				continue; // SQL NULL folded residual: the row is NULL and its lanes are nulled below
@@ -1454,10 +1482,9 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// never folds to a non-object with non-null lanes, so gate this on plain inputs to keep
 			// that case on the fast path unchanged.
 			if (!plain_inputs.empty() && SlotTag(v.SlotAt(0)) != tag::OBJ_START) {
-				conflict = true;
-				break;
+				row_conflict = true;
 			}
-			for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
+			for (idx_t k = 0; k < bind_data.shreds.size() && !row_conflict; k++) {
 				// A top-level shred conflicts only if its key sits in the folded residual (a
 				// non-object residual is handled by the plain-input gate above, preserving the
 				// all-shredded behaviour). A nested shred additionally conflicts if a node along
@@ -1467,14 +1494,14 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				               : (shred_paths[k].size() == 1 ? ResidualHasTopLevelKey(v, bind_data.shreds[k].name)
 				                                             : ResidualConflictsWithShredPath(v, shred_paths[k]));
 				if (hit) {
-					conflict = true;
+					row_conflict = true;
 					break;
 				}
 			}
-			if (conflict) {
-				break;
-			}
 			for (idx_t pi : plain_inputs) {
+				if (row_conflict) {
+					break;
+				}
 				if (raw[pi].Read(row, pblob, pview) != JsonoRowState::Value) {
 					continue;
 				}
@@ -1483,7 +1510,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				// later object patch can rebuild an object residual so the non-object check on the
 				// folded residual alone misses it. Divert to the fallback on any non-object plain input.
 				if (pview.Slots() == 0 || SlotTag(pview.SlotAt(0)) != tag::OBJ_START) {
-					conflict = true;
+					row_conflict = true;
 					break;
 				}
 				// A plain input naming a shred also forces the fallback: a value there is caught by
@@ -1492,7 +1519,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				// covers the top-level shred names in one pass; a plain input touching a NESTED shred path
 				// (its leaf or a non-object along it) needs the per-path descent.
 				if (ObjectKeyInShredSet(pview, bind_data.shreds)) {
-					conflict = true;
+					row_conflict = true;
 					break;
 				}
 				if (has_jsonpath_shred) {
@@ -1500,30 +1527,37 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 						auto &name = bind_data.shreds[k].name;
 						if (name.size() >= 2 && name[0] == '$' && name[1] == '.' &&
 						    ResidualConflictsWithShredPath(pview, shred_paths[k])) {
-							conflict = true;
+							row_conflict = true;
 							break;
 						}
 					}
-					if (conflict) {
+					if (row_conflict) {
 						break;
 					}
 				}
 			}
+			if (row_conflict) {
+				conflict_rows.push_back(row);
+			}
 		}
-		if (!conflict) {
+		auto write_fast_result = [&](bool preserve_constant) {
 			// Capture constness before FastCopyShred flattens any input (which would otherwise
 			// make AllConstant() spuriously false and trip the constant-fold assertion).
-			bool all_constant = args.AllConstant();
+			bool all_constant = preserve_constant && args.AllConstant();
 			fast_residual.Flatten(count);
 			// Copy the folded plain residual's body blobs into the shredded result's body —
 			// except `skips`, which is re-emitted per row below with the output's shred manifest.
 			JsonoBodyWriter writer;
 			writer.Init(result);
-			// The fast path is reached only when scalar shred keys do not appear in the folded
-			// residual. Scalar-array keys may appear as their normal skeleton arrays, but they do not
-			// participate in the per-shred completeness typed-scalar shortcut. A diverted scalar (case B)
-			// would sit in that residual at the scalar shred's key and trip the gate to the fallback,
-			// so every NULL scalar shred here is an absent path (case A), never a diversion.
+			// Reasoning below holds for the rows kept from this fast result: every row when there are
+			// no conflicts, the non-conflict rows when the caller splits (conflict rows are written
+			// speculatively here and overwritten by the reshred fallback below, so their possibly
+			// diverted lanes never reach the output). In a kept row scalar shred keys do not appear in
+			// the folded residual. Scalar-array keys may appear as their normal skeleton arrays, but they
+			// do not participate in the per-shred completeness typed-scalar shortcut. A diverted scalar
+			// (case B) would sit in that residual at the scalar shred's key and trip the gate to the
+			// fallback, so every NULL scalar shred in a kept row is an absent path (case A), never a
+			// diversion.
 			JsonoFillShredsComplete(result, count);
 			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
 			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
@@ -1581,6 +1615,39 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			if (all_constant) {
 				result.SetVectorType(VectorType::CONSTANT_VECTOR);
 			}
+		};
+		if (conflict_rows.empty()) {
+			write_fast_result(true);
+			return;
+		}
+		if (conflict_rows.size() < count) {
+			write_fast_result(false);
+			auto conflict_count = conflict_rows.size();
+			SelectionVector conflict_sel(conflict_count);
+			for (idx_t i = 0; i < conflict_count; i++) {
+				conflict_sel.set_index(i, conflict_rows[i]);
+			}
+			vector<unique_ptr<Vector>> compact_vectors;
+			vector<Vector *> compact_args;
+			compact_vectors.reserve(ncols);
+			compact_args.reserve(ncols);
+			for (idx_t i = 0; i < ncols; i++) {
+				auto compact = make_uniq<Vector>(args.data[i].GetType(), conflict_count);
+				if (args.data[i].GetType().id() == LogicalTypeId::SQLNULL) {
+					compact->SetVectorType(VectorType::CONSTANT_VECTOR);
+					ConstantVector::SetNull(*compact, true);
+				} else {
+					VectorOperations::Copy(args.data[i], *compact, conflict_sel, count, 0, 0, conflict_count);
+				}
+				compact_args.push_back(compact.get());
+				compact_vectors.push_back(std::move(compact));
+			}
+			Vector fallback_result(result.GetType(), conflict_count);
+			run_reshred_fallback(compact_args, conflict_count, fallback_result);
+			auto &identity = *FlatVector::IncrementalSelectionVector();
+			for (idx_t i = 0; i < conflict_count; i++) {
+				VectorOperations::Copy(fallback_result, result, identity, conflict_count, i, conflict_rows[i], 1);
+			}
 			return;
 		}
 		// A shred key landed in the residual (conflict) — fall through to the correct reshred path.
@@ -1588,28 +1655,12 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 
 	// Reshred fallback: reconstruct shredded inputs to plain, fold, reshred. Correct for any
 	// shred/residual key overlap and for plain inputs that can shadow a shred.
-	vector<unique_ptr<Vector>> reconstructed;
-	vector<JsonoRowReader> inputs(ncols);
+	vector<Vector *> fallback_args;
+	fallback_args.reserve(ncols);
 	for (idx_t i = 0; i < ncols; i++) {
-		if (IsShreddedJsonoType(args.data[i].GetType())) {
-			// The reconstruction verifies the shredded input's manifest itself; its plain
-			// output never carries one.
-			auto plain = make_uniq<Vector>(JsonoType(), count);
-			ReconstructShreddedToPlainImpl(args.data[i], count, *plain);
-			init_input(inputs[i], *plain);
-			reconstructed.push_back(std::move(plain));
-		} else {
-			init_input(inputs[i], args.data[i]);
-		}
+		fallback_args.push_back(&args.data[i]);
 	}
-	Vector fold_out(JsonoType(), count);
-	RunResidualFold(mode, inputs, ncols, count, fold_out, lstate);
-	vector<std::pair<string, LogicalType>> shred_specs;
-	shred_specs.reserve(bind_data.shreds.size());
-	for (auto &shred : bind_data.shreds) {
-		shred_specs.emplace_back(shred.name, shred.type);
-	}
-	JsonoShredFromSpec(fold_out, count, shred_specs, result);
+	run_reshred_fallback(fallback_args, count, result);
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
