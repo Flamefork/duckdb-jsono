@@ -116,3 +116,22 @@ select list_extract(json_extract_string(e, list_value('$.clientID')), 1) as clie
 from docs;
 ----
 CID-1
+
+# ---------------------------------------------------------------------------
+# Performance lock: a constant list of paths decomposes into native per-path shred reads, NOT a
+# whole-value reconstruct + core json reparse (the silently-slow path that defeats shred pruning).
+# `jsono_overlay` is the reconstruct marker, so its absence proves the native decomposition held.
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN select json_extract_string(e, list_value('$.clientID', '$.counterUserIDHash')) from docs;
+----
+physical_plan	<!REGEX>:.*jsono_overlay.*
+
+# The scan prunes to the individual shred lanes instead of reading the whole value.
+query II
+EXPLAIN select json_extract_string(e, list_value('$.clientID', '$.counterUserIDHash')) from docs;
+----
+physical_plan	<REGEX>:.*shreds.*clientID.*

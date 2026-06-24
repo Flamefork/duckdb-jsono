@@ -11,6 +11,8 @@
 #include "jsono_shred.hpp"
 #include "jsono_trie_shape_plan.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
@@ -1667,6 +1669,14 @@ private:
 	// serialize containers, so they need the leaf as much as json-valued ones.
 	unique_ptr<Expression> RewriteShreddedExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast) {
 		bool string_fn = IsStringExtractFunction(expr.function.name);
+		// Batch/list path overload: decompose a constant list of paths into a list_value of native
+		// per-path extracts, so each element reads its shred lane (with row-group pruning) instead of
+		// the whole value being reconstructed + reserialized + reparsed once per row by core json's list
+		// overload. A non-decomposable list is left to that overload, whose STRUCT->JSON argument cast
+		// the cast visitor reconstructs independently.
+		if (expr.children[1]->return_type.id() == LogicalTypeId::LIST) {
+			return RewriteShreddedListExtract(expr, shredded_cast, string_fn);
+		}
 		JsonoPathSpec path;
 		if (!TryReadExtractPath(context, *expr.children[1], path)) {
 			// Non-constant (or otherwise unreadable) path: leave the plan untouched. The
@@ -1674,6 +1684,18 @@ private:
 			// jsono-named extracts already refused such a path at their own bind.
 			return nullptr;
 		}
+		return BuildShreddedPathExtract(shredded_cast, std::move(expr.children[1]), path, expr.return_type, string_fn,
+		                                expr.GetAlias());
+	}
+
+	// Build a native single-path extract over a shredded value: read a scalar shred lane directly, or
+	// fall back to a native residual / full-reconstruct extract. `path` is consumed and `path_spec` is
+	// its parsed form; `value_type` is the extract's result type (VARCHAR for ->>/json_extract_string,
+	// JSON/JSONO for the json-valued ->/json_extract). Used once per scalar extract and once per element
+	// of a decomposed list extract.
+	unique_ptr<Expression> BuildShreddedPathExtract(BoundCastExpression &shredded_cast, unique_ptr<Expression> path,
+	                                                const JsonoPathSpec &path_spec, const LogicalType &value_type,
+	                                                bool string_fn, const string &alias) {
 		auto shreds = CollectShreddedShreds(shredded_cast.child->return_type);
 		// Reconstruct-needed reads first, so a render-unsafe container (a shred lives strictly inside
 		// the read path, stripped from the residual) reconstructs rather than bare-reading the lane — a
@@ -1681,20 +1703,62 @@ private:
 		// a json-valued extract of a shred, an array shred, and a read of a subtree holding a stripped
 		// leaf. The exact-scalar read below is then reached only when no shred forces reconstruct.
 		for (auto &shred : shreds) {
-			if (ReadNeedsReconstruct(path.steps, shred, string_fn)) {
-				return MakeReconstructExtract(expr, shredded_cast, string_fn);
+			if (ReadNeedsReconstruct(path_spec.steps, shred, string_fn)) {
+				return MakeReconstructExtract(shredded_cast, std::move(path), value_type, string_fn, alias);
 			}
 		}
 		// An exact match on a scalar (non-list) shred under a string-valued extract reads the shred
 		// lane directly (with the residual COALESCE fallback, dropped when the shred is total).
 		for (auto &shred : shreds) {
-			if (PathStepsEqual(shred.steps, path.steps) && string_fn && !IsShredListType(shred.type)) {
-				auto alias = expr.GetAlias();
-				return MakeShredRead(std::move(shredded_cast.child), shred, std::move(expr.children[1]), alias);
+			if (PathStepsEqual(shred.steps, path_spec.steps) && string_fn && !IsShredListType(shred.type)) {
+				return MakeShredRead(shredded_cast.child->Copy(), shred, std::move(path), alias);
 			}
 		}
 		// No shred touched this read: serve it natively from the residual.
-		return MakeResidualExtract(expr, shredded_cast, string_fn);
+		return MakeResidualExtract(shredded_cast, std::move(path), value_type, string_fn, alias);
+	}
+
+	// Decompose json_extract(_string)(shredded, list_value(p1..pN)) into
+	// list_value(extract(p1), ..., extract(pN)) of native per-path reads, matching the cost of N scalar
+	// extracts. All-or-nothing: if any element is not a constant readable path, decline so core json's
+	// list overload serves the whole list (correct, but reconstructs the whole value per row).
+	unique_ptr<Expression> RewriteShreddedListExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast,
+	                                                  bool string_fn) {
+		if (ListType::GetChildType(expr.children[1]->return_type).id() != LogicalTypeId::VARCHAR) {
+			return nullptr;
+		}
+		vector<string> paths;
+		if (!TryReadStringListValue(context, *expr.children[1], paths)) {
+			return nullptr;
+		}
+		auto element_type = ListType::GetChildType(expr.return_type);
+		vector<unique_ptr<Expression>> elements;
+		elements.reserve(paths.size());
+		for (auto &path_text : paths) {
+			auto path_expr = make_uniq<BoundConstantExpression>(Value(path_text));
+			JsonoPathSpec path_spec;
+			if (!TryReadExtractPath(context, *path_expr, path_spec)) {
+				return nullptr;
+			}
+			elements.push_back(
+			    BuildShreddedPathExtract(shredded_cast, std::move(path_expr), path_spec, element_type, string_fn, ""));
+		}
+		auto result = BindListValue(std::move(elements), element_type);
+		// Match the original list type exactly (JSON aliases VARCHAR; a no-op cast when already equal).
+		result = BoundCastExpression::AddCastToType(context, std::move(result), expr.return_type);
+		result->SetAlias(expr.GetAlias());
+		return result;
+	}
+
+	// Bind core's list_value over N same-typed elements. Resolved from the system catalog because jsono
+	// does not link core_functions, where list_value lives.
+	unique_ptr<Expression> BindListValue(vector<unique_ptr<Expression>> elements, const LogicalType &element_type) {
+		auto &catalog = Catalog::GetSystemCatalog(context);
+		auto &entry = catalog.GetEntry<ScalarFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "list_value");
+		vector<LogicalType> arg_types(elements.size(), element_type);
+		auto fun = entry.functions.GetFunctionByArguments(context, arg_types);
+		FunctionBinder function_binder(context);
+		return function_binder.BindScalarFunction(fun, std::move(elements));
 	}
 
 	// jsono_type / jsono_keys over a shredded value: replace the reconstruct cast on the argument
@@ -1840,13 +1904,12 @@ private:
 	// residual reinterpret or a full reconstruct). Keeps `->>`/json_extract on jsono's own renderer
 	// — text-preserving numbers, lowercase \u escapes — instead of core json's STRUCT->JSON->extract
 	// path, which re-renders numbers and uppercases escapes (a visible to_json-vs-extract divergence).
-	unique_ptr<Expression> MakeNativeExtractOver(BoundFunctionExpression &expr, unique_ptr<Expression> source,
-	                                             bool string_fn) {
-		auto path_type = expr.children[1]->return_type;
+	unique_ptr<Expression> MakeNativeExtractOver(unique_ptr<Expression> source, unique_ptr<Expression> path,
+	                                             const LogicalType &value_type, bool string_fn, const string &alias) {
+		auto path_type = path->return_type;
 		vector<unique_ptr<Expression>> children;
 		children.push_back(std::move(source));
-		children.push_back(std::move(expr.children[1]));
-		auto alias = expr.GetAlias();
+		children.push_back(std::move(path));
 		FunctionBinder function_binder(context);
 		auto shred_path_type = path_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
 		if (string_fn) {
@@ -1857,9 +1920,8 @@ private:
 		}
 		// json-valued extract returns JSONO natively; cast back to the type the original extract
 		// produced — JSON for core `->`/json_extract, JSONO (a no-op) for jsono_extract.
-		auto target_type = expr.return_type;
 		auto extracted = function_binder.BindScalarFunction(JsonoExtractFunction(shred_path_type), std::move(children));
-		auto result = BoundCastExpression::AddCastToType(context, std::move(extracted), target_type);
+		auto result = BoundCastExpression::AddCastToType(context, std::move(extracted), value_type);
 		result->SetAlias(alias);
 		return result;
 	}
@@ -1868,9 +1930,10 @@ private:
 	// non-shredded column's extract cost — no serialize/parse round-trip through core
 	// json. Correct because only shred leaves are stripped: a non-shred scalar keeps its
 	// value, and a json-valued read overlapping a stripped shred already reconstructed.
-	unique_ptr<Expression> MakeResidualExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast,
-	                                           bool string_fn) {
-		return MakeNativeExtractOver(expr, ResidualReinterpret(*shredded_cast.child), string_fn);
+	unique_ptr<Expression> MakeResidualExtract(BoundCastExpression &shredded_cast, unique_ptr<Expression> path,
+	                                           const LogicalType &value_type, bool string_fn, const string &alias) {
+		return MakeNativeExtractOver(ResidualReinterpret(*shredded_cast.child), std::move(path), value_type, string_fn,
+		                             alias);
 	}
 
 	// A shredded read whose value the residual alone cannot serve — its leaf is stripped into a
@@ -1878,10 +1941,10 @@ private:
 	// reconstruct the full plain JSONO value (the array-aware reconstruct cast) and extract natively.
 	// This keeps the result on jsono's own renderer, so it is byte-identical to to_json and a plain
 	// read instead of diverging through core json's normalizing/uppercasing `->>`.
-	unique_ptr<Expression> MakeReconstructExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast,
-	                                              bool string_fn) {
+	unique_ptr<Expression> MakeReconstructExtract(BoundCastExpression &shredded_cast, unique_ptr<Expression> path,
+	                                              const LogicalType &value_type, bool string_fn, const string &alias) {
 		auto reconstruct = BoundCastExpression::AddCastToType(context, shredded_cast.child->Copy(), JsonoType());
-		return MakeNativeExtractOver(expr, std::move(reconstruct), string_fn);
+		return MakeNativeExtractOver(std::move(reconstruct), std::move(path), value_type, string_fn, alias);
 	}
 
 	// Detect CAST(string-shred-extract AS T) where the shred's own type is exactly T, and
