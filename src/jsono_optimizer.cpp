@@ -892,14 +892,18 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 			continue;
 		}
 		FlatVector::Validity(result).SetValid(row);
+		// The window check runs before the lookup: a disable clears the entries, which would
+		// dangle a plan pointer handed out for this row.
 		lstate.project_shape_plans.EndOfWindowCheck();
 		const JsonoTrieShapePlan *plan = nullptr;
-		if (bind_data.shape_plan_eligible && !lstate.project_shape_plans.disabled &&
+		if (bind_data.shape_plan_eligible &&
 		    blob.slots.GetSize() + blob.key_heap.GetSize() <= JSONO_TRIE_SHAPE_PLAN_MAX_SHAPE_BYTES) {
-			auto hash = JsonoTrieShapeBlobHash(blob);
-			plan = lstate.project_shape_plans.Find(hash, blob);
-			if (!plan) {
-				plan = lstate.project_shape_plans.Insert(hash, blob, BuildProjectShapePlan(bind_data, view));
+			uint64_t hash;
+			if (lstate.project_shape_plans.CanLookup(blob, hash)) {
+				plan = lstate.project_shape_plans.Find(hash, blob);
+				if (!plan) {
+					plan = lstate.project_shape_plans.Insert(hash, blob, BuildProjectShapePlan(bind_data, view));
+				}
 			}
 		}
 		if (plan) {

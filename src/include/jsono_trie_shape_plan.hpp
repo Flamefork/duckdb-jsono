@@ -129,6 +129,65 @@ struct JsonoTrieShapePlanCache {
 	uint64_t total_lookups = 0;
 	uint64_t total_hits = 0;
 	uint64_t builds = 0;
+	uint64_t recovery_cooldown_lookups = 0;
+	uint64_t recovery_lookups = 0;
+	uint64_t recovery_hits = 0;
+	uint64_t recovery_hash = 0;
+	string recovery_slots;
+	string recovery_key_heap;
+
+	static bool ShapeBytesEqual(const string &slots, const string &key_heap, const JsonoBlobRow &blob) {
+		return slots.size() == blob.slots.GetSize() && key_heap.size() == blob.key_heap.GetSize() &&
+		       std::memcmp(slots.data(), blob.slots.GetData(), slots.size()) == 0 &&
+		       std::memcmp(key_heap.data(), blob.key_heap.GetData(), key_heap.size()) == 0;
+	}
+
+	void ResetRecoveryProbe() {
+		recovery_lookups = 0;
+		recovery_hits = 0;
+		recovery_hash = 0;
+		recovery_slots.clear();
+		recovery_key_heap.clear();
+	}
+
+	// Gates whether a row consults the plan cache and yields its shape hash when it does. While
+	// enabled every row looks up. Once EndOfWindowCheck disables the cache (a window thrashed below
+	// the 75% hit-rate floor), recovery probes whether the stream has since stabilized: after a
+	// WARMUP-row cooldown, sample one WINDOW-row probe and re-enable only if at least 75% of probe
+	// rows repeat the first probe row's shape byte-for-byte (the same 3/4 floor disable uses, so a
+	// stable tail recovers and a still-thrashing one stays disabled and re-enters cooldown). Probe
+	// rows themselves take the per-row walk (return false), so recovery never serves an unbuilt plan.
+	bool CanLookup(const JsonoBlobRow &blob, uint64_t &hash) {
+		if (!disabled) {
+			hash = JsonoTrieShapeBlobHash(blob);
+			return true;
+		}
+		if (recovery_lookups == 0 && recovery_cooldown_lookups < JSONO_TRIE_SHAPE_PLAN_WARMUP) {
+			recovery_cooldown_lookups++;
+			return false;
+		}
+		hash = JsonoTrieShapeBlobHash(blob);
+		if (recovery_lookups == 0) {
+			recovery_hash = hash;
+			recovery_slots.assign(blob.slots.GetData(), blob.slots.GetSize());
+			recovery_key_heap.assign(blob.key_heap.GetData(), blob.key_heap.GetSize());
+		} else if (recovery_hash == hash && ShapeBytesEqual(recovery_slots, recovery_key_heap, blob)) {
+			recovery_hits++;
+		}
+		recovery_lookups++;
+		if (recovery_lookups < JSONO_TRIE_SHAPE_PLAN_WINDOW) {
+			return false;
+		}
+		if (recovery_hits * 4 >= recovery_lookups * 3) {
+			disabled = false;
+			recovery_cooldown_lookups = 0;
+			ResetRecoveryProbe();
+			return true;
+		}
+		recovery_cooldown_lookups = 0;
+		ResetRecoveryProbe();
+		return false;
+	}
 
 	PLAN *Find(uint64_t hash, const JsonoBlobRow &blob) {
 		if (entries.empty()) {
@@ -138,10 +197,7 @@ struct JsonoTrieShapePlanCache {
 		auto base = idx_t(hash & (JSONO_TRIE_SHAPE_PLAN_BUCKETS - 1)) * JSONO_TRIE_SHAPE_PLAN_WAYS;
 		for (idx_t way = 0; way < JSONO_TRIE_SHAPE_PLAN_WAYS; way++) {
 			auto &entry = entries[base + way];
-			if (entry.plan && entry.sample_hash == hash && entry.slots.size() == blob.slots.GetSize() &&
-			    entry.key_heap.size() == blob.key_heap.GetSize() &&
-			    std::memcmp(entry.slots.data(), blob.slots.GetData(), entry.slots.size()) == 0 &&
-			    std::memcmp(entry.key_heap.data(), blob.key_heap.GetData(), entry.key_heap.size()) == 0) {
+			if (entry.plan && entry.sample_hash == hash && ShapeBytesEqual(entry.slots, entry.key_heap, blob)) {
 				entry.stamp = ++clock;
 				window_hits++;
 				return entry.plan.get();
@@ -183,6 +239,8 @@ struct JsonoTrieShapePlanCache {
 			disabled = true;
 			entries.clear();
 			entries.shrink_to_fit();
+			recovery_cooldown_lookups = 0;
+			ResetRecoveryProbe();
 		}
 		window_lookups = 0;
 		window_hits = 0;

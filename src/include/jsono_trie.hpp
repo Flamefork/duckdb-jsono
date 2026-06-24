@@ -169,8 +169,8 @@ struct JsonoTrie {
 
 // Per-node set-associative rank cache shared by both walks. Rows interleave several object shapes
 // per node (event archetypes), so each trie node keeps a small set of ways: one per recently seen
-// shape class. A matching stored shape_hash proves the cached ranks of every edge with one int
-// compare; otherwise the per-edge ValidateCachedObjectRank check (or a full re-resolve) runs.
+// shape class. A matching stored shape_hash selects the candidate way quickly; every cached edge
+// rank still passes the local boundary check before the entry is reused.
 //
 // Slots are per trie node (the trie is bind-time constant), sized to the node's key edges at Init.
 // No aliasing across nodes and no resizing means a held entry reference survives the recursive
@@ -212,12 +212,10 @@ struct JsonoTrieRankCache {
 		auto &entry = entries[node_index * JSONO_TRIE_RANK_WAYS + JsonoTrieRankWay(layout)];
 		auto cache_valid = entry.valid && entry.key_count == layout.key_count;
 		if (cache_valid) {
-			// A matching stored shape_hash proves the object's sorted key sequence, validating every
-			// edge's cached rank with one int compare. The slot is per node, so the (bind-time
-			// constant) key set needs no re-check.
 			if (TrustShapeHash() && layout.has_span && entry.has_shape_hash) {
 				cache_valid = entry.shape_hash == layout.shape_hash;
-			} else {
+			}
+			if (cache_valid) {
 				for (idx_t edge_index = 0; edge_index < node.key_edges.size(); edge_index++) {
 					if (!ValidateCachedObjectRank(view, layout, node.key_edges[edge_index].key, entry.ranks[edge_index],
 					                              entry.found[edge_index])) {

@@ -136,3 +136,40 @@ FROM shredded_mix WHERE i < 2 ORDER BY i;
 ----
 0	{'name': u0, 'extra': 0, 'missing': NULL}
 1	{'name': 1, 'extra': 1, 'missing': NULL}
+
+# Recovery after a stable tail: the first 6144 rows each carry a distinct key spelling, thrashing
+# the cache below its hit-rate floor so the window check disables it mid-scan. The remaining rows
+# all share one shape (key "k0"; the per-row integers live in the nums blob, not the slots/key_heap
+# that define the shape), so after the cooldown the recovery probe re-enables the cache. Disabled,
+# cooldown, probe, and re-enabled rows must all read identically to the plan — the aggregate is the
+# same regardless of which path each row took, so a miscounted threshold or a stale re-enabled plan
+# would break it.
+statement ok
+CREATE TABLE shape_recovery_stable AS
+SELECT i, jsono('{"k' || (CASE WHEN i < 6144 THEN i + 1 ELSE 0 END) || '": 1, "v": ' || i || '}') AS j
+FROM range(14336) r(i);
+
+query IIII
+SELECT count(*), sum(s.v), count(s.k0), sum(s.k0)
+FROM (SELECT jsono_transform(j, {v: 'BIGINT', k0: 'BIGINT', k1: 'BIGINT'}) s FROM shape_recovery_stable) q;
+----
+14336	102753280	8192	8192
+
+# Recovery must NOT fire on a still-unstable tail: after the same 6144-row flood disables the cache,
+# the tail alternates two shapes ("ka"/"kb"), so no probe window repeats its first row in ≥75% of
+# rows and the cache stays disabled. Both shapes must still read correctly through the per-row walk
+# (and were a re-enable to wrongly fire, Find's byte-equality guard would still reject the other shape).
+statement ok
+CREATE TABLE shape_recovery_unstable AS
+SELECT i, jsono(CASE
+    WHEN i < 6144 THEN '{"k' || (i + 1) || '": 1, "v": ' || i || '}'
+    WHEN i % 2 = 0 THEN '{"ka": 1, "v": ' || i || '}'
+    ELSE '{"kb": 1, "v": ' || i || '}'
+END) AS j
+FROM range(14336) r(i);
+
+query IIIII
+SELECT count(*), sum(s.v), count(s.ka), count(s.kb), sum(s.ka)
+FROM (SELECT jsono_transform(j, {v: 'BIGINT', ka: 'BIGINT', kb: 'BIGINT'}) s FROM shape_recovery_unstable) q;
+----
+14336	102753280	4096	4096	4096

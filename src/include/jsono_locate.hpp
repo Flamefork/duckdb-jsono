@@ -48,17 +48,16 @@ inline nonstd::string_view ObjectKeyAtRank(const JsonoView &view, const ObjectLa
 }
 
 // Binary search for `key` in the object's sorted key block. `rank` is always set to the
-// key's insertion point, so a miss still positions cursors for the caller.
+// key's insertion point, so a miss still positions cursors for the caller. The block is trusted
+// sorted (the writer emits keys in order); a cache hit confirms the key at `rank` per hit rather
+// than re-scanning the whole block.
 inline bool FindObjectKeyRank(const JsonoView &view, const ObjectLayout &layout, const string &key, size_t &rank) {
 	size_t lo = 0;
 	size_t hi = layout.key_count;
 	while (lo < hi) {
 		auto mid = lo + (hi - lo) / 2;
-		auto key_slot = view.SlotAt(layout.key_start + mid);
-		if (SlotTag(key_slot) != tag::KEY) {
-			throw InvalidInputException("malformed JSONO: expected KEY slot");
-		}
-		if (view.KeyAt(SlotPayload(key_slot)) < key) {
+		auto mid_key = ObjectKeyAtRank(view, layout, mid);
+		if (mid_key < key) {
 			lo = mid + 1;
 		} else {
 			hi = mid;
@@ -68,24 +67,36 @@ inline bool FindObjectKeyRank(const JsonoView &view, const ObjectLayout &layout,
 	if (lo >= layout.key_count) {
 		return false;
 	}
-	return ObjectKeyAtRank(view, layout, lo) == key;
+	auto found_key = ObjectKeyAtRank(view, layout, lo);
+	return found_key == key;
 }
 
-// Re-check a cached (rank, found) against this row's key block: the cached rank is valid
-// when the keys around it still bracket `key` the same way the original lookup did.
+// Re-check a cached (rank, found) against this row's key block without re-scanning it: a found rank
+// is confirmed by reading the key at `rank` (so a colliding cache slot is rejected), a miss by its
+// bracketing neighbors. Trusts the writer-guaranteed sort order instead of validating it per hit.
 inline bool ValidateCachedObjectRank(const JsonoView &view, const ObjectLayout &layout, const string &key, size_t rank,
                                      bool found) {
 	if (rank > layout.key_count) {
 		return false;
 	}
 	if (found) {
-		return rank < layout.key_count && ObjectKeyAtRank(view, layout, rank) == key;
+		if (rank >= layout.key_count) {
+			return false;
+		}
+		auto found_key = ObjectKeyAtRank(view, layout, rank);
+		return found_key == key;
 	}
-	if (rank > 0 && ObjectKeyAtRank(view, layout, rank - 1) >= key) {
-		return false;
+	if (rank > 0) {
+		auto previous_key = ObjectKeyAtRank(view, layout, rank - 1);
+		if (previous_key >= key) {
+			return false;
+		}
 	}
-	if (rank < layout.key_count && ObjectKeyAtRank(view, layout, rank) <= key) {
-		return false;
+	if (rank < layout.key_count) {
+		auto next_key = ObjectKeyAtRank(view, layout, rank);
+		if (next_key <= key) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -96,9 +107,9 @@ inline idx_t RankCacheIndex(idx_t step_index, size_t key_count) {
 	return idx_t(((uint64_t(step_index) * 0x9E3779B97F4A7C15ULL) ^ key_count) & (RANK_CACHE_SIZE - 1));
 }
 
-// Default fast path trusts the stored shape_hash; JSONO_RANK_VALIDATE=1 forces the
-// key-heap validation instead, isolating the format's storage/read overhead from the
-// fast-path win in a single build (read once, not per row).
+// Default cache matching uses the stored shape_hash as a cheap prefilter before the per-hit key
+// confirmation; JSONO_RANK_VALIDATE=1 skips the prefilter so every slot match confirms via the key
+// read (a control for measuring the prefilter).
 inline bool TrustShapeHash() {
 	static const bool trust = []() {
 		const char *env = std::getenv("JSONO_RANK_VALIDATE");
@@ -119,9 +130,8 @@ struct RankCacheEntry {
 };
 
 // Direct-mapped cache of key->rank lookups keyed by (step id, object key_count). A stored
-// shape_hash uniquely identifies the object's sorted key sequence, so a matching hash
-// proves the cached rank by an int compare; layouts without one (small objects read
-// without a span) fall back to re-validating the cached rank against the key slots.
+// shape_hash rejects obvious shape mismatches quickly; every hit then confirms the key at the
+// cached rank (no full-block scan).
 struct RankCache {
 	RankCache() : entries(RANK_CACHE_SIZE) {
 	}
@@ -130,11 +140,14 @@ struct RankCache {
 
 	bool Find(idx_t step_index, const JsonoView &view, const ObjectLayout &layout, const string &key, size_t &rank) {
 		auto &entry = entries[RankCacheIndex(step_index, layout.key_count)];
-		auto hit = entry.valid && entry.step_index == step_index && entry.key_count == layout.key_count &&
-		           entry.key == key &&
-		           (TrustShapeHash() && layout.has_span && entry.has_shape_hash
-		                ? entry.shape_hash == layout.shape_hash
-		                : ValidateCachedObjectRank(view, layout, key, entry.rank, entry.found));
+		auto hit =
+		    entry.valid && entry.step_index == step_index && entry.key_count == layout.key_count && entry.key == key;
+		if (hit && TrustShapeHash() && layout.has_span && entry.has_shape_hash) {
+			hit = entry.shape_hash == layout.shape_hash;
+		}
+		if (hit) {
+			hit = ValidateCachedObjectRank(view, layout, key, entry.rank, entry.found);
+		}
 		if (hit) {
 			rank = entry.rank;
 			return entry.found;
@@ -238,8 +251,8 @@ inline bool LocateObjectKeyCached(JsonoPathLocateState &state, idx_t step_index,
 
 // One Key/Index step from the value at `cursor`. `cache` may be null: point readers that
 // resolve the same path per row pass their rank cache (and get the span probe on small
-// objects, so spanned ones validate by shape_hash); one-shot walkers pass null and pay the
-// plain binary search. A miss (absent key, out-of-range index, scalar, wildcard) is false.
+// objects, so spanned ones expose shape_hash to key-block validation); one-shot walkers pass null
+// and pay the plain binary search. A miss (absent key, out-of-range index, scalar, wildcard) is false.
 inline bool LocatePathStep(RankCache *cache, idx_t step_index, const JsonoView &view, const PathStep &step,
                            JsonoCursor &cursor) {
 	if (cursor.pos >= view.Slots()) {

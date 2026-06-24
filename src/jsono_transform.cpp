@@ -1017,12 +1017,14 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 		// dangle a plan pointer handed out for this row.
 		lstate.shape_plans.EndOfWindowCheck();
 		const ShapePlan *plan = nullptr;
-		if (bind_data.shape_plan_eligible && !lstate.shape_plans.disabled &&
+		if (bind_data.shape_plan_eligible &&
 		    blob.slots.GetSize() + blob.key_heap.GetSize() <= JSONO_TRIE_SHAPE_PLAN_MAX_SHAPE_BYTES) {
-			auto hash = JsonoTrieShapeBlobHash(blob);
-			plan = lstate.shape_plans.Find(hash, blob);
-			if (!plan) {
-				plan = lstate.shape_plans.Insert(hash, blob, BuildShapePlan(lstate, bind_data, view));
+			uint64_t hash;
+			if (lstate.shape_plans.CanLookup(blob, hash)) {
+				plan = lstate.shape_plans.Find(hash, blob);
+				if (!plan) {
+					plan = lstate.shape_plans.Insert(hash, blob, BuildShapePlan(lstate, bind_data, view));
+				}
 			}
 		}
 		if (plan) {
