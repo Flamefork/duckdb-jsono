@@ -34,6 +34,7 @@ Merge and aggregate:
 - [`jsono_merge_patch(target, patch[, ...])`](#jsono_merge_patch) — RFC 7396 merge patch (later patches win; a `null` member deletes the key).
 - [`jsono_group_merge(value [ORDER BY ...])`](#jsono_group_merge) — aggregate a stream of patches into one value.
 - [`jsono_group_merge_max(value, order_key)` / `jsono_group_merge_min(value, order_key)`](#jsono_group_merge_max--jsono_group_merge_min) — order-independent keyed merge: per leaf, the value from the row with the greatest (`_max`) or smallest (`_min`) `order_key` wins, without buffering the input.
+- [`jsono_diff(prev, cur[, arrays])`](#jsono_diff) — structural diff of `prev → cur`; `arrays` selects how array changes render (`atomic` reverse merge-patch, `counts`, or `elements`).
 
 Shredded storage:
 
@@ -466,6 +467,55 @@ SELECT to_json(jsono_merge_patch(
 ```
 
 Unlike `jsono_group_merge`, this is a scalar function over a fixed set of patch arguments rather than an aggregate over rows.
+
+### `jsono_diff`
+
+Returns the structural diff of `prev → cur`: a minimal document containing only the keys/paths that changed. Each changed value renders by the **`cur`-side type** (the diff describes how to reach `cur`); a removed key (or a value cleared to `null`) renders as `key: null`. Changed scalars keep their native JSON type.
+
+```sql
+SELECT to_json(jsono_diff(
+    jsono('{"status":"new","total":10,"note":"x"}'),
+    jsono('{"status":"paid","total":10}')
+));
+```
+*Result:*
+```json
+{"note":null,"status":"paid"}
+```
+
+The optional `arrays` named parameter selects how an array-valued change renders (object/scalar handling is identical in all three modes):
+
+| `arrays` | an array change renders as | |
+|----------|----------------------------|---|
+| `'atomic'` *(default)* | the whole new `cur` array | order-sensitive; the exact inverse of `jsono_merge_patch` |
+| `'counts'` | `{"added": N, "removed": M}` | order-insensitive multiset cardinalities |
+| `'elements'` | `{"added": [...], "removed": [...]}` | order-insensitive multiset elements |
+
+```sql
+SELECT to_json(jsono_diff(
+    jsono('{"items":[{"sku":"a"},{"sku":"b"}]}'),
+    jsono('{"items":[{"sku":"a"},{"sku":"c"}]}'),
+    arrays := 'counts'
+));
+```
+*Result:*
+```json
+{"items":{"added":1,"removed":1}}
+```
+
+The default `'atomic'` mode round-trips with `jsono_merge_patch` — `jsono_merge_patch(prev, jsono_diff(prev, cur)) = cur` (for `cur` with no explicit `null` at an object key, since `null` is the merge-patch delete sentinel). The `'counts'` and `'elements'` modes are change *reports*, not appliable patches. A `NULL` argument is treated as the empty document, so `jsono_diff(NULL, cur)` is "everything new" and `jsono_diff(prev, NULL)` is "everything removed" — handy for a `lag()` window over a snapshot stream:
+
+```sql
+SELECT seq, to_json(changed) AS changed
+FROM (
+    SELECT seq,
+           jsono_diff(lag(snapshot) OVER (ORDER BY seq), snapshot, arrays := 'counts') AS changed
+    FROM events
+)
+WHERE changed IS DISTINCT FROM jsono('{}');  -- drop no-op rows (a pure array reorder is also a no-op under counts/elements)
+```
+
+A number's representation is part of its identity, so `1`, `1.0` and `1e0` compare unequal (a snapshot whose serializer drifts a number's form reports a change — normalize upstream if that matters).
 
 ### Introspection
 

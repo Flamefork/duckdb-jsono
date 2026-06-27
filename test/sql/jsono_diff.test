@@ -1,0 +1,314 @@
+# name: test/sql/jsono_diff.test
+# description: jsono_diff structural diff — object/scalar semantics, the three array modes, NULL identity, native scalar types, bind errors, and the merge-patch round-trip / multiset laws
+# group: [sql]
+
+require jsono
+
+# to_json renders the diff back to JSON for assertion (rides core json's to_json(ANY)).
+require json
+
+# ── Object / scalar semantics (mode-independent — asserted under the default 'atomic') ──
+
+# Equal documents diff to the empty object (the no-change identity), not SQL NULL.
+query I
+SELECT to_json(jsono_diff(jsono('{"a":1}'), jsono('{"a":1}')));
+----
+{}
+
+# A changed scalar carries its native jsono type (an int stays an int, not a string).
+query I
+SELECT to_json(jsono_diff(jsono('{"a":1}'), jsono('{"a":2}')));
+----
+{"a":2}
+
+# An added key emits its whole value.
+query I
+SELECT to_json(jsono_diff(jsono('{"a":1}'), jsono('{"a":1,"b":2}')));
+----
+{"b":2}
+
+# A removed key emits key:null.
+query I
+SELECT to_json(jsono_diff(jsono('{"a":1,"b":2}'), jsono('{"a":1}')));
+----
+{"b":null}
+
+# Nested objects recurse; only the changed leaf survives.
+query I
+SELECT to_json(jsono_diff(jsono('{"x":{"p":1,"q":2}}'), jsono('{"x":{"p":1,"q":9}}')));
+----
+{"x":{"q":9}}
+
+# A changed string.
+query I
+SELECT to_json(jsono_diff(jsono('{"s":"new"}'), jsono('{"s":"paid"}')));
+----
+{"s":"paid"}
+
+# A reverted string (diff is directional: how to reach cur).
+query I
+SELECT to_json(jsono_diff(jsono('{"s":"paid"}'), jsono('{"s":"new"}')));
+----
+{"s":"new"}
+
+# A value cleared to JSON null renders as key:null — indistinguishable from a removal, by the
+# merge-patch convention (the round-trip carve-out).
+query I
+SELECT to_json(jsono_diff(jsono('{"a":1}'), jsono('{"a":null}')));
+----
+{"a":null}
+
+# Everything new from an empty document.
+query I
+SELECT to_json(jsono_diff(jsono('{}'), jsono('{"a":1,"b":"x"}')));
+----
+{"a":1,"b":"x"}
+
+# A type change to an object recurses against an empty {} baseline (every leaf added).
+query I
+SELECT to_json(jsono_diff(jsono('{"a":5}'), jsono('{"a":{"p":1}}')));
+----
+{"a":{"p":1}}
+
+# A scalar -> empty object still emits key:{} (the merge-patch inverse needs it to reach cur).
+query I
+SELECT to_json(jsono_diff(jsono('{"a":5}'), jsono('{"a":{}}')));
+----
+{"a":{}}
+
+# ── Native scalar types (§9): the changed value keeps its jsono type, not to_json's string form ──
+
+query I
+SELECT to_json(jsono_diff(jsono('{"revenue":"100"}'), jsono('{"revenue":120}')));
+----
+{"revenue":120}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"flag":1}'), jsono('{"flag":true}')));
+----
+{"flag":true}
+
+# ── NULL handling (§7): a SQL NULL argument is the empty-document identity, never propagated ──
+
+# prev NULL = everything new.
+query I
+SELECT to_json(jsono_diff(NULL, jsono('{"a":1}')));
+----
+{"a":1}
+
+# cur NULL = everything removed.
+query I
+SELECT to_json(jsono_diff(jsono('{"a":1,"b":2}'), NULL));
+----
+{"a":null,"b":null}
+
+# both NULL = the empty object.
+query I
+SELECT to_json(jsono_diff(NULL, NULL));
+----
+{}
+
+# ── Array mode 'atomic' (default): the whole new cur array, order-sensitive ──
+
+# Equal arrays omit.
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a"}]}'), jsono('{"items":[{"sku":"a"}]}')));
+----
+{}
+
+# An appended element emits the whole new array.
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a"}]}'), jsono('{"items":[{"sku":"a"},{"sku":"b"}]}')));
+----
+{"items":[{"sku":"a"},{"sku":"b"}]}
+
+# A replaced element.
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a"}]}'), jsono('{"items":[{"sku":"b"}]}')));
+----
+{"items":[{"sku":"b"}]}
+
+# Cleared to an empty array.
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a"}]}'), jsono('{"items":[]}')));
+----
+{"items":[]}
+
+# Order-sensitive: a pure reorder emits the whole array.
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[1,2]}'), jsono('{"items":[2,1]}')));
+----
+{"items":[2,1]}
+
+# ── Array mode 'counts': {added: N, removed: M}, order-insensitive multiset cardinalities ──
+
+# Multiset-equal (incl. pure reorder) omits.
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[1,2]}'), jsono('{"items":[2,1]}'), arrays := 'counts'));
+----
+{}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a"}]}'), jsono('{"items":[{"sku":"a"},{"sku":"b"}]}'), arrays := 'counts'));
+----
+{"items":{"added":1,"removed":0}}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a"}]}'), jsono('{"items":[{"sku":"b"}]}'), arrays := 'counts'));
+----
+{"items":{"added":1,"removed":1}}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a"}]}'), jsono('{"items":[]}'), arrays := 'counts'));
+----
+{"items":{"added":0,"removed":1}}
+
+# Duplicates count by surplus multiplicity.
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[1,1,2]}'), jsono('{"items":[1,2,2]}'), arrays := 'counts'));
+----
+{"items":{"added":1,"removed":1}}
+
+# A whole-element identity change (a qty change is 1 removed + 1 added).
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a","qty":1}]}'), jsono('{"items":[{"sku":"a","qty":2}]}'), arrays := 'counts'));
+----
+{"items":{"added":1,"removed":1}}
+
+# A newly-added array key.
+query I
+SELECT to_json(jsono_diff(jsono('{}'), jsono('{"items":[1,2]}'), arrays := 'counts'));
+----
+{"items":{"added":2,"removed":0}}
+
+# A JSON null element is an ordinary value (counted, not delete-sentinel).
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[null,1]}'), jsono('{"items":[1]}'), arrays := 'counts'));
+----
+{"items":{"added":0,"removed":1}}
+
+# Number representation is part of identity: 1 (int) != 1.0 (decimal).
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"q":1}]}'), jsono('{"items":[{"q":1.0}]}'), arrays := 'counts'));
+----
+{"items":{"added":1,"removed":1}}
+
+# ── Array mode 'elements': {added: [...], removed: [...]}, multiplicity-expanded ──
+
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[1,2]}'), jsono('{"items":[2,1]}'), arrays := 'elements'));
+----
+{}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a"}]}'), jsono('{"items":[{"sku":"a"},{"sku":"b"}]}'), arrays := 'elements'));
+----
+{"items":{"added":[{"sku":"b"}],"removed":[]}}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[{"sku":"a"}]}'), jsono('{"items":[{"sku":"b"}]}'), arrays := 'elements'));
+----
+{"items":{"added":[{"sku":"b"}],"removed":[{"sku":"a"}]}}
+
+# 'elements' ordering is deterministic: added in cur order, removed in prev order.
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[1,1,2]}'), jsono('{"items":[1,2,2]}'), arrays := 'elements'));
+----
+{"items":{"added":[2],"removed":[1]}}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[null,1]}'), jsono('{"items":[1]}'), arrays := 'elements'));
+----
+{"items":{"added":[],"removed":[null]}}
+
+# ── Array-mode applies only when cur is an array (§5): a type change away from array renders by cur ──
+
+query I
+SELECT to_json(jsono_diff(jsono('{"items":[1,2]}'), jsono('{"items":9}'), arrays := 'counts'));
+----
+{"items":9}
+
+# ── Mode-independence of object/scalar handling: a non-array change is identical across modes ──
+
+query III
+SELECT
+  to_json(jsono_diff(jsono('{"a":1}'), jsono('{"a":2}'))),
+  to_json(jsono_diff(jsono('{"a":1}'), jsono('{"a":2}'), arrays := 'counts')),
+  to_json(jsono_diff(jsono('{"a":1}'), jsono('{"a":2}'), arrays := 'elements'));
+----
+{"a":2}	{"a":2}	{"a":2}
+
+# ── Laws (§8) ──
+
+# Empty on equal, every mode.
+query III
+SELECT
+  to_json(jsono_diff(jsono('{"a":1,"x":[1,2]}'), jsono('{"a":1,"x":[1,2]}'))),
+  to_json(jsono_diff(jsono('{"a":1,"x":[1,2]}'), jsono('{"a":1,"x":[1,2]}'), arrays := 'counts')),
+  to_json(jsono_diff(jsono('{"a":1,"x":[1,2]}'), jsono('{"a":1,"x":[1,2]}'), arrays := 'elements'));
+----
+{}	{}	{}
+
+# Atomic is the merge-patch inverse: applying the diff back onto prev reproduces cur.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"a":1,"b":{"x":1,"y":2},"keep":[1,2]}'),
+  jsono_diff(jsono('{"a":1,"b":{"x":1,"y":2},"keep":[1,2]}'), jsono('{"a":2,"b":{"x":1},"c":[9],"keep":[1,2]}'))
+)) = to_json(jsono('{"a":2,"b":{"x":1},"c":[9],"keep":[1,2]}'));
+----
+true
+
+# counts == element-list lengths, and the symmetry diff(a,b).added == diff(b,a).removed.
+query II
+SELECT
+  to_json(jsono_diff(jsono('{"i":[1,1,2,3]}'), jsono('{"i":[2,3,3,4]}'), arrays := 'counts')),
+  to_json(jsono_diff(jsono('{"i":[2,3,3,4]}'), jsono('{"i":[1,1,2,3]}'), arrays := 'elements'));
+----
+{"i":{"added":2,"removed":2}}	{"i":{"added":[1,1],"removed":[3,4]}}
+
+# ── Shredded inputs are accepted (reconstructed to the logical value at bind) ──
+
+query I
+SELECT to_json(jsono_diff(
+  jsono('{"status":"new","amount":10}', shredding := {'status':'VARCHAR','amount':'BIGINT'}),
+  jsono('{"status":"paid","amount":10}', shredding := {'status':'VARCHAR','amount':'BIGINT'})
+));
+----
+{"status":"paid"}
+
+# ── The consuming-asset shape (§11): lag() window + counts, with no-op rows dropped ──
+
+query II
+WITH snapshots(txn, seq, snap) AS (VALUES
+  (1, 1, jsono('{"status":"new","items":[{"sku":"a"}]}')),
+  (1, 2, jsono('{"status":"paid","items":[{"sku":"a"},{"sku":"b"}]}')),
+  (1, 3, jsono('{"status":"paid","items":[{"sku":"a"},{"sku":"b"}]}'))
+), diffed AS (
+  SELECT seq,
+         jsono_diff(lag(snap) OVER (PARTITION BY txn ORDER BY seq), snap, arrays := 'counts') AS changed
+  FROM snapshots
+)
+SELECT seq, to_json(changed)
+FROM diffed
+WHERE changed IS DISTINCT FROM jsono('{}')
+ORDER BY seq;
+----
+1	{"items":{"added":1,"removed":0},"status":"new"}
+2	{"items":{"added":1,"removed":0},"status":"paid"}
+
+# ── Bind-time errors: the arrays value is a closed set, fail loud (no silent fallback) ──
+
+statement error
+SELECT jsono_diff(jsono('{}'), jsono('{}'), arrays := 'bogus');
+----
+arrays must be 'atomic', 'counts' or 'elements'
+
+statement error
+SELECT jsono_diff(jsono('{}'), jsono('{}'), mode := 'counts');
+----
+unknown argument 'mode'
+
+statement error
+SELECT jsono_diff(42, jsono('{}'));
+----
+argument must be JSONO

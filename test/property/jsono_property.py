@@ -1,3 +1,4 @@
+from collections import Counter
 from decimal import Decimal
 from json import dumps as json_dumps
 from json import loads as json_loads
@@ -1328,6 +1329,94 @@ def test_transform_walk_parity(generated: tuple[dict[str, Any], int]) -> None:
     assert leg_b == "true", f"transform field != ->> extraction: {text!r}"
 
 
+def _object_reachable_null(value: Any) -> bool:
+    # A JSON null sitting at an object key reachable through object chains only. merge_patch deletes on
+    # such a null (it is the RFC 7396 delete sentinel), so the reverse-merge-patch round-trip cannot
+    # reach it — the documented domain carve-out (§8). A null inside an array is preserved, because
+    # merge_patch replaces an array wholesale, so arrays are not descended into here.
+    if isinstance(value, dict):
+        for child in value.values():
+            if child is None:
+                return True
+            if isinstance(child, dict) and _object_reachable_null(child):
+                return True
+    return False
+
+
+# The atomic mode is the exact inverse of jsono_merge_patch: applying the diff back onto prev must
+# reproduce cur. The law holds for an object cur with no object-reachable null leaf (the carve-out);
+# other shapes still exercise the diff walk (no crash) without the equality assertion.
+@settings(PROPERTY_SETTINGS)
+@example(prev_text='{"a":1,"b":{"x":1,"y":2}}', cur_text='{"a":2,"b":{"x":1},"c":[1,2]}')
+@example(prev_text='{"a":5}', cur_text='{"a":{}}')  # scalar -> empty object: patch must carry key:{}
+@example(prev_text='{}', cur_text='{"a":1,"b":[1,2,3],"c":{"d":true}}')  # everything new
+@example(prev_text='5', cur_text='{"a":1}')  # non-object prev replaced by an object
+@given(prev_text=json_documents, cur_text=json_documents)
+def test_diff_atomic_round_trip(prev_text: str, cur_text: str) -> None:
+    diff = f"jsono_diff(jsono({sql_literal(prev_text)}), jsono({sql_literal(cur_text)}))"
+    cur_value = json_loads(cur_text)
+    if not isinstance(cur_value, dict) or _object_reachable_null(cur_value):
+        SESSION.value(f"to_json({diff})")  # exercise the path; the round-trip is out of the law's domain
+        return
+    patched = SESSION.value(f"to_json(jsono_merge_patch(jsono({sql_literal(prev_text)}), {diff}))")
+    expected = SESSION.value(f"to_json(jsono({sql_literal(cur_text)}))")
+    assert (
+        patched == expected
+    ), f"atomic diff round-trip failed: prev {prev_text!r} cur {cur_text!r}: {patched!r} != {expected!r}"
+
+
+# The counts/elements array reports must obey their laws: counts == element-list lengths, the multiset
+# reconstruction multiset(prev) ⊎ added == multiset(cur) ⊎ removed, and the symmetry
+# diff(a,b).added == diff(b,a).removed (per array). Items are small scalars so collisions and dups occur.
+diff_array_scalars = st.lists(
+    st.one_of(st.integers(min_value=-3, max_value=3), st.sampled_from(["x", "y", "z"]), st.none(), st.booleans()),
+    max_size=6,
+)
+
+
+@settings(PROPERTY_SETTINGS)
+@example(prev_items=[1, 1, 2], cur_items=[1, 2, 2])
+@example(prev_items=[1, 2], cur_items=[2, 1])  # pure reorder -> omitted
+@example(prev_items=[None, 1], cur_items=[1])  # null is an ordinary array element
+@given(prev_items=diff_array_scalars, cur_items=diff_array_scalars)
+def test_diff_array_multiset_laws(prev_items: list[Any], cur_items: list[Any]) -> None:
+    prev = json_dumps({"items": prev_items})
+    cur = json_dumps({"items": cur_items})
+
+    def diff(left: str, right: str, mode: str) -> Any:
+        return json_loads(
+            SESSION.value(
+                f"to_json(jsono_diff(jsono({sql_literal(left)}), jsono({sql_literal(right)}), arrays:={sql_literal(mode)}))"
+            )
+        )
+
+    counts = diff(prev, cur, "counts")
+    elements = diff(prev, cur, "elements")
+    if "items" not in counts:
+        # multiset-equal (incl. pure reorder): both reports omit the key.
+        assert "items" not in elements, f"counts omitted items but elements did not: prev {prev!r} cur {cur!r}"
+        return
+    added = elements["items"]["added"]
+    removed = elements["items"]["removed"]
+    assert counts["items"]["added"] == len(added), f"counts.added != |elements.added|: prev {prev!r} cur {cur!r}"
+    assert counts["items"]["removed"] == len(
+        removed
+    ), f"counts.removed != |elements.removed|: prev {prev!r} cur {cur!r}"
+
+    prev_rendered = json_loads(SESSION.value(f"to_json(jsono({sql_literal(prev)}))"))["items"]
+    cur_rendered = json_loads(SESSION.value(f"to_json(jsono({sql_literal(cur)}))"))["items"]
+    key = lambda items: Counter(json_dumps(item) for item in items)
+    assert key(prev_rendered) + key(added) == key(cur_rendered) + key(
+        removed
+    ), f"multiset reconstruction failed: prev {prev!r} cur {cur!r}"
+
+    reverse = diff(cur, prev, "elements")
+    reverse_removed = reverse.get("items", {}).get("removed", [])
+    assert key(added) == key(
+        reverse_removed
+    ), f"symmetry diff(a,b).added != diff(b,a).removed: prev {prev!r} cur {cur!r}"
+
+
 PROPERTIES = [
     test_round_trip_idempotent,
     test_value_parity,
@@ -1344,6 +1433,8 @@ PROPERTIES = [
     test_narrowing_fails_loud,
     test_group_merge_keyed_parity,
     test_transform_walk_parity,
+    test_diff_atomic_round_trip,
+    test_diff_array_multiset_laws,
     test_fuzz_text_no_crash,
     test_fuzz_blob_no_crash,
     test_fuzz_validish_blob_no_crash,
