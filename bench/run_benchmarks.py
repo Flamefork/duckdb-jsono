@@ -859,6 +859,150 @@ def build_jsono_merge_patch_query(
     )
 
 
+def diff_sql_emulation_timed_sql(partition_col: str, order_col: str) -> str:
+    # The pre-jsono_diff SQL subtree the asset used to compute `changed`: flatten every snapshot to
+    # dotted leaves, lag each leaf per (transaction, path) to detect changes, string-build the changed
+    # sub-document, and except-all the items array for the {added, removed} churn. This is the
+    # superlinear flatten+sort jsono_diff collapses to one per-row call (plan §2). It is faithful to
+    # the ALGORITHM/cost, not a byte-exact reconstructor — the string-build is varchar concatenation.
+    return f"""
+        CREATE OR REPLACE TEMP TABLE _bench_out AS
+        WITH leaves AS (
+            SELECT {partition_col}, {order_col}, entry.key AS path, entry.value AS value
+            FROM _bench_in,
+                 unnest(jsono_entries(snap, key_style := 'dotted')) AS u(entry)
+            WHERE entry.key NOT LIKE 'items.%'
+        ),
+        changed_leaves AS (
+            SELECT {partition_col}, {order_col}, path, value,
+                   lag(value) OVER (PARTITION BY {partition_col}, path ORDER BY {order_col}) AS prev_value
+            FROM leaves
+        ),
+        changed_doc AS (
+            SELECT {partition_col}, {order_col},
+                   '{{' || string_agg(to_json(path) || ':' || value, ',' ORDER BY path) || '}}' AS changed_json
+            FROM changed_leaves
+            WHERE prev_value IS DISTINCT FROM value
+            GROUP BY {partition_col}, {order_col}
+        ),
+        items_cur AS (
+            SELECT {partition_col}, {order_col}, to_json(item) AS item
+            FROM _bench_in,
+                 unnest(from_json(to_json(jsono_extract(snap, '$.items')), '["json"]')) AS u(item)
+        ),
+        items_prev AS (
+            SELECT {partition_col}, {order_col} + 1 AS {order_col}, item FROM items_cur
+        ),
+        items_added AS (
+            SELECT {partition_col}, {order_col}, count(*) AS added FROM (
+                SELECT {partition_col}, {order_col}, item FROM items_cur
+                EXCEPT ALL
+                SELECT {partition_col}, {order_col}, item FROM items_prev
+            ) GROUP BY {partition_col}, {order_col}
+        ),
+        items_removed AS (
+            SELECT {partition_col}, {order_col}, count(*) AS removed FROM (
+                SELECT {partition_col}, {order_col}, item FROM items_prev
+                EXCEPT ALL
+                SELECT {partition_col}, {order_col}, item FROM items_cur
+            ) GROUP BY {partition_col}, {order_col}
+        )
+        SELECT _bench_in.{partition_col}, _bench_in.{order_col},
+               changed_doc.changed_json,
+               coalesce(items_added.added, 0) AS items_added,
+               coalesce(items_removed.removed, 0) AS items_removed
+        FROM _bench_in
+        LEFT JOIN changed_doc   USING ({partition_col}, {order_col})
+        LEFT JOIN items_added   USING ({partition_col}, {order_col})
+        LEFT JOIN items_removed USING ({partition_col}, {order_col})
+    """
+
+
+def build_jsono_diff_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    # jsono_diff over a per-transaction ordered snapshot stream (the rick/data transaction_webhook
+    # shape). The `mode` selects what is timed:
+    #   isolated_{atomic,counts,elements,merge_patch_proxy} — the lag pairing is materialized OUTSIDE
+    #       timing, so only the per-row C++ op is measured (the merge_patch-analogous shape;
+    #       merge_patch_proxy is the two-in/one-out floor jsono_diff is compared against).
+    #   windowed_{atomic,counts,elements} — jsono is materialized, the lag window runs INSIDE timing
+    #       (the §11 asset query, comparable to the SQL emulation below — same windowed shape).
+    #   sql_emulation — the flatten + per-leaf lag + reconstruct + except-all subtree jsono_diff
+    #       replaces (the superlinear baseline; the speedup denominator).
+    #   parse_counts — end-to-end: jsono(text) parse + lag + counts diff, all inside timing.
+    mode = scenario_config["mode"]
+    partition_col = scenario_config.get("partition_col", "transaction_id")
+    order_col = scenario_config.get("order_col", "seq")
+    window = f"OVER (PARTITION BY {partition_col} ORDER BY {order_col})"
+
+    if mode.startswith("isolated_"):
+        value_sql = jsono_value_sql(scenario_config)
+        prepare = f"""
+            CREATE OR REPLACE TEMP TABLE _bench_in AS
+            SELECT
+                lag({value_sql}) {window} AS prev,
+                {value_sql} AS cur
+            FROM {table_sql(data_path)}
+        """
+        if mode == "isolated_merge_patch_proxy":
+            op = "jsono_merge_patch(prev, cur)"
+        else:
+            arrays = mode.split("isolated_", 1)[1]
+            op = f"jsono_diff(prev, cur, arrays := '{arrays}')"
+        return BenchmarkQuery(
+            prepare_sql=(prepare,),
+            timed_sql=f"""
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT {op} AS r
+                FROM _bench_in
+            """,
+        )
+
+    if mode == "parse_counts":
+        # End-to-end: carry raw text, parse inside timing (the repo's explicit-parse-cost rule).
+        text_config = {**scenario_config, "json_column": "txt"}
+        cur_sql = jsono_value_sql(text_config)
+        return BenchmarkQuery(
+            prepare_sql=(
+                f"""
+                CREATE OR REPLACE TEMP TABLE _bench_in AS
+                SELECT {partition_col}, {order_col}, {scenario_config["json_column"]}::VARCHAR AS txt
+                FROM {table_sql(data_path)}
+                """,
+            ),
+            timed_sql=f"""
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT jsono_diff(lag({cur_sql}) {window}, {cur_sql}, arrays := 'counts') AS r
+                FROM _bench_in
+            """,
+        )
+
+    # Stream modes: materialize the jsono snapshot column (`snap` — `snapshot` is a DuckDB keyword);
+    # the window runs in the timed SQL.
+    prepare_stream = (
+        f"""
+        CREATE OR REPLACE TEMP TABLE _bench_in AS
+        SELECT {partition_col}, {order_col}, {jsono_value_sql(scenario_config)} AS snap
+        FROM {table_sql(data_path)}
+        """,
+    )
+    if mode.startswith("windowed_"):
+        arrays = mode.split("windowed_", 1)[1]
+        return BenchmarkQuery(
+            prepare_sql=prepare_stream,
+            timed_sql=f"""
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT jsono_diff(lag(snap) {window}, snap, arrays := '{arrays}') AS r
+                FROM _bench_in
+            """,
+        )
+    if mode == "sql_emulation":
+        return BenchmarkQuery(
+            prepare_sql=prepare_stream,
+            timed_sql=diff_sql_emulation_timed_sql(partition_col, order_col),
+        )
+    raise ValueError(f"unknown diff mode: {mode}")
+
+
 def build_jsono_reshred_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     # The INSERT-into-a-differently-shredded-column write path: the optimizer rewrites that
     # cast into exactly this jsono(value, shredding := target) call, so timing the call times
@@ -1004,6 +1148,8 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_prune_filter_query(scenario_config, data_path)
         case "merge_patch":
             return build_jsono_merge_patch_query(scenario_config, data_path)
+        case "diff":
+            return build_jsono_diff_query(scenario_config, data_path)
         case "reshred":
             return build_jsono_reshred_query(scenario_config, data_path)
         case "entries":

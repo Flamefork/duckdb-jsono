@@ -83,6 +83,20 @@ JSONO-only operations:
 - `group_merge_keyed_pair_jsono`: one `jsono_group_merge_min(wide_payload, key)`
   and one `jsono_group_merge_max(detail_payload, key)` in the same `GROUP BY`,
   matching a two-keyed-aggregate wide/detail shape.
+- `diff`: `jsono_diff(prev, cur[, arrays])` over the `diff_pairs` dataset — per-transaction ordered
+  cumulative snapshots (the rick/data transaction-webhook shape). The `mode` scenario field selects
+  what is timed; every variant uses `PARTITION BY transaction_id ORDER BY seq`. jsono-only (core
+  `json` has no diff op; the `sql_emulation` mode IS the comparator). Read relative within one run:
+  - `isolated_atomic` / `isolated_counts` / `isolated_elements` materialize the `lag()` `(prev, cur)`
+    pair *outside* timing, so only the per-row `jsono_diff(prev, cur, arrays := …)` is measured;
+    `isolated_merge_patch_proxy` times `jsono_merge_patch(prev, cur)` on the same pair as the
+    two-in/one-out C++ floor. The `isolated_atomic → isolated_counts/elements` gap is the array-multiset cost.
+  - `windowed_counts` runs the `lag()` window *inside* timing (the production asset query), and
+    `sql_emulation_counts` times the subtree it replaces — flatten
+    (`unnest(jsono_entries(…, key_style := 'dotted'))`) + per-leaf `lag()` + reconstruct + `EXCEPT ALL`
+    items churn — the superlinear flatten+sort baseline. Run both at `10k` and `100k`: `jsono_diff`
+    stays linear while the baseline does not, so the `windowed_counts ÷ sql_emulation` gap widens with scale.
+  - `parse_counts` re-parses `jsono(text)` inside timing for the end-to-end parse cost.
 
 The `keyed_pair` generator writes explicit Parquet row groups. For parallel
 triage, verify row groups with `parquet_metadata()`; the benchmark summary's
@@ -186,6 +200,9 @@ uv run --frozen python bench/run_benchmarks.py --list
 uv run --frozen python bench/generate_data.py --kind events --size 10k
 uv run --frozen python bench/generate_data.py --kind wide_flat
 uv run --frozen python bench/generate_data.py --kind keyed_pair
+# diff_pairs is not auto-generated (like keyed_pair); build it, then run the diff family directly:
+uv run --frozen python bench/generate_data.py --kind diff_pairs --size 100k
+uv run --frozen python bench/run_benchmarks.py --filter diff/ --runs 3 --threads 1,8
 uv run --frozen python bench/compare_results.py --save-baseline
 uv run --frozen python bench/compare_results.py
 uv run --frozen python bench/run_benchmarks.py --profile --filter current/transform/1k/flat_core

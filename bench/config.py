@@ -104,6 +104,22 @@ KEYED_PAIR_ROW_GROUP_SIZE = 32_768
 KEYED_PAIR_PAGE_GROUPS = 86_207
 KEYED_PAIR_USER_GROUPS = 263_000
 
+# Transaction-snapshot diff dataset: per-transaction ordered CUMULATIVE snapshots — the
+# rick/data transaction_webhook shape jsono_diff consumes. Each successive snapshot of a
+# transaction is the prior one with a few mutated scalar leaves plus a small churning `items`
+# array, so jsono_diff(lag(snapshot) OVER (PARTITION BY transaction_id ORDER BY seq), snapshot)
+# yields a realistic small delta. Long-tail snapshots-per-transaction (~16 avg, tail to ~112)
+# mirrors the keyed_pair group distribution. Kept outside `--kind all` (generate explicitly,
+# like keyed_pair): `uv run python bench/generate_data.py --kind diff_pairs --size 100k`.
+# Two sizes so the linear jsono_diff can be read against the superlinear SQL-emulation baseline
+# across a 10x data step (the plan's ×4.1-data → ×6.8-time flatten+sort blow-up).
+DIFF_PAIRS_SIZES = {
+    "10k": 10_000,
+    "100k": 100_000,
+}
+# Average snapshots per transaction; the long tail is in DIFF_PAIRS_SNAPSHOT_SEGMENTS below.
+DIFF_PAIRS_ROW_GROUP_SIZE = 32_768
+
 # Schema of the wide-flat dataset (generate_data.py reads these to emit rows, the
 # shredded merge scenarios read them to build a shred spec that matches the keys
 # exactly). group prefix -> [(key suffix, value kind)], flattened to

@@ -1,5 +1,6 @@
 from config import (
     DATA_DIR,
+    DIFF_PAIRS_SIZES,
     KEYED_PAIR_SIZES,
     KEYED_PAIR_WIDE_SHREDDING_SPEC,
     EXTRACT_CORE_SPEC,
@@ -605,4 +606,37 @@ SCENARIOS = [
         "copy_row_group_size": PRUNE_FILTER_ROW_GROUP_SIZE,
         "targets": ["jsono"],
     },
+]
+
+
+# jsono_diff over per-transaction ordered cumulative snapshots (diff_pairs dataset; generate with
+# `uv run python bench/generate_data.py --kind diff_pairs --size 100k`). jsono-only: core json has no
+# diff op, and the SQL-emulation mode below IS the comparator. Read RELATIVE within one run:
+#   - isolated_atomic ≈ isolated_merge_patch_proxy (the two-in/one-out C++ floor); isolated_counts /
+#     isolated_elements expose the array-multiset cost on top of it;
+#   - windowed_counts vs sql_emulation is the headline before→after (the superlinear flatten+sort the
+#     §11 asset replaced) — run at 10k and 100k to see jsono_diff stay linear while the baseline does not;
+#   - parse_counts adds the end-to-end jsono(text) parse cost.
+DIFF_PAIRS_MODES = [
+    ("isolated_atomic", "isolated_atomic"),
+    ("isolated_counts", "isolated_counts"),
+    ("isolated_elements", "isolated_elements"),
+    ("isolated_merge_patch_proxy", "isolated_merge_patch_proxy"),
+    ("windowed_counts", "windowed_counts"),
+    ("sql_emulation", "sql_emulation_counts"),
+    ("parse_counts", "parse_counts"),
+]
+SCENARIOS += [
+    {
+        "operation": "diff",
+        "scenario": scenario_label,
+        "size": size_name,
+        "row_count": num_rows,
+        "data_file": DATA_DIR / f"diff_pairs_{size_name}.parquet",
+        "json_column": "snapshot_json",
+        "mode": mode,
+        "targets": ["jsono"],
+    }
+    for size_name, num_rows in DIFF_PAIRS_SIZES.items()
+    for mode, scenario_label in DIFF_PAIRS_MODES
 ]

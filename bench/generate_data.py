@@ -24,6 +24,8 @@ import duckdb
 
 from config import (
     DATA_DIR,
+    DIFF_PAIRS_ROW_GROUP_SIZE,
+    DIFF_PAIRS_SIZES,
     KEYED_PAIR_PAGE_GROUPS,
     KEYED_PAIR_ROW_GROUP_SIZE,
     KEYED_PAIR_SIZES,
@@ -923,6 +925,190 @@ def generate_keyed_pair_data(size_name: str, num_rows: int, seed: int) -> None:
     print(f"  Saved to {output_path}")
 
 
+# ────────────────────────────────────────────────────────────────────────
+# Transaction-snapshot diff dataset — per-transaction ordered CUMULATIVE
+# snapshots (the rick/data transaction_webhook shape jsono_diff consumes).
+#
+# Each transaction emits a stream of snapshots; snapshot N+1 is snapshot N
+# with a FEW mutated scalar leaves plus a small `items` array that churns by
+# 0-1 element. The diff between consecutive snapshots is therefore small and
+# realistic (a handful of changed keys; occasional item add/remove), which is
+# exactly what jsono_diff(prev, cur) reports. The snapshots-per-transaction
+# count is long-tailed (centred ~16, tail to ~112), mirroring the keyed_pair
+# group distribution and the plan's "~16 webhooks/txn, long tail" measurement.
+# ────────────────────────────────────────────────────────────────────────
+
+# (transaction_count, snapshots_in_each) — a long-tail distribution over how
+# many cumulative snapshots a transaction produces. Weighted to ~16 mean with a
+# heavy single-snapshot tail (created-then-closed) and a thin large tail.
+DIFF_PAIRS_SNAPSHOT_SEGMENTS = [
+    (40, 2),
+    (30, 8),
+    (18, 16),
+    (8, 32),
+    (3, 64),
+    (1, 112),
+]
+
+DIFF_DEAL_STATUSES = [
+    "new",
+    "qualified",
+    "proposal",
+    "negotiation",
+    "won",
+    "lost",
+]
+DIFF_DEAL_STAGES = ["intake", "discovery", "demo", "quote", "contract", "closed"]
+DIFF_DEAL_PIPELINES = ["inbound", "outbound", "partner", "renewal"]
+DIFF_DEAL_OWNERS = [f"owner_{i}" for i in range(24)]
+DIFF_ITEM_SKUS = [f"sku_{i:03d}" for i in range(64)]
+
+
+def diff_pairs_initial_snapshot(rng: random.Random, txn_id: int) -> dict:
+    # A moderately wide deal: stable scalars (rarely change) + evolving scalars
+    # (mutate across steps) + a small line-item array.
+    item_count = rng.randint(2, 4)
+    return {
+        "transaction_id": f"txn_{txn_id}",
+        "created_at": 1_717_000_000 + txn_id * 37,
+        "currency": rng.choice(["USD", "EUR", "GBP"]),
+        "owner_id": rng.choice(DIFF_DEAL_OWNERS),
+        "pipeline": rng.choice(DIFF_DEAL_PIPELINES),
+        "source": rng.choice(UTM_SOURCES),
+        "utm_source": rng.choice(UTM_SOURCES),
+        "utm_medium": rng.choice(UTM_MEDIUMS),
+        "utm_campaign": rng.choice(UTM_CAMPAIGNS),
+        "contact_id": f"contact_{rng.randint(0, 99999)}",
+        "company_id": f"company_{rng.randint(0, 9999)}",
+        "region": rng.choice(["emea", "amer", "apac"]),
+        "status": "new",
+        "stage": "intake",
+        "amount": rng.randint(500, 50_000),
+        "probability": 10,
+        "score": rng.randint(0, 100),
+        "priority": rng.choice(["low", "medium", "high"]),
+        "last_event": "created",
+        "revision": 1,
+        "updated_at": 1_717_000_000 + txn_id * 37,
+        "items": [
+            {
+                "sku": rng.choice(DIFF_ITEM_SKUS),
+                "qty": rng.randint(1, 5),
+                "price": rng.randint(10, 500),
+            }
+            for _ in range(item_count)
+        ],
+    }
+
+
+def diff_pairs_advance(snapshot: dict, rng: random.Random) -> dict:
+    # Cumulative: copy the prior snapshot, then mutate a few leaves. `revision`
+    # and `updated_at` always move; a realistic subset of the rest changes per
+    # step, and the items array churns occasionally.
+    nxt = json.loads(json.dumps(snapshot))  # deep copy
+    nxt["revision"] = snapshot["revision"] + 1
+    nxt["updated_at"] = snapshot["updated_at"] + rng.randint(60, 86_400)
+    if rng.random() < 0.5:
+        idx = min(
+            DIFF_DEAL_STATUSES.index(snapshot["status"]) + 1,
+            len(DIFF_DEAL_STATUSES) - 1,
+        )
+        nxt["status"] = DIFF_DEAL_STATUSES[idx]
+        nxt["stage"] = DIFF_DEAL_STAGES[min(idx, len(DIFF_DEAL_STAGES) - 1)]
+        nxt["probability"] = min(snapshot["probability"] + rng.randint(10, 30), 100)
+        nxt["last_event"] = "stage_changed"
+    if rng.random() < 0.6:
+        nxt["amount"] = max(0, snapshot["amount"] + rng.randint(-2_000, 5_000))
+        nxt["last_event"] = "amount_changed"
+    if rng.random() < 0.3:
+        nxt["score"] = rng.randint(0, 100)
+    if rng.random() < 0.25:
+        nxt["owner_id"] = rng.choice(DIFF_DEAL_OWNERS)
+    # Items churn: append a new line, or bump one item's qty, or drop the last.
+    roll = rng.random()
+    if roll < 0.2:
+        nxt["items"].append(
+            {
+                "sku": rng.choice(DIFF_ITEM_SKUS),
+                "qty": rng.randint(1, 5),
+                "price": rng.randint(10, 500),
+            }
+        )
+        nxt["last_event"] = "item_added"
+    elif roll < 0.35 and nxt["items"]:
+        nxt["items"][rng.randrange(len(nxt["items"]))]["qty"] += 1
+    elif roll < 0.42 and len(nxt["items"]) > 1:
+        nxt["items"].pop()
+        nxt["last_event"] = "item_removed"
+    return nxt
+
+
+def generate_diff_pairs_rows(num_rows: int, seed: int) -> list[tuple[int, int, str]]:
+    # Walk the snapshot-count segments round-robin (deterministic), emitting one
+    # transaction at a time until num_rows snapshots are produced.
+    rows: list[tuple[int, int, str]] = []
+    txn_id = 0
+    seg_index = 0
+    while len(rows) < num_rows:
+        remaining_in_segment = DIFF_PAIRS_SNAPSHOT_SEGMENTS[
+            seg_index % len(DIFF_PAIRS_SNAPSHOT_SEGMENTS)
+        ]
+        seg_index += 1
+        for _ in range(remaining_in_segment[0]):
+            if len(rows) >= num_rows:
+                break
+            snapshot_count = remaining_in_segment[1]
+            rng = random.Random((seed << 20) ^ txn_id)
+            snapshot = diff_pairs_initial_snapshot(rng, txn_id)
+            for seq in range(1, snapshot_count + 1):
+                if len(rows) >= num_rows:
+                    break
+                if seq > 1:
+                    snapshot = diff_pairs_advance(snapshot, rng)
+                rows.append((txn_id, seq, json.dumps(snapshot, separators=(",", ":"))))
+            txn_id += 1
+    return rows
+
+
+def generate_diff_pairs_data(size_name: str, num_rows: int, seed: int) -> None:
+    print(f"Generating diff_pairs {size_name} ({num_rows:,} rows) with seed={seed}...")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = DATA_DIR / f"diff_pairs_{size_name}.parquet"
+
+    rows = generate_diff_pairs_rows(num_rows, seed)
+    transactions = rows[-1][0] + 1 if rows else 0
+
+    conn = duckdb.connect()
+    conn.execute("""
+        CREATE OR REPLACE TABLE data (
+            transaction_id BIGINT,
+            seq UBIGINT,
+            snapshot_json JSON
+        )
+        """)
+    conn.executemany("INSERT INTO data VALUES (?, ?, ?)", rows)
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    conn.execute(f"""
+        COPY (SELECT * FROM data ORDER BY transaction_id, seq) TO '{output_path}' (
+            FORMAT PARQUET,
+            ROW_GROUP_SIZE {DIFF_PAIRS_ROW_GROUP_SIZE},
+            KV_METADATA {{
+                seed: '{seed}',
+                size: '{size_name}',
+                rows: '{num_rows}',
+                transactions: '{transactions}',
+                generated_at: '{generated_at}',
+                schema_version: 'diff_pairs_v1'
+            }}
+        )
+        """)
+    conn.close()
+
+    print(f"  Saved to {output_path} ({transactions:,} transactions)")
+
+
 def clean_path(path: str) -> str:
     return path.split("?", 1)[0]
 
@@ -1075,7 +1261,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--kind",
-        choices=["all", "events", "urls", "numbers", "wide_flat", "keyed_pair"],
+        choices=[
+            "all",
+            "events",
+            "urls",
+            "numbers",
+            "wide_flat",
+            "keyed_pair",
+            "diff_pairs",
+        ],
         default="all",
         help="Dataset kind to generate (default: all)",
     )
@@ -1095,6 +1289,8 @@ def main() -> None:
             generate_wide_flat_data(args.size, WIDE_FLAT_SIZES[args.size], args.seed)
         if args.kind == "keyed_pair" and args.size in KEYED_PAIR_SIZES:
             generate_keyed_pair_data(args.size, KEYED_PAIR_SIZES[args.size], args.seed)
+        if args.kind == "diff_pairs" and args.size in DIFF_PAIRS_SIZES:
+            generate_diff_pairs_data(args.size, DIFF_PAIRS_SIZES[args.size], args.seed)
     else:
         if args.kind in ("all", "events"):
             for size_name, num_rows in SIZES.items():
@@ -1111,6 +1307,9 @@ def main() -> None:
         if args.kind == "keyed_pair":
             for size_name, num_rows in KEYED_PAIR_SIZES.items():
                 generate_keyed_pair_data(size_name, num_rows, args.seed)
+        if args.kind == "diff_pairs":
+            for size_name, num_rows in DIFF_PAIRS_SIZES.items():
+                generate_diff_pairs_data(size_name, num_rows, args.seed)
 
 
 if __name__ == "__main__":
