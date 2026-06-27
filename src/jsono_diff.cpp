@@ -86,6 +86,7 @@ struct DiffScratch {
 	std::vector<std::string> arr_prev_keys;
 	std::vector<idx_t> added_idx;
 	std::vector<idx_t> removed_idx;
+	std::vector<char> prev_matched; // per prev element: matched by some cur element (structural path)
 	std::unordered_map<std::string, int> count_prev;
 	std::unordered_map<std::string, int> count_cur;
 	std::unordered_map<std::string, int> seen;
@@ -236,6 +237,116 @@ bool ScalarEqual(const JsonoView &pv, const JsonoCursor &pc, const JsonoView &cv
 	return false;
 }
 
+// Structural equality of two canonical JSONO values at `pc`/`cc`, advancing both cursors past the
+// value on the equal path (a difference returns early and leaves the cursors mid-value — the caller
+// then bails, so the drift is moot). Both inputs are canonical (sorted keys), so logical equality is
+// structural equality: equal slot tags, equal scalar payloads (the same slot-word identity as
+// ScalarEqual — 1 INT60, 1.0 DEC60 and 1e0 NUMBER-text stay distinct), equal key sequences, and
+// recursively equal children. This is the allocation-free equivalent of comparing two canonical
+// ElementKeys: re-emitting a value into a fresh builder and concatenating its streams produces
+// byte-identical output for two values iff they are structurally equal, so the direct walk decides
+// the same equivalence without the per-element re-emit + heap concat.
+bool ValueEqualAdvance(const JsonoView &pv, JsonoCursor &pc, const JsonoView &cv, JsonoCursor &cc, size_t depth) {
+	if (depth > JSONO_MAX_NESTING_DEPTH) {
+		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
+		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+	}
+	auto prev_slot = pv.SlotAt(pc.pos);
+	auto cur_slot = cv.SlotAt(cc.pos);
+	auto cur_tag = SlotTag(cur_slot);
+	if (cur_tag == tag::OBJ_START) {
+		if (SlotTag(prev_slot) != tag::OBJ_START) {
+			return false;
+		}
+		auto prev_layout = ReadObjectLayout(pv, pc.pos);
+		auto cur_layout = ReadObjectLayout(cv, cc.pos);
+		if (prev_layout.key_count != cur_layout.key_count) {
+			return false;
+		}
+		for (size_t i = 0; i < cur_layout.key_count; i++) {
+			auto prev_key_slot = pv.SlotAt(prev_layout.key_start + i);
+			auto cur_key_slot = cv.SlotAt(cur_layout.key_start + i);
+			if (SlotTag(prev_key_slot) != tag::KEY || SlotTag(cur_key_slot) != tag::KEY) {
+				throw InvalidInputException("malformed JSONO: object key slot expected");
+			}
+			if (pv.KeyAt(SlotPayload(prev_key_slot)) != cv.KeyAt(SlotPayload(cur_key_slot))) {
+				return false;
+			}
+		}
+		pc.pos = prev_layout.value_start;
+		cc.pos = cur_layout.value_start;
+		for (size_t i = 0; i < cur_layout.key_count; i++) {
+			if (!ValueEqualAdvance(pv, pc, cv, cc, depth + 1)) {
+				return false;
+			}
+		}
+		pc.pos++; // OBJ_END
+		cc.pos++;
+		return true;
+	}
+	if (cur_tag == tag::ARR_START) {
+		if (SlotTag(prev_slot) != tag::ARR_START) {
+			return false;
+		}
+		auto prev_end = ReadArrayEndPos(pv, pc.pos);
+		auto cur_end = ReadArrayEndPos(cv, cc.pos);
+		pc.pos++;
+		cc.pos++;
+		while (pc.pos < prev_end && cc.pos < cur_end) {
+			if (!ValueEqualAdvance(pv, pc, cv, cc, depth + 1)) {
+				return false;
+			}
+		}
+		if (pc.pos != prev_end || cc.pos != cur_end) {
+			return false; // element-count mismatch
+		}
+		pc.pos = prev_end + 1; // ARR_END
+		cc.pos = cur_end + 1;
+		return true;
+	}
+	// A cur scalar: a prev container can never equal it; otherwise compare slot words then payload.
+	if (SlotTag(prev_slot) == tag::OBJ_START || SlotTag(prev_slot) == tag::ARR_START) {
+		return false;
+	}
+	if (prev_slot != cur_slot) {
+		return false;
+	}
+	switch (ClassifyRawScalarSlot(cur_slot)) {
+	case RawScalarValueKind::Literal:
+		pc.pos++;
+		cc.pos++;
+		return true;
+	case RawScalarValueKind::Number: {
+		bool eq = pv.NumAt(pc.num_cursor) == cv.NumAt(cc.num_cursor);
+		pc.num_cursor++;
+		cc.num_cursor++;
+		pc.pos++;
+		cc.pos++;
+		return eq;
+	}
+	case RawScalarValueKind::LengthHeap: {
+		auto prev_len = pv.LengthAt(pc.length_cursor);
+		auto cur_len = cv.LengthAt(cc.length_cursor);
+		bool eq =
+		    prev_len == cur_len && pv.StringAt(pc.string_cursor, prev_len) == cv.StringAt(cc.string_cursor, cur_len);
+		pc.string_cursor += prev_len;
+		pc.length_cursor++;
+		cc.string_cursor += cur_len;
+		cc.length_cursor++;
+		pc.pos++;
+		cc.pos++;
+		return eq;
+	}
+	}
+	return false;
+}
+
+bool ValueEqual(const JsonoView &pv, const JsonoCursor &pc, const JsonoView &cv, const JsonoCursor &cc, size_t depth) {
+	JsonoCursor a = pc;
+	JsonoCursor b = cc;
+	return ValueEqualAdvance(pv, a, cv, b, depth);
+}
+
 // A canonical comparison key for one array element: its value re-emitted verbatim into a fresh
 // builder, whose five value streams (slots, key_heap, string_heap, lengths, nums) are then
 // length-prefix concatenated. A fresh builder normalizes container ids and heap offsets from zero,
@@ -262,10 +373,11 @@ void ElementKey(const JsonoView &view, JsonoCursor cursor, JsonoBuilder &key_bui
 	AppendStreamKey(key_builder, out);
 }
 
-// Materialize both arrays' element cursors and (when needed) their canonical keys into scratch.
-// `prev` contributes its elements only if it is itself an array; otherwise the baseline is empty.
+// Materialize both arrays' element cursors into scratch (keys are built lazily by the multiset, only
+// when it falls back to the hash path). `prev` contributes its elements only if it is itself an
+// array; otherwise the baseline is empty.
 bool BuildArraySides(DiffScratch &s, bool prev_present, const JsonoView &pv, const JsonoCursor &pc, const JsonoView &cv,
-                     const JsonoCursor &cc, bool need_keys, size_t depth) {
+                     const JsonoCursor &cc) {
 	CollectArrayElements(cv, cc, s.arr_cur_cursors);
 	bool prev_is_array = prev_present && SlotTag(pv.SlotAt(pc.pos)) == tag::ARR_START;
 	if (prev_is_array) {
@@ -273,24 +385,28 @@ bool BuildArraySides(DiffScratch &s, bool prev_present, const JsonoView &pv, con
 	} else {
 		s.arr_prev_cursors.clear();
 	}
-	if (need_keys) {
-		s.arr_cur_keys.resize(s.arr_cur_cursors.size());
-		for (size_t i = 0; i < s.arr_cur_cursors.size(); i++) {
-			ElementKey(cv, s.arr_cur_cursors[i], s.key_builder, s.arr_cur_keys[i], depth + 1);
-		}
-		s.arr_prev_keys.resize(s.arr_prev_cursors.size());
-		for (size_t i = 0; i < s.arr_prev_cursors.size(); i++) {
-			ElementKey(pv, s.arr_prev_cursors[i], s.key_builder, s.arr_prev_keys[i], depth + 1);
-		}
-	}
 	return prev_is_array;
 }
 
-// By-value multiset difference over the canonical element keys. `added_idx` holds the cur element
-// indices whose cur multiplicity exceeds their prev multiplicity (in cur iteration order);
-// `removed_idx` the symmetric prev indices (in prev iteration order). The first min(prev,cur)
-// occurrences of a value match; the surplus is the diff. Deterministic and order-insensitive.
-void ComputeMultiset(DiffScratch &s) {
+// Array element counts above which the multiset diff switches from the direct O(n²) structural match
+// to the O(n) canonical-key hash. Realistic arrays are short (single digits), where the structural
+// match allocates nothing and beats building one std::string + hash per element; the hash path keeps
+// a pathological wide array linear.
+constexpr size_t MULTISET_STRUCTURAL_MAX = 16;
+
+// Hash-based by-value multiset difference over canonical element keys — the O(n) fallback for wide
+// arrays. `added_idx` holds the cur element indices whose cur multiplicity exceeds their prev
+// multiplicity (in cur iteration order); `removed_idx` the symmetric prev indices (in prev order).
+// The first min(prev,cur) occurrences of a value match; the surplus is the diff.
+void ComputeMultisetHashed(DiffScratch &s, const JsonoView &pv, const JsonoView &cv, size_t depth) {
+	s.arr_cur_keys.resize(s.arr_cur_cursors.size());
+	for (size_t i = 0; i < s.arr_cur_cursors.size(); i++) {
+		ElementKey(cv, s.arr_cur_cursors[i], s.key_builder, s.arr_cur_keys[i], depth + 1);
+	}
+	s.arr_prev_keys.resize(s.arr_prev_cursors.size());
+	for (size_t i = 0; i < s.arr_prev_cursors.size(); i++) {
+		ElementKey(pv, s.arr_prev_cursors[i], s.key_builder, s.arr_prev_keys[i], depth + 1);
+	}
 	s.count_prev.clear();
 	for (auto &k : s.arr_prev_keys) {
 		s.count_prev[k]++;
@@ -319,6 +435,42 @@ void ComputeMultiset(DiffScratch &s) {
 	}
 }
 
+// By-value multiset difference between the two arrays' collected element cursors. For short arrays
+// this greedily matches each cur element to the first still-unmatched structurally-equal prev element
+// (`ValueEqual`), so cur elements with no match are `added_idx` (cur order) and prev elements never
+// matched are `removed_idx` (prev order). Greedy first-match yields the same index sets as the
+// canonical-multiplicity rule — the first min(prev,cur) occurrences of a value pair up — without any
+// per-element re-emit, std::string, or hashing. Wide arrays defer to the hash path.
+void ComputeMultiset(DiffScratch &s, const JsonoView &pv, const JsonoView &cv, size_t depth) {
+	size_t n_cur = s.arr_cur_cursors.size();
+	size_t n_prev = s.arr_prev_cursors.size();
+	if (std::max(n_cur, n_prev) > MULTISET_STRUCTURAL_MAX) {
+		ComputeMultisetHashed(s, pv, cv, depth);
+		return;
+	}
+	s.prev_matched.assign(n_prev, 0);
+	s.added_idx.clear();
+	for (size_t i = 0; i < n_cur; i++) {
+		bool matched = false;
+		for (size_t j = 0; j < n_prev; j++) {
+			if (!s.prev_matched[j] && ValueEqual(pv, s.arr_prev_cursors[j], cv, s.arr_cur_cursors[i], depth + 1)) {
+				s.prev_matched[j] = 1;
+				matched = true;
+				break;
+			}
+		}
+		if (!matched) {
+			s.added_idx.push_back(i);
+		}
+	}
+	s.removed_idx.clear();
+	for (size_t j = 0; j < n_prev; j++) {
+		if (!s.prev_matched[j]) {
+			s.removed_idx.push_back(j);
+		}
+	}
+}
+
 bool DiffChanged(bool prev_present, const JsonoView &pv, const JsonoCursor &pc, const JsonoView &cv,
                  const JsonoCursor &cc, DiffArrayMode mode, size_t depth, DiffScratch &s);
 
@@ -327,19 +479,16 @@ bool DiffChanged(bool prev_present, const JsonoView &pv, const JsonoCursor &pc, 
 // (including a pure reorder). The empty baseline (prev not an array) means every cur element is new.
 bool ArrayDiffers(bool prev_present, const JsonoView &pv, const JsonoCursor &pc, const JsonoView &cv,
                   const JsonoCursor &cc, DiffArrayMode mode, size_t depth, DiffScratch &s) {
-	bool prev_is_array = BuildArraySides(s, prev_present, pv, pc, cv, cc, true, depth);
 	if (mode == DiffArrayMode::Atomic) {
-		if (!prev_is_array || s.arr_cur_keys.size() != s.arr_prev_keys.size()) {
+		// Order-sensitive whole-array equality: differs iff prev is not the same array structurally.
+		// A structural walk (no canonical keys) is the atomic equivalence and allocates nothing.
+		if (!prev_present || SlotTag(pv.SlotAt(pc.pos)) != tag::ARR_START) {
 			return true;
 		}
-		for (size_t i = 0; i < s.arr_cur_keys.size(); i++) {
-			if (s.arr_cur_keys[i] != s.arr_prev_keys[i]) {
-				return true;
-			}
-		}
-		return false;
+		return !ValueEqual(pv, pc, cv, cc, depth);
 	}
-	ComputeMultiset(s);
+	BuildArraySides(s, prev_present, pv, pc, cv, cc);
+	ComputeMultiset(s, pv, cv, depth);
 	return !s.added_idx.empty() || !s.removed_idx.empty();
 }
 
@@ -420,8 +569,8 @@ void EmitDiffArray(bool prev_present, const JsonoView &pv, const JsonoCursor &pc
 		EmitValueVerbatim(cv, c, builder, depth);
 		return;
 	}
-	BuildArraySides(s, prev_present, pv, pc, cv, cc, true, depth);
-	ComputeMultiset(s);
+	BuildArraySides(s, prev_present, pv, pc, cv, cc);
+	ComputeMultiset(s, pv, cv, depth);
 	builder.EmitObjectStart(2);
 	builder.EmitKeySlot(nonstd::string_view("added", 5));
 	builder.EmitKeySlot(nonstd::string_view("removed", 7));
@@ -620,7 +769,13 @@ void JsonoDiffExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 		JsonoCursor prev_cursor;
 		JsonoCursor cur_cursor;
 		builder.Reset();
-		if (DiffChanged(prev_present, prev_view, prev_cursor, cur, cur_cursor, mode, 0, scratch)) {
+		// For an object cur (the dominant case) EmitDiffObject builds the change plan and already emits
+		// jsono('{}') when the plan is empty, so the separate top-level DiffChanged predicate would be a
+		// redundant full walk — emit directly. Only a non-object top-level (scalar/array) needs the
+		// predicate to choose between emitting the changed value and the no-change empty object.
+		if (SlotTag(cur.SlotAt(cur_cursor.pos)) == tag::OBJ_START) {
+			EmitDiffValue(prev_present, prev_view, prev_cursor, cur, cur_cursor, builder, mode, 0, scratch);
+		} else if (DiffChanged(prev_present, prev_view, prev_cursor, cur, cur_cursor, mode, 0, scratch)) {
 			EmitDiffValue(prev_present, prev_view, prev_cursor, cur, cur_cursor, builder, mode, 0, scratch);
 		} else {
 			builder.EmitObjectStart(0);
