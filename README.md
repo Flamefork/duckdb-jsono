@@ -27,7 +27,7 @@ Extract and project:
 - [`jsono_extract(value, path)` / `value -> path`](#jsono_extract) — extract one value as JSONO.
 - [`jsono_extract_string(value, path)` / `value ->> path`](#jsono_extract_string) — extract one value as `VARCHAR`.
 - [`jsono_transform(value, spec[, on_type_mismatch])`](#jsono_transform) — project many fields into a typed `STRUCT` in one pass (`spec` is a `STRUCT` literal; type mismatches default to `convert`).
-- [`jsono_entries(value[, key_style])`](#jsono_entries) — flatten scalar leaves into `STRUCT(key VARCHAR, value VARCHAR)[]`.
+- [`jsono_entries(value[, key_style, array_style])`](#jsono_entries) — flatten scalar leaves into `STRUCT(key VARCHAR, value VARCHAR)[]`.
 
 Merge and aggregate:
 
@@ -345,7 +345,17 @@ SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"}}'), key_style := 'dotted
 -- {'key': b.c, 'value': x}
 ```
 
-JSON null leaves keep their key and return SQL `NULL` as `value`; empty objects and arrays do not produce entries. Dotted output can collide when a literal dotted key and a nested path render to the same string, for example `"a.b"` and `{"a":{"b":...}}`.
+The named argument `array_style` selects where the walk stops at an array. The default `'indexed_elements'` recurses into arrays, giving each element an indexed key (`arr[0]`, `arr.0`, …). Pass `array_style := 'whole_json'` to stop at the array boundary and emit each array as a single leaf whose value is the whole array as JSON text:
+
+```sql
+SELECT unnest(jsono_entries(jsono('{"items":[{"sku":"a"},{"sku":"b"}],"name":"x"}'), array_style := 'whole_json'));
+-- {'key': $.items, 'value': [{"sku":"a"},{"sku":"b"}]}
+-- {'key': $.name,  'value': x}
+```
+
+`array_style` is orthogonal to `key_style` and both are order-independent. In `'whole_json'` an array leaf's `value` is a JSON literal (parse it as JSON), while a scalar leaf stays bare text; an empty array surfaces as a present `[]` value; and a document whose top level is itself an array is rejected at runtime (the mode is defined for object documents whose array-valued fields render whole).
+
+JSON null leaves keep their key and return SQL `NULL` as `value`; empty objects (and, under `indexed_elements`, empty arrays) do not produce entries. Dotted output can collide when a literal dotted key and a nested path render to the same string, for example `"a.b"` and `{"a":{"b":...}}`.
 
 The order of the returned entries is unspecified — do not rely on it. Over a shredded value the shred leaves are emitted after the residual leaves (the shreds are read straight from their columns), so the same logical document can flatten in a different order than its plain form, which lists leaves in sorted-key order. Sort the result yourself if you need a stable order.
 

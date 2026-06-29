@@ -128,3 +128,69 @@ SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM p)) +
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT ALL SELECT * FROM s));
 ----
 0
+
+# =====================================================================================
+# array_style := 'whole_json' over shredded arrays (plan 031 §8): the shredded array renders
+# as the SAME single whole-array JSON leaf as the equivalent residual array. Reconstruction
+# goes through the validated read path (the plan-029 array-shred landmine), never a naive walker.
+# =====================================================================================
+
+# A scalar-array shred (goalsID — the events4 segfault shape) renders as one whole-JSON leaf.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"goalsID":[1,2]}', shredding := {'$.goalsID':'BIGINT[]'}),
+                              array_style := 'whole_json')) AS e
+) ORDER BY ALL;
+----
+$.goalsID	[1,2]
+
+# An object-array shred (LIST<STRUCT>) renders as one whole-JSON leaf, all element fields in order.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"items":[{"sku":"a"}]}', shredding := {'$.items':'STRUCT(sku VARCHAR)[]'}),
+                              array_style := 'whole_json')) AS e
+) ORDER BY ALL;
+----
+$.items	[{"sku":"a"}]
+
+# Mixed shred set, dotted: a scalar shred (kind) plus an object-array shred (products), each a
+# whole-JSON leaf for the array; the residual scalar (note) stays bare text.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"kind":"order","products":[{"id":1,"name":"a"},{"id":2,"name":"b"}],"note":"x"}',
+                                    shredding := {'$.kind':'VARCHAR','$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                              key_style := 'dotted', array_style := 'whole_json')) AS e
+) ORDER BY ALL;
+----
+kind	order
+note	x
+products	[{"id":1,"name":"a"},{"id":2,"name":"b"}]
+
+# §8 parity law: whole_json over a shredded array == whole_json over the same plain doc, as a
+# multiset, across a complex shape with residual tail (sku), non-object/null/type-mismatch elements.
+query I
+SELECT (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":"x"}]}',
+                                            shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                                      array_style := 'whole_json'))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":"x"}]}'),
+                                      array_style := 'whole_json')))) +
+       (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":"x"}]}'),
+                                      array_style := 'whole_json'))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":"x"}]}',
+                                            shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                                      array_style := 'whole_json'))));
+----
+0
+
+# Multi-row whole_json parity over a table (empty array, missing path, NULL row): shredded == plain.
+query I
+WITH s AS (SELECT id, unnest(jsono_entries(jsono(doc, shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}), array_style := 'whole_json')) AS e FROM arr_entries),
+     p AS (SELECT id, unnest(jsono_entries(jsono(doc), array_style := 'whole_json')) AS e FROM arr_entries)
+SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM p)) +
+       (SELECT count(*) FROM (SELECT * FROM p EXCEPT ALL SELECT * FROM s));
+----
+0

@@ -151,6 +151,163 @@ SELECT jsono_entries(jsono('{}'), 'dotted');
 ----
 unknown argument
 
+# =====================================================================================
+# array_style := 'whole_json' (plan 031): an array renders as ONE leaf whose value is the
+# whole array as JSON text; the walk stops at the array boundary. Orthogonal to key_style.
+# =====================================================================================
+
+# --- mode contrast: same doc, both modes (indexed_elements default unchanged above) ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"arr":[10,20]}'), key_style := 'dotted', array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+arr	[10,20]
+
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"arr":[10,20]}'), array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+$.arr	[10,20]
+
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"items":[{"sku":"a"},{"sku":"b"}]}'), key_style := 'dotted', array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+items	[{"sku":"a"},{"sku":"b"}]
+
+# nested array of mixed scalar/object/array stays one whole-JSON leaf (no descent)
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":[1,{"b":2},[3,4]]}'), key_style := 'dotted', array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+a	[1,{"b":2},[3,4]]
+
+# --- whole_json structure & edges ---
+
+# array nested under objects: key_style governs the object path down to the array
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":{"items":[1,2]}}'), key_style := 'dotted', array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+a.items	[1,2]
+
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":{"items":[1,2]}}'), array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+$.a.items	[1,2]
+
+# scalar leaf stays bare text; array leaf is a JSON literal — the §7 asymmetry, side by side
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"items":[1],"name":"x"}'), key_style := 'dotted', array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+items	[1]
+name	x
+
+# empty array is a present `[]` value (deliberate divergence from indexed_elements)
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":[]}'), key_style := 'dotted', array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+a	[]
+
+# JSON null inside an array is part of the array text, not a separate null leaf
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":[null,1]}'), key_style := 'dotted', array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+a	[null,1]
+
+# no arrays: identical output to the default mode (nothing to stop at)
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":1,"b":true}'), key_style := 'dotted', array_style := 'whole_json')) u)
+ORDER BY u.key;
+----
+a	1
+b	true
+
+# --- root-level array: fail loud at runtime, regardless of key_style ---
+statement error
+SELECT jsono_entries(jsono('[1,2]'), array_style := 'whole_json');
+----
+whole_json requires an object document
+
+statement error
+SELECT jsono_entries(jsono('[1,2]'), key_style := 'dotted', array_style := 'whole_json');
+----
+whole_json requires an object document
+
+# indexed_elements is unaffected: a root array still flattens
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('[1,2]'), key_style := 'dotted', array_style := 'indexed_elements')) u)
+ORDER BY u.key;
+----
+0	1
+1	2
+
+# --- named args are order-independent ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"arr":[1]}'), array_style := 'whole_json', key_style := 'dotted')) u)
+ORDER BY u.key;
+----
+arr	[1]
+
+# --- default identity: jsono_entries(x) == jsono_entries(x, array_style := 'indexed_elements') ---
+query I
+SELECT jsono_entries(jsono('{"arr":[10,20],"x":{"y":[1]},"s":"hi"}'))
+     = jsono_entries(jsono('{"arr":[10,20],"x":{"y":[1]},"s":"hi"}'), array_style := 'indexed_elements');
+----
+true
+
+# --- whole-array round-trip: the JSON leaf reconstructs the original array value ---
+require json
+
+query I
+SELECT jsono(value) = jsono('[{"sku":"a"},{"sku":"b"}]')
+FROM (SELECT u.value FROM (SELECT unnest(jsono_entries(jsono('{"items":[{"sku":"a"},{"sku":"b"}]}'), array_style := 'whole_json')) u) WHERE u.key = '$.items');
+----
+true
+
+# --- key-set equality at depth: whole_json keys == indexed_elements keys truncated at first index ---
+# {"a":{"b":[1,2]},"c":3} → whole keys {$.a.b, $.c}; indexed keys {$.a.b[0],$.a.b[1],$.c} → truncate → same set
+query I
+WITH w AS (SELECT u.key FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":[1,2]},"c":3}'), array_style := 'whole_json')) u)),
+     i AS (SELECT DISTINCT regexp_replace(u.key, '\[\d+\].*$', '') AS key FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":[1,2]},"c":3}'))) u))
+SELECT (SELECT count(*) FROM (SELECT * FROM w EXCEPT SELECT * FROM i)) +
+       (SELECT count(*) FROM (SELECT * FROM i EXCEPT SELECT * FROM w));
+----
+0
+
+# --- whole_json bind errors ---
+statement error
+SELECT jsono_entries(jsono('{}'), array_style := 'flat');
+----
+array_style must be 'indexed_elements' or 'whole_json'
+
+statement error
+SELECT jsono_entries(jsono('{}'), array_style := NULL);
+----
+array_style must not be NULL
+
+# array_style is named-only: a bare positional triple is rejected
+statement error
+SELECT jsono_entries(jsono('{}'), 'dotted', 'whole_json');
+----
+unknown argument
+
 # --- shred-aware: a shredded value flattens its residual tape AND its shred columns ---
 query I
 SELECT jsono_entries(

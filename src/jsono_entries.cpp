@@ -35,6 +35,11 @@ using namespace jsono;
 
 enum class JsonoEntriesKeyStyle : uint8_t { JsonPath, Dotted };
 
+// Where the leaf-flattening walk stops at an array. IndexedElements (default) recurses into the
+// array, indexing each element; WholeJson stops at the array boundary and emits the whole array as
+// one JSON-text leaf (§3-§7 of plan 031). Orthogonal to key_style.
+enum class JsonoEntriesArrayStyle : uint8_t { IndexedElements, WholeJson };
+
 // A shred of a shredded input: its struct child index, type, and the entry key in both styles
 // (precomputed at bind). A top-level literal shred name `n` keys as `n` (dotted) or `$.n`
 // (jsonpath); a `$.`-prefixed path keys as itself (jsonpath) or without the prefix (dotted). A
@@ -50,18 +55,20 @@ struct EntriesShred {
 };
 
 struct JsonoEntriesBindData : public FunctionData {
-	JsonoEntriesBindData(JsonoEntriesKeyStyle style_p, vector<EntriesShred> shreds_p)
-	    : style(style_p), shreds(std::move(shreds_p)) {
+	JsonoEntriesBindData(JsonoEntriesKeyStyle style_p, JsonoEntriesArrayStyle array_style_p,
+	                     vector<EntriesShred> shreds_p)
+	    : style(style_p), array_style(array_style_p), shreds(std::move(shreds_p)) {
 	}
 	JsonoEntriesKeyStyle style;
+	JsonoEntriesArrayStyle array_style;
 	vector<EntriesShred> shreds;
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<JsonoEntriesBindData>(style, shreds);
+		return make_uniq<JsonoEntriesBindData>(style, array_style, shreds);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<JsonoEntriesBindData>();
-		if (style != other.style || shreds.size() != other.shreds.size()) {
+		if (style != other.style || array_style != other.array_style || shreds.size() != other.shreds.size()) {
 			return false;
 		}
 		for (idx_t i = 0; i < shreds.size(); i++) {
@@ -76,31 +83,47 @@ struct JsonoEntriesBindData : public FunctionData {
 unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments) {
 	auto style = JsonoEntriesKeyStyle::JsonPath;
-	if (arguments.size() >= 2) {
-		auto &style_arg = arguments[1];
-		if (style_arg->GetAlias() != "key_style") {
-			throw BinderException("jsono_entries: unknown argument '%s' (pass key_style := 'jsonpath' | 'dotted')",
-			                      style_arg->GetAlias());
+	auto array_style = JsonoEntriesArrayStyle::IndexedElements;
+	// key_style and array_style are named-only and order-independent: a call places them positionally in
+	// argument order with the parameter name carried as the expression alias (TransformNamedArg), so we
+	// dispatch by alias, not position. A bare positional value (empty alias) is rejected.
+	for (idx_t i = 1; i < arguments.size(); i++) {
+		auto &arg = arguments[i];
+		auto alias = arg->GetAlias();
+		if (alias != "key_style" && alias != "array_style") {
+			throw BinderException("jsono_entries: unknown argument '%s' (pass key_style := 'jsonpath' | "
+			                      "'dotted', array_style := 'indexed_elements' | 'whole_json')",
+			                      alias);
 		}
-		if (style_arg->HasParameter()) {
+		if (arg->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
-		if (!style_arg->IsFoldable()) {
-			throw BinderException("jsono_entries: key_style must be constant");
+		if (!arg->IsFoldable()) {
+			throw BinderException("jsono_entries: %s must be constant", alias);
 		}
-		auto style_value = ExpressionExecutor::EvaluateScalar(context, *style_arg);
-		if (style_value.IsNull()) {
-			throw BinderException("jsono_entries: key_style must not be NULL");
+		auto value = ExpressionExecutor::EvaluateScalar(context, *arg);
+		if (value.IsNull()) {
+			throw BinderException("jsono_entries: %s must not be NULL", alias);
 		}
-		auto name = StringValue::Get(style_value);
+		auto name = StringValue::Get(value);
 		StringUtil::Trim(name);
 		name = StringUtil::Lower(name);
-		if (name == "jsonpath") {
-			style = JsonoEntriesKeyStyle::JsonPath;
-		} else if (name == "dotted") {
-			style = JsonoEntriesKeyStyle::Dotted;
+		if (alias == "key_style") {
+			if (name == "jsonpath") {
+				style = JsonoEntriesKeyStyle::JsonPath;
+			} else if (name == "dotted") {
+				style = JsonoEntriesKeyStyle::Dotted;
+			} else {
+				throw BinderException("jsono_entries: key_style must be 'jsonpath' or 'dotted'");
+			}
 		} else {
-			throw BinderException("jsono_entries: key_style must be 'jsonpath' or 'dotted'");
+			if (name == "indexed_elements") {
+				array_style = JsonoEntriesArrayStyle::IndexedElements;
+			} else if (name == "whole_json") {
+				array_style = JsonoEntriesArrayStyle::WholeJson;
+			} else {
+				throw BinderException("jsono_entries: array_style must be 'indexed_elements' or 'whole_json'");
+			}
 		}
 	}
 	auto &input_type = arguments[0]->return_type;
@@ -127,7 +150,7 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 			shreds.push_back(std::move(shred));
 		}
 	}
-	return make_uniq<JsonoEntriesBindData>(style, std::move(shreds));
+	return make_uniq<JsonoEntriesBindData>(style, array_style, std::move(shreds));
 }
 
 // A bare JSONPath key segment is parseable only while it avoids the grammar's
@@ -312,15 +335,113 @@ nonstd::string_view FormatShredValue(const UnifiedVectorFormat &fmt, idx_t idx, 
 	return JsonoPrimitiveVectorText(kind, fmt, idx, scratch);
 }
 
+// whole_json walk (plan 031 §4): recurse objects key-by-key, emit each scalar leaf as bare text, and
+// emit each array node as ONE leaf whose value is the array's whole JSON text (the shared to_json
+// render). It stops at the array boundary — unlike WalkJsonoValue / indexed_elements it never enters
+// array elements. The input is always a plain JSONO value (a shredded value is reconstructed first), so
+// there is no shred overlay. A top-level array (depth 0) has no object-key path and is rejected (§5).
+void WalkJsonoWholeJson(const JsonoView &view, JsonoCursor &cursor, std::string &path, JsonoEntriesKeyStyle style,
+                        EntriesSink &sink, std::string &scratch, size_t depth) {
+	if (depth > JSONO_MAX_NESTING_DEPTH) {
+		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
+		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+	}
+	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
+	switch (slot_tag) {
+	case tag::OBJ_START: {
+		auto layout = ReadObjectLayout(view, cursor.pos);
+		cursor.pos = layout.value_start;
+		for (size_t i = 0; i < layout.key_count; i++) {
+			auto key_slot = view.SlotAt(layout.key_start + i);
+			if (SlotTag(key_slot) != tag::KEY) {
+				throw InvalidInputException("malformed JSONO: expected KEY slot");
+			}
+			auto saved = path.size();
+			AppendKeySegment(path, view.KeyAt(SlotPayload(key_slot)), style);
+			WalkJsonoWholeJson(view, cursor, path, style, sink, scratch, depth + 1);
+			path.resize(saved);
+		}
+		if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
+			throw InvalidInputException("malformed JSONO: object value span mismatch");
+		}
+		cursor.pos++;
+		return;
+	}
+	case tag::ARR_START:
+		if (depth == 0) {
+			throw InvalidInputException(
+			    "jsono_entries: whole_json requires an object document; the value is a top-level array");
+		}
+		scratch.clear();
+		AppendJsonValueText(view, cursor, scratch, depth); // advances cursor past the whole array
+		sink.AppendText(nonstd::string_view(path.data(), path.size()), false, scratch);
+		return;
+	default:
+		sink.Append(path, DecodeScalarAt(view, cursor));
+		return;
+	}
+}
+
+void JsonoEntriesExecuteWholeJson(DataChunk &args, const JsonoEntriesBindData &bind_data, Vector &result) {
+	auto count = args.size();
+	auto style = bind_data.style;
+
+	// A shredded value is reconstructed to a plain document via the validated read path (the same path
+	// to_json / ::varchar use), so the whole_json walk never reimplements shred-array reconstruction —
+	// this satisfies the plan-029 array-shred correctness requirement (plan 031 §8). A plain value is
+	// read directly (the capacity-1 holder is unused in that case).
+	bool shredded = IsShreddedJsonoType(args.data[0].GetType());
+	Vector reconstructed(JsonoType(), shredded ? count : 1);
+	if (shredded) {
+		JsonoReconstructToPlain(args.data[0], count, reconstructed);
+	}
+	Vector &source = shredded ? reconstructed : args.data[0];
+
+	JsonoRowReader reader;
+	reader.Init(source, count);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	ListVector::SetListSize(result, 0);
+	EntriesSink sink(result);
+	// Zero-copy scalar text points into the source string_heap; keep its buffer alive on the value child.
+	StringVector::AddHeapReference(*sink.value_vec, reader.StringHeapVector());
+
+	std::string path;
+	std::string scratch;
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob;
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			SetListRowNull(result, row);
+			continue;
+		}
+		auto start = sink.next_child;
+		path.clear();
+		if (style == JsonoEntriesKeyStyle::JsonPath) {
+			path.push_back('$');
+		}
+		JsonoCursor cursor;
+		WalkJsonoWholeJson(view, cursor, path, style, sink, scratch, 0);
+		FinishListRow(result, row, start, sink.next_child - start);
+	}
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
 void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<JsonoEntriesBindData>();
+	if (bind_data.array_style == JsonoEntriesArrayStyle::WholeJson) {
+		JsonoEntriesExecuteWholeJson(args, bind_data, result);
+		return;
+	}
 	auto count = args.size();
 	// The row reader verifies each row's shred manifest against the shreds this input type
 	// carries, so a row narrowed by a raw struct cast fails loud instead of emitting
 	// incomplete entries.
 	JsonoRowReader reader;
 	reader.Init(args.data[0], count);
-	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = func_expr.bind_info->Cast<JsonoEntriesBindData>();
 	auto style = bind_data.style;
 	auto &shreds = bind_data.shreds;
 
@@ -526,9 +647,17 @@ void RegisterJsonoEntries(ExtensionLoader &loader) {
 	// The input is ANY so a shredded jsono struct (whose type varies by shred set) also
 	// binds; JsonoEntriesBind validates it is JSONO or shredded and collects the shreds.
 	ScalarFunctionSet set("jsono_entries");
-	set.AddFunction(ScalarFunction({LogicalType::ANY}, entry_type, JsonoEntriesExecute, JsonoEntriesBind));
-	set.AddFunction(
-	    ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, entry_type, JsonoEntriesExecute, JsonoEntriesBind));
+	// SPECIAL_HANDLING so a NULL named-arg constant (key_style/array_style) reaches the bind validator
+	// instead of folding the whole call to NULL (DEFAULT_NULL_HANDLING short-circuits any NULL constant
+	// argument before bind). Execute already handles NULL input rows per-row, so this changes only the
+	// bind-time fold, not the output of any valid call.
+	for (auto &signature :
+	     {vector<LogicalType> {LogicalType::ANY}, vector<LogicalType> {LogicalType::ANY, LogicalType::VARCHAR},
+	      vector<LogicalType> {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
+		ScalarFunction f(signature, entry_type, JsonoEntriesExecute, JsonoEntriesBind);
+		f.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+		set.AddFunction(f);
+	}
 	loader.RegisterFunction(set);
 }
 
