@@ -95,6 +95,28 @@ WIDE_FLAT_SIZES = {
     "100k": 100_000,
 }
 
+# Array-heavy ecommerce dataset: every row is a purchase event whose `products` array carries
+# several item objects (~10 fields each), mirroring the retail_sample_ecommerce shape that
+# jsono_entries `array_style` is built for. Exists so the indexed_elements (per-element explosion)
+# vs whole_json (one leaf per array) comparison has an array-dominated local dataset — the
+# 4%-array synthetic events file is too diluted to show the difference. Generate explicitly
+# (outside `--kind all`): `uv run python bench/generate_data.py --kind ecom --size 100k`.
+ECOM_SIZES = {
+    "10k": 10_000,
+    "100k": 100_000,
+}
+
+# products shredded into a LIST<STRUCT> lane — the production rick/data event_properties shape
+# (the array is physically shredded, not residual). entries whole_json over this exercises the
+# reconstruct-to-plain read path, the cost the plain ecom dataset does not cover.
+ECOM_PRODUCTS_SHRED = {
+    "$.products": (
+        "STRUCT(item_id VARCHAR, item_name VARCHAR, item_brand VARCHAR, "
+        "item_category VARCHAR, item_variant VARCHAR, affiliation VARCHAR, "
+        'price DOUBLE, quantity BIGINT, discount DOUBLE, "position" BIGINT)[]'
+    )
+}
+
 # Events4 keyed-aggregate proxy. Kept outside `--kind all` generation because it
 # is deliberately larger than the routine synthetic datasets.
 KEYED_PAIR_SIZES = {

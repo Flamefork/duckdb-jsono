@@ -318,6 +318,16 @@ FIELD_SAMPLE_SCENARIOS = [
         "targets": ["jsono"],
     },
     {
+        "operation": "entries",
+        "scenario": "retail_sample_nested_whole",
+        "size": "245760",
+        "row_count": RETAIL_SAMPLE_ROW_COUNT,
+        "data_file": RETAIL_SAMPLE_EVENTS_PATH,
+        "json_column": "event_properties",
+        "array_style": "whole_json",
+        "targets": ["jsono"],
+    },
+    {
         "operation": "group_merge",
         "scenario": "retail_sample_clientid",
         "size": "245760",
@@ -367,6 +377,16 @@ FIELD_SAMPLE_SCENARIOS = [
         "row_count": RETAIL_SAMPLE_ECOMMERCE_ROW_COUNT,
         "data_file": RETAIL_SAMPLE_ECOMMERCE_PATH,
         "json_column": "event_properties",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "entries",
+        "scenario": "retail_sample_ecommerce_whole",
+        "size": "65987",
+        "row_count": RETAIL_SAMPLE_ECOMMERCE_ROW_COUNT,
+        "data_file": RETAIL_SAMPLE_ECOMMERCE_PATH,
+        "json_column": "event_properties",
+        "array_style": "whole_json",
         "targets": ["jsono"],
     },
     {

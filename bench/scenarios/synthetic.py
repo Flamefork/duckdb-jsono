@@ -1,6 +1,8 @@
 from config import (
     DATA_DIR,
     DIFF_PAIRS_SIZES,
+    ECOM_PRODUCTS_SHRED,
+    ECOM_SIZES,
     KEYED_PAIR_SIZES,
     KEYED_PAIR_WIDE_SHREDDING_SPEC,
     EXTRACT_CORE_SPEC,
@@ -639,4 +641,48 @@ SCENARIOS += [
     }
     for size_name, num_rows in DIFF_PAIRS_SIZES.items()
     for mode, scenario_label in DIFF_PAIRS_MODES
+]
+
+# jsono_entries array_style: the same array-heavy ecom doc flattened both ways. indexed_elements
+# (default) explodes each `products` array into per-element leaves; whole_json emits one leaf per
+# array. JSONO-only (core json has no equivalent contract); both run so a single run gives the
+# relative cost. Needs the ecom dataset (`generate_data.py --kind ecom`).
+SCENARIOS += [
+    {
+        "operation": "entries",
+        "scenario": scenario_label,
+        "size": size_name,
+        "row_count": num_rows,
+        "data_file": DATA_DIR / f"ecom_{size_name}.parquet",
+        "json_column": "json_ecom",
+        "array_style": array_style,
+        "targets": ["jsono"],
+    }
+    for size_name, num_rows in ECOM_SIZES.items()
+    for array_style, scenario_label in (
+        ("indexed_elements", "ecom_indexed"),
+        ("whole_json", "ecom_whole"),
+    )
+]
+
+# Same flatten over a products-shredded input — the production event_properties shape. whole_json
+# here goes through reconstruct-to-plain (the shredded read path), so the shredded-vs-plain gap is
+# the reconstruct cost. Paired indexed control reads the LIST<STRUCT> lanes element-by-element.
+SCENARIOS += [
+    {
+        "operation": "entries",
+        "scenario": scenario_label,
+        "size": size_name,
+        "row_count": num_rows,
+        "data_file": DATA_DIR / f"ecom_{size_name}.parquet",
+        "json_column": "json_ecom",
+        "shredding": ECOM_PRODUCTS_SHRED,
+        "array_style": array_style,
+        "targets": ["jsono"],
+    }
+    for size_name, num_rows in ECOM_SIZES.items()
+    for array_style, scenario_label in (
+        ("indexed_elements", "ecom_shred_indexed"),
+        ("whole_json", "ecom_shred_whole"),
+    )
 ]

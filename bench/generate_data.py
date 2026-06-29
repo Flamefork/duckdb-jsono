@@ -26,6 +26,7 @@ from config import (
     DATA_DIR,
     DIFF_PAIRS_ROW_GROUP_SIZE,
     DIFF_PAIRS_SIZES,
+    ECOM_SIZES,
     KEYED_PAIR_PAGE_GROUPS,
     KEYED_PAIR_ROW_GROUP_SIZE,
     KEYED_PAIR_SIZES,
@@ -789,6 +790,95 @@ def generate_wide_flat_data(size_name: str, num_rows: int, seed: int) -> None:
     print(f"  Saved to {output_path}")
 
 
+def generate_ecom_row(row_idx: int, seed: int) -> dict:
+    """One ecommerce purchase event: a few top-level scalars plus a `products` array of N item
+    objects (~10 fields each). Array-dominated by construction so jsono_entries indexed_elements
+    explodes each row into many per-element leaves while whole_json emits one leaf per array.
+    """
+    rng = make_rng(seed, row_idx)
+    n_items = rng.randint(2, 8)
+    products = [
+        {
+            "item_id": f"sku_{rng.randint(1000, 9999)}",
+            "item_name": rng.choice(ITEM_NAMES),
+            "item_brand": rng.choice(
+                ("Acme", "Globex", "Initech", "Umbrella", "Soylent")
+            ),
+            "item_category": rng.choice(
+                ("apparel", "electronics", "home", "outdoor", "books")
+            ),
+            "item_variant": rng.choice(("S", "M", "L", "XL", "default")),
+            "affiliation": rng.choice(("web", "ios", "android")),
+            "price": round(rng.uniform(5, 500), 2),
+            "quantity": rng.randint(1, 5),
+            "discount": round(rng.uniform(0, 0.4), 2),
+            "position": position,
+        }
+        for position in range(1, n_items + 1)
+    ]
+    event = {
+        "event_name": "purchase",
+        "transaction_id": f"txn_{rng.randint(100000, 999999)}",
+        "currency": rng.choice(CURRENCIES),
+        "revenue": round(sum(p["price"] * p["quantity"] for p in products), 2),
+        "products": products,
+    }
+    return {"json_ecom": json.dumps(event, separators=(",", ":"))}
+
+
+def generate_ecom_data(size_name: str, num_rows: int, seed: int) -> None:
+    print(f"Generating ecom {size_name} ({num_rows:,} rows) with seed={seed}...")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = DATA_DIR / f"ecom_{size_name}.parquet"
+
+    conn = duckdb.connect()
+
+    batch_size = 50_000
+    rows_generated = 0
+    temp_table_created = False
+
+    while rows_generated < num_rows:
+        batch_rows = min(batch_size, num_rows - rows_generated)
+        batch = [generate_ecom_row(rows_generated + i, seed) for i in range(batch_rows)]
+
+        conn.execute("""
+            CREATE OR REPLACE TEMP TABLE batch (
+                json_ecom JSON
+            )
+            """)
+        conn.executemany(
+            "INSERT INTO batch VALUES (?)",
+            [(r["json_ecom"],) for r in batch],
+        )
+
+        if not temp_table_created:
+            conn.execute("CREATE OR REPLACE TABLE data AS SELECT * FROM batch")
+            temp_table_created = True
+        else:
+            conn.execute("INSERT INTO data SELECT * FROM batch")
+
+        rows_generated += batch_rows
+        print(f"  {rows_generated:,} / {num_rows:,}")
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    conn.execute(f"""
+        COPY data TO '{output_path}' (
+            FORMAT PARQUET,
+            KV_METADATA {{
+                seed: '{seed}',
+                size: '{size_name}',
+                rows: '{num_rows}',
+                generated_at: '{generated_at}',
+                schema_version: 'ecom_purchase_v1'
+            }}
+        )
+        """)
+    conn.close()
+
+    print(f"  Saved to {output_path}")
+
+
 def sql_string(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
@@ -1269,6 +1359,7 @@ def main() -> None:
             "wide_flat",
             "keyed_pair",
             "diff_pairs",
+            "ecom",
         ],
         default="all",
         help="Dataset kind to generate (default: all)",
@@ -1291,6 +1382,8 @@ def main() -> None:
             generate_keyed_pair_data(args.size, KEYED_PAIR_SIZES[args.size], args.seed)
         if args.kind == "diff_pairs" and args.size in DIFF_PAIRS_SIZES:
             generate_diff_pairs_data(args.size, DIFF_PAIRS_SIZES[args.size], args.seed)
+        if args.kind == "ecom" and args.size in ECOM_SIZES:
+            generate_ecom_data(args.size, ECOM_SIZES[args.size], args.seed)
     else:
         if args.kind in ("all", "events"):
             for size_name, num_rows in SIZES.items():
@@ -1310,6 +1403,9 @@ def main() -> None:
         if args.kind == "diff_pairs":
             for size_name, num_rows in DIFF_PAIRS_SIZES.items():
                 generate_diff_pairs_data(size_name, num_rows, args.seed)
+        if args.kind == "ecom":
+            for size_name, num_rows in ECOM_SIZES.items():
+                generate_ecom_data(size_name, num_rows, args.seed)
 
 
 if __name__ == "__main__":

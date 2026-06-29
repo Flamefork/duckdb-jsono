@@ -1028,11 +1028,14 @@ def build_jsono_reshred_query(scenario_config: dict, data_path: Path) -> Benchma
 
 
 def build_jsono_entries_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    # array_style is interpolated (default 'indexed_elements' = today's behaviour); a 'whole_json'
+    # scenario emits each array as one leaf instead of exploding it per element.
+    array_style = scenario_config.get("array_style", "indexed_elements")
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
-        timed_sql="""
+        timed_sql=f"""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
-            SELECT jsono_entries(t, key_style := 'dotted') AS r
+            SELECT jsono_entries(t, key_style := 'dotted', array_style := {sql_string(array_style)}) AS r
             FROM _bench_in
         """,
     )
