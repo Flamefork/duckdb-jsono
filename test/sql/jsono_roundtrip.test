@@ -255,3 +255,27 @@ query I
 SELECT to_json(jsono('{"a":1}'));
 ----
 {"a":1}
+
+# Multibyte UTF-8 round-trips verbatim through jsono's own renderer: bytes >= 0x80 are copied, never
+# re-escaped, and \uXXXX escapes decode to raw UTF-8 on the way in.
+
+# Literal multibyte UTF-8 in keys and values (BMP and astral/surrogate) survives byte-exact.
+query I
+SELECT to_json(jsono('{"s":"héllo","ключ":"😀"}'));
+----
+{"s":"héllo","ключ":"😀"}
+
+# A \uXXXX escape decodes to the same raw UTF-8 a literal character produces (chr(92) injects the
+# backslash so the JSON escape reaches the parser intact rather than being a literal char in SQL).
+query II
+SELECT
+  to_json(jsono('{"k":"' || chr(92) || 'u00e9"}')),
+  to_json(jsono('{"k":"' || chr(92) || 'u00e9"}')) = to_json(jsono('{"k":"é"}'));
+----
+{"k":"é"}	true
+
+# A surrogate pair decodes to its astral code point.
+query I
+SELECT to_json(jsono('{"k":"' || chr(92) || 'ud83d' || chr(92) || 'ude00"}'));
+----
+{"k":"😀"}

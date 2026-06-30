@@ -238,6 +238,55 @@ SELECT
 ----
 {"a":2}	{"a":2}	{"a":2}
 
+# ── Top-level non-object cur (§5): the diff root is itself a scalar or array, so the result is the
+# bare changed value (or the no-change empty object), with no wrapper key ──
+
+# A changed top-level scalar emits the bare new value; an unchanged one is the empty-object identity.
+query II
+SELECT to_json(jsono_diff(jsono('5'), jsono('6'))), to_json(jsono_diff(jsono('5'), jsono('5')));
+----
+6	{}
+
+# A top-level scalar type change emits cur; an absent (NULL) prev makes the scalar all-new.
+query II
+SELECT to_json(jsono_diff(jsono('5'), jsono('"five"'))), to_json(jsono_diff(NULL, jsono('42')));
+----
+"five"	42
+
+# A top-level array under the default 'atomic' mode: changed emits the whole new array, equal omits.
+query II
+SELECT to_json(jsono_diff(jsono('[1,2]'), jsono('[2,1]'))), to_json(jsono_diff(jsono('[1,2]'), jsono('[1,2]')));
+----
+[2,1]	{}
+
+# A top-level array under 'counts' emits the bare delta object (no wrapper key); a multiset-equal pair omits.
+query II
+SELECT
+  to_json(jsono_diff(jsono('[1]'), jsono('[1,2]'), arrays := 'counts')),
+  to_json(jsono_diff(jsono('[1,2]'), jsono('[2,1]'), arrays := 'counts'));
+----
+{"added":1,"removed":0}	{}
+
+# A top-level array under 'elements'; an absent prev makes every element added.
+query II
+SELECT
+  to_json(jsono_diff(jsono('[1]'), jsono('[1,2]'), arrays := 'elements')),
+  to_json(jsono_diff(NULL, jsono('[1,2]'), arrays := 'counts'));
+----
+{"added":[2],"removed":[]}	{"added":2,"removed":0}
+
+# A top-level type change from array to scalar renders by cur (array mode does not apply).
+query I
+SELECT to_json(jsono_diff(jsono('[1,2]'), jsono('9'), arrays := 'counts'));
+----
+9
+
+# Deep nesting recurses without dangling the diff scratch pool (depth-pool reserve guard).
+query I
+SELECT to_json(jsono_diff(jsono('{"a":{"b":{"c":{"d":{"e":1}}}}}'), jsono('{"a":{"b":{"c":{"d":{"e":2}}}}}')));
+----
+{"a":{"b":{"c":{"d":{"e":2}}}}}
+
 # ── Laws (§8) ──
 
 # Empty on equal, every mode.
@@ -275,6 +324,15 @@ SELECT to_json(jsono_diff(
 ));
 ----
 {"status":"paid"}
+
+# Mixed plain/shredded arguments diff to the same result as both-shredded (each side is
+# reconstructed independently at bind).
+query II
+SELECT
+  to_json(jsono_diff(jsono('{"status":"new","amount":10}'), jsono('{"status":"paid","amount":10}', shredding := {'status':'VARCHAR','amount':'BIGINT'}))),
+  to_json(jsono_diff(jsono('{"status":"new","amount":10}', shredding := {'status':'VARCHAR','amount':'BIGINT'}), jsono('{"status":"paid","amount":10}')));
+----
+{"status":"paid"}	{"status":"paid"}
 
 # ── The consuming-asset shape (§11): lag() window + counts, with no-op rows dropped ──
 
