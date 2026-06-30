@@ -521,6 +521,13 @@ void SerializeBuilderToBlob(const JsonoBuilder &builder, OwnedJsonoBlob &out) {
 	auto index_bytes = builder.object_checkpoint_index.size() * sizeof(ObjectCheckpointIndex);
 	auto checkpoints_bytes = builder.object_checkpoints.size() * sizeof(ObjectCursorCheckpoint);
 	out.skips.resize(sizeof(ContainerMetadataHeader) + span_ids_bytes + spans_bytes + index_bytes + checkpoints_bytes);
+	if (builder.skips.size() > std::numeric_limits<uint32_t>::max() ||
+	    builder.object_checkpoint_index.size() > std::numeric_limits<uint32_t>::max() ||
+	    builder.object_checkpoints.size() > std::numeric_limits<uint32_t>::max()) {
+		// Fail loud on the 32-bit count truncation rather than silently writing a wrong header, matching
+		// WriteSkipsBlobInto on the writer path.
+		throw InvalidInputException("jsono: skips blob exceeds storage limits");
+	}
 	ContainerMetadataHeader meta;
 	meta.span_count = uint32_t(builder.skips.size());
 	meta.checkpoint_index_count = uint32_t(builder.object_checkpoint_index.size());

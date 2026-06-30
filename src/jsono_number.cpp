@@ -153,10 +153,15 @@ void EmitDouble(double v, std::string &out) {
 	duckdb_yyjson::yyjson_mut_val *val = duckdb_yyjson::yyjson_mut_real(doc, v);
 	size_t len = 0;
 	char *text = duckdb_yyjson::yyjson_mut_val_write(val, 0, &len);
-	if (text) {
-		out.append(text, len);
-		free(text);
+	if (!text) {
+		// A null write means the value did not serialize (yyjson buffer allocation failed). Fail loud
+		// rather than append nothing and emit a syntactically broken document, matching the non-finite
+		// guard above.
+		duckdb_yyjson::yyjson_mut_doc_free(doc);
+		throw InternalException("JSONO failed to serialize double value");
 	}
+	out.append(text, len);
+	free(text);
 	duckdb_yyjson::yyjson_mut_doc_free(doc);
 }
 
