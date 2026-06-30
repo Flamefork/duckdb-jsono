@@ -640,10 +640,8 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 } // namespace
 
 void RegisterJsonoEntries(ExtensionLoader &loader) {
-	auto jsono_type = JsonoType();
 	auto entry_type =
 	    LogicalType::LIST(LogicalType::STRUCT({{"key", LogicalType::VARCHAR}, {"value", LogicalType::VARCHAR}}));
-	(void)jsono_type;
 	// The input is ANY so a shredded jsono struct (whose type varies by shred set) also
 	// binds; JsonoEntriesBind validates it is JSONO or shredded and collects the shreds.
 	ScalarFunctionSet set("jsono_entries");

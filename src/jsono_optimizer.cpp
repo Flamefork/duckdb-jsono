@@ -1383,8 +1383,9 @@ bool RewriteProjectionProjector(OptimizerExtensionInput &input, LogicalProjectio
 //===--------------------------------------------------------------------===//
 // Shredded JSONO transparency
 //
-// A shredded JSONO column reaches the binder as a plain STRUCT (six BLOB prefix
-// followed by VARCHAR shred columns named by canonical path). No implicit cast turns
+// A shredded JSONO column reaches the binder as a plain STRUCT: a `jsono` layout field wrapping a
+// six-blob `body` and a sibling `shreds` struct of typed columns named by canonical path (each a
+// STRUCT(value, complete) or a LIST). No implicit cast turns
 // that struct into JSONO, so a bare `j->>'path'` / `to_json(j)` binds to core json's
 // STRUCT->JSON path, which serializes the raw struct (wrong: leaks the blobs, never
 // reads the value). This pre-optimize pass rewrites those bound expressions off the
@@ -2083,9 +2084,9 @@ private:
 
 	// Reconstruct the full JSONO value as JSON by overlaying the shreds onto the residual:
 	// the residual is authoritative and each shred only fills a path the residual dropped
-	// (jsono_overlay deep-merges, so nested shreds refill nested leaves). Correct for both
-	// storage modes — a PRESERVE residual keeps every path so the shreds are no-ops; a
-	// stripped residual is refilled from its shreds. Index/array shreds are never stripped,
+	// (jsono_overlay deep-merges, so nested shreds refill nested leaves). Correct whether or not
+	// a path was stripped — a path still present in the residual makes its shred a no-op; a
+	// stripped path is refilled from its shred. Index/array shreds are never stripped,
 	// so they stay in the residual and sit out the patch; with no object-key shreds the
 	// overlay is skipped.
 	unique_ptr<Expression> ReconstructShreddedToJson(unique_ptr<Expression> column) {

@@ -141,9 +141,10 @@ inline void PrefetchJsonoRowStreams(const JsonoBlobRow &blob) {
 // Read one row's six body blobs once validity is unsettled. `Strict` selects the missing-child
 // policy: the strict read (the default for value-decoding operators) treats a present top-level row
 // with a NULL nested field as corruption and fails loud with the field name; the permissive read
-// (union-merged reconstruction, where a dead layout group is expected to be NULL) treats any missing
-// nested field as an absent row. A NULL top-level struct is an absent value under both. The
-// all_valid fast copy and the per-field handling are otherwise identical, so one body owns both.
+// (optimizer-injected expressions that can see NULL body fields on rows the surrounding CASE
+// discards) treats any missing nested field as an absent row. A NULL top-level struct is an absent
+// value under both. The all_valid fast copy and the per-field handling are otherwise identical, so
+// one body owns both.
 template <bool Strict>
 JSONO_ALWAYS_INLINE bool ReadJsonoRowImpl(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
 	if (data.all_valid) {
@@ -196,8 +197,10 @@ JSONO_ALWAYS_INLINE bool ReadJsonoRowImpl(const JsonoVectorData &data, idx_t row
 	return true;
 }
 
-// Permissive row read for union-merged reconstruction: a dead layout group is expected to be NULL,
-// so any missing nested field is treated as an absent row.
+// Permissive row read for __jsono_internal_checked_residual: it eagerly verifies every row of the
+// reinterpreted residual before the surrounding CASE (WHEN column IS NULL THEN NULL ELSE ...) selects,
+// so it legitimately sees NULL body fields on the NULL-column rows the CASE then discards. Any missing
+// nested field is treated as an absent row rather than corruption.
 inline bool ReadJsonoRow(const JsonoVectorData &data, idx_t row, JsonoBlobRow &out) {
 	return ReadJsonoRowImpl<false>(data, row, out);
 }
