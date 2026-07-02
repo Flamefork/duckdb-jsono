@@ -723,9 +723,9 @@ Use power-of-two values when comparing performance. The default is tuned for loc
 - Declare a shredded storage column with `CREATE TABLE … AS SELECT jsono(…, shredding := …)` or from `jsono_storage_type(<shred DDL>)`, and access a shred through `->>`/`to_json` (the optimizer reads the shred) rather than by struct member name — `.body` and the shred fields are physical storage details. Inserting a value shredded on any other shred set — fully disjoint included — lands losslessly (the optimizer reshredds it to the column's shred set). A raw struct cast that drops or retypes a shred column (only possible without the extension optimizer) is caught at read time by the shred manifest: reading the narrowed row raises an error instead of silently losing the stripped value.
 - `jsono_extract` / `->` / `jsono_extract_string` / `->>` require a constant path, do not support wildcard list extraction yet, and do not support negative array indexes.
 - Unsupported scalar types in `jsono_transform` fail at bind time.
-- JSON nested deeper than 1000 levels is rejected with an error (the limit is lowered to 50 under sanitizer builds).
+- JSON nested deeper than 1000 levels is rejected with an error (the limit is lowered to 32 under sanitizer builds).
 - The binary JSONO format is strict-versioned (current `version = 4`, reported by `jsono_version()`). Incompatible storage changes must bump `jsono::VERSION`. A present-but-unreadable header — wrong magic, a different format version, misaligned slots — fails loud on read rather than silently reading as SQL `NULL`; only an absent value (a slots blob too short to hold a header) reads as `NULL`, and `jsono_validate` reports a corrupt blob as `false`.
-- Malformed input raises DuckDB errors unless `try_jsono` is used.
+- Malformed input raises DuckDB errors unless `try_jsono` is used. `try_jsono` never raises: implementation-limit violations on otherwise valid JSON (nesting past the depth limit, an oversized key or string) also map to `NULL`, indistinguishable from malformed input — use the strict `jsono` when a limit overflow must surface instead of dropping the row.
 
 ## Known limitations
 
