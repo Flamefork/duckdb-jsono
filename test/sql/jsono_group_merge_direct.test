@@ -85,6 +85,22 @@ FROM (
 ----
 true	"scalar-wins"
 
+# The UBIGINT lane carries values above the int64 range through fold, divert and re-adoption —
+# a value routed through the BIGINT slot would come back distorted.
+query II
+SELECT to_json(m1) = to_json(m2), to_json(m1)
+FROM (
+  SELECT jsono_group_merge(jsono(doc, shredding := {big:'UBIGINT'}) ORDER BY ord) AS m1,
+         jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
+  FROM (VALUES
+    (1, '{"big":18446744073709551615}'),
+    (2, '{"big":"diverted"}'),
+    (3, '{"big":10000000000000000000}')
+  ) v(ord, doc)
+);
+----
+true	{"big":10000000000000000000}
+
 # Array shreds: whole-array replacement across rows, absent field keeps the previous array,
 # a null member keeps it too (IgnoreNulls).
 statement ok
@@ -189,3 +205,54 @@ true	{"k":"s","n":9}
 
 statement ok
 RESET threads;
+
+# A sliding window frame drives the direct accumulator through the window segment tree
+# (combine_type PRESERVE_INPUT: DirectFoldState must copy, never consume, the frame partials,
+# and Finalize must be re-runnable per frame). The frame order is fixed by ord, so the shredded
+# and plain folds see identical sequences.
+query I
+SELECT count(*)
+FROM (
+  SELECT to_json(jsono_group_merge(jsono(doc, shredding := {k:'BIGINT', c:'DOUBLE', '$.n.deep':'BIGINT', tags:'BIGINT[]'})) OVER w) AS shredded,
+         to_json(jsono_group_merge(jsono(doc)) OVER w) AS plain
+  FROM mixed
+  WINDOW w AS (PARTITION BY g ORDER BY ord ROWS BETWEEN 50 PRECEDING AND CURRENT ROW)
+)
+WHERE shredded IS DISTINCT FROM plain;
+----
+0
+
+# The direct finalize writes residual blobs + manifest natively (no reshred) — the materialized
+# result must survive a Parquet round-trip: bare lane reads agree with the authoritative
+# reconstruct read (a wrong manifest would either throw or silently NULL the diverted lane).
+
+require parquet
+
+statement ok
+CREATE TABLE gm_direct AS
+SELECT g, jsono_group_merge(j ORDER BY ord) AS m
+FROM (
+  SELECT g, ord, jsono(doc, shredding := {k:'BIGINT', '$.n.deep':'BIGINT'}) AS j
+  FROM (VALUES
+    ('g1', 1, '{"k":1,"n":{"deep":10},"extra":"a"}'),
+    ('g1', 2, '{"k":2}'),
+    ('g2', 1, '{"k":"diverted","n":5}'),
+    ('g2', 2, '{"extra":"b"}')
+  ) v(g, ord, doc)
+) GROUP BY g;
+
+statement ok
+COPY gm_direct TO '__TEST_DIR__/gm_direct.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM read_parquet('__TEST_DIR__/gm_direct.parquet')
+WHERE (m->>'$.k') IS DISTINCT FROM (jsono(to_json(m)::VARCHAR)->>'$.k')
+   OR (m->>'$.n.deep') IS DISTINCT FROM (jsono(to_json(m)::VARCHAR)->>'$.n.deep');
+----
+0
+
+query II
+SELECT g, to_json(m)::VARCHAR FROM read_parquet('__TEST_DIR__/gm_direct.parquet') ORDER BY g;
+----
+g1	{"extra":"a","k":2,"n":{"deep":10}}
+g2	{"extra":"b","k":"diverted","n":5}

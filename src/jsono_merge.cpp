@@ -2026,8 +2026,9 @@ void DirectFoldState(DirectShreddedAcc &target, const DirectShreddedAcc &source,
 		residual_has_members = target_view.ParseHeader() && target_view.Slots() > 0 &&
 		                       ContainerChildCount(SlotPayload(target_view.SlotAt(0))) > 0;
 	}
+	D_ASSERT(source.lanes.size() == bind_data.shred_plan.size());
 	for (idx_t f = 0; f < bind_data.shred_plan.size(); f++) {
-		if (bind_data.shred_plan[f].kind != ShredKind::Scalar || f >= source.lanes.size() || !source.lanes[f].active) {
+		if (bind_data.shred_plan[f].kind != ShredKind::Scalar || !source.lanes[f].active) {
 			continue;
 		}
 		// Adopt the source lane only when the SOURCE residual leaves the path free — i.e. source's own
@@ -2285,6 +2286,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		bool residual_has_members = acc_view.Slots() > 0 && SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START &&
 		                            ContainerChildCount(SlotPayload(acc_view.SlotAt(0))) > 0;
 		stripped_fields.clear();
+		D_ASSERT(direct->lanes.size() == bind_data.shreds.size());
 		for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 			auto &plan = bind_data.shred_plan[f];
 			if (plan.kind != ShredKind::Scalar) {
@@ -2292,7 +2294,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 				FlatVector::SetNull(*lane_out[f], rid, true);
 				continue;
 			}
-			bool lane_active = f < direct->lanes.size() && direct->lanes[f].active;
+			bool lane_active = direct->lanes[f].active;
 			int8_t complete = 1;
 			bool write_lane = false;
 			if (residual_has_members) {
