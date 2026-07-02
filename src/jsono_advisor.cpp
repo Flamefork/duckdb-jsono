@@ -195,6 +195,19 @@ void AppendJsonPathStep(string &path, nonstd::string_view key) {
 	path.push_back('"');
 }
 
+// Name a top-level key in the candidate map (and so in the emitted spec). The common case is the
+// bare name; a key the spec parser would misread as a JSONPath (`$`-leading, see ParseShredPathSpec)
+// or reject as a reserved layout name (`body`) is spelled through its quoted `$.`-rooted path form,
+// which names the same top-level key.
+string TopLevelSpecName(nonstd::string_view key) {
+	if (key[0] != '$' && key != "body") {
+		return string(key.data(), key.size());
+	}
+	string path = "$";
+	AppendJsonPathStep(path, key);
+	return path;
+}
+
 // Classify a top-level array value at `cursor` into the scalar-array / object-array counters. The
 // cursor arrives at ARR_START with correct stream cursors and is advanced past the whole array. A
 // row fits scalar-array primitive p when every element is a scalar fitting p; it is an object-array
@@ -226,6 +239,10 @@ void ClassifyTopLevelArray(const JsonoView &view, JsonoCursor &cursor, SuggestCa
 				}
 				auto sub_name = view.KeyAt(SlotPayload(key_slot));
 				auto sub_tag = SlotTag(view.SlotAt(cursor.pos));
+				if (sub_name.empty()) {
+					SkipValueFast(view, cursor);
+					continue;
+				}
 				auto &sub = row_subfields[string(sub_name.data(), sub_name.size())];
 				sub.present++;
 				if (sub_tag == tag::OBJ_START || sub_tag == tag::ARR_START) {
@@ -299,7 +316,7 @@ void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, nonstd::string
 		}
 		auto child_key = view.KeyAt(SlotPayload(key_slot));
 		auto child_tag = SlotTag(view.SlotAt(cursor.pos));
-		if (child_tag == tag::OBJ_START || child_tag == tag::ARR_START) {
+		if (child_key.empty() || child_tag == tag::OBJ_START || child_tag == tag::ARR_START) {
 			SkipValueFast(view, cursor);
 			continue;
 		}
@@ -316,7 +333,9 @@ void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, nonstd::string
 
 // Accumulate one document's contributions over the auto-shred universe: top-level scalar keys
 // (bare name), one-level-nested scalar keys (`$.parent.child`), and top-level array keys (scalar-
-// or object-array). A non-object document contributes nothing (no key to name a shred).
+// or object-array). A non-object document contributes nothing (no key to name a shred). Empty keys
+// (at any level) are out of the universe: their lane name would carry an empty quoted path step
+// (`$.""`), which the shredded readers do not support.
 void AccumulateDocument(const JsonoView &view, std::map<string, SuggestCandidate> &paths) {
 	if (view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
 		return;
@@ -331,13 +350,15 @@ void AccumulateDocument(const JsonoView &view, std::map<string, SuggestCandidate
 		}
 		auto key = view.KeyAt(SlotPayload(key_slot));
 		auto value_tag = SlotTag(view.SlotAt(cursor.pos));
-		if (value_tag == tag::OBJ_START) {
+		if (key.empty()) {
+			SkipValueFast(view, cursor);
+		} else if (value_tag == tag::OBJ_START) {
 			WalkNestedObject(view, cursor, key, paths);
 		} else if (value_tag == tag::ARR_START) {
-			ClassifyTopLevelArray(view, cursor, GetCandidate(paths, string(key.data(), key.size())));
+			ClassifyTopLevelArray(view, cursor, GetCandidate(paths, TopLevelSpecName(key)));
 		} else {
 			auto scalar = DecodeScalarAt(view, cursor);
-			RecordScalar(GetCandidate(paths, string(key.data(), key.size())), scalar);
+			RecordScalar(GetCandidate(paths, TopLevelSpecName(key)), scalar);
 		}
 	}
 }
@@ -358,8 +379,9 @@ bool PickLanePrimitive(const FitCounts &fit, idx_t present, double min_fit, Json
 	return false;
 }
 
-// Append a struct-literal key, bare when it is a plain SQL identifier, else double-quoted (the form
-// jsono(value, shredding := {...}) accepts for a `$.a.b` path).
+// Append a struct-literal key, bare when it is a plain SQL identifier, else double-quoted with
+// embedded quotes doubled (SQL identifier escaping — the spec must re-parse when pasted into
+// jsono(value, shredding := {...})).
 void AppendSpecKey(string &out, const string &key) {
 	bool simple = !key.empty();
 	for (size_t i = 0; simple && i < key.size(); i++) {
@@ -373,8 +395,8 @@ void AppendSpecKey(string &out, const string &key) {
 	}
 	out.push_back('"');
 	for (char c : key) {
-		if (c == '"' || c == '\\') {
-			out.push_back('\\');
+		if (c == '"') {
+			out.push_back('"');
 		}
 		out.push_back(c);
 	}
@@ -542,8 +564,7 @@ void JsonoSuggestUpdate(Vector inputs[], AggregateInputData &, idx_t, Vector &st
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<SuggestState *>(state_fmt);
-	// Group each row to its own state via a single-row read (candidate accumulation is a map insert,
-	// so the per-row reader init is negligible next to the aggregate grouping itself).
+	// Group each row to its own state: one chunk-level reader, per-row map inserts.
 	JsonoRowReader reader;
 	reader.Init(inputs[0], count);
 	JsonoView view;

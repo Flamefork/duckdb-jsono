@@ -181,6 +181,74 @@ SELECT jsono_suggest_shredding(j) FROM (
 ----
 8192
 
+# ---- spec keys that need quoting or path-form naming ----
+
+# Non-identifier keys are double-quoted with embedded quotes doubled (SQL identifier escaping);
+# a key the spec parser would misread as a JSONPath (`$`-leading) or reject as a reserved layout
+# name (`body`) is spelled through its quoted `$.`-rooted path form. Every emitted key must
+# re-parse when the spec is pasted back into jsono(value, shredding := ...).
+query I
+SELECT jsono_suggest_shredding(jsono('{"a\"b":1,"a\\b":2,"a.b":3,"with space":4,"$x":5,"body":6}'));
+----
+{"$.$x": 'BIGINT', "$.body": 'BIGINT', "a""b": 'BIGINT', "a.b": 'BIGINT', "a\b": 'BIGINT', "with space": 'BIGINT'}
+
+query I
+SELECT count(*) FROM (
+  SELECT to_json(jsono(d, shredding := {"$.$x": 'BIGINT', "$.body": 'BIGINT', "a""b": 'BIGINT', "a.b": 'BIGINT', "a\b": 'BIGINT', "with space": 'BIGINT'})) AS s,
+         to_json(jsono(d)) AS p
+  FROM (VALUES ('{"a\"b":1,"a\\b":2,"a.b":3,"with space":4,"$x":5,"body":6}')) t(d)
+) WHERE s IS DISTINCT FROM p;
+----
+0
+
+# A nested key with an embedded quote is JSONPath-quoted first (backslash escaping inside the
+# path step), then SQL-quoted as a struct key (quote doubling) — two distinct escaping layers.
+query I
+SELECT jsono_suggest_shredding(jsono('{"m":{"q\"uote":1}}'));
+----
+{"$.m.""q\""uote""": 'BIGINT'}
+
+query I
+SELECT count(*) FROM (
+  SELECT to_json(jsono(d, shredding := {"$.m.""q\""uote""": 'BIGINT'})) AS s,
+         to_json(jsono(d)) AS p
+  FROM (VALUES ('{"m":{"q\"uote":1}}')) t(d)
+) WHERE s IS DISTINCT FROM p;
+----
+0
+
+# An object-array subfield name is a STRUCT field identifier in the type string — same doubling.
+query I
+SELECT jsono_suggest_shredding(jsono('{"arr":[{"a\"b":1}]}'));
+----
+{arr: 'STRUCT("a""b" BIGINT)[]'}
+
+query I
+SELECT count(*) FROM (
+  SELECT to_json(jsono(d, shredding := {arr: 'STRUCT("a""b" BIGINT)[]'})) AS s,
+         to_json(jsono(d)) AS p
+  FROM (VALUES ('{"arr":[{"a\"b":1}]}')) t(d)
+) WHERE s IS DISTINCT FROM p;
+----
+0
+
+# Empty keys (at any level) are out of the shred universe — their lane name would carry an empty
+# quoted path step, which the shredded readers do not support — so they are never suggested.
+query I
+SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
+  ('{"":1}'),
+  ('{"m":{"":2}}'),
+  ('{"arr":[{"":3}]}')
+) AS t(d);
+----
+NULL
+
+# An empty subfield is skipped without dropping the sibling that qualifies.
+query I
+SELECT jsono_suggest_shredding(jsono('{"arr":[{"":1,"n":2}]}'));
+----
+{arr: 'STRUCT(n BIGINT)[]'}
+
 # ---- jsono_shred_stats: per-shred lane / divert / complete rates over shredded input ----
 
 statement ok
@@ -209,6 +277,19 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
 );
 ----
 [{"path":"tags","type":"BIGINT[]","lane_rate":0.5,"divert_rate":0.0,"complete_rate":1.0}]
+
+# An array shred DIVERTS when the value at its path does not fit the element lane (a scalar there
+# stays whole in the residual): lane NULL plus a residual hit counts as a divert, unlike the
+# missing key above.
+query I
+SELECT to_json(jsono_shred_stats(j)) FROM (
+  SELECT jsono(d, shredding := {'tags':'BIGINT[]'}) AS j FROM (VALUES
+    ('{"tags":[1,2]}'),
+    ('{"tags":"oops"}')
+  ) AS t(d)
+);
+----
+[{"path":"tags","type":"BIGINT[]","lane_rate":0.5,"divert_rate":0.5,"complete_rate":1.0}]
 
 # Multiple shreds report in sorted path order.
 query I
@@ -311,3 +392,19 @@ SELECT jsono_suggest_shredding(j) FROM (
 );
 ----
 subfield
+
+# ---- plan (de)serialization ----
+
+# The named thresholds survive a plan (de)serialize round-trip through the custom serialize
+# callbacks — a deserialize-side re-bind would see plain arguments with the := aliases stripped
+# and reject them. The result must reflect BOTH non-default thresholds.
+statement ok
+PRAGMA verify_serializer;
+
+query I
+SELECT jsono_suggest_shredding(j, min_presence := 0.25, min_fit := 0.5) FROM docs;
+----
+{"$.meta.nested_int": 'BIGINT', flag: 'BOOLEAN', items: 'STRUCT(n BIGINT, s VARCHAR)[]', mixed: 'BIGINT', sparse: 'BIGINT', stable_int: 'BIGINT', stable_str: 'VARCHAR', tags: 'BIGINT[]'}
+
+statement ok
+PRAGMA disable_verify_serializer;
