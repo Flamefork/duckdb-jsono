@@ -2208,70 +2208,139 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		FinalizePlainGroups(result, state_fmt, state_data, count, offset);
 		return;
 	}
-	// Shredded return from the direct accumulator: stage each group's state as one shredded row
-	// (residual blob + scalar lanes; array values are already plain inside the residual), let the
-	// residual-authoritative reconstruct compose the plain value, then reshred into the result's
-	// shredded type — identical divert/manifest semantics to the previous reconstruct-fold path.
-	Vector staged(result.GetType(), count);
+	// Native shredded finalize from the direct accumulator: write each group's state straight into
+	// the result — the residual blobs verbatim (skips re-emitted with the manifest of the lanes
+	// actually stripped), the scalar lanes from the lane slots — with no staged reconstruct and no
+	// reshred. Per scalar shred the residual decides, matching what compose(residual-authoritative)
+	// + reshred used to emit:
+	//   - path present in the residual (a later diverted write outranks the older lane) -> NULL
+	//     lane, complete = 0 (the value lives in the residual);
+	//   - a non-object prefix (the parent was replaced by a scalar) -> NULL lane, complete = 1
+	//     (the lane value is dropped, replace semantics);
+	//   - path absent and the lane active -> the lane value, complete = 1, manifested as stripped;
+	//   - path absent and no lane -> NULL lane, complete = 1 (absent field).
+	// The fully-shredded hot case (empty residual) skips every locate.
+	result.SetVectorType(VectorType::FLAT_VECTOR);
 	JsonoBodyWriter writer;
-	writer.Init(staged);
-	JsonoFillShredsComplete(staged, count);
+	writer.Init(result);
+	auto layout_hash = int64_t(JsonoLayoutHashOf(result.GetType()));
+	auto &set_vec = jsono::JsonoShredSetVector(result);
+	set_vec.SetVectorType(VectorType::FLAT_VECTOR);
+	auto set_data = FlatVector::GetData<int64_t>(set_vec);
 	vector<Vector *> lane_out(bind_data.shreds.size());
+	vector<Vector *> complete_out(bind_data.shreds.size(), nullptr);
+	vector<JsonoShredManifestEntryBytes> manifest_entries(bind_data.shreds.size());
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
-		lane_out[f] = &jsono::JsonoShredVector(staged, f);
+		lane_out[f] = &jsono::JsonoShredVector(result, f);
 		lane_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
+		if (bind_data.shred_plan[f].kind == ShredKind::Scalar) {
+			complete_out[f] = &jsono::JsonoShredCompleteVector(result, f);
+			complete_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
+		}
+		manifest_entries[f] = JsonoShredManifestEntry(bind_data.shreds[f].first, bind_data.shreds[f].second);
 	}
 	JsonoBuilder empty_builder;
+	std::string skips_buf;
+	vector<idx_t> stripped_fields;
 	for (idx_t i = 0; i < count; i++) {
+		auto rid = offset + i;
 		auto &state = *state_data[RowIndex(state_fmt, i)];
 		auto *direct = state.direct;
 		bool live = state.has_input && direct && direct->kind != DirectShreddedAcc::Kind::Empty;
+		set_data[rid] = layout_hash;
 		if (!live) {
-			// An empty/all-NULL group finalizes to {} with NULL shreds, as before.
+			// An empty/all-NULL group finalizes to {} with NULL shreds (complete = 1: absent), as before.
 			empty_builder.Reset();
 			empty_builder.EmitObjectStart(0);
 			empty_builder.EmitObjectEnd();
-			writer.WriteRow(i, empty_builder);
+			writer.WriteRow(rid, empty_builder);
 			for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
-				FlatVector::SetNull(*lane_out[f], i, true);
+				FlatVector::SetNull(*lane_out[f], rid, true);
+				if (complete_out[f]) {
+					FlatVector::GetData<int8_t>(*complete_out[f])[rid] = 1;
+				}
 			}
 			continue;
 		}
-		WriteOwnedBlobRow(writer, i, direct->residual);
+		JsonoView acc_view = ViewOfBlob(direct->residual);
+		acc_view.ParseHeader();
+		bool residual_has_members = acc_view.Slots() > 0 && SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START &&
+		                            ContainerChildCount(SlotPayload(acc_view.SlotAt(0))) > 0;
+		stripped_fields.clear();
 		for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 			auto &plan = bind_data.shred_plan[f];
-			bool active = plan.kind == ShredKind::Scalar && f < direct->lanes.size() && direct->lanes[f].active;
-			if (!active) {
-				FlatVector::SetNull(*lane_out[f], i, true);
+			if (plan.kind != ShredKind::Scalar) {
+				// Array shreds have no lane state: their values sit fully composed in the residual.
+				FlatVector::SetNull(*lane_out[f], rid, true);
 				continue;
 			}
-			auto &lane = direct->lanes[f];
-			auto &out = *lane_out[f];
-			switch (plan.prim) {
-			case jsono::JsonoScalarPrimitive::Varchar:
-				FlatVector::GetData<string_t>(out)[i] = StringVector::AddStringOrBlob(out, lane.s);
-				break;
-			case jsono::JsonoScalarPrimitive::Bigint:
-				FlatVector::GetData<int64_t>(out)[i] = lane.i;
-				break;
-			case jsono::JsonoScalarPrimitive::Ubigint:
-				FlatVector::GetData<uint64_t>(out)[i] = lane.u;
-				break;
-			case jsono::JsonoScalarPrimitive::Double:
-				FlatVector::GetData<double>(out)[i] = lane.d;
-				break;
-			case jsono::JsonoScalarPrimitive::Boolean:
-				FlatVector::GetData<bool>(out)[i] = lane.b;
-				break;
+			bool lane_active = f < direct->lanes.size() && direct->lanes[f].active;
+			int8_t complete = 1;
+			bool write_lane = false;
+			if (residual_has_members) {
+				JsonoCursor cursor;
+				bool found = true;
+				bool non_object_prefix = false;
+				for (idx_t depth = 0; depth < plan.steps.size(); depth++) {
+					if (!LocatePathStep(nullptr, depth, acc_view, plan.steps[depth], cursor)) {
+						found = false;
+						break;
+					}
+					if (depth + 1 < plan.steps.size() && SlotTag(acc_view.SlotAt(cursor.pos)) != tag::OBJ_START) {
+						found = false;
+						non_object_prefix = true;
+						break;
+					}
+				}
+				if (found) {
+					complete = 0;
+				} else if (!non_object_prefix && lane_active) {
+					write_lane = true;
+				}
+			} else if (lane_active) {
+				write_lane = true;
+			}
+			if (write_lane) {
+				auto &lane = direct->lanes[f];
+				auto &out = *lane_out[f];
+				switch (plan.prim) {
+				case jsono::JsonoScalarPrimitive::Varchar:
+					FlatVector::GetData<string_t>(out)[rid] = StringVector::AddStringOrBlob(out, lane.s);
+					break;
+				case jsono::JsonoScalarPrimitive::Bigint:
+					FlatVector::GetData<int64_t>(out)[rid] = lane.i;
+					break;
+				case jsono::JsonoScalarPrimitive::Ubigint:
+					FlatVector::GetData<uint64_t>(out)[rid] = lane.u;
+					break;
+				case jsono::JsonoScalarPrimitive::Double:
+					FlatVector::GetData<double>(out)[rid] = lane.d;
+					break;
+				case jsono::JsonoScalarPrimitive::Boolean:
+					FlatVector::GetData<bool>(out)[rid] = lane.b;
+					break;
+				}
+				stripped_fields.push_back(f);
+			} else {
+				FlatVector::SetNull(*lane_out[f], rid, true);
+			}
+			if (complete_out[f]) {
+				FlatVector::GetData<int8_t>(*complete_out[f])[rid] = complete;
 			}
 		}
+		auto &blob = direct->residual;
+		writer.data[BODY_SLOTS][rid] = WriteBlobInto(writer.Slots(), blob.slots.data(), blob.slots.size());
+		writer.data[BODY_KEY_HEAP][rid] = WriteBlobInto(writer.KeyHeap(), blob.key_heap.data(), blob.key_heap.size());
+		writer.data[BODY_STRING_HEAP][rid] =
+		    WriteBlobInto(writer.StringHeap(), blob.string_heap.data(), blob.string_heap.size());
+		writer.data[BODY_LENGTHS][rid] = WriteBlobInto(writer.Lengths(), blob.lengths.data(), blob.lengths.size());
+		writer.data[BODY_NUMS][rid] = WriteBlobInto(writer.Nums(), blob.nums.data(), blob.nums.size());
+		skips_buf.assign(blob.skips.data(), blob.skips.size());
+		if (!stripped_fields.empty()) {
+			JsonoAppendShredManifest(skips_buf, manifest_entries, stripped_fields);
+		}
+		writer.data[BODY_SKIPS][rid] = WriteBlobInto(writer.Skips(), skips_buf.data(), skips_buf.size());
 	}
-	Vector plain(JsonoType(), count);
-	ReconstructShreddedToPlainImpl(staged, count, plain);
-	Vector shredded(result.GetType(), count);
-	JsonoShredFromSpec(plain, count, bind_data.shreds, shredded);
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	VectorOperations::Copy(shredded, result, count, 0, offset);
 }
 
 // ===== Order-independent last-write-wins group merge (jsono_group_merge_max / _min) =====
