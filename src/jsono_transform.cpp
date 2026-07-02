@@ -461,6 +461,13 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 	bind_data->shape_plan_eligible =
 	    bind_data->mismatch_mode != TransformMismatchMode::Fail && scalar_fields >= SHAPE_PLAN_MIN_SCALAR_FIELDS;
 	bound_function.return_type = bind_data->return_type;
+	// A field descending into an array shred forces the whole value to be reconstructed to plain
+	// JSONO. Wrap the argument in __jsono_reconstruct so that reconstruct is a visible operator in
+	// EXPLAIN rather than an anonymous cast the binder would otherwise insert (arguments[0] is now
+	// plain, matching the plain type JsonoResolveJsonoArgument returned, so no cast is added).
+	if (reconstruct_shredded) {
+		arguments[0] = MakeJsonoReconstructExpression(std::move(arguments[0]));
+	}
 	return std::move(bind_data);
 }
 

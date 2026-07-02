@@ -1,0 +1,61 @@
+# name: test/sql/jsono_reconstruct_explain.test
+# description: jsono_transform's array-touching reconstruct is visible in EXPLAIN as __jsono_reconstruct
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE t AS SELECT jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
+                               shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}) AS j;
+
+# Value parity: wrapping the reconstruct in __jsono_reconstruct feeds the executor the same plain
+# document the anonymous cast did, so a field descending into the array shred reads unchanged.
+query I
+SELECT jsono_transform(j, {'first_id':{'type':'BIGINT','path':'$.products[0].id'}}) FROM t;
+----
+{'first_id': 1}
+
+# A field that descends into the array shred forces a whole-value reconstruct; it now shows up as an
+# explicit __jsono_reconstruct operator (the 3-10x cost is no longer hidden inside an anonymous cast).
+query II
+EXPLAIN SELECT jsono_transform(j, {'first_id':{'type':'BIGINT','path':'$.products[0].id'}}) FROM t;
+----
+physical_plan	<REGEX>:.*__jsono_reconstruct.*
+
+# A sibling scalar read stays on the native residual-first fast path: no reconstruct, so no
+# __jsono_reconstruct in the plan (the argument is the bare shredded column).
+statement ok
+CREATE TABLE flat AS SELECT jsono('{"a":1,"products":[{"id":1,"name":"a"}]}',
+                                  shredding := {'$.a':'BIGINT','$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}) AS j;
+
+query II
+EXPLAIN SELECT jsono_transform(j, {'a':'BIGINT'}) FROM flat;
+----
+physical_plan	<!REGEX>:.*__jsono_reconstruct.*
+
+# A plain (unshredded) input never reconstructs, so no __jsono_reconstruct is inserted.
+statement ok
+CREATE TABLE p AS SELECT jsono('{"products":[{"id":1,"name":"a"}]}') AS j;
+
+query II
+EXPLAIN SELECT jsono_transform(j, {'first_id':{'type':'BIGINT','path':'$.products[0].id'}}) FROM p;
+----
+physical_plan	<!REGEX>:.*__jsono_reconstruct.*
+
+# The reconstruct wrapper is not serializable (it carries its intent inline, like the other
+# JSONO optimizer-internal operators), but the query still executes and prepared re-execution is
+# stable — the wrapper output is plain JSONO, so re-binding jsono_transform does not re-wrap it.
+statement ok
+PREPARE pq AS SELECT jsono_transform(j, {'first_id':{'type':'BIGINT','path':'$.products[0].id'}}) FROM t;
+
+query I
+EXECUTE pq;
+----
+{'first_id': 1}
+
+query I
+EXECUTE pq;
+----
+{'first_id': 1}

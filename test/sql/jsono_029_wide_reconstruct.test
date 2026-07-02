@@ -168,22 +168,23 @@ WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[
 
 # ---------------------------------------------------------------------------
 # B — plan-lock: the per-field gate keeps the transform argument a bare column for a sibling-scalar
-# read, and only wraps it in a reconstruct CAST when a field actually descends into the array.
+# read, and only wraps it in a reconstruct operator when a field actually descends into the array.
 # ---------------------------------------------------------------------------
 statement ok
 CREATE TABLE arr AS SELECT jsono('{"f0":7,"goals":[1,2,3]}', shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'}) AS e;
 
-# Sibling scalar f0: fast path, argument is the bare column (no reconstruct CAST).
+# Sibling scalar f0: fast path, argument is the bare column (no reconstruct).
 query II
 EXPLAIN SELECT jsono_transform(e, {'f0': 'BIGINT'}) FROM arr;
 ----
-physical_plan	<!REGEX>:.*jsono_transform\(CAST.*
+physical_plan	<!REGEX>:.*__jsono_reconstruct.*
 
-# A field descending into the array: the argument IS wrapped in a reconstruct CAST.
+# A field descending into the array: the argument IS wrapped in the visible __jsono_reconstruct
+# operator (instead of an anonymous cast) so the whole-value reconstruct cost shows up in EXPLAIN.
 query II
 EXPLAIN SELECT jsono_transform(e, {'g0': {'path': '$.goals[0]', 'type': 'BIGINT'}}) FROM arr;
 ----
-physical_plan	<REGEX>:.*jsono_transform\(CAST.*
+physical_plan	<REGEX>:.*__jsono_reconstruct.*
 
 # ---------------------------------------------------------------------------
 # B — manifest fail-loud is preserved under the per-field gate. A raw by-name struct cast (extension

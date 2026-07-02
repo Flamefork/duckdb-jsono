@@ -1017,6 +1017,24 @@ ScalarFunction MakeJsonoInternalDoubleTextFunction() {
 	return fun;
 }
 
+// __jsono_reconstruct(shredded) -> plain JSONO: the explicit, named form of the shredded->plain
+// reconstruct a bind would otherwise hide inside an anonymous cast. The executor delegates to the
+// shared JsonoReconstructToPlain overlay. The declared argument type is the exact shredded type of
+// the wrapped expression, so no inner cast is added; the executor reads the actual vector type.
+void JsonoReconstructInternalExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)state;
+	JsonoReconstructToPlain(args.data[0], args.size(), result);
+}
+
+ScalarFunction MakeJsonoReconstructFunction(const LogicalType &input_type) {
+	ScalarFunction fun("__jsono_reconstruct", {input_type}, JsonoType(), JsonoReconstructInternalExecute);
+	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	return fun;
+}
+
 idx_t ConservativePredicateRank(const JsonoMatchPredicate &predicate) {
 	auto root_path = predicate.path.steps.size() <= 1;
 	// A range comparison keeps a value interval, so it ranks with multi-value sets: less selective
@@ -2384,6 +2402,14 @@ void JsonoOptimizerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOp
 }
 
 } // namespace
+
+unique_ptr<Expression> MakeJsonoReconstructExpression(unique_ptr<Expression> shredded_arg) {
+	auto input_type = shredded_arg->return_type;
+	vector<unique_ptr<Expression>> children;
+	children.push_back(std::move(shredded_arg));
+	return make_uniq<BoundFunctionExpression>(JsonoType(), MakeJsonoReconstructFunction(input_type),
+	                                          std::move(children), nullptr);
+}
 
 void RegisterJsonoOptimizer(ExtensionLoader &loader) {
 	OptimizerExtension extension;
