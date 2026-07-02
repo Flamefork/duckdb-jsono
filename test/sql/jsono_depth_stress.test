@@ -1,0 +1,90 @@
+# name: test/sql/jsono_depth_stress.test
+# description: Recursive walkers near the nesting-depth limit (adaptive: 999 / 511 / 31 by build and platform)
+# group: [sql]
+
+require jsono
+
+require json
+
+# Every recursive walker (parse, render, extract, merge, diff, entries, validate, group_merge)
+# has depth levels the shallow suites never reach; a depth-dependent bug (a reallocation
+# invalidating a held reference, stack-adjacent trouble) ships silently without this. The depth
+# adapts to the build's limit by probing (1000 on Linux release/UBSan-only -> 999; 512 on
+# macOS release -> 511; 32 under ASan or macOS UBSan-only -> 31). SET VARIABLE keeps the derived paths constant-foldable (extract
+# requires a constant path).
+statement ok
+SET VARIABLE d = (SELECT CASE
+    WHEN try_jsono(repeat('[', 48) || '1' || repeat(']', 48)) IS NULL THEN 31
+    WHEN try_jsono(repeat('[', 600) || '1' || repeat(']', 600)) IS NULL THEN 511
+    ELSE 999 END);
+
+statement ok
+SET VARIABLE arr_text = repeat('[', getvariable('d')) || '1' || repeat(']', getvariable('d'));
+
+statement ok
+SET VARIABLE obj_text = repeat('{"a":', getvariable('d')) || '1' || repeat('}', getvariable('d'));
+
+statement ok
+SET VARIABLE obj2_text = repeat('{"a":', getvariable('d') - 1) || '{"a":2}' || repeat('}', getvariable('d') - 1);
+
+statement ok
+SET VARIABLE deep_path = '$' || repeat('.a', getvariable('d'));
+
+# Parse + render round-trip both container kinds at depth limit-1.
+query II
+SELECT to_json(jsono(getvariable('arr_text')))::VARCHAR = getvariable('arr_text'),
+       to_json(jsono(getvariable('obj_text')))::VARCHAR = getvariable('obj_text');
+----
+true	true
+
+# The boundary itself is pinned: depth limit (d + 1) still parses, one past it fails loud.
+query III
+SELECT try_jsono(repeat('[', getvariable('d') + 1) || '1' || repeat(']', getvariable('d') + 1)) IS NOT NULL,
+       try_jsono(repeat('[', getvariable('d') + 2) || '1' || repeat(']', getvariable('d') + 2)) IS NULL,
+       try_jsono(repeat('{"a":', getvariable('d') + 2) || '1' || repeat('}', getvariable('d') + 2)) IS NULL;
+----
+true	true	true
+
+# Point extract walks the full chain; the leaf and a missing sibling both resolve.
+query II
+SELECT jsono_extract_string(jsono(getvariable('obj_text')), getvariable('deep_path')),
+       jsono_extract_string(jsono(getvariable('obj_text')), getvariable('deep_path') || '.missing') IS NULL;
+----
+1	true
+
+# The merge walker recurses through every shared level: obj2 overwrites obj's leaf subtree.
+query I
+SELECT to_json(jsono_merge_patch(jsono(getvariable('obj_text')), jsono(getvariable('obj2_text'))))::VARCHAR
+     = getvariable('obj2_text');
+----
+true
+
+# The diff walkers agree with the merge contract at depth: prev + diff == cur.
+query I
+SELECT to_json(jsono_merge_patch(jsono(getvariable('obj_text')),
+                                 jsono_diff(jsono(getvariable('obj_text')), jsono(getvariable('obj2_text')))))::VARCHAR
+     = getvariable('obj2_text');
+----
+true
+
+# Entries reaches the deepest leaf (one leaf, its jsonpath key spans every level).
+query II
+SELECT len(jsono_entries(jsono(getvariable('obj_text')))),
+       jsono_entries(jsono(getvariable('obj_text')))[1].key = getvariable('deep_path');
+----
+1	true
+
+# Validate walks the whole tape; group_merge folds two deep documents.
+query II
+SELECT jsono_validate(jsono(getvariable('obj_text'))),
+       (SELECT to_json(jsono_group_merge(v))::VARCHAR = getvariable('obj2_text')
+        FROM (VALUES (jsono(getvariable('obj_text'))), (jsono(getvariable('obj2_text')))) t(v));
+----
+true	true
+
+# Array elements of a nested-at-depth array: the element re-emit walks d - 1 levels.
+query I
+SELECT to_json(jsono_array_elements(jsono(getvariable('arr_text')))[1])::VARCHAR
+     = repeat('[', getvariable('d') - 1) || '1' || repeat(']', getvariable('d') - 1);
+----
+true

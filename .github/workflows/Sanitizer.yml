@@ -85,3 +85,45 @@ jobs:
           JSONO_DUCKDB_BIN: build/debug/duckdb
           JSONO_EXTENSION: build/debug/extension/jsono/jsono.duckdb_extension
         run: uv run --frozen test/pruning/jsono_pruning.py
+
+  # UBSan-only companion: ASan's fat stack frames force the nesting-depth limit down to 32, so
+  # depths 33-1000 of every recursive walker never run under the ASan job. A UBSan-only build on
+  # Linux keeps the full 1000-depth limit (worker threads get the platform-default 8 MiB stack;
+  # macOS's ~512 KiB worker stacks cannot fit the instrumented recursion, so the gate drops that
+  # combination to 32) — this job is the one place the deep recursion levels execute
+  # instrumented: jsono_depth_stress.test runs at depth 999 here.
+  ubsan-full-depth:
+    name: UBSan full-depth (linux_amd64)
+    runs-on: ubuntu-latest
+    env:
+      GEN: ninja
+      CC: clang
+      CXX: clang++
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build clang
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: sanitizer-ubsan-only
+          max-size: 1G
+
+      - name: Build (Debug = UBSan only, full depth limit)
+        env:
+          EXT_FLAGS: -DENABLE_SANITIZER=FALSE -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        run: make debug
+
+      - name: SQLLogic tests under UBSan at full depth
+        run: make test_debug

@@ -349,6 +349,12 @@ constexpr uint32_t OBJECT_CHECKPOINT_STRIDE = 16;
 #if defined(__SANITIZE_ADDRESS__)
 #define JSONO_ADDRESS_SANITIZER 1
 #endif
+// Whether this translation unit is built with UBSan instrumentation (without ASan).
+#if defined(__has_feature) && !defined(JSONO_ADDRESS_SANITIZER)
+#if __has_feature(undefined_behavior_sanitizer)
+#define JSONO_UB_SANITIZER 1
+#endif
+#endif
 
 // Maximum container nesting accepted by the writer and the recursive readers.
 // The tape walkers recurse per nesting level, so an unbounded depth overflows
@@ -362,8 +368,23 @@ constexpr uint32_t OBJECT_CHECKPOINT_STRIDE = 16;
 // throw overflowed ~2/3 of runs (ASLR-dependent). 32 clears the deepest exercised
 // document (depth 30 in jsono_depth_limit.test) yet leaves ~18 recursion frames of
 // headroom below the observed overflow point for the throw's own serialization.
-#ifdef JSONO_ADDRESS_SANITIZER
+// A UBSan-only build keeps the full depth EXCEPT on macOS: UBSan frames are thinner than
+// ASan's but still overflow macOS's ~512 KiB worker-thread stacks ASLR-dependently anywhere
+// past a few dozen levels (observed: strip recursion died between 128 and 150; the over-limit
+// guard throw at the deepest parse frame died 4/10 runs even at 64). Linux worker threads get
+// the platform-default 8 MiB stack, which fits the full 1000-level recursion — that is where
+// the UBSan full-depth CI job runs depths the ASan bound never reaches.
+// macOS worker threads run on ~512 KiB stacks (Linux defaults to 8 MiB), and the depth-999
+// stress showed even the RELEASE recursion plus the guard throw overflowing there
+// ASLR-dependently (2/10 unittest runs, bus error) — the guard must trip before the stack does,
+// so the release bound is halved on macOS. Realistic documents nest a few dozen levels; both
+// bounds stay far above that.
+#if defined(JSONO_ADDRESS_SANITIZER)
 constexpr size_t JSONO_MAX_NESTING_DEPTH = 32;
+#elif defined(JSONO_UB_SANITIZER) && defined(__APPLE__)
+constexpr size_t JSONO_MAX_NESTING_DEPTH = 32;
+#elif defined(__APPLE__)
+constexpr size_t JSONO_MAX_NESTING_DEPTH = 512;
 #else
 constexpr size_t JSONO_MAX_NESTING_DEPTH = 1000;
 #endif
