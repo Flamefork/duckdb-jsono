@@ -643,6 +643,46 @@ SCENARIOS += [
     for mode, scenario_label in DIFF_PAIRS_MODES
 ]
 
+# The same isolated diff over shredded snapshot pairs (the rick/data storage shape): both sides
+# share one all-scalar shredded type, so the direct lane diff applies — pairwise typed lanes plus
+# the residual walk, reconstruct only for lane-presence-mismatch rows. Compare against
+# isolated_atomic from the same run for the shredded-input overhead.
+DIFF_PAIRS_SNAPSHOT_SHREDDING = {
+    "transaction_id": "VARCHAR",
+    "created_at": "BIGINT",
+    "currency": "VARCHAR",
+    "owner_id": "VARCHAR",
+    "pipeline": "VARCHAR",
+    "source": "VARCHAR",
+    "utm_source": "VARCHAR",
+    "utm_medium": "VARCHAR",
+    "utm_campaign": "VARCHAR",
+    "contact_id": "VARCHAR",
+    "company_id": "VARCHAR",
+    "region": "VARCHAR",
+    "status": "VARCHAR",
+    "stage": "VARCHAR",
+    "amount": "BIGINT",
+    "probability": "BIGINT",
+    "score": "BIGINT",
+    "priority": "VARCHAR",
+    "last_event": "VARCHAR",
+}
+SCENARIOS += [
+    {
+        "operation": "diff",
+        "scenario": "isolated_atomic_shredded",
+        "size": size_name,
+        "row_count": num_rows,
+        "data_file": DATA_DIR / f"diff_pairs_{size_name}.parquet",
+        "json_column": "snapshot_json",
+        "mode": "isolated_atomic",
+        "shredding": DIFF_PAIRS_SNAPSHOT_SHREDDING,
+        "targets": ["jsono"],
+    }
+    for size_name, num_rows in DIFF_PAIRS_SIZES.items()
+]
+
 # jsono_entries array_style: the same array-heavy ecom doc flattened both ways. indexed_elements
 # (default) explodes each `products` array into per-element leaves; whole_json emits one leaf per
 # array. JSONO-only (core json has no equivalent contract); both run so a single run gives the

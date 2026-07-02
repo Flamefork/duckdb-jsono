@@ -1,7 +1,10 @@
 #include "jsono.hpp"
 #include "jsono_copy.hpp"
+#include "jsono_path.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_row_read.hpp"
+#include "jsono_scalar_write.hpp"
+#include "jsono_shred.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -38,18 +41,83 @@ using namespace jsono;
 // Object/scalar handling is identical across modes; only array rendering differs.
 enum class DiffArrayMode : uint8_t { Atomic, Counts, Elements };
 
+// One scalar shred lane of the direct shredded diff: the shred's position in the (identical)
+// input types, its primitive, and its compiled object-key path. Sorted by path keys so the
+// change-patch tree groups shared prefixes (same order the reconstruct patch uses).
+struct DiffLanePlan {
+	idx_t shred_index = 0;
+	jsono::JsonoScalarPrimitive prim = jsono::JsonoScalarPrimitive::Varchar;
+	vector<PathStep> steps;
+};
+
 struct JsonoDiffBindData : public FunctionData {
 	explicit JsonoDiffBindData(DiffArrayMode mode_p) : mode(mode_p) {
 	}
 	DiffArrayMode mode;
+	// Non-empty => both arguments share one all-scalar shredded type and the executor diffs
+	// residuals + typed lanes directly instead of reconstructing every row.
+	vector<DiffLanePlan> lanes;
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<JsonoDiffBindData>(mode);
+		auto result = make_uniq<JsonoDiffBindData>(mode);
+		result->lanes = lanes;
+		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
-		return mode == other_p.Cast<JsonoDiffBindData>().mode;
+		auto &other = other_p.Cast<JsonoDiffBindData>();
+		if (mode != other.mode || lanes.size() != other.lanes.size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < lanes.size(); i++) {
+			if (lanes[i].shred_index != other.lanes[i].shred_index || lanes[i].prim != other.lanes[i].prim) {
+				return false;
+			}
+		}
+		return true;
 	}
 };
+
+// Build the lane plan for a shredded input type: one entry per scalar shred, sorted by path
+// keys. Returns false (no direct diff) when the type carries an array shred — array skeletons
+// plus lockstep lanes need the reconstruct path's overlay semantics.
+bool TryBuildDiffLanePlan(const LogicalType &type, vector<DiffLanePlan> &lanes) {
+	JsonoLayoutType layout;
+	if (!TryParseJsonoLayoutType(type, layout)) {
+		return false;
+	}
+	lanes.clear();
+	lanes.reserve(layout.shreds.size());
+	for (idx_t f = 0; f < layout.shreds.size(); f++) {
+		if (ClassifyShredKind(layout.shreds[f].second) != ShredKind::Scalar) {
+			return false;
+		}
+		DiffLanePlan plan;
+		plan.shred_index = f;
+		plan.prim = jsono::JsonoScalarPrimitiveFromType(layout.shreds[f].second, "jsono_diff shred");
+		auto &name = layout.shreds[f].first;
+		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
+			plan.steps = ParseJsonoPath(name, "jsono_diff shred");
+		} else {
+			plan.steps.push_back(PathStep {PathStepKind::Key, name, 0});
+		}
+		for (auto &step : plan.steps) {
+			if (step.kind != PathStepKind::Key) {
+				return false;
+			}
+		}
+		lanes.push_back(std::move(plan));
+	}
+	std::sort(lanes.begin(), lanes.end(), [](const DiffLanePlan &a, const DiffLanePlan &b) {
+		auto n = std::min(a.steps.size(), b.steps.size());
+		for (size_t i = 0; i < n; i++) {
+			if (a.steps[i].key != b.steps[i].key) {
+				return a.steps[i].key < b.steps[i].key;
+			}
+		}
+		return a.steps.size() < b.steps.size();
+	});
+	return true;
+}
 
 // One object child captured in a single value-block walk: its key and the value's cursor (slot
 // position plus the three stream cursors) and slot tag. Mirrors the merge family's MergeChild.
@@ -728,17 +796,311 @@ unique_ptr<FunctionData> JsonoDiffBind(ClientContext &context, ScalarFunction &b
 			throw BinderException("jsono_diff: arrays must be 'atomic', 'counts' or 'elements'");
 		}
 	}
+	auto bind_data = make_uniq<JsonoDiffBindData>(mode);
+	auto &prev_type = arguments[0]->return_type;
+	auto &cur_type = arguments[1]->return_type;
+	if (IsShreddedJsonoType(prev_type) && prev_type == cur_type && TryBuildDiffLanePlan(prev_type, bind_data->lanes)) {
+		// Both sides share one all-scalar shredded type: diff directly — pairwise typed lanes plus a
+		// residual walk. Equal shredding places equal values identically (a value's fitting is a
+		// pure function of the value), so lane-vs-lane and residual-vs-residual comparisons are
+		// complete; a row whose lane presence differs on any path (fitting <-> diverted/absent/null
+		// transitions) falls back to per-row reconstruct inside the executor.
+		bound_function.arguments[0] = prev_type;
+		bound_function.arguments[1] = cur_type;
+		return std::move(bind_data);
+	}
+	bind_data->lanes.clear();
 	// Both document arguments are reconstructed to plain JSONO at bind (the binder inserts the
 	// lossless reconstruct cast for a shredded input), so the executor reads whole logical values and
 	// never touches shred lanes — sidestepping the shredded-array read path entirely.
 	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_diff", true);
 	bound_function.arguments[1] = JsonoResolveJsonoArgument(context, *arguments[1], "jsono_diff", true);
-	return make_uniq<JsonoDiffBindData>(mode);
+	return std::move(bind_data);
+}
+
+// Typed equality of one lane pair. Doubles compare bitwise: the reconstruct oracle emits the
+// lane's raw bits and the plain diff compares num-stream words, so -0.0 != 0.0 there too.
+bool LaneValueEqual(jsono::JsonoScalarPrimitive prim, const UnifiedVectorFormat &pf, idx_t pi,
+                    const UnifiedVectorFormat &cf, idx_t ci) {
+	switch (prim) {
+	case jsono::JsonoScalarPrimitive::Varchar:
+		return UnifiedVectorFormat::GetData<string_t>(pf)[pi] == UnifiedVectorFormat::GetData<string_t>(cf)[ci];
+	case jsono::JsonoScalarPrimitive::Bigint:
+		return UnifiedVectorFormat::GetData<int64_t>(pf)[pi] == UnifiedVectorFormat::GetData<int64_t>(cf)[ci];
+	case jsono::JsonoScalarPrimitive::Ubigint:
+		return UnifiedVectorFormat::GetData<uint64_t>(pf)[pi] == UnifiedVectorFormat::GetData<uint64_t>(cf)[ci];
+	case jsono::JsonoScalarPrimitive::Double: {
+		auto a = UnifiedVectorFormat::GetData<double>(pf)[pi];
+		auto b = UnifiedVectorFormat::GetData<double>(cf)[ci];
+		return std::memcmp(&a, &b, sizeof(double)) == 0;
+	}
+	case jsono::JsonoScalarPrimitive::Boolean:
+		return UnifiedVectorFormat::GetData<bool>(pf)[pi] == UnifiedVectorFormat::GetData<bool>(cf)[ci];
+	}
+	return false;
+}
+
+void EmitLaneValue(JsonoBuilder &b, jsono::JsonoScalarPrimitive prim, const UnifiedVectorFormat &fmt, idx_t idx) {
+	switch (prim) {
+	case jsono::JsonoScalarPrimitive::Varchar: {
+		auto v = UnifiedVectorFormat::GetData<string_t>(fmt)[idx];
+		b.EmitString(nonstd::string_view(v.GetData(), v.GetSize()));
+		break;
+	}
+	case jsono::JsonoScalarPrimitive::Bigint:
+		b.EmitInt(UnifiedVectorFormat::GetData<int64_t>(fmt)[idx]);
+		break;
+	case jsono::JsonoScalarPrimitive::Ubigint:
+		b.EmitUInt(UnifiedVectorFormat::GetData<uint64_t>(fmt)[idx]);
+		break;
+	case jsono::JsonoScalarPrimitive::Double:
+		b.EmitDouble(UnifiedVectorFormat::GetData<double>(fmt)[idx]);
+		break;
+	case jsono::JsonoScalarPrimitive::Boolean:
+		b.EmitBool(UnifiedVectorFormat::GetData<bool>(fmt)[idx]);
+		break;
+	}
+}
+
+// Emit the changed lanes changed[lo,hi) (sharing the key prefix steps[0..depth)) as a nested
+// patch object keyed by steps[depth]. The lane plan is pre-sorted by path keys, so groups are
+// contiguous and every object's keys emit in canonical order. A leaf group is always a single
+// lane: two lanes on path X and X.Y cannot both be non-NULL (X would have to be a scalar and an
+// object at once), and changed lanes are non-NULL on both sides.
+void EmitLanePatch(JsonoBuilder &b, const vector<DiffLanePlan> &lanes, const vector<idx_t> &changed,
+                   const vector<UnifiedVectorFormat> &cur_fmt, idx_t row, idx_t lo, idx_t hi, size_t depth) {
+	idx_t groups = 0;
+	for (idx_t i = lo; i < hi;) {
+		idx_t j = i + 1;
+		while (j < hi && lanes[changed[j]].steps[depth].key == lanes[changed[i]].steps[depth].key) {
+			j++;
+		}
+		groups++;
+		i = j;
+	}
+	b.EmitObjectStart(groups);
+	for (idx_t i = lo; i < hi;) {
+		idx_t j = i + 1;
+		while (j < hi && lanes[changed[j]].steps[depth].key == lanes[changed[i]].steps[depth].key) {
+			j++;
+		}
+		b.EmitKeySlot(lanes[changed[i]].steps[depth].key);
+		i = j;
+	}
+	for (idx_t i = lo; i < hi;) {
+		idx_t j = i + 1;
+		while (j < hi && lanes[changed[j]].steps[depth].key == lanes[changed[i]].steps[depth].key) {
+			j++;
+		}
+		b.EmitObjectChildStart();
+		auto &first = lanes[changed[i]];
+		if (depth + 1 == first.steps.size()) {
+			if (j != i + 1) {
+				throw InternalException("jsono_diff: lane patch leaf group is not a single lane");
+			}
+			auto ci = cur_fmt[changed[i]].sel->get_index(row);
+			EmitLaneValue(b, first.prim, cur_fmt[changed[i]], ci);
+		} else {
+			EmitLanePatch(b, lanes, changed, cur_fmt, row, i, j, depth + 1);
+		}
+		i = j;
+	}
+	b.EmitObjectEnd();
+}
+
+// Union two diff objects (the residual diff and the lane patch tree) into one. Keys are disjoint
+// except at shared object prefixes, where the union recurses: a non-NULL lane pair means the
+// path is stripped from both residuals, so the residual diff can never carry the same leaf.
+void UnionDiffObjects(const JsonoView &va, const JsonoCursor &ca, const JsonoView &vb, const JsonoCursor &cb,
+                      JsonoBuilder &builder, DiffScratch &s, size_t depth) {
+	auto &a_children = s.PrevChildren(depth);
+	auto &b_children = s.CurChildren(depth);
+	CollectChildren(va, ca, a_children);
+	CollectChildren(vb, cb, b_children);
+	idx_t total = 0;
+	{
+		size_t ia = 0, ib = 0;
+		while (ia < a_children.size() || ib < b_children.size()) {
+			int cmp = ia == a_children.size()   ? 1
+			          : ib == b_children.size() ? -1
+			                                    : CompareKeys(a_children[ia].key, b_children[ib].key);
+			ia += cmp <= 0 ? 1 : 0;
+			ib += cmp >= 0 ? 1 : 0;
+			total++;
+		}
+	}
+	builder.EmitObjectStart(total);
+	{
+		size_t ia = 0, ib = 0;
+		while (ia < a_children.size() || ib < b_children.size()) {
+			int cmp = ia == a_children.size()   ? 1
+			          : ib == b_children.size() ? -1
+			                                    : CompareKeys(a_children[ia].key, b_children[ib].key);
+			builder.EmitKeySlot(cmp <= 0 ? a_children[ia].key : b_children[ib].key);
+			ia += cmp <= 0 ? 1 : 0;
+			ib += cmp >= 0 ? 1 : 0;
+		}
+	}
+	size_t ia = 0, ib = 0;
+	while (ia < a_children.size() || ib < b_children.size()) {
+		int cmp = ia == a_children.size()   ? 1
+		          : ib == b_children.size() ? -1
+		                                    : CompareKeys(a_children[ia].key, b_children[ib].key);
+		builder.EmitObjectChildStart();
+		if (cmp < 0) {
+			JsonoCursor c = a_children[ia].cursor;
+			EmitValueVerbatim(va, c, builder, depth + 1);
+			ia++;
+		} else if (cmp > 0) {
+			JsonoCursor c = b_children[ib].cursor;
+			EmitValueVerbatim(vb, c, builder, depth + 1);
+			ib++;
+		} else {
+			if (a_children[ia].tag != tag::OBJ_START || b_children[ib].tag != tag::OBJ_START) {
+				throw InternalException("jsono_diff: lane patch collided with a residual diff leaf");
+			}
+			UnionDiffObjects(va, a_children[ia].cursor, vb, b_children[ib].cursor, builder, s, depth + 1);
+			ia++;
+			ib++;
+		}
+	}
+	builder.EmitObjectEnd();
+}
+
+// Direct shredded diff: pairwise typed lane compare + residual diff; rows whose lane presence
+// differs on any path (or with a SQL-NULL side) are reconstructed and diffed the plain way.
+void JsonoDiffExecuteDirect(DataChunk &args, JsonoDiffLocalState &lstate, const JsonoDiffBindData &bind_data,
+                            Vector &result) {
+	auto mode = bind_data.mode;
+	auto count = args.size();
+	auto &lanes = bind_data.lanes;
+
+	JsonoRowReader prev_reader;
+	prev_reader.Init(args.data[0], count);
+	JsonoRowReader cur_reader;
+	cur_reader.Init(args.data[1], count);
+	vector<UnifiedVectorFormat> prev_fmt(lanes.size());
+	vector<UnifiedVectorFormat> cur_fmt(lanes.size());
+	for (idx_t k = 0; k < lanes.size(); k++) {
+		jsono::JsonoShredVector(args.data[0], lanes[k].shred_index).ToUnifiedFormat(count, prev_fmt[k]);
+		jsono::JsonoShredVector(args.data[1], lanes[k].shred_index).ToUnifiedFormat(count, cur_fmt[k]);
+	}
+
+	JsonoBodyWriter writer;
+	writer.Init(result);
+	auto &builder = lstate.builder;
+	auto &scratch = lstate.scratch;
+	SelectionVector fallback_sel(count);
+	idx_t fallback_count = 0;
+	vector<idx_t> changed;
+	static thread_local JsonoBuilder patch_builder;
+	static thread_local OwnedJsonoBlob patch_blob;
+	static thread_local OwnedJsonoBlob diff_blob;
+
+	JsonoView prev_view;
+	JsonoView cur_view;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow prev_blob;
+		JsonoBlobRow cur_blob;
+		bool prev_present = prev_reader.Read(row, prev_blob, prev_view) == JsonoRowState::Value;
+		bool cur_present = cur_reader.Read(row, cur_blob, cur_view) == JsonoRowState::Value;
+		// A SQL-NULL side keeps the empty-document semantics through the reconstruct fallback (its
+		// lanes are NULL while the other side's may not be, which reads as a presence mismatch).
+		bool mixed = !prev_present || !cur_present;
+		changed.clear();
+		if (!mixed) {
+			for (idx_t k = 0; k < lanes.size(); k++) {
+				auto pi = prev_fmt[k].sel->get_index(row);
+				auto ci = cur_fmt[k].sel->get_index(row);
+				bool pv = prev_fmt[k].validity.RowIsValid(pi);
+				bool cv = cur_fmt[k].validity.RowIsValid(ci);
+				if (pv != cv) {
+					mixed = true;
+					break;
+				}
+				if (pv && !LaneValueEqual(lanes[k].prim, prev_fmt[k], pi, cur_fmt[k], ci)) {
+					changed.push_back(k);
+				}
+			}
+		}
+		if (mixed) {
+			fallback_sel.set_index(fallback_count++, row);
+			continue;
+		}
+		builder.Reset();
+		JsonoCursor prev_cursor;
+		JsonoCursor cur_cursor;
+		if (SlotTag(cur_view.SlotAt(cur_cursor.pos)) == tag::OBJ_START) {
+			EmitDiffValue(true, prev_view, prev_cursor, cur_view, cur_cursor, builder, mode, 0, scratch);
+		} else if (DiffChanged(true, prev_view, prev_cursor, cur_view, cur_cursor, mode, 0, scratch)) {
+			EmitDiffValue(true, prev_view, prev_cursor, cur_view, cur_cursor, builder, mode, 0, scratch);
+		} else {
+			builder.EmitObjectStart(0);
+			builder.EmitObjectEnd();
+		}
+		if (changed.empty()) {
+			writer.WriteRow(row, builder);
+			continue;
+		}
+		patch_builder.Reset();
+		EmitLanePatch(patch_builder, lanes, changed, cur_fmt, row, 0, changed.size(), 0);
+		SerializeBuilderToBlob(patch_builder, patch_blob);
+		JsonoView patch_view = ViewOfBlob(patch_blob);
+		patch_view.ParseHeader();
+		SerializeBuilderToBlob(builder, diff_blob);
+		JsonoView diff_view = ViewOfBlob(diff_blob);
+		diff_view.ParseHeader();
+		builder.Reset();
+		UnionDiffObjects(diff_view, JsonoCursor(), patch_view, JsonoCursor(), builder, scratch, 0);
+		writer.WriteRow(row, builder);
+	}
+
+	if (fallback_count == 0) {
+		return;
+	}
+	Vector prev_sliced(args.data[0], fallback_sel, fallback_count);
+	Vector cur_sliced(args.data[1], fallback_sel, fallback_count);
+	Vector prev_plain(JsonoType(), fallback_count);
+	Vector cur_plain(JsonoType(), fallback_count);
+	JsonoReconstructToPlain(prev_sliced, fallback_count, prev_plain);
+	JsonoReconstructToPlain(cur_sliced, fallback_count, cur_plain);
+	JsonoRowReader prev_fallback_reader;
+	prev_fallback_reader.Init(prev_plain, fallback_count);
+	JsonoRowReader cur_fallback_reader;
+	cur_fallback_reader.Init(cur_plain, fallback_count);
+	const JsonoView &empty_object = lstate.EmptyObjectView();
+	for (idx_t i = 0; i < fallback_count; i++) {
+		auto out_row = fallback_sel.get_index(i);
+		JsonoBlobRow prev_blob;
+		JsonoBlobRow cur_blob;
+		bool prev_present = prev_fallback_reader.Read(i, prev_blob, prev_view) == JsonoRowState::Value;
+		bool cur_present = cur_fallback_reader.Read(i, cur_blob, cur_view) == JsonoRowState::Value;
+		const JsonoView &cur = cur_present ? cur_view : empty_object;
+		JsonoCursor prev_cursor;
+		JsonoCursor cur_cursor;
+		builder.Reset();
+		if (SlotTag(cur.SlotAt(cur_cursor.pos)) == tag::OBJ_START) {
+			EmitDiffValue(prev_present, prev_view, prev_cursor, cur, cur_cursor, builder, mode, 0, scratch);
+		} else if (DiffChanged(prev_present, prev_view, prev_cursor, cur, cur_cursor, mode, 0, scratch)) {
+			EmitDiffValue(prev_present, prev_view, prev_cursor, cur, cur_cursor, builder, mode, 0, scratch);
+		} else {
+			builder.EmitObjectStart(0);
+			builder.EmitObjectEnd();
+		}
+		writer.WriteRow(out_row, builder);
+	}
 }
 
 void JsonoDiffExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoDiffLocalState>();
 	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoDiffBindData>();
+	if (!bind_data.lanes.empty()) {
+		JsonoDiffExecuteDirect(args, lstate, bind_data, result);
+		if (args.AllConstant()) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		}
+		return;
+	}
 	auto mode = bind_data.mode;
 	auto count = args.size();
 
