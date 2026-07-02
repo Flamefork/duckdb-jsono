@@ -136,6 +136,47 @@ SELECT e ->> 'a' FROM narrow_target ORDER BY 1;
 ok
 v1
 
+# --- The newer readers fail loud on a narrowed row too, including one whose dropped shred is an
+# ARRAY lane (the residual keeps only the element skeleton, so a silent read would fabricate
+# placeholder content). ---
+
+statement ok
+CREATE TABLE narrow_arr AS SELECT jsono('{}', shredding := {'a':'VARCHAR'}) AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO narrow_arr SELECT jsono('{"a":"v","tags":[1,2]}', shredding := {'a':'VARCHAR','tags':'BIGINT[]'});
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT jsono_array_length(e, '$.tags') FROM narrow_arr;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT jsono_array_elements(e, '$.tags') FROM narrow_arr;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT jsono_group_array(e) FROM narrow_arr;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT jsono_group_object('k', e) FROM narrow_arr;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT jsono_diff(e, e) FROM narrow_arr;
+----
+narrowed by a raw struct cast
+
 # Shredded operations that the extension binds directly require the extension optimizer. Plain
 # JSONO remains usable without it, but shredded values are unsafe because core DuckDB can
 # otherwise route them through generic STRUCT casts.

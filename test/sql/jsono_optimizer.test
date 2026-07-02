@@ -720,6 +720,43 @@ WHERE (jsono_extract_string(j, '$.n') > '10') AND (jsono_extract_string(j, '$.n'
 ----
 3
 
+# Constant-on-left ranges flip into the fused matcher; the flipped direction must hold BY VALUE
+# for every operator (an EXPLAIN alone stays green under a wrong flip). Binary order here:
+# nyc < se < sea < tokyo. 'se' <= city AND 'tokyo' > city keeps [se, tokyo) — the inclusive and
+# exclusive bounds land on se/sea exactly as the right-side spelling.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT count(*) FROM jsono_matcher_range
+WHERE ('se' <= jsono_extract_string(j, '$.city'))
+  AND ('tokyo' > jsono_extract_string(j, '$.city'));
+----
+physical_plan	<REGEX>:.*__jsono_internal_match.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT jsono_extract_string(j, '$.city'), jsono_extract_string(j, '$.n')
+FROM jsono_matcher_range
+WHERE ('se' <= jsono_extract_string(j, '$.city'))
+  AND ('tokyo' > jsono_extract_string(j, '$.city'))
+ORDER BY ALL;
+----
+se	9
+sea	10
+
+# The other two flipped operators: 'se' < city AND 'sea' >= city keeps (se, sea].
+query II
+SELECT jsono_extract_string(j, '$.city'), jsono_extract_string(j, '$.n')
+FROM jsono_matcher_range
+WHERE ('se' < jsono_extract_string(j, '$.city'))
+  AND ('sea' >= jsono_extract_string(j, '$.city'))
+ORDER BY ALL;
+----
+sea	10
+
 statement ok
 SET disabled_optimizers='extension';
 
@@ -738,6 +775,25 @@ SELECT count(*) FROM jsono_matcher_range
 WHERE (jsono_extract_string(j, '$.n') > '10') AND (jsono_extract_string(j, '$.n') <= '9');
 ----
 3
+
+query II
+SELECT jsono_extract_string(j, '$.city'), jsono_extract_string(j, '$.n')
+FROM jsono_matcher_range
+WHERE ('se' <= jsono_extract_string(j, '$.city'))
+  AND ('tokyo' > jsono_extract_string(j, '$.city'))
+ORDER BY ALL;
+----
+se	9
+sea	10
+
+query II
+SELECT jsono_extract_string(j, '$.city'), jsono_extract_string(j, '$.n')
+FROM jsono_matcher_range
+WHERE ('se' < jsono_extract_string(j, '$.city'))
+  AND ('sea' >= jsono_extract_string(j, '$.city'))
+ORDER BY ALL;
+----
+sea	10
 
 statement ok
 RESET disabled_optimizers;
