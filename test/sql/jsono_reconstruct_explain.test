@@ -59,3 +59,24 @@ query I
 EXECUTE pq;
 ----
 {'first_id': 1}
+
+# A CONSTANT array-shredded argument (no FROM): the optimizer still wraps the whole-value reconstruct
+# in __jsono_reconstruct, but because its args are all constant it re-marks the result CONSTANT, so
+# DuckDB folds the entire jsono_transform to its literal value. The descended array-shred field reads
+# the same document the table-driven case produced.
+query I
+SELECT jsono_transform(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
+                             shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                       {'first_id':{'type':'BIGINT','path':'$.products[0].id'}});
+----
+{'first_id': 1}
+
+# The constant-fold branch is what collapses the wrapper: with a constant argument no
+# __jsono_reconstruct operator survives in the plan (contrast the table-driven `t` case above, which
+# keeps it). If the branch stopped re-marking the result CONSTANT the operator would resurface here.
+query II
+EXPLAIN SELECT jsono_transform(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
+                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                              {'first_id':{'type':'BIGINT','path':'$.products[0].id'}});
+----
+physical_plan	<!REGEX>:.*__jsono_reconstruct.*

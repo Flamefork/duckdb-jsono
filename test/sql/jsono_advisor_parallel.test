@@ -1,0 +1,57 @@
+# name: test/sql/jsono_advisor_parallel.test
+# description: jsono_suggest_shredding / jsono_shred_stats grouped Update + parallel Combine must match the single-threaded fold
+# group: [sql]
+
+require jsono
+
+# jsono_shred_stats renders its LIST<STRUCT> result through core json's to_json(ANY).
+require json
+
+# 200k rows across 100 groups (multiple row groups, so the scan parallelizes into partial states),
+# mixed NULL documents (every 13th) and varied shapes: `a` is always a fitting int, `x` is an int
+# in 2/3 rows and a string in 1/3 (a real type-too-narrow divert), `b` is a string, `tags` an int
+# array, and `meta` a nested object. The GROUP BY forces the vectorized Update path and, under
+# multiple threads, the partial-state Combine.
+statement ok
+CREATE TABLE docs AS
+  SELECT (i % 100) AS g,
+         CASE WHEN i % 13 = 0 THEN NULL
+              ELSE '{"a":' || i || ',"b":"s' || (i % 4) || '",' ||
+                   CASE WHEN i % 3 = 0 THEN '"x":"str' || i || '",' ELSE '"x":' || i || ',' END ||
+                   '"tags":[' || (i % 5) || ',' || (i % 7) || '],' ||
+                   '"meta":{"m":' || (i % 9) || '}}'
+         END AS doc
+  FROM range(200000) t(i);
+
+# Single-threaded reference: SimpleUpdate feeds one accumulator per group, so the suggestion spec and
+# the per-shred rates are the ground truth for the parallel run to reproduce.
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE ref AS
+  SELECT g,
+         jsono_suggest_shredding(jsono(doc)) AS sug,
+         to_json(jsono_shred_stats(jsono(doc, shredding := {'a':'BIGINT','x':'BIGINT','tags':'BIGINT[]'}))) AS stats
+  FROM docs GROUP BY g;
+
+# Recompute under 4 threads: each group's suggestion and shred-stats result must match the reference
+# exactly, so the map-merge Combine (path candidates + non_null_rows) and the counter Combine both
+# fold partial states back to the single-threaded totals.
+statement ok
+SET threads = 4;
+
+query I
+SELECT count(*)
+FROM ( SELECT g,
+              jsono_suggest_shredding(jsono(doc)) AS sug,
+              to_json(jsono_shred_stats(jsono(doc, shredding := {'a':'BIGINT','x':'BIGINT','tags':'BIGINT[]'}))) AS stats
+       FROM docs GROUP BY g ) cur
+JOIN ref USING (g)
+WHERE cur.sug IS DISTINCT FROM ref.sug
+   OR cur.stats IS DISTINCT FROM ref.stats;
+----
+0
+
+statement ok
+RESET threads;

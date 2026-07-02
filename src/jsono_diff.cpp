@@ -69,7 +69,8 @@ struct JsonoDiffBindData : public FunctionData {
 			return false;
 		}
 		for (idx_t i = 0; i < lanes.size(); i++) {
-			if (lanes[i].shred_index != other.lanes[i].shred_index || lanes[i].prim != other.lanes[i].prim) {
+			if (lanes[i].shred_index != other.lanes[i].shred_index || lanes[i].prim != other.lanes[i].prim ||
+			    !PathStepsEqual(lanes[i].steps, other.lanes[i].steps)) {
 				return false;
 			}
 		}
@@ -95,11 +96,7 @@ bool TryBuildDiffLanePlan(const LogicalType &type, vector<DiffLanePlan> &lanes) 
 		plan.shred_index = f;
 		plan.prim = jsono::JsonoScalarPrimitiveFromType(layout.shreds[f].second, "jsono_diff shred");
 		auto &name = layout.shreds[f].first;
-		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
-			plan.steps = ParseJsonoPath(name, "jsono_diff shred");
-		} else {
-			plan.steps.push_back(PathStep {PathStepKind::Key, name, 0});
-		}
+		plan.steps = ShredNamePath(name, "jsono_diff shred");
 		for (auto &step : plan.steps) {
 			if (step.kind != PathStepKind::Key) {
 				return false;

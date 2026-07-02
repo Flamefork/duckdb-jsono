@@ -89,6 +89,55 @@ SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
 ----
 {items: 'STRUCT(n BIGINT)[]'}
 
+# A path seen as a scalar in some rows and an array in others is genuinely mixed. min_fit is measured
+# over the path's TOTAL present rows (scalar + array), so at the default min_fit := 1.0 neither role
+# covers every present value: the path drops and, being the only path, the whole spec is SQL NULL.
+query I
+SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
+  ('{"p":1}'),
+  ('{"p":2}'),
+  ('{"p":[1,2]}'),
+  ('{"p":[3,4]}')
+) AS t(d);
+----
+NULL
+
+# Lowering min_fit surfaces the majority role: 3 scalar rows and 1 array row make the scalar lane fit
+# 3/4 present values, clearing min_fit := 0.75 and winning over the array lane (1/4).
+query I
+SELECT jsono_suggest_shredding(jsono(d), min_fit := 0.75) FROM (VALUES
+  ('{"p":1}'),
+  ('{"p":2}'),
+  ('{"p":3}'),
+  ('{"p":[1,2]}')
+) AS t(d);
+----
+{p: 'BIGINT'}
+
+# A path that is a scalar in some rows and an OBJECT in others: the object occurrences are not a
+# competing role (they feed the nested $.meta.n candidate instead), so the scalar lane fits every
+# scalar occurrence and both suggestions surface. The overlapping pair stays ready-to-paste — the
+# constructor accepts a shred inside another shred's path (the container lane becomes
+# render-unsafe) and the shredded value round-trips losslessly.
+query I
+SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
+  ('{"meta":"s1"}'),
+  ('{"meta":"s2"}'),
+  ('{"meta":{"n":1}}'),
+  ('{"meta":{"n":2}}')
+) AS t(d);
+----
+{"$.meta.n": 'BIGINT', meta: 'VARCHAR'}
+
+query I
+SELECT count(*) FROM (
+  SELECT to_json(jsono(d, shredding := {'$.meta.n':'BIGINT', meta:'VARCHAR'})) AS s,
+         to_json(jsono(d)) AS p
+  FROM (VALUES ('{"meta":"s1"}'), ('{"meta":"s2"}'), ('{"meta":{"n":1}}'), ('{"meta":{"n":2}}')) t(d)
+) WHERE s IS DISTINCT FROM p;
+----
+0
+
 # No qualifying paths (or no non-NULL rows) yields SQL NULL.
 query I
 SELECT jsono_suggest_shredding(j) FROM docs WHERE false;
@@ -198,3 +247,67 @@ statement error
 SELECT jsono_shred_stats(jsono('{"a":1}'));
 ----
 shredded
+
+# A nested-path shred ($.m.deep): a fit populates the lane; a diverted string stays in the residual
+# under the full path (a real divert); a row where m is a scalar breaks the path's object skeleton
+# (the path is absent — complete, no divert), like a missing key.
+query I
+SELECT to_json(jsono_shred_stats(j)) FROM (
+  SELECT jsono(d, shredding := {'$.m.deep':'BIGINT'}) AS j FROM (VALUES
+    ('{"m":{"deep":1}}'),
+    ('{"m":{"deep":"x"}}'),
+    ('{"m":5}'),
+    ('{"x":1}')
+  ) AS t(d)
+);
+----
+[{"path":"$.m.deep","type":"BIGINT","lane_rate":0.25,"divert_rate":0.25,"complete_rate":0.75}]
+
+# A spec key that begins with `$` but is not a `$.`-rooted JSONPath is rejected loudly by the
+# constructor (the spec DSL reserves the `$` prefix for JSONPath), so no literal `$`-prefixed
+# shred name ever reaches the stats path classifier.
+statement error
+SELECT jsono('{"$x":1}', shredding := {'$x':'BIGINT'});
+----
+invalid path
+
+# jsono_shred_stats is a whole-document reader: a row narrowed by a raw struct cast (the dropped
+# shred still named by the residual manifest) fails loud like every other reader instead of
+# reporting plausible rates over the loss. Contract owner: jsono_shredded_cast_guard.test.
+statement ok
+CREATE TABLE stats_wide AS
+  SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT','b':'VARCHAR'}) AS j;
+
+statement ok
+CREATE TABLE stats_narrow AS
+  SELECT jsono('{"a":1}', shredding := {'a':'BIGINT'}) AS j WHERE 1=0;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO stats_narrow SELECT j FROM stats_wide;
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT jsono_shred_stats(j) FROM stats_narrow;
+----
+narrowed by a raw struct cast
+
+# ---- named-argument and cap edges ----
+
+# A duplicate named argument is rejected loud instead of silently keeping the last value.
+statement error
+SELECT jsono_suggest_shredding(j, min_fit := 1.0, min_fit := 0.5) FROM docs;
+----
+duplicate argument
+
+# Exceeding the object-array subfield cap fails loud instead of silently truncating the STRUCT spec.
+statement error
+SELECT jsono_suggest_shredding(j) FROM (
+  SELECT jsono('{"arr":[{' || string_agg('"s' || i || '":1', ',') || '}]}') AS j FROM range(8193) AS t(i)
+);
+----
+subfield

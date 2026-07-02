@@ -334,13 +334,13 @@ SELECT count(*) FROM events WHERE CAST(payload ->> '$.time_us' AS BIGINT) BETWEE
 
 Values shredded differently compose freely. A set operation, `CASE` or `COALESCE` over differently-shredded values merges into one shredded type on the union of the shred sets, and an `INSERT` into a column with any other shred set — fully disjoint included — lands losslessly: the optimizer rewrites the struct cast into a reshred against the column's shred set (single-pass when the target keeps every source shred), and a path with no shred column in the target simply stays in the residual.
 
-Most shredded reads never rebuild the whole document — `->>`, typed-shred filters, and a `jsono_transform` field on a scalar shred leaf read the shred column directly. A read that needs the whole logical value instead (a `jsono_transform` field descending into an array shred is the common case) reconstructs the shredded value to plain JSONO first, a 3-10x per-row cost. That reconstruct is an explicit `__jsono_reconstruct` operator in `EXPLAIN` / `EXPLAIN ANALYZE` (it was previously hidden inside an anonymous cast): if you see it, prefer the shred-aware paths — filter or `jsono_transform` on the scalar shred leaves, or shred the exact path you read — so the query reads narrow typed columns instead of rebuilding the document.
+Most shredded reads never rebuild the whole document — `->>`, typed-shred filters, and a `jsono_transform` field on a scalar shred leaf read the shred column directly. A read that needs the whole logical value instead (a `jsono_transform` field descending into an array shred is the common case) reconstructs the shredded value to plain JSONO first, a 3-10x per-row cost. A `jsono_transform` field forcing that reconstruct surfaces it as an explicit `__jsono_reconstruct` operator in `EXPLAIN` / `EXPLAIN ANALYZE`; the other whole-value reads (`jsono_diff`, `jsono_array_elements`, the collect aggregates) show it as an anonymous `CAST(… AS STRUCT(jsono …))`. If you see either, prefer the shred-aware paths — filter or `jsono_transform` on the scalar shred leaves, or shred the exact path you read — so the query reads narrow typed columns instead of rebuilding the document.
 
 The safety net for the raw struct cast (no extension optimizer: another process, `SET disabled_optimizers='extension'`) is the *shred manifest*: each shredded value records, inside its residual, which paths were stripped into shred columns and as what type. A cast that silently drops or retypes a shred column leaves that record contradicting the data, and every JSONO reader verifies it — reading such a narrowed row raises an error instead of silently returning partial data. The manifest lives in the value's own blobs, so the protection rides with the data through Parquet and DuckLake. Shred order does not matter: the shred field order is canonicalized (sorted by name), so the same shred set always yields the *identical* type — `jsono_storage_type(<shred DDL>)` and `CREATE TABLE … AS SELECT` produce the same column type regardless of the order shreds are written in.
 
 ### `jsono_suggest_shredding`
 
-Aggregates a **plain** JSONO column and returns a ready-to-paste `shredding :=` spec string, so you don't have to hand-pick shred paths and types. It walks each document over the auto-shred universe — top-level scalar keys, one-level-nested scalar keys (`$.parent.child`), and top-level arrays (as scalar-array `TYPE[]` or object-array `STRUCT(...)[]`) — and picks, per path, the narrowest lane type every present value fits losslessly.
+Aggregates a **plain** JSONO column and returns a ready-to-paste `shredding :=` spec string, so you don't have to hand-pick shred paths and types. It walks each document over a subset of what the constructor auto-shreds — top-level scalar keys, one-level-nested scalar keys (`$.parent.child`), and top-level arrays (as scalar-array `TYPE[]` or object-array `STRUCT(...)[]`) — and picks, per path, the narrowest lane type every present value fits losslessly. Nested arrays (`$.parent.items`) are outside that subset even though the constructor lifts them one level deep, so a nested list path never appears in the suggested spec.
 
 ```sql
 SELECT jsono_suggest_shredding(payload) FROM events;
@@ -367,7 +367,7 @@ Number lanes follow the `BIGINT` > `DOUBLE` > `BOOLEAN` > `VARCHAR` preference, 
 
 Aggregates an existing **shredded** column and reports, per shred, how well the shred set is working — as a `LIST<STRUCT(path VARCHAR, type VARCHAR, lane_rate DOUBLE, divert_rate DOUBLE, complete_rate DOUBLE)>` sorted by path:
 
-- `lane_rate` — fraction of non-`NULL` rows whose typed lane is populated (the value fit and was lifted).
+- `lane_rate` — fraction of non-`NULL` rows whose typed lane is populated (by a lifted value, or a read copy in a `VARCHAR` lane).
 - `divert_rate` — fraction of rows where the lane is `NULL` because the value did not fit its shred type and stayed behind in the residual. A high divert rate means the shred type is too narrow. An explicit JSON `null` (a complete NULL lane) is lossless and does **not** count as a divert.
 - `complete_rate` — fraction of rows where a bare typed lane read is the full `->>` answer (a fit, an absent path, or an explicit `null`). Array shreds report `1.0`.
 
@@ -410,7 +410,7 @@ The order of the returned entries is unspecified — do not rely on it. Over a s
 
 ### `jsono_array_elements`
 
-Returns a JSON array's elements as a `LIST` of self-contained JSONO values — each element is re-emitted into its own six-blob document, so `unnest`-ing the list gives one native JSONO value per row with no `to_json` + reparse round-trip:
+Returns a JSON array's elements as a `LIST` of self-contained JSONO values — each element becomes a complete JSONO document of its own, so `unnest`-ing the list gives one native JSONO value per row with no `to_json` + reparse round-trip:
 
 ```sql
 SELECT unnest(jsono_array_elements(jsono('[{"name":"a"},{"name":"b"}]'))) ->> 'name';
@@ -619,10 +619,10 @@ FROM (VALUES ('b', jsono('2')), ('a', jsono('1'))) t(k, j);
 jsono_type(value[, path])         -> VARCHAR    -- OBJECT/ARRAY/VARCHAR/BIGINT/UBIGINT/DOUBLE/BOOLEAN/NULL
 jsono_keys(value[, path])         -> VARCHAR[]  -- object keys
 jsono_array_length(value[, path]) -> BIGINT     -- array element count, NULL for a non-array
-jsono_validate(value)         -> BOOLEAN    -- strict current-format validation
-jsono_storage_size(value)     -> STRUCT     -- physical byte sizes (body blobs + shreds + total)
-jsono_storage_type()          -> VARCHAR    -- DDL of the physical STRUCT backing JSONO
-jsono_shred_manifest(value)   -> STRUCT[]   -- paths stripped into shred columns, with their types
+jsono_validate(value)             -> BOOLEAN    -- strict current-format validation
+jsono_storage_size(value)         -> STRUCT     -- physical byte sizes (body blobs + shreds + total)
+jsono_storage_type()              -> VARCHAR    -- DDL of the physical STRUCT backing JSONO
+jsono_shred_manifest(value)       -> STRUCT[]   -- paths stripped into shred columns, with their types
 ```
 
 `jsono_type` and `jsono_keys` inspect the shape of unknown JSON before extracting it with `jsono_transform`. The optional `path` is a constant JSONPath (same grammar as `jsono_transform`, without wildcards) that points at a nested position; a missing path yields `NULL`.
@@ -645,7 +645,7 @@ SELECT jsono_array_length(jsono('{"a":1}'));
 -- NULL
 ```
 
-`jsono_validate` checks the current binary format contract: header flags, sorted unique keys, slots, heaps, navigation metadata, UTF-8 strings, and raw number text. It returns `false` for malformed physical blobs and `NULL` for SQL `NULL`. On a shredded value it validates the residual encoding; the typed shred columns are DuckDB-native and not jsono's to assert.
+`jsono_validate` checks the current binary format contract: header flags, sorted unique keys, slots, heaps, navigation metadata, UTF-8 strings, and raw number text. It returns `false` for malformed physical blobs and `NULL` for SQL `NULL`. On a shredded value it validates the residual encoding and cross-checks each non-`NULL` array-lane's length against the residual skeleton's element count (the lockstep framing every reader enforces, so it is jsono's to assert), returning `false` on a mismatch; the typed shred lane *values* are DuckDB-native and not jsono's to check.
 
 `jsono_storage_size` reports `slots`, `key_heap`, `string_heap`, `skips`, `shreds`, and `total` byte counts. `shreds` is the per-row shred payload (0 for a plain value); `total` sums the body blobs and the shreds. It is a physical diagnostic and does not validate the value.
 
@@ -723,7 +723,7 @@ Use power-of-two values when comparing performance. The default is tuned for loc
 - Declare a shredded storage column with `CREATE TABLE … AS SELECT jsono(…, shredding := …)` or from `jsono_storage_type(<shred DDL>)`, and access a shred through `->>`/`to_json` (the optimizer reads the shred) rather than by struct member name — `.body` and the shred fields are physical storage details. Inserting a value shredded on any other shred set — fully disjoint included — lands losslessly (the optimizer reshredds it to the column's shred set). A raw struct cast that drops or retypes a shred column (only possible without the extension optimizer) is caught at read time by the shred manifest: reading the narrowed row raises an error instead of silently losing the stripped value.
 - `jsono_extract` / `->` / `jsono_extract_string` / `->>` require a constant path, do not support wildcard list extraction yet, and do not support negative array indexes.
 - Unsupported scalar types in `jsono_transform` fail at bind time.
-- JSON nested deeper than 1000 levels is rejected with an error (512 on macOS, whose worker-thread stacks are too small for the deeper recursion; 32 under sanitizer builds).
+- JSON nested deeper than 1000 levels is rejected with an error (512 on macOS, whose worker-thread stacks are too small for the deeper recursion). Sanitizer builds lower the bound only where their fatter frames need it: 32 under AddressSanitizer (any platform) and under UndefinedBehaviorSanitizer on macOS; the UndefinedBehaviorSanitizer build on Linux keeps the full 1000.
 - The binary JSONO format is strict-versioned (current `version = 4`, reported by `jsono_version()`). Incompatible storage changes must bump `jsono::VERSION`. A present-but-unreadable header — wrong magic, a different format version, misaligned slots — fails loud on read rather than silently reading as SQL `NULL`; only an absent value (a slots blob too short to hold a header) reads as `NULL`, and `jsono_validate` reports a corrupt blob as `false`.
 - Malformed input raises DuckDB errors unless `try_jsono` is used. `try_jsono` never raises: implementation-limit violations on otherwise valid JSON (nesting past the depth limit, an oversized key or string) also map to `NULL`, indistinguishable from malformed input — use the strict `jsono` when a limit overflow must surface instead of dropping the row.
 

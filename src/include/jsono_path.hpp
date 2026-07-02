@@ -144,6 +144,18 @@ inline vector<PathStep> LiteralKeyPath(const string &name) {
 	return path;
 }
 
+// Resolve a shred lane name to its path steps. A lane name is either a bare literal top-level object
+// key or a `$.`-rooted JSONPath naming a nested key. Only the `$.` prefix marks the JSONPath form:
+// a literal top-level key may itself begin with `$` (e.g. `$x`), and the reserved `$jsono$set` marker
+// begins with `$` too, so a bare-`$` test would misparse both. Every reader that turns a shred name
+// into path steps must agree on this split, so they share this one classifier.
+inline vector<PathStep> ShredNamePath(const string &name, const char *function_name) {
+	if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
+		return ParseJsonoPath(name, function_name);
+	}
+	return LiteralKeyPath(name);
+}
+
 inline vector<PathStep> ArrayIndexPath(idx_t index) {
 	vector<PathStep> path;
 	path.push_back(PathStep {PathStepKind::Index, string(), index});

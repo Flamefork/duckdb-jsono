@@ -358,10 +358,12 @@ constexpr uint32_t OBJECT_CHECKPOINT_STRIDE = 16;
 
 // Maximum container nesting accepted by the writer and the recursive readers.
 // The tape walkers recurse per nesting level, so an unbounded depth overflows
-// the C++ stack; this bound makes the guard trip before that happens. Both values
-// stay above any realistic document (real JSON nests a few dozen levels deep). A
-// sanitizer build gets a far lower bound: AddressSanitizer's fat frames sit atop a
-// deep execution pipeline on a ~512 KiB macOS worker-thread stack, and the
+// the C++ stack; this bound makes the guard trip before that happens. The release
+// bounds (1000, or 512 on macOS) stay far above any realistic document (real JSON
+// nests a few dozen levels deep); a sanitizer build drops far lower, close to that
+// ceiling, because its instrumented frames overflow the stack much sooner.
+// AddressSanitizer's fat frames sit atop a deep execution pipeline on a ~512 KiB
+// macOS worker-thread stack, and the
 // over-limit exception is itself serialized (yyjson, via DuckDB's ToJSON exception
 // constructor) at the deepest recursion frame, so the guard must fire much sooner
 // there to stay ahead of a stack overflow. 50 was still too high — the serialized
@@ -374,11 +376,9 @@ constexpr uint32_t OBJECT_CHECKPOINT_STRIDE = 16;
 // guard throw at the deepest parse frame died 4/10 runs even at 64). Linux worker threads get
 // the platform-default 8 MiB stack, which fits the full 1000-level recursion — that is where
 // the UBSan full-depth CI job runs depths the ASan bound never reaches.
-// macOS worker threads run on ~512 KiB stacks (Linux defaults to 8 MiB), and the depth-999
-// stress showed even the RELEASE recursion plus the guard throw overflowing there
-// ASLR-dependently (2/10 unittest runs, bus error) — the guard must trip before the stack does,
-// so the release bound is halved on macOS. Realistic documents nest a few dozen levels; both
-// bounds stay far above that.
+// The depth-999 stress showed even the RELEASE recursion plus the guard throw overflowing the macOS
+// stack ASLR-dependently (2/10 unittest runs, bus error) — the guard must trip before the stack does,
+// so the release bound is halved on macOS.
 #if defined(JSONO_ADDRESS_SANITIZER)
 constexpr size_t JSONO_MAX_NESTING_DEPTH = 32;
 #elif defined(JSONO_UB_SANITIZER) && defined(__APPLE__)

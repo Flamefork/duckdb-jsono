@@ -37,7 +37,9 @@ using namespace jsono;
 // value fitting more than one candidate (a non-negative int64 fits both BIGINT and UBIGINT) is
 // lifted to BIGINT; UBIGINT wins only when a value exceeds the int64 range so BIGINT no longer
 // fits every present value. DOUBLE/BOOLEAN/VARCHAR are mutually exclusive with the integer lanes
-// and each other, so their relative order only breaks a tie no real value produces.
+// and each other, so at min_fit = 1.0 at most one of them can qualify; under a lowered min_fit a
+// mixed path can clear the threshold for several, and this fixed order — not the larger fit
+// count — picks the lane.
 constexpr std::array<JsonoScalarPrimitive, 5> kPrimitivePreference = {
     JsonoScalarPrimitive::Bigint, JsonoScalarPrimitive::Ubigint, JsonoScalarPrimitive::Double,
     JsonoScalarPrimitive::Boolean, JsonoScalarPrimitive::Varchar};
@@ -150,6 +152,23 @@ SuggestCandidate &GetCandidate(std::map<string, SuggestCandidate> &paths, const 
 	return paths[path];
 }
 
+// Fetch (or create) one object-array subfield's stat, sharing GetCandidate's cap and loud-throw
+// rationale: silently truncating the subfield union would emit a partial STRUCT spec that looks
+// authoritative. The two subfield maps (accumulate and combine) grow only through this helper.
+SubfieldStat &GetSubfieldStat(std::map<string, SubfieldStat> &subfields, const string &key) {
+	auto it = subfields.find(key);
+	if (it != subfields.end()) {
+		return it->second;
+	}
+	if (subfields.size() >= kMaxCandidatePaths) {
+		throw InvalidInputException("jsono_suggest_shredding: distinct object-array subfield count exceeds the cap "
+		                            "of %llu; the array elements have too many distinct keys to be a shredding "
+		                            "target",
+		                            (unsigned long long)kMaxCandidatePaths);
+	}
+	return subfields[key];
+}
+
 // Append `key` as a `$`-rooted JSONPath step, quoting it when a bare `.key` step would be
 // mis-parsed (empty key, or a delimiter/quote/backslash inside it). Mirrors jsono_entries'
 // AppendKeySegment so a suggested nested path re-parses to the same steps.
@@ -255,7 +274,7 @@ void ClassifyTopLevelArray(const JsonoView &view, JsonoCursor &cursor, SuggestCa
 		candidate.oarray_object_rows++;
 		candidate.object_elements += element_count;
 		for (auto &entry : row_subfields) {
-			auto &agg = candidate.subfields[entry.first];
+			auto &agg = GetSubfieldStat(candidate.subfields, entry.first);
 			agg.present += entry.second.present;
 			for (idx_t p = 0; p < 5; p++) {
 				agg.fit[p] += entry.second.fit[p];
@@ -390,8 +409,14 @@ string BuildObjectArrayType(const SuggestCandidate &candidate, double min_presen
 // Choose one candidate path's shred type string, or empty when no role qualifies. Roles compete by
 // presence (the count of rows the path appears in that role); scalar beats scalar-array beats
 // object-array on a tie. Each role must also clear min_presence over the group's non-NULL rows.
+// min_fit is measured over the path's TOTAL present occurrences across every role (scalar +
+// array_rows): a role that fits its own rows but covers only part of a mixed path falls below
+// min_fit, so a genuinely mixed path drops instead of a majority role silently winning.
 string ChooseShredType(const SuggestCandidate &candidate, idx_t non_null_rows, double min_presence, double min_fit) {
 	double presence_floor = min_presence * double(non_null_rows);
+	// A row observes the path as at most one role (scalar leaf or array), so the roles' row counts sum
+	// to the count of rows carrying this path.
+	idx_t total_present = candidate.scalar_present + candidate.array_rows;
 	string best;
 	idx_t best_present = 0;
 
@@ -399,7 +424,7 @@ string ChooseShredType(const SuggestCandidate &candidate, idx_t non_null_rows, d
 	{
 		JsonoScalarPrimitive primitive;
 		if (candidate.scalar_present > 0 && double(candidate.scalar_present) >= presence_floor - 1e-9 &&
-		    PickLanePrimitive(candidate.scalar_fit, candidate.scalar_present, min_fit, primitive)) {
+		    PickLanePrimitive(candidate.scalar_fit, total_present, min_fit, primitive)) {
 			best = string("'") + JsonoScalarPrimitiveTypeName(primitive) + "'";
 			best_present = candidate.scalar_present;
 		}
@@ -408,7 +433,7 @@ string ChooseShredType(const SuggestCandidate &candidate, idx_t non_null_rows, d
 	if (candidate.array_rows > 0 && candidate.saw_scalar_element &&
 	    double(candidate.array_rows) >= presence_floor - 1e-9 && candidate.array_rows > best_present) {
 		JsonoScalarPrimitive primitive;
-		if (PickLanePrimitive(candidate.sarray_fit, candidate.array_rows, min_fit, primitive)) {
+		if (PickLanePrimitive(candidate.sarray_fit, total_present, min_fit, primitive)) {
 			best = string("'") + JsonoScalarPrimitiveTypeName(primitive) + "[]'";
 			best_present = candidate.array_rows;
 		}
@@ -416,7 +441,7 @@ string ChooseShredType(const SuggestCandidate &candidate, idx_t non_null_rows, d
 	// Object array.
 	if (candidate.array_rows > 0 && candidate.saw_object_element &&
 	    double(candidate.array_rows) >= presence_floor - 1e-9 && candidate.array_rows > best_present &&
-	    double(candidate.oarray_object_rows) >= min_fit * double(candidate.array_rows) - 1e-9) {
+	    double(candidate.oarray_object_rows) >= min_fit * double(total_present) - 1e-9) {
 		auto struct_type = BuildObjectArrayType(candidate, min_presence, min_fit);
 		if (!struct_type.empty()) {
 			best = string("'") + struct_type + "'";
@@ -442,6 +467,8 @@ unique_ptr<FunctionData> JsonoSuggestBind(ClientContext &context, AggregateFunct
                                           vector<unique_ptr<Expression>> &arguments) {
 	double min_presence = 0.5;
 	double min_fit = 1.0;
+	bool seen_min_presence = false;
+	bool seen_min_fit = false;
 	for (idx_t i = 1; i < arguments.size(); i++) {
 		auto &arg = arguments[i];
 		auto alias = arg->GetAlias();
@@ -450,6 +477,11 @@ unique_ptr<FunctionData> JsonoSuggestBind(ClientContext &context, AggregateFunct
 			                      "min_fit := <fraction>)",
 			                      alias);
 		}
+		auto &seen = alias == "min_presence" ? seen_min_presence : seen_min_fit;
+		if (seen) {
+			throw BinderException("jsono_suggest_shredding: duplicate argument '%s'", alias);
+		}
+		seen = true;
 		if (arg->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
@@ -541,7 +573,7 @@ void MergeSuggestCandidate(SuggestCandidate &target, const SuggestCandidate &sou
 		target.sarray_fit[p] += source.sarray_fit[p];
 	}
 	for (auto &entry : source.subfields) {
-		auto &agg = target.subfields[entry.first];
+		auto &agg = GetSubfieldStat(target.subfields, entry.first);
 		agg.present += entry.second.present;
 		for (idx_t p = 0; p < 5; p++) {
 			agg.fit[p] += entry.second.fit[p];
@@ -695,11 +727,7 @@ unique_ptr<FunctionData> JsonoShredStatsBind(ClientContext &context, AggregateFu
 		descriptor.path = shred.first;
 		descriptor.type_name = shred.second.ToString();
 		descriptor.kind = ClassifyShredKind(shred.second);
-		if (!shred.first.empty() && shred.first[0] == '$') {
-			descriptor.steps = ParseJsonoPath(shred.first, "jsono_shred_stats shred");
-		} else {
-			descriptor.steps.push_back(PathStep {PathStepKind::Key, shred.first, 0});
-		}
+		descriptor.steps = ShredNamePath(shred.first, "jsono_shred_stats shred");
 		bind_data->shreds.push_back(std::move(descriptor));
 	}
 	function.arguments[0] = type;
@@ -715,9 +743,12 @@ struct ShredStatsLanes {
 };
 
 void InitShredStatsLanes(Vector &input, idx_t count, const ShredStatsBindData &bind_data, ShredStatsLanes &lanes) {
-	// The residual legitimately carries a manifest (stripped paths); this read only probes presence,
-	// so verification is not needed.
-	lanes.reader.InitTrusted(input, count);
+	// Whole-document policy: the divert probe interprets residual presence, and a diagnostic that is
+	// natural to run over a suspect column must fail loud on a narrowed row (a manifest naming a shred
+	// the type no longer carries) like every other reader — not report plausible rates over it. An
+	// honest shredded column's manifest names exactly the type's shreds, so verification passes (and
+	// is memoized to a byte-compare per row).
+	lanes.reader.Init(input, count);
 	auto nshreds = bind_data.shreds.size();
 	lanes.value_fmt.resize(nshreds);
 	lanes.complete_fmt.resize(nshreds);

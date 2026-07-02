@@ -411,7 +411,6 @@ inline Vector &JsonoBodyVector(Vector &result) {
 	return *StructVector::GetEntries(layout)[0];
 }
 
-// The `shreds` STRUCT vector of a shredded jsono result: layout field [0] -> shreds [1] (after body).
 // A self-owned JSONO blob: a complete document (header + metadata framing) serialized into six
 // owned byte streams, viewable in place. It backs the merge family's fold accumulators, the
 // direct diff's scratch documents, and the collect aggregates' per-element storage — shared here
@@ -442,7 +441,6 @@ inline void SerializeBuilderToBlob(const JsonoBuilder &builder, OwnedJsonoBlob &
 	auto spans_bytes = builder.skips.size() * sizeof(ContainerSpan);
 	auto index_bytes = builder.object_checkpoint_index.size() * sizeof(ObjectCheckpointIndex);
 	auto checkpoints_bytes = builder.object_checkpoints.size() * sizeof(ObjectCursorCheckpoint);
-	out.skips.resize(sizeof(ContainerMetadataHeader) + span_ids_bytes + spans_bytes + index_bytes + checkpoints_bytes);
 	if (builder.skips.size() > std::numeric_limits<uint32_t>::max() ||
 	    builder.object_checkpoint_index.size() > std::numeric_limits<uint32_t>::max() ||
 	    builder.object_checkpoints.size() > std::numeric_limits<uint32_t>::max()) {
@@ -450,6 +448,7 @@ inline void SerializeBuilderToBlob(const JsonoBuilder &builder, OwnedJsonoBlob &
 		// WriteSkipsBlobInto on the writer path.
 		throw InvalidInputException("jsono: skips blob exceeds storage limits");
 	}
+	out.skips.resize(sizeof(ContainerMetadataHeader) + span_ids_bytes + spans_bytes + index_bytes + checkpoints_bytes);
 	ContainerMetadataHeader meta;
 	meta.span_count = uint32_t(builder.skips.size());
 	meta.checkpoint_index_count = uint32_t(builder.object_checkpoint_index.size());
@@ -480,6 +479,7 @@ inline JsonoView ViewOfBlob(const OwnedJsonoBlob &b) {
 	                 b.nums.data(), b.nums.size());
 }
 
+// The `shreds` STRUCT vector of a shredded jsono result: layout field [0] -> shreds [1] (after body).
 inline Vector &JsonoShredsStructVector(Vector &result) {
 	auto &layout = *StructVector::GetEntries(result)[0];
 	return *StructVector::GetEntries(layout)[1];

@@ -742,6 +742,73 @@ WHERE (jsono_extract_string(j, '$.n') > '10') AND (jsono_extract_string(j, '$.n'
 statement ok
 RESET disabled_optimizers;
 
+# Shredded twin of the range parity above: a fused range over a RESIDUAL path of a SHREDDED column.
+# A sibling ($.tag) is shredded so city/n stay in the residual; the two predicates over one residual
+# path fuse into __jsono_internal_match. Its parity oracle is the plain jsono_matcher_range table
+# (optimizer ON) rather than `disabled_optimizers='extension'`: jsono_extract_string over a shredded
+# value is a hard Binder Error with the extension optimizer off (the unsafe STRUCT cast is refused),
+# so a shredded column can only be checked against its plain equivalent, never re-run unoptimized.
+# Identical residual bytes => identical rows, text-vs-numeric order ('10' < '9') included.
+statement ok
+CREATE TABLE jsono_matcher_shredded_range AS
+SELECT jsono(payload, shredding := {'$.tag':'VARCHAR'}) AS j
+FROM (
+  VALUES
+    ('{"tag":"t","city":"sea","n":10}'),
+    ('{"tag":"t","city":"se","n":9}'),
+    ('{"tag":"t","city":"nyc","n":100}'),
+    ('{"tag":"t","n":5}'),
+    ('{"tag":"t","city":"tokyo"}')
+) t(payload);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# Two range predicates over one residual path fuse into a single __jsono_internal_match.
+query II
+EXPLAIN SELECT count(*) FROM jsono_matcher_shredded_range
+WHERE (jsono_extract_string(j, '$.city') >= 'se') AND (jsono_extract_string(j, '$.city') < 'sea1');
+----
+physical_plan	<REGEX>:.*__jsono_internal_match.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Prefix-order parity: the shredded residual range returns exactly the plain jsono_matcher_range rows
+# (symmetric EXCEPT is empty), so 'se' < 'sea' and the inclusive/exclusive bounds match the plain run.
+query I
+SELECT count(*)
+FROM (
+  (SELECT jsono_extract_string(j, '$.city') AS city, jsono_extract_string(j, '$.n') AS n
+   FROM jsono_matcher_shredded_range
+   WHERE (jsono_extract_string(j, '$.city') >= 'se') AND (jsono_extract_string(j, '$.city') < 'sea1')
+   EXCEPT ALL
+   SELECT jsono_extract_string(j, '$.city') AS city, jsono_extract_string(j, '$.n') AS n
+   FROM jsono_matcher_range
+   WHERE (jsono_extract_string(j, '$.city') >= 'se') AND (jsono_extract_string(j, '$.city') < 'sea1'))
+  UNION ALL
+  (SELECT jsono_extract_string(j, '$.city') AS city, jsono_extract_string(j, '$.n') AS n
+   FROM jsono_matcher_range
+   WHERE (jsono_extract_string(j, '$.city') >= 'se') AND (jsono_extract_string(j, '$.city') < 'sea1')
+   EXCEPT ALL
+   SELECT jsono_extract_string(j, '$.city') AS city, jsono_extract_string(j, '$.n') AS n
+   FROM jsono_matcher_shredded_range
+   WHERE (jsono_extract_string(j, '$.city') >= 'se') AND (jsono_extract_string(j, '$.city') < 'sea1'))
+);
+----
+0
+
+# Text-vs-numeric order parity: numbers compare as their `->>` text, so ('$.n' > '10') AND
+# ('$.n' <= '9') matches every present n on the shredded residual exactly as on the plain document.
+query II
+SELECT
+  (SELECT count(*) FROM jsono_matcher_shredded_range
+   WHERE (jsono_extract_string(j, '$.n') > '10') AND (jsono_extract_string(j, '$.n') <= '9')),
+  (SELECT count(*) FROM jsono_matcher_range
+   WHERE (jsono_extract_string(j, '$.n') > '10') AND (jsono_extract_string(j, '$.n') <= '9'));
+----
+3	3
+
 # Correctness: the fused matcher returns the same rows as the plain-equivalent documents.
 query III
 SELECT

@@ -377,11 +377,7 @@ void InitLockstepLanes(Vector &input, idx_t count, vector<LockstepLane> &lanes) 
 		}
 		LockstepLane lane;
 		auto &name = layout.shreds[f].first;
-		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
-			lane.steps = ParseJsonoPath(name, "jsono_validate shred");
-		} else {
-			lane.steps.push_back(PathStep {PathStepKind::Key, name, 0});
-		}
+		lane.steps = ShredNamePath(name, "jsono_validate shred");
 		auto &lane_vec = JsonoShredVector(input, f);
 		lane_vec.ToUnifiedFormat(count, lane.fmt);
 		lane.entries = UnifiedVectorFormat::GetData<list_entry_t>(lane.fmt);

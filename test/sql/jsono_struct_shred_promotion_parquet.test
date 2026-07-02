@@ -1,0 +1,38 @@
+# name: test/sql/jsono_struct_shred_promotion_parquet.test
+# description: Promoted narrow-int/float lanes (INTEGER/SMALLINT/unsigned-narrow -> BIGINT, FLOAT -> DOUBLE) survive a Parquet round-trip: the shredded struct layout and widened lane types persist in the Parquet schema and the value reads back byte-identically.
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+statement ok
+CREATE TABLE prom AS
+SELECT jsono(struct_pack(qty := 42::INTEGER, cnt := 7::SMALLINT, usmall := 4000000000::UINTEGER, price := 0.5::FLOAT)) AS j;
+
+statement ok
+COPY prom TO '__TEST_DIR__/jsono_promotion.parquet' (FORMAT parquet);
+
+# The promoted lane types survive the Parquet schema: qty/cnt/usmall are BIGINT lanes (the
+# unsigned-narrow value widened, NOT a UBIGINT lane) and price a DOUBLE lane — identical to the
+# pre-COPY shredded struct type, so the shredded structure round-tripped intact.
+query I
+SELECT typeof(j) FROM '__TEST_DIR__/jsono_promotion.parquet';
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, cnt STRUCT("value" BIGINT, complete TINYINT), price STRUCT("value" DOUBLE, complete TINYINT), qty STRUCT("value" BIGINT, complete TINYINT), usmall STRUCT("value" BIGINT, complete TINYINT))))
+
+# The document reads back byte-identical through the promoted lanes (unsigned narrow above INT32_MAX
+# kept its full magnitude; the FLOAT lane renders through double(float) exactly as before promotion).
+query I
+SELECT to_json(j)::VARCHAR FROM '__TEST_DIR__/jsono_promotion.parquet';
+----
+{"cnt":7,"price":0.5,"qty":42,"usmall":4000000000}
+
+# ->> reads the promoted lanes back out of the Parquet-restored value (the optimizer shred rewrite
+# runs over the value read from Parquet, not just over freshly-constructed jsono).
+query II
+SELECT j->>'qty', j->>'price' FROM '__TEST_DIR__/jsono_promotion.parquet';
+----
+42	0.5

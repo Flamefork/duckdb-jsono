@@ -1669,8 +1669,9 @@ struct GroupMergeShredPlan {
 struct GroupMergeBindData : public FunctionData {
 	MergeMode merge_mode;
 	// Empty for a plain input (Finalize writes the plain accumulator verbatim). For a shredded
-	// input the captured shreds (clean names, canonical order) reshred the merged accumulator back
-	// to the input's shredded type so the shreds "stick" across the aggregation.
+	// input the captured shreds (clean names, canonical order) are the sticky shredded return
+	// type: they drive the direct fold plan and Finalize's native lane/residual write (plus its
+	// manifest entries), so the shreds "stick" across the aggregation with no reshred.
 	vector<std::pair<string, LogicalType>> shreds;
 	// Derived (not part of Equals): fold plan per shred plus the array-shred index filter for the
 	// per-chunk array composition pass.
@@ -1688,14 +1689,10 @@ struct GroupMergeBindData : public FunctionData {
 			auto &plan = shred_plan[f];
 			plan.kind = ClassifyShredKind(shreds[f].second);
 			auto &name = shreds[f].first;
-			if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
-				plan.steps = ParseJsonoPath(name, "jsono_group_merge shred");
-			} else {
-				plan.steps.push_back(PathStep {PathStepKind::Key, name, 0});
-			}
+			plan.steps = ShredNamePath(name, "jsono_group_merge shred");
 			for (auto &step : plan.steps) {
 				if (step.kind != PathStepKind::Key) {
-					throw InvalidInputException("jsono_group_merge: shred path '%s' is not an object-key path", name);
+					throw BinderException("jsono_group_merge: shred path '%s' is not an object-key path", name);
 				}
 			}
 			if (plan.kind == ShredKind::Scalar) {
@@ -1740,6 +1737,8 @@ struct DirectShreddedAcc {
 	enum class Kind : uint8_t { Empty, NonObject, Object };
 	Kind kind = Kind::Empty;
 	OwnedJsonoBlob residual;
+	// Sized once to the bind shred count at allocation so the fold paths index by shred `f` directly;
+	// array/nested-object shred slots simply stay inactive (their values live in the residual).
 	vector<DirectLaneSlot> lanes;
 };
 
@@ -1779,17 +1778,19 @@ unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFu
 	JsonoRequireExtensionOptimizerForShredded(context, type, "jsono_group_merge");
 	auto bind_data = make_uniq<GroupMergeBindData>(MergeMode::IgnoreNulls);
 	if (IsShreddedJsonoType(type)) {
-		// Capture the shreds (clean names, the type's canonical order) so Finalize reshreds the
-		// merged accumulator back to this exact shredded type — sticky shredding, like
-		// jsono_merge_patch. Update folds the shredded rows directly (residual merge + scalar lane
-		// state), so no per-row reconstruct cast is involved.
+		// Capture the shreds (clean names, the type's canonical order) as the sticky shredded return
+		// type — like jsono_merge_patch, the result stays shredded across the aggregation. They also
+		// drive the direct fold plan; Finalize writes the native lanes/residual straight out (no
+		// reshred). Update folds the shredded rows directly (residual merge + scalar lane state), so
+		// no per-row reconstruct cast is involved.
 		JsonoLayoutType layout;
 		TryParseJsonoLayoutType(type, layout);
 		for (auto &shred : layout.shreds) {
 			bind_data->shreds.emplace_back(shred.first, shred.second);
 		}
 		bind_data->BuildShredPlan();
-		// Keep the shredded argument type (Update reconstructs it to plain itself) rather than
+		// Keep the shredded argument type (Update folds it directly; only array shreds are composed to
+		// plain per chunk) rather than
 		// forcing a plain argument with a binder cast. With a plain argument the bound aggregate's
 		// argument type and its sticky shredded return type disagree, so a plan serialize→deserialize
 		// re-bind (debug verification) would re-derive a plain return and fail to reconcile it back to
@@ -1840,7 +1841,8 @@ void FoldIntoGroupState(GroupMergeState &state, const JsonoView &incoming) {
 }
 
 // ===== Direct shredded fold: non-keyed jsono_group_merge consumes shredded rows without =====
-// ===== reconstructing each row to plain (see plan 028's accumulator contract).          =====
+// ===== reconstructing each row to plain (the accumulator contract is documented on      =====
+// ===== DirectShreddedAcc above).                                                        =====
 
 // Chunk-level read handles for the direct fold. A type with array shreds first composes the
 // array paths to plain for the whole chunk (skeleton + lockstep lane -> plain array, via the
@@ -1848,6 +1850,7 @@ void FoldIntoGroupState(GroupMergeState &state, const JsonoView &incoming) {
 // their typed vectors and folded as lane state.
 void DirectFoldPrepare(Vector &input, idx_t count, const GroupMergeBindData &bind_data, Vector &arrays_plain,
                        JsonoRowReader &reader, vector<UnifiedVectorFormat> &lane_fmt) {
+	D_ASSERT(bind_data.shred_plan.size() == bind_data.shreds.size());
 	if (!bind_data.array_shred_filter.empty()) {
 		ReconstructShreddedToPlainImpl(input, count, arrays_plain, &bind_data.array_shred_filter);
 		reader.Init(arrays_plain, count);
@@ -1909,9 +1912,6 @@ void DirectShadowDeletePath(DirectShreddedAcc &acc, const vector<PathStep> &step
 void DirectFoldRow(DirectShreddedAcc &acc, const JsonoView &incoming, const GroupMergeBindData &bind_data,
                    const vector<UnifiedVectorFormat> &lane_fmt, idx_t row) {
 	static thread_local JsonoBuilder scratch;
-	if (acc.lanes.size() != bind_data.shreds.size()) {
-		acc.lanes.resize(bind_data.shreds.size());
-	}
 	bool incoming_is_object = SlotTag(incoming.SlotAt(0)) == tag::OBJ_START;
 	if (!incoming_is_object) {
 		// A non-object replaces the accumulator wholesale (jsono_merge_patch's non-object patch
@@ -1948,10 +1948,15 @@ void DirectFoldRow(DirectShreddedAcc &acc, const JsonoView &incoming, const Grou
 		SerializeBuilderToBlob(scratch, acc.residual);
 	}
 	// Adopt the row's present scalar lanes. Shadow-deletes only matter while the residual
-	// accumulator has members at all — the fully-shredded hot case skips the locates.
-	JsonoView acc_view = ViewOfBlob(acc.residual);
-	bool residual_has_members =
-	    acc_view.ParseHeader() && acc_view.Slots() > 0 && ContainerChildCount(SlotPayload(acc_view.SlotAt(0))) > 0;
+	// accumulator has members at all — the fully-shredded hot case skips the locates. The view is
+	// scoped out before the loop: DirectShadowDeletePath re-serializes the residual, dangling any
+	// view of it.
+	bool residual_has_members;
+	{
+		JsonoView acc_view = ViewOfBlob(acc.residual);
+		residual_has_members =
+		    acc_view.ParseHeader() && acc_view.Slots() > 0 && ContainerChildCount(SlotPayload(acc_view.SlotAt(0))) > 0;
+	}
 	for (idx_t f = 0; f < bind_data.shred_plan.size(); f++) {
 		auto &plan = bind_data.shred_plan[f];
 		if (plan.kind != ShredKind::Scalar) {
@@ -2001,13 +2006,7 @@ void DirectFoldState(DirectShreddedAcc &target, const DirectShreddedAcc &source,
 		target.kind = source.kind;
 		target.residual = source.residual;
 		target.lanes = source.lanes;
-		if (target.lanes.size() != bind_data.shreds.size()) {
-			target.lanes.resize(bind_data.shreds.size());
-		}
 		return;
-	}
-	if (target.lanes.size() != bind_data.shreds.size()) {
-		target.lanes.resize(bind_data.shreds.size());
 	}
 	JsonoView source_view = ViewOfBlob(source.residual);
 	if (source_view.ParseHeader() && source_view.Slots() > 0 &&
@@ -2019,11 +2018,26 @@ void DirectFoldState(DirectShreddedAcc &target, const DirectShreddedAcc &source,
 		MergeTwoObjects(target_view, JsonoCursor(), source_view, JsonoCursor(), scratch, MergeMode::IgnoreNulls, 0);
 		SerializeBuilderToBlob(scratch, target.residual);
 	}
-	JsonoView target_view = ViewOfBlob(target.residual);
-	bool residual_has_members = target_view.ParseHeader() && target_view.Slots() > 0 &&
-	                            ContainerChildCount(SlotPayload(target_view.SlotAt(0))) > 0;
+	// Scoped out before the loop: DirectShadowDeletePath re-serializes target.residual, dangling any
+	// view of it. source_view stays valid across the loop — shadow-deletes mutate only the target.
+	bool residual_has_members;
+	{
+		JsonoView target_view = ViewOfBlob(target.residual);
+		residual_has_members = target_view.ParseHeader() && target_view.Slots() > 0 &&
+		                       ContainerChildCount(SlotPayload(target_view.SlotAt(0))) > 0;
+	}
 	for (idx_t f = 0; f < bind_data.shred_plan.size(); f++) {
 		if (bind_data.shred_plan[f].kind != ShredKind::Scalar || f >= source.lanes.size() || !source.lanes[f].active) {
+			continue;
+		}
+		// Adopt the source lane only when the SOURCE residual leaves the path free — i.e. source's own
+		// finalize would honor the lane. When the source residual pins the path (a later divert) or
+		// breaks its object skeleton (a parent replaced by a scalar), that residual value was just
+		// merged into the target and legitimately out-ranks the now-stale source lane; adopting the
+		// lane and shadow-deleting the merged value would silently resurrect the older lane. Skipping
+		// needs no target-lane bookkeeping: the residual-authoritative finalize ignores lanes whose
+		// path the residual carries, mirroring DirectFoldRow's per-row divert resolution.
+		if (ResidualConflictsWithShredPath(source_view, bind_data.shred_plan[f].steps)) {
 			continue;
 		}
 		target.lanes[f] = source.lanes[f];
@@ -2033,9 +2047,10 @@ void DirectFoldState(DirectShreddedAcc &target, const DirectShreddedAcc &source,
 	}
 }
 
-// Shredded group_merge input is kept native at bind (so the aggregate's arg and sticky
-// return types agree across a debug serialize re-bind); the direct fold above consumes the
-// residual and lanes without reconstructing. Plain input reads pass through unchanged.
+// Reconstruct a shredded input to plain. The non-keyed direct fold above never calls this — it
+// consumes the residual and lanes natively; this survives only for the keyed-LWW fallback
+// (JsonoGroupMergeLWWReconstructFold), which still stages a reconstruct. Plain input passes through
+// unchanged.
 Vector *GroupMergeReadInput(Vector &input, idx_t count, Vector &reconstructed) {
 	if (IsShreddedJsonoType(input.GetType())) {
 		JsonoReconstructToPlain(input, count, reconstructed);
@@ -2059,6 +2074,7 @@ void JsonoGroupMergeSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input
 		DirectFoldPrepare(inputs[0], count, bind_data, arrays_plain, reader, lane_fmt);
 		if (!state.direct) {
 			state.direct = new DirectShreddedAcc();
+			state.direct->lanes.resize(bind_data.shreds.size());
 		}
 		for (idx_t row = 0; row < count; row++) {
 			JsonoBlobRow blob;
@@ -2105,6 +2121,7 @@ void JsonoGroupMergeUpdate(Vector inputs[], AggregateInputData &aggr_input_data,
 			auto &state = *state_data[RowIndex(state_fmt, row)];
 			if (!state.direct) {
 				state.direct = new DirectShreddedAcc();
+				state.direct->lanes.resize(bind_data.shreds.size());
 			}
 			DirectFoldRow(*state.direct, view, bind_data, lane_fmt, row);
 			state.has_input = true;
@@ -2140,6 +2157,7 @@ void JsonoGroupMergeCombine(Vector &source, Vector &target, AggregateInputData &
 			auto &target_state = *target_data[row];
 			if (!target_state.direct) {
 				target_state.direct = new DirectShreddedAcc();
+				target_state.direct->lanes.resize(bind_data.shreds.size());
 			}
 			DirectFoldState(*target_state.direct, *source_state.direct, bind_data);
 			target_state.has_input = true;

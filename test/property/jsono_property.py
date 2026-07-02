@@ -530,7 +530,8 @@ hex_blob = st.text(alphabet="0123456789ABCDEF", min_size=0, max_size=48).map(
 # drawn per example (rotating instead of running all of them keeps the example budget constant);
 # the dict covers the walkers the original fuzz missed: the merge family's contiguity-gated bulk
 # memcpy (corrupt value on either side), the diff recursion, entries in both array styles,
-# transform's shape-plan walk, the introspection walks, and the collect/array-elements emitters.
+# transform's shape-plan walk, the introspection walks, the collect/array-elements emitters, and the
+# shredding advisor's plain-tape AccumulateDocument (jsono_suggest_shredding walks slots per row).
 FUZZ_READER_CALLS = {
     "to_json": lambda s: f"to_json({s})",
     "validate": lambda s: f"jsono_validate({s})",
@@ -548,6 +549,7 @@ FUZZ_READER_CALLS = {
     "diff_cur": lambda s: f"to_json(jsono_diff(jsono('{{}}'), {s}))",
     "group_merge": lambda s: f"(SELECT to_json(jsono_group_merge(v)) FROM (VALUES ({s}), (jsono('{{\"k\":1}}'))) t(v))",
     "group_array": lambda s: f"(SELECT to_json(jsono_group_array(v)) FROM (VALUES ({s}), (jsono('{{}}'))) t(v))",
+    "suggest_shredding": lambda s: f"(SELECT jsono_suggest_shredding(v) FROM (VALUES ({s}), (jsono('{{\"k\":1}}'))) t(v))",
 }
 fuzz_readers = st.sampled_from(sorted(FUZZ_READER_CALLS))
 
@@ -1537,6 +1539,7 @@ def test_fuzz_shredded_lanes_no_lie(doc: dict[str, Any], mutation: str) -> None:
     rendered = SESSION.read(f"to_json({mutant})")
     SESSION.value(f"jsono_extract_string({mutant}, '$.k')")
     SESSION.value(f"(SELECT count(*) FROM (SELECT unnest(jsono_entries({mutant}))))")
+    SESSION.value(f"(SELECT to_json(jsono_shred_stats(v)) FROM (VALUES ({mutant})) t(v))")
     if verdict == "true":
         assert not isinstance(
             rendered, JsonoSession.Errored

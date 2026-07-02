@@ -1,0 +1,73 @@
+# name: test/sql/jsono_collect_window.test
+# description: jsono_group_array / jsono_group_object window combine must preserve reused source state
+# group: [sql]
+
+require jsono
+
+# array_agg / json parity references and the ->>-free JSON casts ride core json.
+require json
+
+# A wide sliding frame drives the window segment tree, and DISTINCT drives the distinct window
+# aggregator; both combine partial states with PRESERVE_INPUT and REUSE the source state across
+# frames. A destructive combine leaves moved-from element blobs behind, so the next frame that
+# reuses that source produces a malformed JSONO. These parity checks stay green only if the combine
+# copies the source instead of moving it.
+
+statement ok
+CREATE TABLE w AS
+  SELECT i AS ts, i % 4 AS g, CAST(i AS VARCHAR) AS k, jsono(CAST(i AS VARCHAR)) AS j
+  FROM range(5000) t(i);
+
+# jsono_group_array over a wide sliding frame (200 rows -> inner segment-tree nodes): byte-exact
+# parity against core array_agg over the same frame, whose element order matches the group's fold.
+query I
+SELECT bool_and(js = ref)
+FROM (
+  SELECT to_json(jsono_group_array(j) OVER win)::VARCHAR AS js,
+         to_json(array_agg(ts) OVER win)::VARCHAR AS ref
+  FROM w
+  WINDOW win AS (ORDER BY ts ROWS BETWEEN 200 PRECEDING AND CURRENT ROW)
+);
+----
+true
+
+# jsono_group_object over the same wide sliding frame. Keys are unique per frame (order-independent),
+# so parity is the frame's key count and its value sum against core count(*) / sum(ts) over the frame.
+query I
+SELECT bool_and(len(map_values(m)) = cnt AND list_sum(map_values(m)) = sm)
+FROM (
+  SELECT to_json(jsono_group_object(k, j) OVER win)::JSON::MAP(VARCHAR, BIGINT) AS m,
+         count(*) OVER win AS cnt,
+         sum(ts) OVER win AS sm
+  FROM w
+  WINDOW win AS (ORDER BY ts ROWS BETWEEN 200 PRECEDING AND CURRENT ROW)
+);
+----
+true
+
+# jsono_group_array(DISTINCT ...) routes through the distinct window aggregator. Values are distinct,
+# so the running frame keeps every element: parity is element count and sum against the same frame.
+query I
+SELECT bool_and(len(a) = cnt AND list_sum(a) = sm)
+FROM (
+  SELECT to_json(jsono_group_array(DISTINCT j) OVER win)::JSON::BIGINT[] AS a,
+         count(*) OVER win AS cnt,
+         sum(ts) OVER win AS sm
+  FROM w
+  WINDOW win AS (PARTITION BY g ORDER BY ts)
+);
+----
+true
+
+# jsono_group_object(DISTINCT ...) over the whole partition, again through the distinct aggregator.
+# Keys are unique so every (key, value) pair survives: parity is total key count and value sum.
+query I
+SELECT bool_and(len(map_values(m)) = cnt AND list_sum(map_values(m)) = sm)
+FROM (
+  SELECT to_json(jsono_group_object(DISTINCT k, j) OVER ())::JSON::MAP(VARCHAR, BIGINT) AS m,
+         count(*) OVER () AS cnt,
+         sum(ts) OVER () AS sm
+  FROM w
+);
+----
+true

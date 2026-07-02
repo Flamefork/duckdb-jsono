@@ -513,8 +513,9 @@ bool MatchTextComparison(ExpressionType comparison, const vector<string> &values
 	}
 }
 
-// EmitLocatedText sink for the filter matcher: a located value matches when its `->>` text equals one
-// of the predicate's expected values; a JSON null (or an unlocatable miss) never matches.
+// EmitLocatedText sink for the filter matcher: a located value matches when its `->>` text satisfies
+// the predicate's comparison — equality against one of the expected values, or an ordering (>, >=, <,
+// <=) against values[0] in binary VARCHAR order; a JSON null (or an unlocatable miss) never matches.
 struct JsonoMatchSink {
 	const JsonoMatchPredicate &predicate;
 	bool matched;

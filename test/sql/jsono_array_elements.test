@@ -148,6 +148,16 @@ SELECT jsono_array_elements(NULL) IS NULL;
 ----
 true
 
+# A constant-NULL path → SQL NULL (NOT a bind error). Like jsono_array_length, jsono_array_elements
+# keeps DEFAULT null handling, so a constant NULL path folds the whole call to NULL before the shared
+# path bind runs — unlike jsono_extract (SPECIAL_HANDLING), which reaches that bind and rejects a NULL
+# path loudly. The typed NULL::VARCHAR behaves the same.
+query II
+SELECT jsono_array_elements(jsono('{"items":[1,2,3]}'), NULL) IS NULL,
+       jsono_array_elements(jsono('[1,2,3]'), NULL::VARCHAR) IS NULL;
+----
+true	true
+
 # ── unnest integration: per-element ->> reads a field at native speed ──
 
 query I
@@ -253,3 +263,23 @@ statement error
 SELECT jsono_array_elements(jsono('[1]'), '$[*]');
 ----
 invalid path
+
+# ── List-capacity growth: one row with far more elements than the initial LIST capacity (2048) ──
+# The sink grows the LIST child mid-row and re-Inits the six-blob writer's cached data pointers;
+# stale pointers would corrupt earlier elements or crash. Element count, the tail element, and the
+# full element sum pin every element surviving the reallocations.
+
+statement ok
+CREATE TABLE big_arr AS
+  SELECT jsono('[' || string_agg(i, ',' ORDER BY i) || ']') AS j FROM range(5000) t(i);
+
+query II
+SELECT len(jsono_array_elements(j)), to_json(jsono_array_elements(j)[5000]) FROM big_arr;
+----
+5000	4999
+
+query I
+SELECT sum(to_json(e)::VARCHAR::BIGINT)
+FROM (SELECT unnest(jsono_array_elements(j)) AS e FROM big_arr);
+----
+12497500

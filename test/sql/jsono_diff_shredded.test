@@ -50,6 +50,40 @@ SELECT to_json(jsono_diff(jsono('{"k":"a","n":1,"m":{"deep":10},"other":true}', 
 ----
 {"k":"b","m":{"deep":11},"other":false}
 
+# A lane path ($.m.deep) AND a residual sibling ($.m.other) change under the SAME nested object: the
+# direct path must recurse into $.m and union the lane patch with the residual object's diff
+# (UnionDiffObjects over a nested EmitLanePatch), yielding the same merged sub-object the plain diff
+# does. Both columns are asserted equal, so this pins shredded == plain for the shared-prefix union.
+query II
+SELECT to_json(jsono_diff(jsono('{"m":{"deep":1,"other":"a"}}', shredding := {'$.m.deep':'BIGINT'}),
+                          jsono('{"m":{"deep":2,"other":"b"}}', shredding := {'$.m.deep':'BIGINT'}))),
+       to_json(jsono_diff(jsono('{"m":{"deep":1,"other":"a"}}'),
+                          jsono('{"m":{"deep":2,"other":"b"}}')));
+----
+{"m":{"deep":2,"other":"b"}}	{"m":{"deep":2,"other":"b"}}
+
+# UBIGINT and BOOLEAN lanes: the two primitives the main pair set leaves out of the lane plan.
+# Changed, unchanged, and diverted (u out of uint64 range is impossible — divert via a string)
+# values must match the plain diff, so LaneValueEqual/EmitLaneValue handle the raw uint64 (above
+# int64 range) and bool lanes and never mis-emit them through another primitive's writer.
+query I
+SELECT count(*)
+FROM (
+  SELECT id,
+         to_json(jsono_diff(jsono(prev, shredding := {u:'UBIGINT', b:'BOOLEAN'}),
+                            jsono(cur,  shredding := {u:'UBIGINT', b:'BOOLEAN'}))) AS shredded,
+         to_json(jsono_diff(jsono(prev), jsono(cur))) AS plain
+  FROM (VALUES
+    (1, '{"u":18446744073709551615,"b":true}',  '{"u":18446744073709551614,"b":false}'),
+    (2, '{"u":18446744073709551615,"b":true}',  '{"u":18446744073709551615,"b":true}'),
+    (3, '{"u":"diverted","b":true}',            '{"u":18446744073709551615,"b":true}'),
+    (4, '{"u":9223372036854775808}',            '{"b":false}')
+  ) t(id, prev, cur)
+)
+WHERE shredded IS DISTINCT FROM plain;
+----
+0
+
 # Atomic diffs stay applyable on the direct path: prev + diff == cur.
 query I
 SELECT count(*)

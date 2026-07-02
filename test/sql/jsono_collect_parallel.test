@@ -1,5 +1,5 @@
 # name: test/sql/jsono_collect_parallel.test
-# description: jsono_group_array / jsono_group_object Combine path must match the single-threaded fold
+# description: jsono_group_array / jsono_group_object parallel folds must match the single-threaded reference
 # group: [sql]
 
 require jsono
@@ -25,8 +25,10 @@ CREATE TABLE ref AS
          to_json(jsono_group_object(k, j ORDER BY ts)) AS obj
   FROM hits GROUP BY g;
 
-# Recompute under 4 threads; every group's output must match the reference exactly, so the
-# partial-state Combine preserves both fold order (array) and last-wins-then-sort (object).
+# Recompute under 4 threads; every group's output must match the reference exactly. NOTE: the
+# in-aggregate ORDER BY routes through DuckDB's sorted-aggregate wrapper, which replays sorted
+# buffers via SimpleUpdate — the collect aggregates' own Combine is NOT on this path (the
+# no-ORDER-BY section below covers it); this pins the ordered fold across threads.
 statement ok
 SET threads = 4;
 
@@ -41,3 +43,42 @@ WHERE cur.arr IS DISTINCT FROM ref.arr
    OR cur.obj IS DISTINCT FROM ref.obj;
 ----
 0
+
+# ── True Combine: parallel GROUP BY without an in-aggregate ORDER BY ──
+# Without the ORDER BY the hash aggregate combines thread-local partial states directly
+# (ALLOW_DESTRUCTIVE), exercising JsonoGroupArrayCombine / JsonoGroupObjectCombine. The table spans
+# multiple row groups (>122880 rows) so the scan actually parallelizes into partials. Partial fold
+# order is scheduling-dependent, so the assertions are order-independent: element count + element
+# sum for the array, and the exact object for unique-per-group keys (JSONO emits sorted unique
+# keys, so the object result does not depend on fold order).
+statement ok
+CREATE TABLE combine_hits AS
+  SELECT (i % 100) AS g, i AS ts, jsono(CAST(i AS VARCHAR)) AS jn, ('k' || i) AS uk
+  FROM range(200000) t(i);
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE combine_ref AS
+  SELECT g, count(*) AS cnt, sum(ts) AS sm, to_json(jsono_group_object(uk, jn)) AS obj
+  FROM combine_hits GROUP BY g;
+
+statement ok
+SET threads = 8;
+
+query I
+SELECT count(*)
+FROM ( SELECT g,
+              to_json(jsono_group_array(jn))::JSON::BIGINT[] AS a,
+              to_json(jsono_group_object(uk, jn)) AS obj
+       FROM combine_hits GROUP BY g ) cur
+JOIN combine_ref USING (g)
+WHERE len(cur.a) != combine_ref.cnt
+   OR list_sum(cur.a) != combine_ref.sm
+   OR cur.obj IS DISTINCT FROM combine_ref.obj;
+----
+0
+
+statement ok
+RESET threads;

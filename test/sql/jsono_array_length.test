@@ -52,6 +52,15 @@ SELECT jsono_array_length(NULL), jsono_array_length(NULL, '$.a');
 ----
 NULL	NULL
 
+# A constant-NULL path → NULL result (NOT a bind error). jsono_array_length keeps DEFAULT null
+# handling, so a constant NULL argument folds the whole call to NULL before the shared path bind
+# runs — unlike jsono_extract, which is SPECIAL_HANDLING and reaches the same bind to reject a NULL
+# path loudly. The typed NULL::VARCHAR behaves the same.
+query II
+SELECT jsono_array_length(jsono('{"items":[1,2,3]}'), NULL), jsono_array_length(jsono('[1,2,3]'), NULL::VARCHAR);
+----
+NULL	NULL
+
 # Non-JSONO argument is rejected loudly.
 statement error
 SELECT jsono_array_length('foo');

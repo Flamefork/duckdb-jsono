@@ -106,11 +106,12 @@ void JsonoGroupArrayUpdate(Vector inputs[], AggregateInputData &, idx_t, Vector 
 	}
 }
 
-void JsonoGroupArrayCombine(Vector &source, Vector &target, AggregateInputData &, idx_t count) {
+void JsonoGroupArrayCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
 	UnifiedVectorFormat source_fmt;
 	source.ToUnifiedFormat(count, source_fmt);
 	auto source_data = UnifiedVectorFormat::GetData<CollectArrayState *>(source_fmt);
 	auto target_data = FlatVector::GetData<CollectArrayState *>(target);
+	auto destructive = aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE;
 	for (idx_t row = 0; row < count; row++) {
 		auto &src = *source_data[RowIndex(source_fmt, row)];
 		if (!src.elements || src.elements->empty()) {
@@ -121,9 +122,18 @@ void JsonoGroupArrayCombine(Vector &source, Vector &target, AggregateInputData &
 			tgt.elements = new std::vector<CollectBlob>();
 		}
 		// Fold order: the source partial's elements follow the target's, matching how the ordered
-		// aggregate replays sorted partials into one accumulator.
-		for (auto &elem : *src.elements) {
-			tgt.elements->push_back(std::move(elem));
+		// aggregate replays sorted partials into one accumulator. A PRESERVE_INPUT combine (window
+		// segment tree / distinct aggregator) reuses the source across frames, so only a destructive
+		// combine may move its blobs out; the moved-from container is then cleared to stay valid.
+		if (destructive) {
+			for (auto &elem : *src.elements) {
+				tgt.elements->push_back(std::move(elem));
+			}
+			src.elements->clear();
+		} else {
+			for (const auto &elem : *src.elements) {
+				tgt.elements->push_back(elem);
+			}
 		}
 	}
 }
@@ -147,7 +157,9 @@ void JsonoGroupArrayFinalize(Vector &states, AggregateInputData &, Vector &resul
 		builder.EmitArrayStart();
 		for (auto &elem : *state.elements) {
 			JsonoView view = ViewOfBlob(elem);
-			view.ParseHeader();
+			if (!view.ParseHeader()) {
+				throw InternalException("jsono_group_array: malformed collected element blob");
+			}
 			JsonoCursor cursor;
 			EmitValueVerbatim(view, cursor, builder, 1);
 		}
@@ -236,11 +248,12 @@ void JsonoGroupObjectUpdate(Vector inputs[], AggregateInputData &, idx_t, Vector
 	}
 }
 
-void JsonoGroupObjectCombine(Vector &source, Vector &target, AggregateInputData &, idx_t count) {
+void JsonoGroupObjectCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
 	UnifiedVectorFormat source_fmt;
 	source.ToUnifiedFormat(count, source_fmt);
 	auto source_data = UnifiedVectorFormat::GetData<CollectObjectState *>(source_fmt);
 	auto target_data = FlatVector::GetData<CollectObjectState *>(target);
+	auto destructive = aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE;
 	for (idx_t row = 0; row < count; row++) {
 		auto &src = *source_data[RowIndex(source_fmt, row)];
 		if (!src.entries || src.entries->empty()) {
@@ -250,8 +263,18 @@ void JsonoGroupObjectCombine(Vector &source, Vector &target, AggregateInputData 
 		if (!tgt.entries) {
 			tgt.entries = new std::vector<CollectObjectEntry>();
 		}
-		for (auto &entry : *src.entries) {
-			tgt.entries->push_back(std::move(entry));
+		// A PRESERVE_INPUT combine (window segment tree / distinct aggregator) reuses the source across
+		// frames, so only a destructive combine may move its entries out; the moved-from container is
+		// then cleared to stay valid.
+		if (destructive) {
+			for (auto &entry : *src.entries) {
+				tgt.entries->push_back(std::move(entry));
+			}
+			src.entries->clear();
+		} else {
+			for (const auto &entry : *src.entries) {
+				tgt.entries->push_back(entry);
+			}
 		}
 	}
 }
@@ -285,7 +308,9 @@ void JsonoGroupObjectFinalize(Vector &states, AggregateInputData &, Vector &resu
 		for (auto &kv : last_by_key) {
 			builder.EmitObjectChildStart();
 			JsonoView view = ViewOfBlob((*state.entries)[kv.second].value);
-			view.ParseHeader();
+			if (!view.ParseHeader()) {
+				throw InternalException("jsono_group_object: malformed collected value blob");
+			}
 			JsonoCursor cursor;
 			EmitValueVerbatim(view, cursor, builder, 1);
 		}

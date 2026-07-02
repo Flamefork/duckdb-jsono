@@ -130,8 +130,11 @@ FROM (
 ----
 {}	true
 
-# Multi-group + multi-threaded Combine parity over a mixed workload: shredded fold equals the
-# plain fold per group, and the manifest-carrying result reads back.
+# Multi-group ordered parity over a mixed workload: shredded fold equals the plain fold per group,
+# and the manifest-carrying result reads back. NOTE: the in-aggregate ORDER BY routes through
+# DuckDB's sorted-aggregate wrapper, which replays sorted buffers via SimpleUpdate — the direct
+# accumulator's own Combine (DirectFoldState) is NOT on this path; the no-ORDER-BY section below
+# covers it.
 statement ok
 CREATE TABLE mixed AS
   SELECT (i % 37) AS g, i AS ord,
@@ -157,6 +160,32 @@ FROM (
 WHERE shredded IS DISTINCT FROM plain;
 ----
 0
+
+# Parallel Combine over the direct accumulator (no ORDER BY, so DirectFoldState runs — an
+# in-aggregate ORDER BY routes through SortedAggregateFunction and never exercises Combine). One
+# early row fits the BIGINT lanes (k and the nested $.n.deep); every later row diverts both paths
+# into the residual (k as a string, n as a scalar that also breaks the nested path's object
+# skeleton). The diverted values win under every legal fold/combine order, so the result is
+# deterministic and must equal the plain fold. Guards the Combine bug where a stale source lane was
+# adopted over the newer merged residual value.
+statement ok
+SET threads = 8;
+
+statement ok
+CREATE TABLE combine_conflict AS
+  SELECT i,
+         CASE WHEN i = 0 THEN '{"k":1,"n":{"deep":5}}' ELSE '{"k":"s","n":9}' END AS doc
+  FROM range(200000) t(i);
+
+query II
+SELECT to_json(m1) = to_json(m2), to_json(m1)
+FROM (
+  SELECT jsono_group_merge(jsono(doc, shredding := {k:'BIGINT', '$.n.deep':'BIGINT'})) AS m1,
+         jsono_group_merge(jsono(doc)) AS m2
+  FROM combine_conflict
+);
+----
+true	{"k":"s","n":9}
 
 statement ok
 RESET threads;
