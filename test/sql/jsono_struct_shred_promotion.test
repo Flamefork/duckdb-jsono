@@ -1,0 +1,69 @@
+# name: test/sql/jsono_struct_shred_promotion.test
+# description: Auto-shred narrow-type promotion: INTEGER/SMALLINT/unsigned-narrow -> BIGINT lanes, FLOAT -> DOUBLE lanes
+# group: [sql]
+
+require jsono
+
+require json
+
+# Narrow numeric struct fields are promoted and lifted into typed shred lanes instead of falling
+# to the residual: signed and unsigned narrow ints -> BIGINT (unsigned narrow must NOT become a
+# UBIGINT lane: the UBIGINT shred source reads the raw child as uint64), FLOAT -> DOUBLE.
+query I
+SELECT typeof(jsono(struct_pack(qty := 1::INTEGER, cnt := 2::SMALLINT, usmall := 3::UINTEGER, price := 0.5::FLOAT)));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, cnt STRUCT("value" BIGINT, complete TINYINT), price STRUCT("value" DOUBLE, complete TINYINT), qty STRUCT("value" BIGINT, complete TINYINT), usmall STRUCT("value" BIGINT, complete TINYINT))))
+
+# Values land in the lanes widened, and unsigned values above INT32_MAX survive the promotion.
+query IIII
+SELECT j.jsono.shreds."qty".value, j.jsono.shreds."cnt".value, j.jsono.shreds."usmall".value, j.jsono.shreds."price".value
+FROM (SELECT jsono(struct_pack(qty := -5::INTEGER, cnt := 7::SMALLINT, usmall := 4000000000::UINTEGER, price := 0.5::FLOAT)) AS j);
+----
+-5	7	4000000000	0.5
+
+# Render parity: promotion must not change to_json output. A FLOAT value renders through
+# double(float) exactly as the residual emit did before promotion (0.1f widens to its double).
+query I
+SELECT to_json(jsono(struct_pack(qty := -5::INTEGER, usmall := 4000000000::UINTEGER, price := 0.1::FLOAT, exact := 0.5::FLOAT)))::VARCHAR;
+----
+{"exact":0.5,"price":0.10000000149011612,"qty":-5,"usmall":4000000000}
+
+# ->> reads the promoted lanes transparently.
+query III
+SELECT j->>'qty', j->>'usmall', j->>'price'
+FROM (SELECT jsono(struct_pack(qty := 42::INTEGER, usmall := 4000000000::UINTEGER, price := 0.5::FLOAT)) AS j);
+----
+42	4000000000	0.5
+
+# One-level nested narrow scalars are lifted under their JSON path, promoted the same way.
+query I
+SELECT jsono_shred_manifest(jsono(struct_pack(m := struct_pack(q := 1::INTEGER, f := 0.5::FLOAT))));
+----
+[{'path': $.m.f, 'type': DOUBLE}, {'path': $.m.q, 'type': BIGINT}]
+
+# Narrow element types promote inside array shreds: LIST<INTEGER> -> LIST<BIGINT> scalar-array
+# lane, and LIST<STRUCT> subfields promote to the BIGINT/DOUBLE lane types.
+query I
+SELECT jsono_shred_manifest(jsono(struct_pack(ids := [1::INTEGER, 2::INTEGER], items := [{'n': 3::SMALLINT, 'p': 0.5::FLOAT}])));
+----
+[{'path': ids, 'type': 'BIGINT[]'}, {'path': items, 'type': 'STRUCT(n BIGINT, p DOUBLE)[]'}]
+
+# NULL narrow fields keep the NULL-shred = value-in-residual contract.
+query III
+SELECT j.jsono.shreds."qty".value IS NULL, j->>'qty', to_json(j)::VARCHAR
+FROM (SELECT jsono(struct_pack(qty := NULL::INTEGER, k := 1::BIGINT)) AS j);
+----
+true	NULL	{"k":1,"qty":null}
+
+# Out-of-int64 territory is untouched: UBIGINT keeps its raw UBIGINT lane, HUGEINT and DECIMAL
+# stay in the residual (NumberText / DEC60 encodings have no lossless lane type).
+query I
+SELECT jsono_shred_manifest(jsono(struct_pack(u := 18446744073709551615::UBIGINT, h := 170141183460469231731687303715884105727::HUGEINT, d := 1.25::DECIMAL(10,2))));
+----
+[{'path': u, 'type': UBIGINT}]
+
+# Round-trip losslessness across promoted lanes and residual big numbers together.
+query I
+SELECT to_json(jsono(struct_pack(q := 1::INTEGER, u := 18446744073709551615::UBIGINT, h := 170141183460469231731687303715884105727::HUGEINT)))::VARCHAR;
+----
+{"h":170141183460469231731687303715884105727,"q":1,"u":18446744073709551615}

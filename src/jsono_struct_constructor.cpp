@@ -1098,6 +1098,39 @@ void AppendShredPathStep(string &path, const string &key) {
 	path.push_back('"');
 }
 
+// Shred-lane type for an auto-shred candidate field: narrow numerics are lifted through the same
+// widening the residual emit already applies (BuildStructConstructorPlan maps narrow ints to
+// BIGINT and FLOAT to DOUBLE), so the lane stores exactly the value the residual would have
+// carried and to_json output is unchanged. Unsigned narrow types promote to BIGINT, never
+// UBIGINT: every value fits int64, and the UBIGINT shred source reads the RAW input child as
+// uint64, which would misread a narrower unsigned vector. LIST element and LIST<STRUCT> subfield
+// types promote recursively so narrow-typed arrays gain lanes too; everything else (UBIGINT,
+// HUGEINT, DECIMAL, aliased JSON, ...) keeps its type and the existing eligibility gates decide.
+LogicalType PromoteAutoShredType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+		return LogicalType::BIGINT;
+	case LogicalTypeId::FLOAT:
+		return LogicalType::DOUBLE;
+	case LogicalTypeId::LIST:
+		return LogicalType::LIST(PromoteAutoShredType(ListType::GetChildType(type)));
+	case LogicalTypeId::STRUCT: {
+		child_list_t<LogicalType> children;
+		for (auto &child : StructType::GetChildTypes(type)) {
+			children.emplace_back(child.first, PromoteAutoShredType(child.second));
+		}
+		return LogicalType::STRUCT(std::move(children));
+	}
+	default:
+		return type;
+	}
+}
+
 // Type-driven auto-shred: lift shred-eligible scalar fields into typed shreds. Top-level scalars
 // keep their bare key name (the fast one-pass shred path); a scalar one level down inside a nested
 // STRUCT is lifted under its `$.parent.child` JSON path so the existing path-aware two-pass shred
@@ -1117,13 +1150,14 @@ void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix
 		if (top_level && (child.first == "body" || child.first == JsonoShredSetName())) {
 			continue;
 		}
-		if (IsShredValueType(child.second)) {
+		auto shred_type = PromoteAutoShredType(child.second);
+		if (IsShredValueType(shred_type)) {
 			if (top_level) {
-				shreds.emplace_back(child.first, child.second);
+				shreds.emplace_back(child.first, shred_type);
 			} else {
 				string path = path_prefix;
 				AppendShredPathStep(path, child.first);
-				shreds.emplace_back(std::move(path), child.second);
+				shreds.emplace_back(std::move(path), shred_type);
 			}
 			continue;
 		}
@@ -1131,13 +1165,13 @@ void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix
 		// subfields, or scalars (LIST<UBIGINT>, LIST<VARCHAR>, …) lifting each whole element — into a
 		// parallel typed list shred, leaving a skeleton array in the residual. Lifted at the top level
 		// by bare name and one struct level deep under `$.parent.items`, like a scalar leaf.
-		if (IsShredListType(child.second)) {
+		if (IsShredListType(shred_type)) {
 			if (top_level) {
-				shreds.emplace_back(child.first, child.second);
+				shreds.emplace_back(child.first, shred_type);
 			} else {
 				string path = path_prefix;
 				AppendShredPathStep(path, child.first);
-				shreds.emplace_back(std::move(path), child.second);
+				shreds.emplace_back(std::move(path), shred_type);
 			}
 			continue;
 		}
@@ -1366,7 +1400,8 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
-	// Type-driven auto-shred never diverts: each shred's type is its source field's type, so a
+	// Type-driven auto-shred never diverts: each shred's type is its source field's promoted plan
+	// type (narrow numerics widen to the BIGINT/DOUBLE the casted input already carries), so a
 	// present value always fits the shred and a NULL shred is only an absent field. The value is
 	// therefore always complete — which gives jsono(struct, shredding) the COALESCE-free typed
 	// read on read-back for struct-ingest workloads.

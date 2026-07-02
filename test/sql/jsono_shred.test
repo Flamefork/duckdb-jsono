@@ -219,11 +219,12 @@ FROM (
 {"body":"v3","jsono":"v5","jsono_slots":"v1","jsono_slots_extra":"v2","shreds":"v4"}	v1	v2	v3	v4	v5
 
 # jsono(struct) lifts top-level scalar fields of shred types into shreds directly (no spec):
-# scalars of shred types become columns, the rest stays in the residual tape. The type is the same
-# one jsono_storage_type builds from the same shreds (asserted by struct-type equality).
+# scalars of shred types become columns (narrow ints promote to BIGINT, incl. one level down the
+# nested descend), the rest stays in the residual tape. The type is the same one
+# jsono_storage_type builds from the same shreds (asserted by struct-type equality).
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'name': 'x', 'nested': {'k': 2}}))
-     = jsono_storage_type('a BIGINT, "name" VARCHAR');
+     = jsono_storage_type('a BIGINT, "name" VARCHAR, "$.nested.k" BIGINT');
 ----
 true
 
@@ -252,11 +253,11 @@ SELECT s ->> 'k', to_json(s) FROM (
 ----
 c	{"k":"c","raw":{"z":1}}
 
-# the struct constructor lifts only top-level shred-typed scalars. (Here `a` is INTEGER, not a
-# shred type, so only the VARCHAR `name` lifts; the residual keeps `a`.)
+# the struct constructor lifts top-level shred-typed scalars, promoting narrow ints: INTEGER `a`
+# lifts as a BIGINT shred alongside the VARCHAR `name`.
 query I
 SELECT typeof(jsono({'a': 1, 'name': 'x'}))
-     = jsono_storage_type('"name" VARCHAR');
+     = jsono_storage_type('a BIGINT, "name" VARCHAR');
 ----
 true
 

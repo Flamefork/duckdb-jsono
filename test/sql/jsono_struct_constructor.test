@@ -36,11 +36,12 @@ SELECT to_json(jsono({'b': NULL, 'a': 1, 'nested': {'x': NULL, 'y': 2}}));
 ----
 {"a":1,"b":null,"nested":{"x":null,"y":2}}
 
-# jsono(STRUCT) uses the same default constructor semantics as the bare STRUCT cast did.
+# jsono(STRUCT) uses the same default constructor semantics as the bare STRUCT cast did; an
+# INTEGER literal field auto-shreds through the BIGINT promotion.
 query II
 SELECT typeof(jsono({'a': 1})), to_json(jsono({'b': 2, 'a': 'x'}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))	{"a":"x","b":2}
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, a STRUCT("value" BIGINT, complete TINYINT))))	{"a":"x","b":2}
 
 # Top-level NULL STRUCT becomes SQL NULL, matching jsono(NULL).
 query I
