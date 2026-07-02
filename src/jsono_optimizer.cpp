@@ -80,6 +80,10 @@ struct JsonoCompiledPath {
 struct JsonoMatchPredicate {
 	JsonoPathSpec path;
 	JsonoCompiledPath compiled_path;
+	// COMPARE_EQUAL is set membership over `values` (equality / IN / contains). The four range
+	// comparisons carry a single bound in values[0] and compare the `->>` text in DuckDB's binary
+	// VARCHAR order, so the fused result matches the unfused string comparison exactly.
+	ExpressionType comparison = ExpressionType::COMPARE_EQUAL;
 	vector<string> values;
 	idx_t step_base = 0;
 };
@@ -102,7 +106,7 @@ struct JsonoMatchBindData : public FunctionData {
 			auto &left = predicates[predicate_index];
 			auto &right = other.predicates[predicate_index];
 			if (!JsonoPathSpecEqual(left.path, right.path) || left.step_base != right.step_base ||
-			    left.values != right.values) {
+			    left.comparison != right.comparison || left.values != right.values) {
 				return false;
 			}
 		}
@@ -336,9 +340,19 @@ void SetPredicateSource(JsonoRewritePredicate &predicate, Expression &source, Js
 	predicate.predicate = std::move(match_predicate);
 }
 
-bool TryReadEqualsPredicate(ClientContext &context, BoundComparisonExpression &comparison,
-                            JsonoRewritePredicate &predicate) {
-	if (comparison.GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
+// Equality plus the four range comparisons over a `->>` extract and a constant. A range with the
+// extract on the RIGHT flips its comparison (const < x  ==  x > const).
+bool TryReadComparisonPredicate(ClientContext &context, BoundComparisonExpression &comparison,
+                                JsonoRewritePredicate &predicate) {
+	auto type = comparison.GetExpressionType();
+	switch (type) {
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		break;
+	default:
 		return false;
 	}
 	Expression *source = nullptr;
@@ -352,7 +366,9 @@ bool TryReadEqualsPredicate(ClientContext &context, BoundComparisonExpression &c
 		    !TryReadStringValue(context, *comparison.left, value)) {
 			return false;
 		}
+		type = FlipComparisonExpression(type);
 	}
+	match_predicate.comparison = type;
 	match_predicate.values.push_back(std::move(value));
 	SetPredicateSource(predicate, *source, std::move(match_predicate));
 	return true;
@@ -400,7 +416,7 @@ bool TryReadContainsPredicate(ClientContext &context, BoundFunctionExpression &f
 bool TryReadPredicate(ClientContext &context, Expression &expr, JsonoRewritePredicate &predicate) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COMPARISON:
-		return TryReadEqualsPredicate(context, expr.Cast<BoundComparisonExpression>(), predicate);
+		return TryReadComparisonPredicate(context, expr.Cast<BoundComparisonExpression>(), predicate);
 	case ExpressionClass::BOUND_FUNCTION:
 		return TryReadContainsPredicate(context, expr.Cast<BoundFunctionExpression>(), predicate);
 	case ExpressionClass::BOUND_OPERATOR:
@@ -466,17 +482,48 @@ bool ContainsExpectedValue(const vector<string> &values, nonstd::string_view can
 	return false;
 }
 
+// DuckDB's default VARCHAR order (binary): bytewise, a strict prefix sorts first.
+int CompareMatchText(nonstd::string_view a, nonstd::string_view b) {
+	auto n = std::min(a.size(), b.size());
+	if (n > 0) {
+		auto c = std::memcmp(a.data(), b.data(), n);
+		if (c != 0) {
+			return c;
+		}
+	}
+	return a.size() < b.size() ? -1 : (a.size() > b.size() ? 1 : 0);
+}
+
+bool MatchTextComparison(ExpressionType comparison, const vector<string> &values, nonstd::string_view candidate) {
+	if (comparison == ExpressionType::COMPARE_EQUAL) {
+		return ContainsExpectedValue(values, candidate);
+	}
+	auto c = CompareMatchText(candidate, values[0]);
+	switch (comparison) {
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return c > 0;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return c >= 0;
+	case ExpressionType::COMPARE_LESSTHAN:
+		return c < 0;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return c <= 0;
+	default:
+		throw InternalException("jsono match: unexpected comparison type");
+	}
+}
+
 // EmitLocatedText sink for the filter matcher: a located value matches when its `->>` text equals one
 // of the predicate's expected values; a JSON null (or an unlocatable miss) never matches.
 struct JsonoMatchSink {
-	const vector<string> &values;
+	const JsonoMatchPredicate &predicate;
 	bool matched;
 
 	void OnInlineText(nonstd::string_view text) {
-		matched = ContainsExpectedValue(values, text);
+		matched = MatchTextComparison(predicate.comparison, predicate.values, text);
 	}
 	void OnRenderedText(nonstd::string_view text) {
-		matched = ContainsExpectedValue(values, text);
+		matched = MatchTextComparison(predicate.comparison, predicate.values, text);
 	}
 	void OnNull() {
 		matched = false;
@@ -485,7 +532,7 @@ struct JsonoMatchSink {
 
 bool LocatedValueMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoMatchPredicate &predicate,
                          const JsonoView &view, const JsonoMatchLocation &location) {
-	JsonoMatchSink sink {predicate.values, false};
+	JsonoMatchSink sink {predicate, false};
 	EmitLocatedText(reader, view, predicate.path.steps, location.cursor, lstate.scratch, sink);
 	return sink.matched;
 }
@@ -972,14 +1019,16 @@ ScalarFunction MakeJsonoInternalDoubleTextFunction() {
 
 idx_t ConservativePredicateRank(const JsonoMatchPredicate &predicate) {
 	auto root_path = predicate.path.steps.size() <= 1;
-	auto multi_value = predicate.values.size() > 1;
-	if (!root_path && !multi_value) {
+	// A range comparison keeps a value interval, so it ranks with multi-value sets: less selective
+	// than a point equality, evaluated later.
+	auto wide_match = predicate.values.size() > 1 || predicate.comparison != ExpressionType::COMPARE_EQUAL;
+	if (!root_path && !wide_match) {
 		return 0;
 	}
 	if (!root_path) {
 		return 1;
 	}
-	if (!multi_value) {
+	if (!wide_match) {
 		return 2;
 	}
 	return 3;
