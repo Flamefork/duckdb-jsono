@@ -164,9 +164,7 @@ class JsonoSession:
         parsed = json_loads(payload) if payload and payload != "[]" else None
         if not parsed:
             self.stderr_file.seek(stderr_before)
-            return JsonoSession.Errored(
-                self.stderr_file.read().decode("utf-8", "replace")
-            )
+            return JsonoSession.Errored(self.stderr_file.read().decode("utf-8", "replace"))
         (cell,) = parsed[0].values()
         return None if cell is None else str(cell)
 
@@ -344,9 +342,7 @@ def manifest_offset(skips: bytes) -> int:
     container_count = int.from_bytes(skips[0:4], "little")
     checkpoint_index_count = int.from_bytes(skips[4:8], "little")
     checkpoint_count = int.from_bytes(skips[8:12], "little")
-    offset = (
-        12 + container_count * 16 + checkpoint_index_count * 12 + checkpoint_count * 8
-    )
+    offset = 12 + container_count * 16 + checkpoint_index_count * 12 + checkpoint_count * 8
     return min(offset, len(skips))
 
 
@@ -592,15 +588,9 @@ def test_fuzz_blob_no_crash(
     mutation="lengths_misalign",
     reader="entries",
 )
-@example(
-    text='{"u":18446744073709551615}', mutation="nums_truncate", reader="transform"
-)
-@example(
-    text='{"u":18446744073709551615}', mutation="nums_extra_entry", reader="group_merge"
-)
-@example(
-    text='{"u":18446744073709551615}', mutation="nums_misalign", reader="group_array"
-)
+@example(text='{"u":18446744073709551615}', mutation="nums_truncate", reader="transform")
+@example(text='{"u":18446744073709551615}', mutation="nums_extra_entry", reader="group_merge")
+@example(text='{"u":18446744073709551615}', mutation="nums_misalign", reader="group_array")
 @example(text=wide_object_text, mutation="checkpoint_stride", reader="entries_whole")
 @example(text='{"n":1e3}', mutation="string_heap_bad_number", reader="array_elements")
 @given(text=validish_json_documents, mutation=validish_mutations, reader=fuzz_readers)
@@ -618,9 +608,7 @@ def test_fuzz_validish_blob_no_crash(text: str, mutation: str, reader: str) -> N
 
 # Shredding properties run on object documents whose top-level keys are plain identifiers
 # (shred paths are spec field names; quoting rules are not the property under test).
-shred_keys = st.text(
-    alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=8
-).filter(lambda key: key != "body")
+shred_keys = st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=8).filter(lambda key: key != "body")
 shred_documents = st.dictionaries(shred_keys, json_scalars, min_size=1, max_size=6)
 shred_types = st.sampled_from(["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN"])
 
@@ -647,12 +635,8 @@ def test_shred_lossless(doc: dict[str, Any], data: Any) -> None:
     )
     spec = {path: data.draw(shred_types) for path in paths}
     plain = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
-    shredded = SESSION.value(
-        f"to_json(jsono({sql_literal(text)}, shredding := {shred_spec_sql(spec)}))"
-    )
-    assert (
-        plain == shredded
-    ), f"shredding changed the value: {text!r} spec {spec!r}: {plain!r} -> {shredded!r}"
+    shredded = SESSION.value(f"to_json(jsono({sql_literal(text)}, shredding := {shred_spec_sql(spec)}))")
+    assert plain == shredded, f"shredding changed the value: {text!r} spec {spec!r}: {plain!r} -> {shredded!r}"
 
 
 @settings(PROPERTY_SETTINGS)
@@ -662,9 +646,7 @@ def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
     # reconstruct fallback alike) must preserve the logical value.
     text = json_dumps(doc)
     keys = sorted(doc.keys())
-    first_paths = data.draw(
-        st.lists(st.sampled_from(keys), min_size=1, max_size=3, unique=True)
-    )
+    first_paths = data.draw(st.lists(st.sampled_from(keys), min_size=1, max_size=3, unique=True))
     second_paths = data.draw(
         st.lists(
             st.sampled_from(keys + ["missing_path"]),
@@ -679,9 +661,7 @@ def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
     reshredded = SESSION.value(
         f"to_json(jsono(jsono({sql_literal(text)}, shredding := {first}), shredding := {second}))"
     )
-    assert (
-        plain == reshredded
-    ), f"reshred changed the value: {text!r} {first} -> {second}: {plain!r} -> {reshredded!r}"
+    assert plain == reshredded, f"reshred changed the value: {text!r} {first} -> {second}: {plain!r} -> {reshredded!r}"
 
 
 # merge_patch over a SHREDDED base with PLAIN patch arguments must fold identically to the same
@@ -714,46 +694,28 @@ merge_patch_args = st.lists(
     min_size=1,
     max_size=3,
 )
-merge_patch_base = st.dictionaries(
-    merge_patch_keys, merge_patch_scalars, min_size=1, max_size=5
-)
+merge_patch_base = st.dictionaries(merge_patch_keys, merge_patch_scalars, min_size=1, max_size=5)
 
 
 @settings(PROPERTY_SETTINGS)
-@example(
-    base={"a": 1}, patches=[{"a": None}], spec_keys=["a"]
-)  # RFC 7396 null deletes a lane
-@example(
-    base={"a": 1}, patches=[5], spec_keys=["a"]
-)  # non-object patch replaces the document
-@example(
-    base={"a": 1, "b": 2}, patches=[{"c": 3}], spec_keys=["a", "b"]
-)  # disjoint append, fast path
-@example(
-    base={"a": 1}, patches=[{"a": 2}], spec_keys=["a"]
-)  # value collides into the residual
-@example(
-    base={"a": 1}, patches=[{"a": None}, {"a": 9}], spec_keys=["a"]
-)  # delete then re-add a lane
+@example(base={"a": 1}, patches=[{"a": None}], spec_keys=["a"])  # RFC 7396 null deletes a lane
+@example(base={"a": 1}, patches=[5], spec_keys=["a"])  # non-object patch replaces the document
+@example(base={"a": 1, "b": 2}, patches=[{"c": 3}], spec_keys=["a", "b"])  # disjoint append, fast path
+@example(base={"a": 1}, patches=[{"a": 2}], spec_keys=["a"])  # value collides into the residual
+@example(base={"a": 1}, patches=[{"a": None}, {"a": 9}], spec_keys=["a"])  # delete then re-add a lane
 @given(
     base=merge_patch_base,
     patches=merge_patch_args,
     spec_keys=st.lists(merge_patch_keys, min_size=1, max_size=5, unique=True),
 )
-def test_merge_patch_shredded_plain_parity(
-    base: dict[str, Any], patches: list[Any], spec_keys: list[str]
-) -> None:
+def test_merge_patch_shredded_plain_parity(base: dict[str, Any], patches: list[Any], spec_keys: list[str]) -> None:
     base_text = json_dumps(base)
     spec_keys = [key for key in spec_keys if key in base]
     if not spec_keys:
         return
     spec = shred_spec_sql({key: "VARCHAR" for key in spec_keys})
-    patch_args = ", ".join(
-        f"jsono({sql_literal(json_dumps(patch))})" for patch in patches
-    )
-    reference = SESSION.value(
-        f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}), {patch_args}))"
-    )
+    patch_args = ", ".join(f"jsono({sql_literal(json_dumps(patch))})" for patch in patches)
+    reference = SESSION.value(f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}), {patch_args}))")
     candidate = SESSION.value(
         f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}, shredding := {spec}), {patch_args}))"
     )
@@ -776,13 +738,7 @@ def struct_literal_sql(value: Any) -> str:
     if isinstance(value, str):
         return sql_literal(value)
     if isinstance(value, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"{sql_literal(k)}: {struct_literal_sql(v)}" for k, v in value.items()
-            )
-            + "}"
-        )
+        return "{" + ", ".join(f"{sql_literal(k)}: {struct_literal_sql(v)}" for k, v in value.items()) + "}"
     raise ValueError(f"unsupported struct literal value: {value!r}")
 
 
@@ -792,16 +748,12 @@ def struct_literal_sql(value: Any) -> str:
 # reconstructs such overlapping paths via the independent-overlay fallback, so the shredded fold must
 # still agree with the plain RFC 7396 reference.
 merge_patch_struct_key = st.sampled_from(["a", "b", "c"])
-merge_patch_struct_scalars = st.one_of(
-    st.booleans(), st.integers(min_value=-100, max_value=100), st.text(max_size=4)
-)
+merge_patch_struct_scalars = st.one_of(st.booleans(), st.integers(min_value=-100, max_value=100), st.text(max_size=4))
 merge_patch_struct_patch = st.dictionaries(
     merge_patch_struct_key,
     st.one_of(
         merge_patch_struct_scalars,
-        st.dictionaries(
-            merge_patch_struct_key, merge_patch_struct_scalars, min_size=1, max_size=3
-        ),
+        st.dictionaries(merge_patch_struct_key, merge_patch_struct_scalars, min_size=1, max_size=3),
     ),
     min_size=1,
     max_size=4,
@@ -809,18 +761,10 @@ merge_patch_struct_patch = st.dictionaries(
 
 
 @settings(PROPERTY_SETTINGS)
-@example(
-    base={"a": 1}, patches=[{"a": {"a": 1, "b": 2}}], spec_keys=["a"]
-)  # disjoint nested add
-@example(
-    base={"a": 1}, patches=[{"a": {"a": 1}}, {"a": 9}], spec_keys=["a"]
-)  # nested then top-level lane
-@example(
-    base={"a": 1}, patches=[{"a": {"a": 1}}, {"a": {"a": 2}}], spec_keys=["a"]
-)  # nested collision
-@example(
-    base={"a": None}, patches=[{"a": {"a": False}}, {"a": False}], spec_keys=["a"]
-)  # scalar↔object↔scalar
+@example(base={"a": 1}, patches=[{"a": {"a": 1, "b": 2}}], spec_keys=["a"])  # disjoint nested add
+@example(base={"a": 1}, patches=[{"a": {"a": 1}}, {"a": 9}], spec_keys=["a"])  # nested then top-level lane
+@example(base={"a": 1}, patches=[{"a": {"a": 1}}, {"a": {"a": 2}}], spec_keys=["a"])  # nested collision
+@example(base={"a": None}, patches=[{"a": {"a": False}}, {"a": False}], spec_keys=["a"])  # scalar↔object↔scalar
 @given(
     base=merge_patch_base,
     patches=st.lists(merge_patch_struct_patch, min_size=1, max_size=3),
@@ -834,13 +778,9 @@ def test_merge_patch_auto_shred_patch_parity(
     if not spec_keys:
         return
     spec = shred_spec_sql({key: "VARCHAR" for key in spec_keys})
-    plain_args = ", ".join(
-        f"jsono({sql_literal(json_dumps(patch))})" for patch in patches
-    )
+    plain_args = ", ".join(f"jsono({sql_literal(json_dumps(patch))})" for patch in patches)
     shred_args = ", ".join(f"jsono({struct_literal_sql(patch)})" for patch in patches)
-    reference = SESSION.value(
-        f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}), {plain_args}))"
-    )
+    reference = SESSION.value(f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}), {plain_args}))")
     candidate = SESSION.value(
         f"to_json(jsono_merge_patch(jsono({sql_literal(base_text)}, shredding := {spec}), {shred_args}))"
     )
@@ -856,26 +796,18 @@ def test_merge_patch_auto_shred_patch_parity(
 # over- or under-cover them (missing subfield, tail key) and pick any shred type (matching or not).
 array_subfield_names = ["id", "name", "price", "qty", "sku"]
 array_element = st.one_of(
-    st.dictionaries(
-        st.sampled_from(array_subfield_names), json_scalars, min_size=0, max_size=5
-    ),
+    st.dictionaries(st.sampled_from(array_subfield_names), json_scalars, min_size=0, max_size=5),
     st.none(),
     json_scalars,
     st.lists(st.integers(min_value=0, max_value=5), max_size=2),
 )
 array_documents = st.fixed_dictionaries({"items": st.lists(array_element, max_size=6)})
-array_shred_types = st.sampled_from(
-    ["VARCHAR", "BIGINT", "UBIGINT", "DOUBLE", "BOOLEAN"]
-)
+array_shred_types = st.sampled_from(["VARCHAR", "BIGINT", "UBIGINT", "DOUBLE", "BOOLEAN"])
 # A LIST<STRUCT> element schema: a non-empty subset of the subfield names, each with any shred type.
 # The field order is the dict's, so it is frequently unsorted (the overlay patch must re-sort it).
 array_element_schemas = st.dictionaries(
     st.sampled_from(array_subfield_names), array_shred_types, min_size=1, max_size=5
-).map(
-    lambda fields: "STRUCT("
-    + ", ".join(f"{name} {stype}" for name, stype in fields.items())
-    + ")[]"
-)
+).map(lambda fields: "STRUCT(" + ", ".join(f"{name} {stype}" for name, stype in fields.items()) + ")[]")
 
 
 # Every native way to read a shredded value must yield the same result as a plain parse of the same
@@ -888,9 +820,7 @@ def _to_json_parity(shredded: str, plain: str) -> str:
 
 
 def descend_reads_parity(shredded: str, plain: str, reads: list[str]) -> str:
-    cond = " AND ".join(
-        f"(sj ->> '{r}') IS NOT DISTINCT FROM (pj ->> '{r}')" for r in reads
-    )
+    cond = " AND ".join(f"(sj ->> '{r}') IS NOT DISTINCT FROM (pj ->> '{r}')" for r in reads)
     return f"SELECT ({cond}) FROM (SELECT {shredded} sj, {plain} pj)"
 
 
@@ -928,16 +858,12 @@ ARRAY_READER_PARITY = [
     schema="STRUCT(id BIGINT, name VARCHAR)[]",
 )
 @example(doc={"items": []}, schema="STRUCT(id BIGINT)[]")
-@example(
-    doc={"items": [None, {"id": 1}, 5, "x"]}, schema="STRUCT(id BIGINT, name VARCHAR)[]"
-)
+@example(doc={"items": [None, {"id": 1}, 5, "x"]}, schema="STRUCT(id BIGINT, name VARCHAR)[]")
 @example(
     doc={"items": [{"id": 1, "name": None, "sku": "s"}]},
     schema="STRUCT(id BIGINT, name VARCHAR)[]",
 )
-@example(
-    doc={"items": [{"qty": 2, "sku": "s1"}]}, schema="STRUCT(sku VARCHAR, qty BIGINT)[]"
-)
+@example(doc={"items": [{"qty": 2, "sku": "s1"}]}, schema="STRUCT(sku VARCHAR, qty BIGINT)[]")
 @example(
     doc={"items": [{"id": 1, "name": "a", "sku": "tail"}, None, 5]},
     schema="STRUCT(id BIGINT, name VARCHAR)[]",
@@ -959,9 +885,7 @@ def test_array_reader_parity(doc: dict[str, Any], schema: str) -> None:
     plain = f"jsono({sql_literal(text)})"
     for name, build_query in ARRAY_READER_PARITY:
         ok = SESSION.value(build_query(shredded, plain))
-        assert (
-            ok == "true"
-        ), f"array {name} differs shredded vs plain: {text!r} schema {schema!r}"
+        assert ok == "true", f"array {name} differs shredded vs plain: {text!r} schema {schema!r}"
 
 
 # Scalar-array shredding: a regular array's whole scalar elements lift into a parallel LIST<scalar>
@@ -970,17 +894,11 @@ def test_array_reader_parity(doc: dict[str, Any], schema: str) -> None:
 # the same way the object-array test exercises subfield gates.
 scalar_array_element = st.one_of(
     json_scalars,
-    st.dictionaries(
-        st.sampled_from(array_subfield_names), json_scalars, min_size=0, max_size=3
-    ),
+    st.dictionaries(st.sampled_from(array_subfield_names), json_scalars, min_size=0, max_size=3),
     st.lists(st.integers(min_value=0, max_value=5), max_size=2),
 )
-scalar_array_documents = st.fixed_dictionaries(
-    {"items": st.lists(scalar_array_element, max_size=6)}
-)
-scalar_array_shred_types = st.sampled_from(
-    ["VARCHAR[]", "BIGINT[]", "UBIGINT[]", "DOUBLE[]", "BOOLEAN[]"]
-)
+scalar_array_documents = st.fixed_dictionaries({"items": st.lists(scalar_array_element, max_size=6)})
+scalar_array_shred_types = st.sampled_from(["VARCHAR[]", "BIGINT[]", "UBIGINT[]", "DOUBLE[]", "BOOLEAN[]"])
 
 
 def _scalar_descend_reads_parity(shredded: str, plain: str) -> str:
@@ -1020,9 +938,7 @@ def test_scalar_array_reader_parity(doc: dict[str, Any], schema: str) -> None:
     plain = f"jsono({sql_literal(text)})"
     for name, build_query in SCALAR_ARRAY_READER_PARITY:
         ok = SESSION.value(build_query(shredded, plain))
-        assert (
-            ok == "true"
-        ), f"scalar array {name} differs shredded vs plain: {text!r} schema {schema!r}"
+        assert ok == "true", f"scalar array {name} differs shredded vs plain: {text!r} schema {schema!r}"
 
 
 # Typed scalars for the STRUCT-input auto-shred test: each carries an explicit DuckDB type so the
@@ -1087,9 +1003,7 @@ def test_struct_auto_shred_lossless(doc: dict[str, Any]) -> None:
     text = json_dumps(typed_struct_json(doc))
     auto = SESSION.value(f"to_json(jsono({struct_sql}))")
     plain = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
-    assert (
-        auto == plain
-    ), f"auto-shred changed the value: {struct_sql} : {auto!r} != plain {plain!r}"
+    assert auto == plain, f"auto-shred changed the value: {struct_sql} : {auto!r} != plain {plain!r}"
 
 
 # Constructor (native STRUCT) auto-shred of a top-level LIST<STRUCT> field: the lifted array must
@@ -1112,12 +1026,8 @@ def array_struct_sql(elements: list[Any]) -> str:
             parts.append("NULL")
         else:
             flag = "true" if el["flag"] else "false"
-            parts.append(
-                f"{{'id': {el['id']}::BIGINT, 'name': {sql_literal(el['name'])}, 'flag': {flag}}}"
-            )
-    return (
-        "[" + ", ".join(parts) + ']::STRUCT(id BIGINT, "name" VARCHAR, flag BOOLEAN)[]'
-    )
+            parts.append(f"{{'id': {el['id']}::BIGINT, 'name': {sql_literal(el['name'])}, 'flag': {flag}}}")
+    return "[" + ", ".join(parts) + ']::STRUCT(id BIGINT, "name" VARCHAR, flag BOOLEAN)[]'
 
 
 @settings(PROPERTY_SETTINGS)
@@ -1128,19 +1038,10 @@ def test_struct_array_auto_shred_lossless(elements: list[Any]) -> None:
     list_sql = array_struct_sql(elements)
     from_struct = SESSION.value(f"to_json(jsono({{'items': {list_sql}}}))")
     json_doc = {
-        "items": [
-            (
-                None
-                if el is None
-                else {"id": el["id"], "name": el["name"], "flag": el["flag"]}
-            )
-            for el in elements
-        ]
+        "items": [(None if el is None else {"id": el["id"], "name": el["name"], "flag": el["flag"]}) for el in elements]
     }
     plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps(json_doc))}))")
-    assert (
-        from_struct == plain
-    ), f"struct array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
+    assert from_struct == plain, f"struct array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
 
 
 # Constructor (native STRUCT) auto-shred of a top-level LIST<scalar> field: the lifted array must
@@ -1188,18 +1089,10 @@ def test_scalar_array_auto_shred_lossless(spec: tuple[str, list[Any]]) -> None:
     # array into a typed LIST<scalar> shred; whatever the values and NULL elements, the logical value
     # must equal the plain parse of the same document.
     stype, values = spec
-    list_sql = (
-        "["
-        + ", ".join(scalar_list_element_sql(v, stype) for v in values)
-        + f"]::{stype}[]"
-    )
+    list_sql = "[" + ", ".join(scalar_list_element_sql(v, stype) for v in values) + f"]::{stype}[]"
     from_struct = SESSION.value(f"to_json(jsono({{'item_ids': {list_sql}}}))")
-    plain = SESSION.value(
-        f"to_json(jsono({sql_literal(json_dumps({'item_ids': values}))}))"
-    )
-    assert (
-        from_struct == plain
-    ), f"scalar array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
+    plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps({'item_ids': values}))}))")
+    assert from_struct == plain, f"scalar array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
 
 
 @settings(VALIDISH_PROPERTY_SETTINGS)
@@ -1210,9 +1103,7 @@ def test_narrowing_fails_loud(doc: dict[str, Any], data: Any) -> None:
     # shred manifest exists to catch. A shred whose value stayed in the residual (the lossless
     # gate rejected it) is not in the manifest, so narrowing it away is harmless; the property
     # therefore shreds string values as VARCHAR (always stripped).
-    str_keys = sorted(
-        key for key, value in doc.items() if isinstance(value, str) and value
-    )
+    str_keys = sorted(key for key, value in doc.items() if isinstance(value, str) and value)
     if len(str_keys) < 2:
         return
     dropped = data.draw(st.sampled_from(str_keys))
@@ -1221,13 +1112,9 @@ def test_narrowing_fails_loud(doc: dict[str, Any], data: Any) -> None:
     wide_spec = shred_spec_sql({path: "VARCHAR" for path in str_keys})
     narrow_spec = shred_spec_sql({path: "VARCHAR" for path in kept})
     SESSION.statement("DROP TABLE IF EXISTS narrow_prop;")
-    SESSION.statement(
-        f"CREATE TABLE narrow_prop AS SELECT jsono('{{}}', shredding := {narrow_spec}) AS e WHERE false;"
-    )
+    SESSION.statement(f"CREATE TABLE narrow_prop AS SELECT jsono('{{}}', shredding := {narrow_spec}) AS e WHERE false;")
     SESSION.statement("SET disabled_optimizers='extension';")
-    SESSION.statement(
-        f"INSERT INTO narrow_prop SELECT jsono({sql_literal(text)}, shredding := {wide_spec});"
-    )
+    SESSION.statement(f"INSERT INTO narrow_prop SELECT jsono({sql_literal(text)}, shredding := {wide_spec});")
     SESSION.statement("RESET disabled_optimizers;")
     result = SESSION.read("(SELECT to_json(e)::VARCHAR FROM narrow_prop LIMIT 1)")
     # The narrowed row must fail LOUD — a raised SQL error, not a partial document and not a silent
@@ -1237,8 +1124,7 @@ def test_narrowing_fails_loud(doc: dict[str, Any], data: Any) -> None:
         result, JsonoSession.Errored
     ), f"narrowed row did not fail loud: {text!r} dropped {dropped!r} -> {result!r}"
     assert (
-        "was narrowed by a raw struct cast and cannot be read losslessly"
-        in result.message
+        "was narrowed by a raw struct cast and cannot be read losslessly" in result.message
     ), f"narrowed row errored with an unexpected message: {text!r} dropped {dropped!r} -> {result.message!r}"
 
 
@@ -1318,51 +1204,28 @@ lww_rows = st.lists(
 
 
 @settings(PROPERTY_SETTINGS)
-@example(
-    rows=[{"a": 1, "n": {"x": 1}}, {"a": None, "n": {"y": 2}}, {"b": 3}], data=None
-)
+@example(rows=[{"a": 1, "n": {"x": 1}}, {"a": None, "n": {"y": 2}}, {"b": 3}], data=None)
 @example(rows=[{"a": 1}, {"a": 2}, {"a": 3}], data=None)
 @given(rows=lww_rows, data=st.data())
 def test_group_merge_keyed_parity(rows: list[dict[str, Any]], data: Any) -> None:
     # Distinct per-row keys (a permutation) so the ORDER BY fold is itself deterministic and the
     # keyed result has a single well-defined target to match.
-    order_keys = (
-        list(range(len(rows)))
-        if data is None
-        else data.draw(st.permutations(list(range(len(rows)))))
-    )
-    values = ", ".join(
-        f"(jsono({sql_literal(json_dumps(row))}), {key})"
-        for row, key in zip(rows, order_keys)
-    )
+    order_keys = list(range(len(rows))) if data is None else data.draw(st.permutations(list(range(len(rows)))))
+    values = ", ".join(f"(jsono({sql_literal(json_dumps(row))}), {key})" for row, key in zip(rows, order_keys))
     cte = f"WITH t(j, ok) AS (VALUES {values})"
-    keyed_max = SESSION.value(
-        f"({cte} SELECT to_json(jsono_group_merge_max(j, ok)) FROM t)"
-    )
-    ordered_asc = SESSION.value(
-        f"({cte} SELECT to_json(jsono_group_merge(j ORDER BY ok)) FROM t)"
-    )
-    assert (
-        keyed_max == ordered_asc
-    ), f"max != ORDER BY: {rows!r} -> {keyed_max!r} vs {ordered_asc!r}"
+    keyed_max = SESSION.value(f"({cte} SELECT to_json(jsono_group_merge_max(j, ok)) FROM t)")
+    ordered_asc = SESSION.value(f"({cte} SELECT to_json(jsono_group_merge(j ORDER BY ok)) FROM t)")
+    assert keyed_max == ordered_asc, f"max != ORDER BY: {rows!r} -> {keyed_max!r} vs {ordered_asc!r}"
 
-    keyed_min = SESSION.value(
-        f"({cte} SELECT to_json(jsono_group_merge_min(j, ok)) FROM t)"
-    )
-    ordered_desc = SESSION.value(
-        f"({cte} SELECT to_json(jsono_group_merge(j ORDER BY ok DESC)) FROM t)"
-    )
-    assert (
-        keyed_min == ordered_desc
-    ), f"min != ORDER BY DESC: {rows!r} -> {keyed_min!r} vs {ordered_desc!r}"
+    keyed_min = SESSION.value(f"({cte} SELECT to_json(jsono_group_merge_min(j, ok)) FROM t)")
+    ordered_desc = SESSION.value(f"({cte} SELECT to_json(jsono_group_merge(j ORDER BY ok DESC)) FROM t)")
+    assert keyed_min == ordered_desc, f"min != ORDER BY DESC: {rows!r} -> {keyed_min!r} vs {ordered_desc!r}"
 
     # Order independence: the physical row order fed to the aggregate must not change the result.
     keyed_reordered = SESSION.value(
         f"({cte} SELECT to_json(jsono_group_merge_max(j, ok)) FROM (SELECT * FROM t ORDER BY ok DESC))"
     )
-    assert (
-        keyed_max == keyed_reordered
-    ), f"order-dependent: {rows!r} -> {keyed_max!r} vs {keyed_reordered!r}"
+    assert keyed_max == keyed_reordered, f"order-dependent: {rows!r} -> {keyed_max!r} vs {keyed_reordered!r}"
 
 
 # jsono_transform parity: the shared JsonoTrieWalk path (normal edges for named fields and wildcard
@@ -1390,19 +1253,13 @@ transform_item = st.one_of(
     st.dictionaries(st.sampled_from(["v", "w"]), transform_scalars, max_size=2),
     st.none(),
     transform_scalars,
-    st.fixed_dictionaries(
-        {"v": st.lists(st.integers(min_value=0, max_value=3), max_size=2)}
-    ),
+    st.fixed_dictionaries({"v": st.lists(st.integers(min_value=0, max_value=3), max_size=2)}),
 )
 
 
 @st.composite
 def transform_documents(draw: Any) -> tuple[dict[str, Any], int]:
-    doc: dict[str, Any] = draw(
-        st.dictionaries(
-            st.sampled_from(transform_leaf_keys), transform_scalars, max_size=4
-        )
-    )
+    doc: dict[str, Any] = draw(st.dictionaries(st.sampled_from(transform_leaf_keys), transform_scalars, max_size=4))
     if draw(st.booleans()):
         doc["nest"] = draw(
             st.dictionaries(
@@ -1466,9 +1323,7 @@ def transform_varchar_oracle_sql(plain: str, transformed: str) -> str:
             f"CASE WHEN jsono_type({plain}, '{path}') IN ('OBJECT', 'ARRAY') "
             f"THEN NULL ELSE {plain} ->> '{path}' END"
         )
-        conds.append(
-            f"(({transformed}).{field_name} IS NOT DISTINCT FROM ({expected}))"
-        )
+        conds.append(f"(({transformed}).{field_name} IS NOT DISTINCT FROM ({expected}))")
     return "SELECT (" + " AND ".join(conds) + ")"
 
 
@@ -1506,14 +1361,10 @@ def test_transform_walk_parity(generated: tuple[dict[str, Any], int]) -> None:
     # build. The shred set covers the scalar fields the spec reads (so the shred-lane read path runs);
     # values that do not fit a typed shred stay in the residual (the lossless gate), exercising the
     # residual-first / shred-fallback split inside the walk.
-    shred_spec = (
-        "{'$.a': 'VARCHAR', '$.b': 'BIGINT', '$.c': 'DOUBLE', '$.d': 'BOOLEAN'}"
-    )
+    shred_spec = "{'$.a': 'VARCHAR', '$.b': 'BIGINT', '$.c': 'DOUBLE', '$.d': 'BOOLEAN'}"
     shredded = f"jsono({sql_literal(text)}, shredding := {shred_spec})"
     transformed_shredded = f"jsono_transform({shredded}, {spec})"
-    leg_a = SESSION.value(
-        f"SELECT (to_json({transformed_shredded}) IS NOT DISTINCT FROM to_json({transformed_plain}))"
-    )
+    leg_a = SESSION.value(f"SELECT (to_json({transformed_shredded}) IS NOT DISTINCT FROM to_json({transformed_plain}))")
     assert leg_a == "true", f"transform shredded != plain: {text!r}"
 
     # Leg B: each VARCHAR field matches the independent single-path `->>` extraction on the same value.
@@ -1539,30 +1390,18 @@ def _object_reachable_null(value: Any) -> bool:
 # reproduce cur. The law holds for an object cur with no object-reachable null leaf (the carve-out);
 # other shapes still exercise the diff walk (no crash) without the equality assertion.
 @settings(PROPERTY_SETTINGS)
-@example(
-    prev_text='{"a":1,"b":{"x":1,"y":2}}', cur_text='{"a":2,"b":{"x":1},"c":[1,2]}'
-)
-@example(
-    prev_text='{"a":5}', cur_text='{"a":{}}'
-)  # scalar -> empty object: patch must carry key:{}
-@example(
-    prev_text="{}", cur_text='{"a":1,"b":[1,2,3],"c":{"d":true}}'
-)  # everything new
+@example(prev_text='{"a":1,"b":{"x":1,"y":2}}', cur_text='{"a":2,"b":{"x":1},"c":[1,2]}')
+@example(prev_text='{"a":5}', cur_text='{"a":{}}')  # scalar -> empty object: patch must carry key:{}
+@example(prev_text="{}", cur_text='{"a":1,"b":[1,2,3],"c":{"d":true}}')  # everything new
 @example(prev_text="5", cur_text='{"a":1}')  # non-object prev replaced by an object
 @given(prev_text=json_documents, cur_text=json_documents)
 def test_diff_atomic_round_trip(prev_text: str, cur_text: str) -> None:
-    diff = (
-        f"jsono_diff(jsono({sql_literal(prev_text)}), jsono({sql_literal(cur_text)}))"
-    )
+    diff = f"jsono_diff(jsono({sql_literal(prev_text)}), jsono({sql_literal(cur_text)}))"
     cur_value = json_loads(cur_text)
     if not isinstance(cur_value, dict) or _object_reachable_null(cur_value):
-        SESSION.value(
-            f"to_json({diff})"
-        )  # exercise the path; the round-trip is out of the law's domain
+        SESSION.value(f"to_json({diff})")  # exercise the path; the round-trip is out of the law's domain
         return
-    patched = SESSION.value(
-        f"to_json(jsono_merge_patch(jsono({sql_literal(prev_text)}), {diff}))"
-    )
+    patched = SESSION.value(f"to_json(jsono_merge_patch(jsono({sql_literal(prev_text)}), {diff}))")
     expected = SESSION.value(f"to_json(jsono({sql_literal(cur_text)}))")
     assert (
         patched == expected
@@ -1603,25 +1442,17 @@ def test_diff_array_multiset_laws(prev_items: list[Any], cur_items: list[Any]) -
     elements = diff(prev, cur, "elements")
     if "items" not in counts:
         # multiset-equal (incl. pure reorder): both reports omit the key.
-        assert (
-            "items" not in elements
-        ), f"counts omitted items but elements did not: prev {prev!r} cur {cur!r}"
+        assert "items" not in elements, f"counts omitted items but elements did not: prev {prev!r} cur {cur!r}"
         return
     added = elements["items"]["added"]
     removed = elements["items"]["removed"]
-    assert counts["items"]["added"] == len(
-        added
-    ), f"counts.added != |elements.added|: prev {prev!r} cur {cur!r}"
+    assert counts["items"]["added"] == len(added), f"counts.added != |elements.added|: prev {prev!r} cur {cur!r}"
     assert counts["items"]["removed"] == len(
         removed
     ), f"counts.removed != |elements.removed|: prev {prev!r} cur {cur!r}"
 
-    prev_rendered = json_loads(SESSION.value(f"to_json(jsono({sql_literal(prev)}))"))[
-        "items"
-    ]
-    cur_rendered = json_loads(SESSION.value(f"to_json(jsono({sql_literal(cur)}))"))[
-        "items"
-    ]
+    prev_rendered = json_loads(SESSION.value(f"to_json(jsono({sql_literal(prev)}))"))["items"]
+    cur_rendered = json_loads(SESSION.value(f"to_json(jsono({sql_literal(cur)}))"))["items"]
     key = lambda items: Counter(json_dumps(item) for item in items)
     assert key(prev_rendered) + key(added) == key(cur_rendered) + key(
         removed
@@ -1702,9 +1533,7 @@ lane_documents = st.builds(
 def test_fuzz_shredded_lanes_no_lie(doc: dict[str, Any], mutation: str) -> None:
     mutant = lane_mutant_sql(sql_literal(json_dumps(doc)), mutation)
     verdict = SESSION.read(f"jsono_validate({mutant})")
-    assert not isinstance(
-        verdict, JsonoSession.Errored
-    ), f"validate errored: {verdict!r}"
+    assert not isinstance(verdict, JsonoSession.Errored), f"validate errored: {verdict!r}"
     rendered = SESSION.read(f"to_json({mutant})")
     SESSION.value(f"jsono_extract_string({mutant}, '$.k')")
     SESSION.value(f"(SELECT count(*) FROM (SELECT unnest(jsono_entries({mutant}))))")
