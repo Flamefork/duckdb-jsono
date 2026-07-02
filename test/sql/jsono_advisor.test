@@ -1,0 +1,200 @@
+# name: test/sql/jsono_advisor.test
+# description: jsono_suggest_shredding + jsono_shred_stats — the shredding advisor aggregates
+# group: [sql]
+
+require jsono
+
+# jsono_shred_stats renders its LIST<STRUCT> result through core json's to_json(ANY).
+require json
+
+# ---- jsono_suggest_shredding: suggest a shredding spec from a plain jsono corpus ----
+
+statement ok
+CREATE TABLE docs AS SELECT jsono(d) AS j FROM (VALUES
+  ('{"stable_int":1,"stable_str":"a","ratio":1.5,"flag":true,"meta":{"nested_int":10},"tags":[1,2,3],"items":[{"n":1,"s":"x"}],"sparse":99,"mixed":1}'),
+  ('{"stable_int":2,"stable_str":"b","ratio":2.5,"flag":false,"meta":{"nested_int":20},"tags":[4,5],"items":[{"n":2,"s":"y"}],"mixed":2}'),
+  ('{"stable_int":3,"stable_str":"c","ratio":3.5,"flag":true,"meta":{"nested_int":30},"tags":[6],"items":[{"n":3,"s":"z"}],"mixed":"text"}'),
+  ('{"stable_int":4,"stable_str":"d","ratio":4.5,"flag":false,"meta":{"nested_int":40},"tags":[],"items":[],"mixed":"text"}')
+) AS t(d);
+
+# Default min_presence=0.5, min_fit=1.0. Stable typed fields, a nested scalar ($.meta.nested_int),
+# an object array (items) and a scalar array (tags) are lifted; the sparse field (1/4 rows) drops
+# below min_presence, the mixed-type field (BIGINT half, VARCHAR half) fits no single lane, and the
+# decimal `ratio` field fits no typed lane either (JSON decimals never lift losslessly into a scalar
+# lane — the strip gate is JsonoScalarFitsPrimitive, so they stay in the residual).
+query I
+SELECT jsono_suggest_shredding(j) FROM docs;
+----
+{"$.meta.nested_int": 'BIGINT', flag: 'BOOLEAN', items: 'STRUCT(n BIGINT, s VARCHAR)[]', stable_int: 'BIGINT', stable_str: 'VARCHAR', tags: 'BIGINT[]'}
+
+# The suggested literal is ready-to-paste: feeding it back into jsono(doc, shredding := ...) binds
+# and round-trips the document (proves the spec syntax and every type string parse).
+query I
+SELECT to_json(jsono('{"stable_int":1,"stable_str":"a","flag":true,"meta":{"nested_int":10},"tags":[1,2,3],"items":[{"n":1,"s":"x"}]}',
+  shredding := {"$.meta.nested_int": 'BIGINT', flag: 'BOOLEAN', items: 'STRUCT(n BIGINT, s VARCHAR)[]', stable_int: 'BIGINT', stable_str: 'VARCHAR', tags: 'BIGINT[]'}));
+----
+{"flag":true,"items":[{"n":1,"s":"x"}],"meta":{"nested_int":10},"stable_int":1,"stable_str":"a","tags":[1,2,3]}
+
+# Lowering min_fit to 0.5 accepts the mixed field at the majority lane (BIGINT fits 2/4 >= 0.5,
+# first in the BIGINT > DOUBLE > BOOLEAN > VARCHAR preference order).
+query I
+SELECT jsono_suggest_shredding(j, min_fit := 0.5) FROM docs;
+----
+{"$.meta.nested_int": 'BIGINT', flag: 'BOOLEAN', items: 'STRUCT(n BIGINT, s VARCHAR)[]', mixed: 'BIGINT', stable_int: 'BIGINT', stable_str: 'VARCHAR', tags: 'BIGINT[]'}
+
+# Lowering min_presence to 0.25 keeps the sparse field (present in 1/4 rows).
+query I
+SELECT jsono_suggest_shredding(j, min_presence := 0.25) FROM docs;
+----
+{"$.meta.nested_int": 'BIGINT', flag: 'BOOLEAN', items: 'STRUCT(n BIGINT, s VARCHAR)[]', sparse: 'BIGINT', stable_int: 'BIGINT', stable_str: 'VARCHAR', tags: 'BIGINT[]'}
+
+# UBIGINT is preferred over BIGINT only when a value exceeds the int64 range.
+query I
+SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
+  ('{"big":18446744073709551615}'),
+  ('{"big":10000000000000000000}')
+) AS t(d);
+----
+{big: 'UBIGINT'}
+
+# An explicit JSON null is lossless in every lane (it stays complete in the residual), so it counts
+# as fitting any type and does NOT drop a path at the default min_fit := 1.0. A scalar leaf that is
+# int in some rows and null in others is still suggested at its int lane.
+query I
+SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
+  ('{"k":1}'),
+  ('{"k":2}'),
+  ('{"k":null}')
+) AS t(d);
+----
+{k: 'BIGINT'}
+
+# Same lossless-null rule for a scalar array: a null element never disqualifies the element lane
+# (the writer keeps it verbatim in the residual skeleton), so tags stays BIGINT[] at min_fit := 1.0.
+query I
+SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
+  ('{"tags":[1,null,2]}'),
+  ('{"tags":[3,4]}')
+) AS t(d);
+----
+{tags: 'BIGINT[]'}
+
+# And for an object-array subfield: a null subfield value counts as fitting its element lane, so the
+# object array is still lifted with the typed subfield at min_fit := 1.0.
+query I
+SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
+  ('{"items":[{"n":1},{"n":null}]}'),
+  ('{"items":[{"n":2}]}')
+) AS t(d);
+----
+{items: 'STRUCT(n BIGINT)[]'}
+
+# No qualifying paths (or no non-NULL rows) yields SQL NULL.
+query I
+SELECT jsono_suggest_shredding(j) FROM docs WHERE false;
+----
+NULL
+
+# ---- jsono_suggest_shredding: input validation ----
+
+# Named args reach the bind validator (SPECIAL_HANDLING): a NULL constant is rejected loud.
+statement error
+SELECT jsono_suggest_shredding(j, min_fit := NULL) FROM docs;
+----
+must not be NULL
+
+statement error
+SELECT jsono_suggest_shredding(j, min_fit := 2.0) FROM docs;
+----
+min_fit
+
+statement error
+SELECT jsono_suggest_shredding(j, min_presence := -0.1) FROM docs;
+----
+min_presence
+
+statement error
+SELECT jsono_suggest_shredding(j, bogus := 0.5) FROM docs;
+----
+unknown argument
+
+# A shredded column must be re-suggested from its plain source, not from the shredded form.
+statement error
+SELECT jsono_suggest_shredding(jsono('{"a":1}', shredding := {'a':'BIGINT'}));
+----
+plain
+
+# Exceeding the distinct-path cap fails loud instead of silently truncating.
+statement error
+SELECT jsono_suggest_shredding(j) FROM (
+  SELECT jsono('{' || string_agg('"k' || i || '":' || i, ',') || '}') AS j FROM range(8193) AS t(i)
+);
+----
+8192
+
+# ---- jsono_shred_stats: per-shred lane / divert / complete rates over shredded input ----
+
+statement ok
+CREATE TABLE shredded AS SELECT jsono(d, shredding := {'a':'BIGINT'}) AS j FROM (VALUES
+  ('{"a":5,"b":1}'),
+  ('{"a":"x"}'),
+  ('{"b":2}'),
+  ('{"a":7}')
+) AS t(d);
+
+# path a: lane present in 2/4 (fitting ints), diverted in 1/4 (the string "x" stays in the residual),
+# complete in 3/4 (a fit, an absent path, and another fit — only the divert is incomplete).
+query I
+SELECT to_json(jsono_shred_stats(j)) FROM shredded;
+----
+[{"path":"a","type":"BIGINT","lane_rate":0.5,"divert_rate":0.25,"complete_rate":0.75}]
+
+# An array shred reports complete_rate 1.0 (array shreds carry no completeness flag); tags is
+# present as a lane in 1/2 rows and never diverted (its only absence is a missing key).
+query I
+SELECT to_json(jsono_shred_stats(j)) FROM (
+  SELECT jsono(d, shredding := {'tags':'BIGINT[]'}) AS j FROM (VALUES
+    ('{"tags":[1,2]}'),
+    ('{"x":1}')
+  ) AS t(d)
+);
+----
+[{"path":"tags","type":"BIGINT[]","lane_rate":0.5,"divert_rate":0.0,"complete_rate":1.0}]
+
+# Multiple shreds report in sorted path order.
+query I
+SELECT to_json(jsono_shred_stats(j)) FROM (
+  SELECT jsono(d, shredding := {'a':'BIGINT','name':'VARCHAR'}) AS j FROM (VALUES
+    ('{"a":1,"name":"x"}'),
+    ('{"a":2,"name":"y"}')
+  ) AS t(d)
+);
+----
+[{"path":"a","type":"BIGINT","lane_rate":1.0,"divert_rate":0.0,"complete_rate":1.0},{"path":"name","type":"VARCHAR","lane_rate":1.0,"divert_rate":0.0,"complete_rate":1.0}]
+
+# An explicit JSON null keeps a complete NULL lane (it reads back as `->>` NULL) and lives in the
+# residual as null — it is NOT a divert. Here row `null` counts toward complete_rate but not
+# divert_rate, while the string "x" (a real type-too-narrow divert) counts divert but not complete.
+query I
+SELECT to_json(jsono_shred_stats(j)) FROM (
+  SELECT jsono(d, shredding := {'k':'BIGINT'}) AS j FROM (VALUES
+    ('{"k":1}'),
+    ('{"k":null}'),
+    ('{"k":"x"}'),
+    ('{"k":4}')
+  ) AS t(d)
+);
+----
+[{"path":"k","type":"BIGINT","lane_rate":0.5,"divert_rate":0.25,"complete_rate":0.75}]
+
+# All-NULL (no non-NULL rows) yields SQL NULL.
+query I
+SELECT jsono_shred_stats(j) FROM shredded WHERE false;
+----
+NULL
+
+# Plain (non-shredded) input is rejected loud — that is jsono_suggest_shredding's job.
+statement error
+SELECT jsono_shred_stats(jsono('{"a":1}'));
+----
+shredded

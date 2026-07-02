@@ -28,6 +28,7 @@ set(EXTENSION_SOURCES
     src/jsono_validate.cpp
     src/jsono_merge.cpp
     src/jsono_diff.cpp
+    src/jsono_advisor.cpp
     src/jsono_transform.cpp
     src/jsono_optimizer.cpp
     src/jsono_number.cpp

@@ -40,6 +40,8 @@ Merge and aggregate:
 Shredded storage:
 
 - [`jsono(value, shredding := spec)`](#jsonovalue-shredding) — build a *shredded* `STRUCT` from JSON text or an existing JSONO, lifting hot paths into typed shred columns; `->>` and `to_json` stay transparent and read the shreds.
+- [`jsono_suggest_shredding(value[, min_presence, min_fit])`](#jsono_suggest_shredding) — aggregate a *plain* JSONO column into a ready-to-paste `shredding :=` spec string.
+- [`jsono_shred_stats(value)`](#jsono_shred_stats) — aggregate an existing *shredded* column into per-shred lane / divert / complete rates.
 
 Inspect:
 
@@ -331,6 +333,47 @@ SELECT count(*) FROM events WHERE CAST(payload ->> '$.time_us' AS BIGINT) BETWEE
 Values shredded differently compose freely. A set operation, `CASE` or `COALESCE` over differently-shredded values merges into one shredded type on the union of the shred sets, and an `INSERT` into a column with any other shred set — fully disjoint included — lands losslessly: the optimizer rewrites the struct cast into a reshred against the column's shred set (single-pass when the target keeps every source shred), and a path with no shred column in the target simply stays in the residual.
 
 The safety net for the raw struct cast (no extension optimizer: another process, `SET disabled_optimizers='extension'`) is the *shred manifest*: each shredded value records, inside its residual, which paths were stripped into shred columns and as what type. A cast that silently drops or retypes a shred column leaves that record contradicting the data, and every JSONO reader verifies it — reading such a narrowed row raises an error instead of silently returning partial data. The manifest lives in the value's own blobs, so the protection rides with the data through Parquet and DuckLake. Shred order does not matter: the shred field order is canonicalized (sorted by name), so the same shred set always yields the *identical* type — `jsono_storage_type(<shred DDL>)` and `CREATE TABLE … AS SELECT` produce the same column type regardless of the order shreds are written in.
+
+### `jsono_suggest_shredding`
+
+Aggregates a **plain** JSONO column and returns a ready-to-paste `shredding :=` spec string, so you don't have to hand-pick shred paths and types. It walks each document over the auto-shred universe — top-level scalar keys, one-level-nested scalar keys (`$.parent.child`), and top-level arrays (as scalar-array `TYPE[]` or object-array `STRUCT(...)[]`) — and picks, per path, the narrowest lane type every present value fits losslessly.
+
+```sql
+SELECT jsono_suggest_shredding(payload) FROM events;
+-- {"$.meta.seq": 'BIGINT', kind: 'VARCHAR', tags: 'BIGINT[]'}
+
+-- paste the result straight into the shredding constructor
+CREATE TABLE shredded AS
+SELECT jsono(payload, shredding := {"$.meta.seq": 'BIGINT', kind: 'VARCHAR', tags: 'BIGINT[]'}) AS payload
+FROM events;
+```
+
+Two named arguments tune the thresholds (both fractions in `[0.0, 1.0]`):
+
+- `min_presence` (default `0.5`) — keep a path only when it appears in at least this fraction of non-`NULL` rows. Sparse fields drop out.
+- `min_fit` (default `1.0`, fully lossless) — a lane type must fit at least this fraction of the path's present values. Lowering it accepts a majority type for a path with a few off-type values (which stay in the residual). An explicit JSON `null` is lossless in every lane (it stays complete in the residual), so it counts as fitting any type and never blocks a shred at `min_fit := 1.0`.
+
+```sql
+SELECT jsono_suggest_shredding(payload, min_presence := 0.9, min_fit := 0.99) FROM events;
+```
+
+Number lanes follow the `BIGINT` > `DOUBLE` > `BOOLEAN` > `VARCHAR` preference, with `UBIGINT` chosen only when a value exceeds the `int64` range. A path with no qualifying lane is left out; if nothing qualifies (or the column is all `NULL`), the result is `NULL`. The input must be the **plain** column — suggesting from an already-shredded column is `jsono_shred_stats`'s job.
+
+### `jsono_shred_stats`
+
+Aggregates an existing **shredded** column and reports, per shred, how well the shred set is working — as a `LIST<STRUCT(path VARCHAR, type VARCHAR, lane_rate DOUBLE, divert_rate DOUBLE, complete_rate DOUBLE)>` sorted by path:
+
+- `lane_rate` — fraction of non-`NULL` rows whose typed lane is populated (the value fit and was lifted).
+- `divert_rate` — fraction of rows where the lane is `NULL` because the value did not fit its shred type and stayed behind in the residual. A high divert rate means the shred type is too narrow. An explicit JSON `null` (a complete NULL lane) is lossless and does **not** count as a divert.
+- `complete_rate` — fraction of rows where a bare typed lane read is the full `->>` answer (a fit, an absent path, or an explicit `null`). Array shreds report `1.0`.
+
+```sql
+SELECT to_json(jsono_shred_stats(payload)) FROM shredded;
+-- [{"path":"kind","type":"VARCHAR","lane_rate":1.0,"divert_rate":0.0,"complete_rate":1.0},
+--  {"path":"time_us","type":"BIGINT","lane_rate":0.98,"divert_rate":0.02,"complete_rate":0.98}]
+```
+
+Plain (non-shredded) input is rejected — use `jsono_suggest_shredding` to propose shreds for a plain column.
 
 ### `jsono_entries`
 

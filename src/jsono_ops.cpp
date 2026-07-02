@@ -9,6 +9,7 @@ void RegisterJsonoValidate(ExtensionLoader &loader);
 void RegisterJsonoStorageSize(ExtensionLoader &loader);
 void RegisterJsonoMerge(ExtensionLoader &loader);
 void RegisterJsonoDiff(ExtensionLoader &loader);
+void RegisterJsonoAdvisor(ExtensionLoader &loader);
 
 void RegisterJsonoOps(ExtensionLoader &loader) {
 	RegisterJsonoPathOps(loader);
@@ -18,6 +19,7 @@ void RegisterJsonoOps(ExtensionLoader &loader) {
 	RegisterJsonoStorageSize(loader);
 	RegisterJsonoMerge(loader);
 	RegisterJsonoDiff(loader);
+	RegisterJsonoAdvisor(loader);
 }
 
 } // namespace duckdb
