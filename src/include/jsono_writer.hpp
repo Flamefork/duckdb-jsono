@@ -412,9 +412,8 @@ inline Vector &JsonoBodyVector(Vector &result) {
 }
 
 // A self-owned JSONO blob: a complete document (header + metadata framing) serialized into six
-// owned byte streams, viewable in place. It backs the merge family's fold accumulators, the
-// direct diff's scratch documents, and the collect aggregates' per-element storage — shared here
-// so the six-blob framing (including the oversized-count guard) has one source of truth.
+// owned byte streams, viewable in place — shared here so the six-blob framing (including the
+// oversized-count guard) has one source of truth for every accumulator that owns documents.
 struct OwnedJsonoBlob {
 	std::string slots;
 	std::string key_heap;
@@ -473,6 +472,8 @@ inline void SerializeBuilderToBlob(const JsonoBuilder &builder, OwnedJsonoBlob &
 	}
 }
 
+// The view borrows the blob's bytes: any later write to the blob (another SerializeBuilderToBlob
+// into it) dangles every view taken before it — re-take the view after each serialize.
 inline JsonoView ViewOfBlob(const OwnedJsonoBlob &b) {
 	return JsonoView(b.slots.data(), b.slots.size(), b.key_heap.data(), b.key_heap.size(), b.string_heap.data(),
 	                 b.string_heap.size(), b.skips.data(), b.skips.size(), b.lengths.data(), b.lengths.size(),

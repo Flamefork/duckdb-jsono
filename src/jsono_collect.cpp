@@ -26,8 +26,7 @@ using namespace jsono;
 
 // A collected element of a jsono_group_array / jsono_group_object group is a standalone JSONO document
 // stored in an OwnedJsonoBlob (six owned byte streams: header + metadata framing), so Finalize can view
-// it and copy it verbatim into the group's array/object. The six-blob serialize/view helpers live in
-// jsono_writer.hpp, shared with the merge aggregates.
+// it and copy it verbatim into the group's array/object.
 using CollectBlob = OwnedJsonoBlob;
 
 // Serialize the value the reader is positioned on into a standalone element blob. A present value is

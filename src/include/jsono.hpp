@@ -349,7 +349,9 @@ constexpr uint32_t OBJECT_CHECKPOINT_STRIDE = 16;
 #if defined(__SANITIZE_ADDRESS__)
 #define JSONO_ADDRESS_SANITIZER 1
 #endif
-// Whether this translation unit is built with UBSan instrumentation (without ASan).
+// Whether this translation unit is built with UBSan instrumentation (without ASan). The detection
+// is clang-only (`__has_feature`); GCC defines no equivalent, so a GCC UBSan build keeps the
+// uninstrumented bounds.
 #if defined(__has_feature) && !defined(JSONO_ADDRESS_SANITIZER)
 #if __has_feature(undefined_behavior_sanitizer)
 #define JSONO_UB_SANITIZER 1

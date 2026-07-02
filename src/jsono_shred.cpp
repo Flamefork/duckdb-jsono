@@ -498,14 +498,9 @@ bool WriteArrayLaneShred(const JsonoView &view, const JsonoPathLocation &locatio
 		SetListRowNull(list_vec, row);
 		return false;
 	}
-	auto end_pos = ReadArrayEndPos(view, location.cursor.pos);
+	auto element_count = idx_t(CountArrayElements(view, location.cursor));
 	JsonoCursor first = location.cursor;
 	first.pos++; // ARR_START consumes no stream entries, so the stream cursors are the first element's
-	idx_t element_count = 0;
-	for (JsonoCursor walk = first; walk.pos < end_pos;) {
-		SkipValueFast(view, walk);
-		element_count++;
-	}
 	auto start = ListVector::GetListSize(list_vec);
 	EnsureListCapacity(list_vec, start + element_count);
 	setup();

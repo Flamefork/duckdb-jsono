@@ -2410,6 +2410,7 @@ void JsonoOptimizerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOp
 } // namespace
 
 unique_ptr<Expression> MakeJsonoReconstructExpression(unique_ptr<Expression> shredded_arg) {
+	D_ASSERT(IsShreddedJsonoType(shredded_arg->return_type));
 	auto input_type = shredded_arg->return_type;
 	vector<unique_ptr<Expression>> children;
 	children.push_back(std::move(shredded_arg));
