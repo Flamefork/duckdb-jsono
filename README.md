@@ -28,6 +28,7 @@ Extract and project:
 - [`jsono_extract_string(value, path)` / `value ->> path`](#jsono_extract_string) — extract one value as `VARCHAR`.
 - [`jsono_transform(value, spec[, on_type_mismatch])`](#jsono_transform) — project many fields into a typed `STRUCT` in one pass (`spec` is a `STRUCT` literal; type mismatches default to `convert`).
 - [`jsono_entries(value[, key_style, array_style])`](#jsono_entries) — flatten scalar leaves into `STRUCT(key VARCHAR, value VARCHAR)[]`.
+- [`jsono_array_elements(value[, path])`](#jsono_array_elements) — a JSON array's elements as a `LIST` of self-contained JSONO values, ready to `unnest` and query natively.
 
 Merge and aggregate:
 
@@ -359,6 +360,25 @@ SELECT unnest(jsono_entries(jsono('{"items":[{"sku":"a"},{"sku":"b"}],"name":"x"
 JSON null leaves keep their key and return SQL `NULL` as `value`; empty objects (and, under `indexed_elements`, empty arrays) do not produce entries. Dotted output can collide when a literal dotted key and a nested path render to the same string, for example `"a.b"` and `{"a":{"b":...}}`.
 
 The order of the returned entries is unspecified — do not rely on it. Over a shredded value the shred leaves are emitted after the residual leaves (the shreds are read straight from their columns), so the same logical document can flatten in a different order than its plain form, which lists leaves in sorted-key order. Sort the result yourself if you need a stable order.
+
+### `jsono_array_elements`
+
+Returns a JSON array's elements as a `LIST` of self-contained JSONO values — each element is re-emitted into its own six-blob document, so `unnest`-ing the list gives one native JSONO value per row with no `to_json` + reparse round-trip:
+
+```sql
+SELECT unnest(jsono_array_elements(jsono('[{"name":"a"},{"name":"b"}]'))) ->> 'name';
+-- a
+-- b
+```
+
+The optional `path` addresses a nested array with the same grammar as `jsono_extract` — a constant JSONPath (`'$.items'`), a bare top-level key (`'items'`), or a non-negative array index:
+
+```sql
+SELECT to_json(jsono_array_elements(jsono('{"items":[7,8,9]}'), '$.items')[2]);
+-- 8
+```
+
+An empty array yields an empty `LIST` (`[]`). A non-array value (object, scalar, or JSON `null`), a missing path, or a SQL `NULL` input each yield SQL `NULL`. A JSON `null` *element* becomes a JSONO null document, kept in place. A shredded value is reconstructed through the validated read path before its elements are split out.
 
 ### `jsono_group_merge`
 

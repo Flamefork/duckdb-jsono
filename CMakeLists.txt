@@ -23,6 +23,7 @@ set(EXTENSION_SOURCES
     src/jsono_ops.cpp
     src/jsono_path_ops.cpp
     src/jsono_entries.cpp
+    src/jsono_elements.cpp
     src/jsono_storage_size.cpp
     src/jsono_validate.cpp
     src/jsono_merge.cpp
