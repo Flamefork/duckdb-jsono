@@ -44,6 +44,7 @@ Inspect:
 
 - [`jsono_type(value[, path])`](#introspection) — the value's JSON type as `VARCHAR` (`OBJECT`, `ARRAY`, a scalar type, or `NULL`).
 - [`jsono_keys(value[, path])`](#introspection) — object keys as `VARCHAR[]`.
+- [`jsono_array_length(value[, path])`](#introspection) — element count of the array as `BIGINT`, or `NULL` for a non-array.
 - [`jsono_validate(value)`](#introspection) — strict current-format validation as `BOOLEAN`.
 - [`jsono_storage_size(value)`](#introspection) — physical byte sizes (body blobs, shreds, total) as a `STRUCT`.
 - [`jsono_storage_type()`](#introspection) — DDL of the physical `STRUCT` backing a JSONO value.
@@ -530,8 +531,9 @@ A number's representation is part of its identity, so `1`, `1.0` and `1e0` compa
 ### Introspection
 
 ```sql
-jsono_type(value[, path])     -> VARCHAR    -- OBJECT/ARRAY/VARCHAR/BIGINT/UBIGINT/DOUBLE/BOOLEAN/NULL
-jsono_keys(value[, path])     -> VARCHAR[]  -- object keys
+jsono_type(value[, path])         -> VARCHAR    -- OBJECT/ARRAY/VARCHAR/BIGINT/UBIGINT/DOUBLE/BOOLEAN/NULL
+jsono_keys(value[, path])         -> VARCHAR[]  -- object keys
+jsono_array_length(value[, path]) -> BIGINT     -- array element count, NULL for a non-array
 jsono_validate(value)         -> BOOLEAN    -- strict current-format validation
 jsono_storage_size(value)     -> STRUCT     -- physical byte sizes (body blobs + shreds + total)
 jsono_storage_type()          -> VARCHAR    -- DDL of the physical STRUCT backing JSONO
@@ -545,6 +547,17 @@ SELECT jsono_keys(jsono('{"user":{"name":"a","age":1}}'), '$.user');
 -- [age, name]
 SELECT jsono_type(jsono('{"items":[1,2,3]}'), '$.items[0]');
 -- BIGINT
+```
+
+`jsono_array_length` returns the element count of the array at the root or at `path`. A non-array value (object, scalar, or JSON `null`), a missing path, and SQL `NULL` all yield `NULL`. This differs from core DuckDB `json_array_length`, which returns `0` for a non-array; jsono follows the `NULL`-on-mismatch convention of `jsono_type`/`jsono_keys`.
+
+```sql
+SELECT jsono_array_length(jsono('[10,20,30]'));
+-- 3
+SELECT jsono_array_length(jsono('{"items":[1,2,3,4]}'), '$.items');
+-- 4
+SELECT jsono_array_length(jsono('{"a":1}'));
+-- NULL
 ```
 
 `jsono_validate` checks the current binary format contract: header flags, sorted unique keys, slots, heaps, navigation metadata, UTF-8 strings, and raw number text. It returns `false` for malformed physical blobs and `NULL` for SQL `NULL`. On a shredded value it validates the residual encoding; the typed shred columns are DuckDB-native and not jsono's to assert.

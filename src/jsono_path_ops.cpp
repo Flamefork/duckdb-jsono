@@ -100,6 +100,40 @@ struct JsonoTypePolicy {
 	}
 };
 
+// Count the elements of the array at `cursor` (at ARR_START). Arrays carry no child_count in the
+// format (only OBJ_START does), so this skip-walks the value block once, one SkipValueFast per
+// element, exactly like CollectArrayElements but without materializing the cursors.
+int64_t CountArrayElements(const JsonoView &view, JsonoCursor cursor) {
+	auto end_pos = ReadArrayEndPos(view, cursor.pos);
+	cursor.pos++;
+	int64_t count = 0;
+	while (cursor.pos < end_pos) {
+		count++;
+		SkipValueFast(view, cursor);
+	}
+	return count;
+}
+
+struct JsonoArrayLengthPolicy {
+	Vector &result;
+	int64_t *result_data;
+	const vector<PathStep> &root_steps;
+
+	void Null(idx_t row) {
+		FlatVector::SetNull(result, row, true);
+	}
+
+	void Found(JsonoRowReader &reader, const JsonoView &view, const vector<PathStep> *steps, const JsonoCursor &cursor,
+	           idx_t row) {
+		if (SlotTag(view.SlotAt(cursor.pos)) != tag::ARR_START) {
+			FlatVector::SetNull(result, row, true);
+			return;
+		}
+		reader.CheckContainerRead(view, steps ? *steps : root_steps);
+		result_data[row] = CountArrayElements(view, cursor);
+	}
+};
+
 struct JsonoKeysPolicy {
 	Vector &result;
 	const vector<PathStep> &root_steps;
@@ -170,6 +204,28 @@ void JsonoKeysExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 }
 
+// jsono_array_length reports the element count of a found array. Like jsono_keys it reads a whole
+// container, so a manifest leaf strictly inside the array (or a covered path miss) fails loud via
+// CheckContainerRead — the count would silently drop the stripped element. A non-array found value
+// (object, scalar, JSON null) yields SQL NULL, matching jsono_type/jsono_keys' path-miss convention
+// rather than core json_array_length, which returns 0 for non-arrays.
+void JsonoArrayLengthExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto count = args.size();
+	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoSinglePathLocalState>();
+	JsonoRowReader reader;
+	reader.InitPointRead(args.data[0], count);
+	auto steps = PathStepsFromState(state, args.ColumnCount());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data = FlatVector::GetData<int64_t>(result);
+
+	const vector<PathStep> root_steps;
+	JsonoArrayLengthPolicy policy {result, result_data, root_steps};
+	JsonoPointReadRows(reader, count, steps, lstate.locate_state, policy);
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
 } // namespace
 
 // jsono_type/jsono_keys carry a per-expression RankCache in their local state, so the constructed
@@ -196,6 +252,14 @@ void RegisterJsonoPathOps(ExtensionLoader &loader) {
 		set.AddFunction(MakePathOpFunction({LogicalType::ANY, LogicalType::VARCHAR},
 		                                   LogicalType::LIST(LogicalType::VARCHAR), JsonoKeysExecute,
 		                                   JsonoPathOnlyBind));
+		loader.RegisterFunction(set);
+	}
+	{
+		ScalarFunctionSet set("jsono_array_length");
+		set.AddFunction(
+		    MakePathOpFunction({LogicalType::ANY}, LogicalType::BIGINT, JsonoArrayLengthExecute, JsonoArgOnlyBind));
+		set.AddFunction(MakePathOpFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BIGINT,
+		                                   JsonoArrayLengthExecute, JsonoPathOnlyBind));
 		loader.RegisterFunction(set);
 	}
 }
