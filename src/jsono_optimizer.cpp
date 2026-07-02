@@ -1024,6 +1024,11 @@ ScalarFunction MakeJsonoInternalDoubleTextFunction() {
 void JsonoReconstructInternalExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)state;
 	JsonoReconstructToPlain(args.data[0], args.size(), result);
+	// Constant folding evaluates a constant argument through here and asserts a constant result;
+	// the reconstruct writer emits flat rows, so re-mark them (same as JsonoShreddedToVarcharCast).
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
 }
 
 ScalarFunction MakeJsonoReconstructFunction(const LogicalType &input_type) {

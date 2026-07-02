@@ -8,6 +8,8 @@
 #include "jsono_shred.hpp"
 #include "jsono_writer.hpp"
 
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -96,6 +98,23 @@ struct SuggestBindData : public FunctionData {
 		return min_presence == other.min_presence && min_fit == other.min_fit;
 	}
 };
+
+// Plan serialization round-trips the two thresholds directly. Without these callbacks a plan
+// deserialize would RE-BIND from the serialized children, whose named-argument aliases
+// (min_presence :=, min_fit :=) do not survive expression serialization — the re-bind then fails
+// loud on "unknown argument ''" under debug plan verification.
+void SuggestSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                      const AggregateFunction &function) {
+	auto &data = bind_data->Cast<SuggestBindData>();
+	serializer.WriteProperty(100, "min_presence", data.min_presence);
+	serializer.WriteProperty(101, "min_fit", data.min_fit);
+}
+
+unique_ptr<FunctionData> SuggestDeserialize(Deserializer &deserializer, AggregateFunction &function) {
+	auto min_presence = deserializer.ReadProperty<double>(100, "min_presence");
+	auto min_fit = deserializer.ReadProperty<double>(101, "min_fit");
+	return make_uniq<SuggestBindData>(min_presence, min_fit);
+}
 
 // Tally one present scalar into a lane's fit counters. A JSON null is losslessly captured by every
 // typed lane (the shred writer keeps it complete: the NULL lane reads back as `->>` NULL and the
@@ -863,6 +882,8 @@ void RegisterJsonoAdvisor(ExtensionLoader &loader) {
 		                          // instead of folding the whole aggregate call to NULL (the named-arg NULL-fold trap).
 		                          FunctionNullHandling::SPECIAL_HANDLING, JsonoSuggestSimpleUpdate, JsonoSuggestBind,
 		                          AggregateFunction::StateDestroy<SuggestState, SuggestAggregate>);
+		suggest.serialize = SuggestSerialize;
+		suggest.deserialize = SuggestDeserialize;
 		suggest_set.AddFunction(suggest);
 	}
 	loader.RegisterFunction(suggest_set);
