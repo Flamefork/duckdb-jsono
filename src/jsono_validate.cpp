@@ -1,8 +1,12 @@
 #include "jsono_ops.hpp"
 #include "jsono.hpp"
+#include "jsono_locate.hpp"
 #include "jsono_number.hpp"
+#include "jsono_path.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_row_read.hpp"
+#include "jsono_shred.hpp"
+#include "jsono_writer.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -351,6 +355,67 @@ bool ValidateJsonoBlob(const JsonoBlobRow &blob, ShredManifestVerifier &verifier
 	}
 }
 
+// One array shred's lockstep handle: the compiled skeleton path and the lane's list entries.
+struct LockstepLane {
+	vector<PathStep> steps;
+	UnifiedVectorFormat fmt;
+	const list_entry_t *entries = nullptr;
+};
+
+// Array-shred lanes are lockstep with the residual skeleton: readers throw when a non-NULL LIST
+// lane's length disagrees with the skeleton array's element count. Validate enforces the same
+// invariant so it never blesses a row every reader rejects. Lane VALUE integrity stays DuckDB's
+// business; only the lockstep framing is jsono's.
+void InitLockstepLanes(Vector &input, idx_t count, vector<LockstepLane> &lanes) {
+	JsonoLayoutType layout;
+	if (!TryParseJsonoLayoutType(input.GetType(), layout)) {
+		return;
+	}
+	for (idx_t f = 0; f < layout.shreds.size(); f++) {
+		if (ClassifyShredKind(layout.shreds[f].second) == ShredKind::Scalar) {
+			continue;
+		}
+		LockstepLane lane;
+		auto &name = layout.shreds[f].first;
+		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
+			lane.steps = ParseJsonoPath(name, "jsono_validate shred");
+		} else {
+			lane.steps.push_back(PathStep {PathStepKind::Key, name, 0});
+		}
+		auto &lane_vec = JsonoShredVector(input, f);
+		lane_vec.ToUnifiedFormat(count, lane.fmt);
+		lane.entries = UnifiedVectorFormat::GetData<list_entry_t>(lane.fmt);
+		lanes.push_back(std::move(lane));
+	}
+}
+
+bool LanesLockstepValid(const JsonoBlobRow &blob, const vector<LockstepLane> &lanes, idx_t row) {
+	JsonoView view = MakeJsonoView(blob);
+	view.ParseHeader(); // already validated by ValidateJsonoBlob
+	for (auto &lane : lanes) {
+		auto idx = lane.fmt.sel->get_index(row);
+		if (!lane.fmt.validity.RowIsValid(idx)) {
+			continue; // NULL lane: the residual carries the value, nothing to disagree with
+		}
+		JsonoCursor cursor;
+		bool found = true;
+		for (idx_t depth = 0; depth < lane.steps.size(); depth++) {
+			if (!LocatePathStep(nullptr, depth, view, lane.steps[depth], cursor)) {
+				found = false;
+				break;
+			}
+		}
+		if (!found || SlotTag(view.SlotAt(cursor.pos)) != tag::ARR_START) {
+			continue; // no skeleton at the path: readers ignore the lane (divert-robust)
+		}
+		auto skeleton_len = CountArrayElements(view, cursor);
+		if (uint64_t(skeleton_len) != lane.entries[idx].length) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)state;
 	auto count = args.size();
@@ -359,6 +424,8 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 
 	ShredManifestVerifier verifier;
 	verifier.InitFromType(args.data[0].GetType());
+	vector<LockstepLane> lockstep;
+	InitLockstepLanes(args.data[0], count, lockstep);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<bool>(result);
@@ -370,6 +437,9 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 			continue;
 		}
 		result_data[row] = ValidateJsonoBlob(blob, verifier);
+		if (result_data[row] && !lockstep.empty()) {
+			result_data[row] = LanesLockstepValid(blob, lockstep, row);
+		}
 	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -377,8 +447,9 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 }
 
 // Accept ANY so a shredded value reaches bind; keep its shredded type (reconstruct_shredded=false)
-// so Execute validates the residual blobs directly. Validating a shredded value checks its residual
-// encoding — the typed shred columns are DuckDB-native, their integrity is not jsono's to assert.
+// so Execute validates the residual blobs directly plus the array-lane lockstep against the
+// residual skeleton. The typed lane VALUES stay DuckDB-native; only the framing readers enforce
+// (manifest, lockstep lengths) is jsono's to assert.
 unique_ptr<FunctionData> JsonoValidateBind(ClientContext &context, ScalarFunction &bound_function,
                                            vector<unique_ptr<Expression>> &arguments) {
 	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, false);

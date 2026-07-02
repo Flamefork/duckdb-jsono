@@ -1,0 +1,87 @@
+# name: test/sql/jsono_validate_lockstep.test
+# description: jsono_validate cross-checks array-shred lanes against the residual skeleton (lockstep)
+# group: [sql]
+
+require jsono
+
+require json
+
+# An array shred stores a skeleton array in the residual (authoritative for length) and a lockstep
+# LIST lane. A lane whose length disagrees with the skeleton throws on every reader — validate must
+# report such a row false instead of blessing it (the one triage tool must not lie about
+# readability). Rows are hand-built the same way the cast-guard tests forge narrowed rows.
+
+statement ok
+CREATE TABLE lockstep AS
+SELECT struct_pack("jsono" := struct_pack(
+           body := j."jsono".body,
+           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$.a" := [1, 2]::BIGINT[]))) AS truncated,
+       struct_pack("jsono" := struct_pack(
+           body := j."jsono".body,
+           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$.a" := [1, 2, 3, 4]::BIGINT[]))) AS extended,
+       struct_pack("jsono" := struct_pack(
+           body := j."jsono".body,
+           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$.a" := j."jsono".shreds."$.a"))) AS intact
+FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := {'$.a':'BIGINT[]'}) AS j);
+
+# The readers fail loud on the mismatched rows (existing contract) and read the intact one.
+statement error
+SELECT to_json(truncated) FROM lockstep;
+----
+shorter than the residual
+
+statement error
+SELECT to_json(extended) FROM lockstep;
+----
+longer than the residual
+
+query I
+SELECT to_json(intact)::VARCHAR FROM lockstep;
+----
+{"a":[1,2,3],"z":1}
+
+# validate agrees with the readers: mismatched lanes are invalid, the intact row is valid.
+query III
+SELECT jsono_validate(truncated), jsono_validate(extended), jsono_validate(intact) FROM lockstep;
+----
+false	false	true
+
+# The same lockstep contract holds for object-array shreds (LIST<STRUCT> lanes) and for a
+# skeleton at a nested path.
+statement ok
+CREATE TABLE lockstep_obj AS
+SELECT struct_pack("jsono" := struct_pack(
+           body := j."jsono".body,
+           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$.m.items" := [{'n': 1::BIGINT}]::STRUCT(n BIGINT)[]))) AS truncated,
+       struct_pack("jsono" := struct_pack(
+           body := j."jsono".body,
+           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$.m.items" := j."jsono".shreds."$.m.items"))) AS intact
+FROM (SELECT jsono('{"m":{"items":[{"n":1},{"n":2}]},"z":1}', shredding := {'$.m.items':'STRUCT(n BIGINT)[]'}) AS j);
+
+query II
+SELECT jsono_validate(truncated), jsono_validate(intact) FROM lockstep_obj;
+----
+false	true
+
+# A NULL lane is not a lockstep violation: the skeleton (or full array) in the residual is the
+# value, exactly what readers use.
+query I
+SELECT jsono_validate(struct_pack("jsono" := struct_pack(
+           body := j."jsono".body,
+           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$.a" := NULL::BIGINT[]))))
+FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := {'$.a':'BIGINT[]'}) AS j);
+----
+true
+
+# Plain values and scalar-only shredded values keep their existing validate behavior.
+query II
+SELECT jsono_validate(jsono('{"a":[1,2,3]}')),
+       jsono_validate(jsono('{"k":1,"a":[1,2]}', shredding := {k:'BIGINT'}));
+----
+true	true

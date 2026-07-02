@@ -215,6 +215,20 @@ inline void MoveCursorToObjectValueRank(const JsonoView &view, const ObjectLayou
 	cursor = value_cursor;
 }
 
+// Element count of the array at `cursor` (an ARR_START). Arrays store no child_count in the
+// format (only OBJ_START does), so this skip-walks the value block once, one SkipValueFast per
+// element. Shared by jsono_array_length and jsono_validate's lane-lockstep check.
+inline int64_t CountArrayElements(const JsonoView &view, JsonoCursor cursor) {
+	auto end_pos = ReadArrayEndPos(view, cursor.pos);
+	cursor.pos++;
+	int64_t count = 0;
+	while (cursor.pos < end_pos) {
+		count++;
+		SkipValueFast(view, cursor);
+	}
+	return count;
+}
+
 // Position `cursor` (at an ARR_START) on element `index`; false when out of range.
 inline bool LocateArrayIndex(const JsonoView &view, idx_t index, JsonoCursor &cursor) {
 	auto end_pos = ReadArrayEndPos(view, cursor.pos);

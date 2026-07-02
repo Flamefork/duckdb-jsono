@@ -100,20 +100,6 @@ struct JsonoTypePolicy {
 	}
 };
 
-// Count the elements of the array at `cursor` (at ARR_START). Arrays carry no child_count in the
-// format (only OBJ_START does), so this skip-walks the value block once, one SkipValueFast per
-// element, exactly like CollectArrayElements but without materializing the cursors.
-int64_t CountArrayElements(const JsonoView &view, JsonoCursor cursor) {
-	auto end_pos = ReadArrayEndPos(view, cursor.pos);
-	cursor.pos++;
-	int64_t count = 0;
-	while (cursor.pos < end_pos) {
-		count++;
-		SkipValueFast(view, cursor);
-	}
-	return count;
-}
-
 struct JsonoArrayLengthPolicy {
 	Vector &result;
 	int64_t *result_data;
