@@ -1,0 +1,162 @@
+# name: test/sql/jsono_group_merge_direct.test
+# description: Direct shredded fold of non-keyed jsono_group_merge — parity with the plain fold
+# group: [sql]
+
+require jsono
+
+require json
+
+# The direct accumulator (residual merge + scalar lane state) must produce byte-identical
+# results to folding the same documents as plain JSONO. Sequential cases run at threads=1 so the
+# order-dependent fold sees a deterministic row order for both variants.
+
+statement ok
+SET threads = 1;
+
+# Later rows overwrite earlier fields; explicit null members do not overwrite (IgnoreNulls);
+# SQL NULL rows are skipped; duplicate keys inside one row collapse to the last.
+statement ok
+CREATE TABLE seq(ord INTEGER, doc VARCHAR);
+
+statement ok
+INSERT INTO seq VALUES
+  (1, '{"a":1,"b":"x","keep":true,"extra":{"e":1}}'),
+  (2, NULL),
+  (3, '{"a":2,"b":null,"c":3.5}'),
+  (4, '{"a":null,"c":4.5,"keep":false,"extra":null}');
+
+query I
+SELECT to_json(jsono_group_merge(jsono(doc, shredding := {a:'BIGINT', b:'VARCHAR', c:'DOUBLE', keep:'BOOLEAN'}) ORDER BY ord))
+     = to_json(jsono_group_merge(jsono(doc) ORDER BY ord))
+FROM seq WHERE doc IS NOT NULL OR ord = 2;
+----
+true
+
+# Diverted -> fitting -> diverted on one BIGINT shred: the lane must not out-rank a newer
+# residual value and vice versa. Also nested-lane parent replaced by a scalar, then by an object.
+statement ok
+CREATE TABLE tricky(ord INTEGER, doc VARCHAR);
+
+statement ok
+INSERT INTO tricky VALUES
+  (1, '{"k":"not-a-number","n":{"deep":1},"z":1}'),
+  (2, '{"k":5,"n":7}'),
+  (3, '{"k":"diverted-again","n":{"deep":9,"other":2}}'),
+  (4, '{"z":2}');
+
+query II
+SELECT to_json(m1) = to_json(m2), to_json(m1)
+FROM (
+  SELECT jsono_group_merge(jsono(doc, shredding := {k:'BIGINT', '$.n.deep':'BIGINT'}) ORDER BY ord) AS m1,
+         jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
+  FROM tricky
+);
+----
+true	{"k":"diverted-again","n":{"deep":9,"other":2},"z":2}
+
+# A non-object row replaces the accumulator wholesale; an object after it starts fresh.
+statement ok
+CREATE TABLE replaced(ord INTEGER, doc VARCHAR);
+
+statement ok
+INSERT INTO replaced VALUES
+  (1, '{"a":1,"b":2}'),
+  (2, '[1,2,3]'),
+  (3, '{"c":3}');
+
+query II
+SELECT to_json(m1) = to_json(m2), to_json(m1)
+FROM (
+  SELECT jsono_group_merge(jsono(doc, shredding := {a:'BIGINT', c:'BIGINT'}) ORDER BY ord) AS m1,
+         jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
+  FROM replaced
+);
+----
+true	{"c":3}
+
+# A non-object FINAL row wins wholesale (NonObject finalize path through the reshred).
+query II
+SELECT to_json(m1) = to_json(m2), to_json(m1)
+FROM (
+  SELECT jsono_group_merge(jsono(doc, shredding := {a:'BIGINT'}) ORDER BY ord) AS m1,
+         jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
+  FROM (VALUES (1, '{"a":1}'), (2, '"scalar-wins"')) v(ord, doc)
+);
+----
+true	"scalar-wins"
+
+# Array shreds: whole-array replacement across rows, absent field keeps the previous array,
+# a null member keeps it too (IgnoreNulls).
+statement ok
+CREATE TABLE arrs(ord INTEGER, doc VARCHAR);
+
+statement ok
+INSERT INTO arrs VALUES
+  (1, '{"tags":[1,2,3],"items":[{"n":1,"s":"a"},{"n":2,"s":"b"}],"other":1}'),
+  (2, '{"tags":[9],"other":2}'),
+  (3, '{"items":null,"other":3}');
+
+query II
+SELECT to_json(m1) = to_json(m2), to_json(m1)
+FROM (
+  SELECT jsono_group_merge(jsono(doc, shredding := {tags:'BIGINT[]', items:'STRUCT(n BIGINT, s VARCHAR)[]'}) ORDER BY ord) AS m1,
+         jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
+  FROM arrs
+);
+----
+true	{"items":[{"n":1,"s":"a"},{"n":2,"s":"b"}],"other":3,"tags":[9]}
+
+# The direct result stays shredded (sticky type) and its manifest reflects what actually
+# stripped after the fold.
+query I
+SELECT typeof(jsono_group_merge(jsono(doc, shredding := {a:'BIGINT', b:'VARCHAR'}))) = jsono_storage_type('a BIGINT, b VARCHAR')
+FROM (VALUES ('{"a":1,"b":"x"}')) v(doc);
+----
+true
+
+query I
+SELECT jsono_shred_manifest(jsono_group_merge(jsono(doc, shredding := {a:'BIGINT'})))
+FROM (VALUES ('{"a":"diverted"}')) v(doc);
+----
+[]
+
+# Groups whose every row is NULL finalize to {} with NULL shreds (unchanged contract).
+query II
+SELECT to_json(m), m.jsono.shreds."a".value IS NULL
+FROM (
+  SELECT jsono_group_merge(jsono(doc, shredding := {a:'BIGINT'})) AS m
+  FROM (VALUES (NULL), (NULL)) v(doc)
+);
+----
+{}	true
+
+# Multi-group + multi-threaded Combine parity over a mixed workload: shredded fold equals the
+# plain fold per group, and the manifest-carrying result reads back.
+statement ok
+CREATE TABLE mixed AS
+  SELECT (i % 37) AS g, i AS ord,
+         CASE
+           WHEN i % 11 = 0 THEN NULL
+           WHEN i % 13 = 0 THEN '"row-' || i || '"'
+           WHEN i % 7 = 0 THEN '{"k":"txt' || i || '","n":{"deep":' || i || '},"tags":[' || (i % 5) || ']}'
+           ELSE '{"k":' || i || ',"c":' || (i % 200) || '.5,"extra' || (i % 3) || '":' || i || '}'
+         END AS doc
+  FROM range(20000) t(i);
+
+statement ok
+SET threads = 4;
+
+query I
+SELECT count(*)
+FROM (
+  SELECT g,
+         to_json(jsono_group_merge(jsono(doc, shredding := {k:'BIGINT', c:'DOUBLE', '$.n.deep':'BIGINT', tags:'BIGINT[]'}) ORDER BY ord)) AS shredded,
+         to_json(jsono_group_merge(jsono(doc) ORDER BY ord)) AS plain
+  FROM mixed GROUP BY g
+)
+WHERE shredded IS DISTINCT FROM plain;
+----
+0
+
+statement ok
+RESET threads;
