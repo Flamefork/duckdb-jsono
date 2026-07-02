@@ -1,0 +1,43 @@
+# name: test/sql/jsono_collect_parallel.test
+# description: jsono_group_array / jsono_group_object Combine path must match the single-threaded fold
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE hits AS
+  SELECT (i % 200) AS g, i AS ts,
+         jsono('{"i":' || i || '}') AS j,
+         ('k' || (i % 50)) AS k
+  FROM range(20000) t(i);
+
+# Single-threaded reference: the array preserves ORDER BY fold order; the object collapses
+# duplicate keys to the last fold value with sorted keys.
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE ref AS
+  SELECT g,
+         to_json(jsono_group_array(j ORDER BY ts)) AS arr,
+         to_json(jsono_group_object(k, j ORDER BY ts)) AS obj
+  FROM hits GROUP BY g;
+
+# Recompute under 4 threads; every group's output must match the reference exactly, so the
+# partial-state Combine preserves both fold order (array) and last-wins-then-sort (object).
+statement ok
+SET threads = 4;
+
+query I
+SELECT count(*)
+FROM ( SELECT g,
+              to_json(jsono_group_array(j ORDER BY ts)) AS arr,
+              to_json(jsono_group_object(k, j ORDER BY ts)) AS obj
+       FROM hits GROUP BY g ) cur
+JOIN ref USING (g)
+WHERE cur.arr IS DISTINCT FROM ref.arr
+   OR cur.obj IS DISTINCT FROM ref.obj;
+----
+0

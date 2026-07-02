@@ -36,6 +36,8 @@ Merge and aggregate:
 - [`jsono_group_merge(value [ORDER BY ...])`](#jsono_group_merge) — aggregate a stream of patches into one value.
 - [`jsono_group_merge_max(value, order_key)` / `jsono_group_merge_min(value, order_key)`](#jsono_group_merge_max--jsono_group_merge_min) — order-independent keyed merge: per leaf, the value from the row with the greatest (`_max`) or smallest (`_min`) `order_key` wins, without buffering the input.
 - [`jsono_diff(prev, cur[, arrays])`](#jsono_diff) — structural diff of `prev → cur`; `arrays` selects how array changes render (`atomic` reverse merge-patch, `counts`, or `elements`).
+- [`jsono_group_array(value [ORDER BY ...])`](#jsono_group_array--jsono_group_object) — aggregate a group's values into one JSONO array, in fold order.
+- [`jsono_group_object(key, value)`](#jsono_group_array--jsono_group_object) — aggregate `key → value` pairs into one JSONO object (unique sorted keys, last value per key wins).
 
 Shredded storage:
 
@@ -590,6 +592,24 @@ WHERE changed IS DISTINCT FROM jsono('{}');  -- drop no-op rows (a pure array re
 ```
 
 A number's representation is part of its identity, so `1`, `1.0` and `1e0` compare unequal (a snapshot whose serializer drifts a number's form reports a change — normalize upstream if that matters).
+
+### `jsono_group_array` / `jsono_group_object`
+
+Collect a group's values into a single JSONO array or object — the JSONO counterparts of core JSON's `json_group_array` / `json_group_object`.
+
+```sql
+-- Collect values into an array, in the ORDER BY fold order:
+SELECT to_json(jsono_group_array(j ORDER BY ts))
+FROM (VALUES (jsono('1'), 1), (jsono('"x"'), 2), (jsono('[3]'), 3)) t(j, ts);
+-- [1,"x",[3]]
+
+-- Collect key -> value pairs into an object:
+SELECT to_json(jsono_group_object(k, j))
+FROM (VALUES ('b', jsono('2')), ('a', jsono('1'))) t(k, j);
+-- {"a":1,"b":2}
+```
+
+`jsono_group_array` keeps a `NULL` input row as a JSON `null` element (matching `json_group_array`) and returns SQL `NULL` for an empty group. `jsono_group_object` casts the key to `VARCHAR` and fails loud on a `NULL` key. Because JSONO stores unique sorted keys, `jsono_group_object` emits keys **sorted** and collapses duplicate keys to the **last** value in fold order — this diverges from `json_group_object`, which keeps every duplicate in input order. A shredded input is accepted (reconstructed to the whole document) and the result is always plain JSONO.
 
 ### Introspection
 

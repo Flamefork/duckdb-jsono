@@ -412,11 +412,10 @@ inline Vector &JsonoBodyVector(Vector &result) {
 }
 
 // The `shreds` STRUCT vector of a shredded jsono result: layout field [0] -> shreds [1] (after body).
-// A self-owned JSONO blob: the in-flight accumulator for the fold-based scalar
-// jsono_merge_patch and the jsono_group_merge aggregate. Each fold runs the
-// cursor-based MergeTwoObjects over contiguous bytes (no per-key std::string, no
-// per-node heap alloc, keys compared in cache order) and re-serializes the merged
-// builder back into the blob so the next fold can view it.
+// A self-owned JSONO blob: a complete document (header + metadata framing) serialized into six
+// owned byte streams, viewable in place. It backs the merge family's fold accumulators, the
+// direct diff's scratch documents, and the collect aggregates' per-element storage — shared here
+// so the six-blob framing (including the oversized-count guard) has one source of truth.
 struct OwnedJsonoBlob {
 	std::string slots;
 	std::string key_heap;

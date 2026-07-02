@@ -1,0 +1,131 @@
+# name: test/sql/jsono_collect.test
+# description: jsono_group_array / jsono_group_object collect aggregates
+# group: [sql]
+
+require jsono
+
+# to_json rides core json's to_json(ANY); the collect result is plain JSONO.
+require json
+
+# --- jsono_group_array: collect input values into a JSONO array, in fold order ---
+
+# Mixed value kinds (scalar / string / array / object) collect verbatim in ORDER BY order.
+query I
+SELECT to_json(jsono_group_array(j ORDER BY ts))
+FROM (VALUES
+  (jsono('1'), 1),
+  (jsono('"x"'), 2),
+  (jsono('[1,2]'), 3),
+  (jsono('{"k":1}'), 4)
+) t(j, ts);
+----
+[1,"x",[1,2],{"k":1}]
+
+# NULL rows are KEPT as JSON null, matching core json_group_array: a SQL NULL row and a present
+# JSON null both render as null.
+query I
+SELECT to_json(jsono_group_array(j ORDER BY ts))
+FROM (VALUES (jsono('1'), 1), (NULL, 2), (jsono('null'), 3), (jsono('3'), 4)) t(j, ts);
+----
+[1,null,null,3]
+
+# The same logical data through core json_group_array produces the identical element sequence
+# (json_group_array is a macro over string_agg, so it collects a pre-ordered subquery).
+query I
+SELECT json_group_array(x)
+FROM (SELECT x FROM (VALUES (1::JSON, 1), (NULL, 2), ('null'::JSON, 3), (3::JSON, 4)) t(x, ts) ORDER BY ts);
+----
+[1,null,null,3]
+
+# Empty group returns SQL NULL, matching core json_group_array over an empty group.
+query II
+SELECT to_json(jsono_group_array(j ORDER BY ts)) IS NULL, json_group_array(ts) IS NULL
+FROM (VALUES (jsono('1'), 1)) t(j, ts)
+WHERE ts > 100;
+----
+true	true
+
+# ORDER BY drives the array order deterministically (descending here).
+query I
+SELECT to_json(jsono_group_array(j ORDER BY ts DESC))
+FROM (VALUES (jsono('1'), 1), (jsono('2'), 2), (jsono('3'), 3)) t(j, ts);
+----
+[3,2,1]
+
+# GROUP BY: each group collects independently.
+query II
+SELECT g, to_json(jsono_group_array(j ORDER BY ts))
+FROM (VALUES ('a', jsono('1'), 1), ('a', jsono('2'), 2), ('b', jsono('9'), 1)) t(g, j, ts)
+GROUP BY g ORDER BY g;
+----
+a	[1,2]
+b	[9]
+
+# Shredded input is accepted (reconstructed to plain) and collected as whole documents.
+query I
+SELECT to_json(jsono_group_array(j ORDER BY ts))
+FROM (VALUES
+  (jsono('{"event_name":"search","x":1}', shredding := {'event_name':'VARCHAR'}), 1),
+  (jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}), 2)
+) t(j, ts);
+----
+[{"event_name":"search","x":1},{"event_name":"page_view"}]
+
+# --- jsono_group_object: collect key -> value pairs into a JSONO object ---
+
+# Keys are emitted SORTED (format invariant), values collect verbatim.
+query I
+SELECT to_json(jsono_group_object(k, j))
+FROM (VALUES ('b', jsono('2')), ('a', jsono('1')), ('c', jsono('[3]'))) t(k, j);
+----
+{"a":1,"b":2,"c":[3]}
+
+# Duplicate keys collapse to the LAST occurrence in fold order, then the keys sort. This diverges
+# from core json_group_object (which keeps every duplicate) because JSONO stores unique sorted keys.
+query I
+SELECT to_json(jsono_group_object(k, j ORDER BY ts))
+FROM (VALUES ('a', jsono('1'), 1), ('b', jsono('2'), 2), ('a', jsono('3'), 3)) t(k, j, ts);
+----
+{"a":3,"b":2}
+
+# NULL value is kept as JSON null (matching core json_group_object's null-value behavior).
+query I
+SELECT to_json(jsono_group_object(k, j ORDER BY ts))
+FROM (VALUES ('a', jsono('1'), 1), ('b', NULL, 2)) t(k, j, ts);
+----
+{"a":1,"b":null}
+
+# NULL key fails loud, matching core json_group_object (which errors on a NULL key).
+statement error
+SELECT to_json(jsono_group_object(k, j)) FROM (VALUES (NULL, jsono('1'))) t(k, j);
+----
+key cannot be NULL
+
+# Empty group returns SQL NULL.
+query I
+SELECT to_json(jsono_group_object(k, j)) IS NULL
+FROM (VALUES ('a', jsono('1'))) t(k, j)
+WHERE k = 'z';
+----
+true
+
+# Non-VARCHAR keys cast to VARCHAR (like core json_group_object's n::VARCHAR).
+query I
+SELECT to_json(jsono_group_object(k, j ORDER BY k))
+FROM (VALUES (10, jsono('1')), (2, jsono('2'))) t(k, j);
+----
+{"10":1,"2":2}
+
+# Round-trip: build an object, then read a value back through ->>.
+query I
+SELECT (jsono_group_object(k, j)) ->> 'a'
+FROM (VALUES ('a', jsono('"hi"')), ('b', jsono('2'))) t(k, j);
+----
+hi
+
+# Round-trip: build an array, then read element 1 back through ->>.
+query I
+SELECT (jsono_group_array(j ORDER BY ts)) ->> 1
+FROM (VALUES (jsono('"x"'), 1), (jsono('"y"'), 2)) t(j, ts);
+----
+y
