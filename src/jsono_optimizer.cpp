@@ -498,6 +498,8 @@ bool MatchTextComparison(ExpressionType comparison, const vector<string> &values
 	if (comparison == ExpressionType::COMPARE_EQUAL) {
 		return ContainsExpectedValue(values, candidate);
 	}
+	// A range comparison carries exactly one bound (TryReadComparisonPredicate pushes a single value).
+	D_ASSERT(!values.empty());
 	auto c = CompareMatchText(candidate, values[0]);
 	switch (comparison) {
 	case ExpressionType::COMPARE_GREATERTHAN:
@@ -1495,12 +1497,7 @@ vector<JsonoShred> CollectShreddedShreds(const LogicalType &shredded) {
 	}
 	for (idx_t i = 0; i < layout.shreds.size(); i++) {
 		auto &name = layout.shreds[i].first;
-		vector<PathStep> steps;
-		if (!name.empty() && name[0] == '$') {
-			steps = ParseJsonoPath(name, "__jsono_shredded_shred");
-		} else {
-			steps = LiteralKeyPath(name);
-		}
+		vector<PathStep> steps = ShredNamePath(name, "__jsono_shredded_shred");
 		shreds.push_back(JsonoShred {i, layout.shreds[i].second, std::move(steps)});
 	}
 	return shreds;

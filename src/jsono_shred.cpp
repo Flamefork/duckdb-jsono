@@ -126,6 +126,10 @@ bool IsObjectKeyPath(const vector<PathStep> &steps) {
 }
 
 JsonoPathSpec ParseShredPathSpec(const string &path) {
+	// The spec DSL reserves a leading `$` for the JSONPath form: a `$`-leading spec key that is not
+	// `$.`-rooted is rejected here, so a literal key like `$x` must be spelled `$."$x"`. This is the
+	// spec-parse contract, distinct from ShredNamePath, which resolves already-canonical lane names
+	// and reads a bare `$x` as a literal key.
 	auto steps = path.size() > 0 && path[0] == '$' ? ParseJsonoPath(path, "jsono shred") : LiteralKeyPath(path);
 	for (auto &step : steps) {
 		if (step.kind == PathStepKind::Wildcard) {

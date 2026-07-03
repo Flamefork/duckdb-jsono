@@ -373,7 +373,7 @@ void AssignShreddedShreds(TransformBindData &bind_data, const LogicalType &input
 			continue;
 		}
 		auto &name = layout.shreds[i].first;
-		auto steps = !name.empty() && name[0] == '$' ? ParseJsonoPath(name, "jsono_transform") : LiteralKeyPath(name);
+		auto steps = ShredNamePath(name, "jsono_transform");
 		for (idx_t field_index = 0; field_index < bind_data.fields.size(); field_index++) {
 			auto &field = bind_data.fields[field_index];
 			if (field.mode != TransformMode::Scalar || field.shred_child_index != DConstants::INVALID_INDEX) {
@@ -434,8 +434,7 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 				continue;
 			}
 			auto &name = shred.first;
-			auto shred_steps =
-			    !name.empty() && name[0] == '$' ? ParseJsonoPath(name, "jsono_transform") : LiteralKeyPath(name);
+			auto shred_steps = ShredNamePath(name, "jsono_transform");
 			for (auto &field : bind_data->fields) {
 				if (PathStepsMayShareBranch(field.path.steps, shred_steps)) {
 					reconstruct_shredded = true;

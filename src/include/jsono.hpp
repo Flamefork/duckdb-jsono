@@ -178,10 +178,12 @@ class Vector;
 void JsonoReconstructToPlain(Vector &input, idx_t count, Vector &result);
 
 // Wrap a shredded JSONO argument expression in the internal __jsono_reconstruct scalar operator,
-// whose executor is JsonoReconstructToPlain. Used by a bind that would otherwise redeclare the
-// argument as plain JSONO and let the binder insert an anonymous reconstruct cast: the wrapper makes
-// that 3-10x shredded->plain cost an explicit, named operator in EXPLAIN / EXPLAIN ANALYZE. Returns
-// the wrapping expression (plain JSONO return type); `shredded_arg` must have a shredded JSONO type.
+// whose executor is JsonoReconstructToPlain. Only jsono_transform's array-shred reconstruct path uses
+// this wrapper: it would otherwise redeclare the argument as plain JSONO and let the binder insert an
+// anonymous reconstruct cast, so the wrapper makes that 3-10x shredded->plain cost an explicit, named
+// operator in EXPLAIN / EXPLAIN ANALYZE. The other reconstruct binds (collect, elements, diff fallback)
+// still inject anonymous casts. Returns the wrapping expression (plain JSONO return type);
+// `shredded_arg` must have a shredded JSONO type.
 unique_ptr<Expression> MakeJsonoReconstructExpression(unique_ptr<Expression> shredded_arg);
 
 // Overlay only `shreds` (shred indices over the shred set) of the shredded `input` onto its

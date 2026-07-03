@@ -912,6 +912,10 @@ void EmitLanePatch(JsonoBuilder &b, const vector<DiffLanePlan> &lanes, const vec
 // path is stripped from both residuals, so the residual diff can never carry the same leaf.
 void UnionDiffObjects(const JsonoView &va, const JsonoCursor &ca, const JsonoView &vb, const JsonoCursor &cb,
                       JsonoBuilder &builder, DiffScratch &s, size_t depth) {
+	if (depth > JSONO_MAX_NESTING_DEPTH) {
+		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
+		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+	}
 	auto &a_children = s.PrevChildren(depth);
 	auto &b_children = s.CurChildren(depth);
 	CollectChildren(va, ca, a_children);
@@ -1003,8 +1007,8 @@ void JsonoDiffExecuteDirect(DataChunk &args, JsonoDiffLocalState &lstate, const 
 		JsonoBlobRow cur_blob;
 		bool prev_present = prev_reader.Read(row, prev_blob, prev_view) == JsonoRowState::Value;
 		bool cur_present = cur_reader.Read(row, cur_blob, cur_view) == JsonoRowState::Value;
-		// A SQL-NULL side keeps the empty-document semantics through the reconstruct fallback (its
-		// lanes are NULL while the other side's may not be, which reads as a presence mismatch).
+		// A SQL-NULL side (its whole input value absent) routes to the reconstruct fallback, which
+		// carries the empty-document semantics for the missing side.
 		bool mixed = !prev_present || !cur_present;
 		changed.clear();
 		if (!mixed) {

@@ -899,12 +899,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		}
 		// Shred field names ARE the clean path (no fingerprint suffix in the nested layout).
 		auto &name = layout.shreds[i].first;
-		vector<PathStep> steps;
-		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
-			steps = ParseJsonoPath(name, "jsono reconstruct");
-		} else {
-			steps.push_back(PathStep {PathStepKind::Key, name, 0});
-		}
+		vector<PathStep> steps = ShredNamePath(name, "jsono reconstruct");
 		for (auto &step : steps) {
 			if (step.kind != PathStepKind::Key) {
 				throw InvalidInputException("jsono reconstruct: shred path '%s' is not an object-key path", name);
@@ -1435,20 +1430,20 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			fast_viable = false;
 			break;
 		}
+		shred_paths[k] = ShredNamePath(shred.name, "jsono merge fast path");
+		// The JSONPath form gates the per-row nested-shred probe below; a bare-literal top-level key
+		// is already covered there by ObjectKeyInShredSet.
 		if (shred.name.size() >= 2 && shred.name[0] == '$' && shred.name[1] == '.') {
 			has_jsonpath_shred = true;
-			shred_paths[k] = ParseJsonoPath(shred.name, "jsono merge fast path");
-			for (auto &step : shred_paths[k]) {
-				if (step.kind != PathStepKind::Key) {
-					fast_viable = false;
-					break;
-				}
+		}
+		for (auto &step : shred_paths[k]) {
+			if (step.kind != PathStepKind::Key) {
+				fast_viable = false;
+				break;
 			}
-			if (shred_paths[k].size() > 1) {
-				has_nested_shred = true;
-			}
-		} else {
-			shred_paths[k].push_back(PathStep {PathStepKind::Key, shred.name, 0});
+		}
+		if (shred_paths[k].size() > 1) {
+			has_nested_shred = true;
 		}
 	}
 	// A nested shred whose path prefixes (or equals) another shred's path is structurally
@@ -3615,12 +3610,7 @@ bool PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
                                    vector<idx_t> &overlay_shreds) {
 	for (idx_t i = 0; i < bind_shreds.size(); i++) {
 		auto &name = bind_shreds[i].first;
-		vector<PathStep> steps;
-		if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
-			steps = ParseJsonoPath(name, "jsono_group_merge direct shredded update");
-		} else {
-			steps.push_back(PathStep {PathStepKind::Key, name, 0});
-		}
+		vector<PathStep> steps = ShredNamePath(name, "jsono_group_merge direct shredded update");
 		for (auto &step : steps) {
 			if (step.kind != PathStepKind::Key) {
 				return false;
