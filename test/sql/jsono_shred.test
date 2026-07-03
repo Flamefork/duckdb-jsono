@@ -206,6 +206,32 @@ SELECT jsono('{"a":1}', {'$.a':'BIGINT'});
 ----
 unknown argument
 
+# A shred path must be a non-empty object-key chain. An array-index step, a nested index, and the
+# root '$' are rejected at bind: otherwise the value would be lifted into a lane while ALSO staying
+# in the residual (a read-copy), and every reconstruct-based reader would throw on the non-key lane.
+# These bind errors also pin the jsono_entries duplication regression — an index-path leaf can never
+# appear both in a lane and in the residual because the spec is unconstructible.
+statement error
+SELECT jsono('{"arr":[7,8]}', shredding := {'$.arr[0]':'BIGINT'});
+----
+object-key path
+
+statement error
+SELECT jsono('{"x":1}', shredding := {'$':'VARCHAR'});
+----
+object-key path
+
+statement error
+SELECT jsono('{"a":[{"b":1}]}', shredding := {'$.a[0].b':'BIGINT'});
+----
+object-key path
+
+# A bare '$[0]' is malformed JSONPath (an index with no preceding key) and stays rejected as such.
+statement error
+SELECT jsono('{"a":[7]}', shredding := {'$[0]':'BIGINT'});
+----
+invalid path
+
 # No JSON key is reserved by the storage layout: keys that collide with layout names (body,
 # shreds, "jsono") or old flat field names shred and read back correctly — 'body' through its
 # path form (a bare 'body' shred name would duplicate the layout's residual field; see below).

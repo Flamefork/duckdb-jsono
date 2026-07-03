@@ -148,13 +148,40 @@ inline vector<PathStep> LiteralKeyPath(const string &name) {
 // key or a `$.`-rooted JSONPath naming a nested key. Only the `$.` prefix marks the JSONPath form:
 // a literal top-level key may itself begin with `$` (e.g. `$x`), and the reserved `$jsono$set` marker
 // begins with `$` too, so a bare-`$` test would misparse both. New readers must resolve shred names
-// through this classifier; several older readers still inline the split, which agrees on every
-// constructible name only because the spec parser rejects bare-`$` lane names outright.
+// through this classifier; several older readers still inline the split. It agrees with them on
+// every constructible / recognizable name because a lane name is guaranteed to be a non-empty pure
+// object-key chain — enforced at spec parse (ParseShredPathSpec) and at structural layout
+// recognition (TryParseJsonoLayoutType, via ShredNameIsObjectKeyPath), so array-index and root `$`
+// lanes never exist.
 inline vector<PathStep> ShredNamePath(const string &name, const char *function_name) {
 	if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
 		return ParseJsonoPath(name, function_name);
 	}
 	return LiteralKeyPath(name);
+}
+
+// Whether a shred lane name resolves to a non-empty pure object-key chain — the only shape a shred
+// lane may carry (each step strips one object key from the residual; an array-index or root `$` lane
+// cannot be rebuilt by the object overlay). Non-throwing and mirroring ShredNamePath's split, so it
+// doubles as the structural gate in layout recognition: a stored / raw-cast type whose lane name is
+// an index or root path is simply not recognized as JSONO.
+inline bool ShredNameIsObjectKeyPath(const string &name) {
+	vector<PathStep> steps;
+	if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
+		try {
+			steps = ParseJsonoPath(name, "jsono shred");
+		} catch (const std::exception &) {
+			return false;
+		}
+	} else {
+		steps = LiteralKeyPath(name);
+	}
+	for (auto &step : steps) {
+		if (step.kind != PathStepKind::Key) {
+			return false;
+		}
+	}
+	return !steps.empty();
 }
 
 inline vector<PathStep> ArrayIndexPath(idx_t index) {

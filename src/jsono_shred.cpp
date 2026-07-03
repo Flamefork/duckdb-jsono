@@ -79,13 +79,11 @@ struct ShredBindData : public FunctionData {
 	vector<idx_t> return_src;
 	// One-pass text write (JsonoShredFromTextExecute): a trie over the object-key shred paths
 	// lets pass 1 of the direct DOM writer capture and strip the leaves while sizing — the
-	// throwaway plain materialization and the per-row locate/strip/re-emit disappear. Fields
-	// whose path is not a pure key sequence never strip; they are filled from the written
-	// residual per row (residual_fill_fields). Duplicate paths in the spec (e.g. '$.a' and
-	// 'a') fall back to the two-pass path.
+	// throwaway plain materialization and the per-row locate/strip/re-emit disappear. Every shred
+	// path is an object-key chain (the bind rejects the rest), so every field enters the trie.
+	// Duplicate paths in the spec (e.g. '$.a' and 'a') fall back to the two-pass path.
 	bool one_pass_text = false;
 	std::vector<jsono_dom::DomShredTrieNode> trie;
-	vector<idx_t> residual_fill_fields;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<ShredBindData>(*this);
@@ -114,19 +112,10 @@ struct ShredLocalState : public FunctionLocalState {
 	}
 };
 
-JsonoPathSpec ParseShredPathSpec(const string &path) {
-	auto steps = path.size() > 0 && path[0] == '$' ? ParseJsonoPath(path, "jsono shred") : LiteralKeyPath(path);
-	for (auto &step : steps) {
-		if (step.kind == PathStepKind::Wildcard) {
-			throw BinderException("jsono shred: wildcard paths are not supported ('%s')", path);
-		}
-	}
-	return JsonoPathSpec(path, std::move(steps));
-}
-
-// A path may be stripped from the residual only if it is a pure object-key sequence: the
-// residual emit removes a key at each step, and an array element cannot be re-filled by
-// the object overlay on reconstruction. Index/wildcard paths stay preserve-only.
+// A shred path must be a non-empty pure object-key sequence: the residual emit removes a key at
+// each step, and only an object key can be re-filled by the object overlay on reconstruction. An
+// array-index or root '$' path is rejected at bind (ParseShredPathSpec) so a set lane always means
+// the value was stripped from the residual — the value is stored exactly once.
 bool IsObjectKeyPath(const vector<PathStep> &steps) {
 	for (auto &step : steps) {
 		if (step.kind != PathStepKind::Key) {
@@ -134,6 +123,21 @@ bool IsObjectKeyPath(const vector<PathStep> &steps) {
 		}
 	}
 	return !steps.empty();
+}
+
+JsonoPathSpec ParseShredPathSpec(const string &path) {
+	auto steps = path.size() > 0 && path[0] == '$' ? ParseJsonoPath(path, "jsono shred") : LiteralKeyPath(path);
+	for (auto &step : steps) {
+		if (step.kind == PathStepKind::Wildcard) {
+			throw BinderException("jsono shred: wildcard paths are not supported ('%s')", path);
+		}
+	}
+	if (!IsObjectKeyPath(steps)) {
+		throw BinderException("jsono shred: shred path '%s' must be a non-empty object-key path "
+		                      "(array-index and root '$' paths cannot be shredded)",
+		                      path);
+	}
+	return JsonoPathSpec(path, std::move(steps));
 }
 
 LogicalType ShredFieldType(const ShredField &field) {
@@ -200,12 +204,6 @@ void BindShredField(const string &path, const LogicalType &type, const string &t
 	if (!FillShredFieldFromType(type, field)) {
 		throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
 	}
-	if ((field.kind == ShredKind::Array || field.kind == ShredKind::ScalarArray) &&
-	    !IsObjectKeyPath(field.path.steps)) {
-		throw BinderException("jsono shred: array shred '%s' must address an array by an object-key path "
-		                      "(no array index or wildcard)",
-		                      path);
-	}
 }
 
 // Resolve one spec entry's type string into a shred field: a scalar leaf shred, or a
@@ -270,10 +268,6 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 			// Array shreds (object or scalar) extract per element from the parsed value (the two-pass
 			// plain shred path); the one-pass text DOM writer's trie addresses object-key scalar leaves only.
 			bind_data->one_pass_text = false;
-			continue;
-		}
-		if (!IsObjectKeyPath(field.path.steps)) {
-			bind_data->residual_fill_fields.push_back(f);
 			continue;
 		}
 		uint32_t node = 0;
@@ -378,10 +372,12 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 }
 
 // Write a scalar shred's VALUE lane for a field and return whether the original value is losslessly
-// captured by the shred type (so the path is stripped from the residual). A shred stores the value
-// only when it round-trips through the shred type exactly (a real JSON string in a VARCHAR shred, a
-// matching-kind scalar in a typed shred); everything else stays in the residual with a NULL lane, so
-// a set lane always means the path is stripped — the value is stored exactly once.
+// captured by the shred type. Every shred path is an object-key chain (the bind rejects the rest),
+// so this return value alone decides stripping: true means the path is stripped from the residual. A
+// shred stores the value only when it round-trips through the shred type exactly (a real JSON string
+// in a VARCHAR shred, a matching-kind scalar in a typed shred); a divert leaves the lane NULL and the
+// value in the residual, and an absent path / explicit null leaves the lane NULL with nothing
+// stripped — so a set lane always means the path is stripped, the value is stored exactly once.
 // `complete` (optional out) is the per-shred, per-row flag a bare lane read may be trusted by: true
 // when the lane holds the full `->>` answer (absent path, explicit null, a fitting scalar), false
 // when the value stayed in the residual (divert, container) and the read must fall back / reconstruct.
@@ -637,7 +633,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 			bool complete = true;
 			bool strippable = WriteShred(field, view, location, *shred_children[f], row, lstate.text, &complete);
 			FlatVector::GetData<int8_t>(*complete_children[f])[row] = complete ? 1 : 0;
-			if (strippable && IsObjectKeyPath(field.path.steps)) {
+			if (strippable) {
 				lstate.strip_paths.push_back(&field.path.steps);
 				stripped_fields.push_back(f);
 			}
@@ -795,7 +791,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			if (complete_out[f]) {
 				FlatVector::GetData<int8_t>(*complete_out[f])[row] = complete ? 1 : 0;
 			}
-			if (strippable && IsObjectKeyPath(field.path.steps)) {
+			if (strippable) {
 				lstate.strip_paths.push_back(&field.path.steps);
 				stripped_fields.push_back(f);
 			}
@@ -855,9 +851,9 @@ void JsonoShredExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 
 // jsono(text, shredding := spec): parse the JSON text and shred it in one pass — the direct
 // DOM writer's sizing pass captures the shred leaves and strips the lossless ones from the
-// emit plan, so the full plain value is never materialized and no path is located twice.
-// The rare present-but-lossy VARCHAR shred (`->>` text of a number/bool) is filled from the
-// written residual with the exact two-pass semantics, as are non-object-key paths.
+// emit plan, so the full plain value is never materialized and no path is located twice. A
+// present-but-lossy shred (a number's `->>` text at a VARCHAR lane) is captured by the DOM pass
+// itself as a diverted lane value; nothing is filled after the fact.
 void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = expr.bind_info->Cast<ShredBindData>();
@@ -909,15 +905,6 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 
 	jsono_dom::YyjsonAllocator parser;
 	jsono_dom::DomDirectState dom;
-
-	// Fill a shred from the row's written residual: the value was kept there, so the two-pass locate +
-	// render path applies verbatim — and reports the per-shred completeness.
-	auto fill_from_residual = [&](const JsonoView &view, idx_t f, idx_t row) {
-		auto location = LocatePath(view, fields[f].path.steps);
-		bool complete = true;
-		WriteShred(fields[f], view, location, *shred_out[f], row, lstate.text, &complete);
-		FlatVector::GetData<int8_t>(*complete_out[f])[row] = complete ? 1 : 0;
-	};
 
 	for (idx_t row = 0; row < count; row++) {
 		auto idx = input_fmt.sel->get_index(row);
@@ -971,17 +958,6 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 			throw;
 		}
 		yyjson_doc_free(doc);
-		if (!bind_data.residual_fill_fields.empty()) {
-			JsonoBlobRow blob {writer.data[BODY_SLOTS][row],       writer.data[BODY_KEY_HEAP][row],
-			                   writer.data[BODY_STRING_HEAP][row], writer.data[BODY_SKIPS][row],
-			                   writer.data[BODY_LENGTHS][row],     writer.data[BODY_NUMS][row]};
-			JsonoView view = MakeJsonoView(blob);
-			if (view.ParseHeader()) {
-				for (auto f : bind_data.residual_fill_fields) {
-					fill_from_residual(view, f, row);
-				}
-			}
-		}
 	}
 	if (input_constant) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);

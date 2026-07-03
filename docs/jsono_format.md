@@ -131,15 +131,16 @@ columnar read) or whether it must fall back to / reconstruct from the residual:
   `complete = 0`, so the read falls back to the residual / reconstructs.
 
 **Single-storage invariant: every value is stored exactly once, and a set lane
-means the path is stripped from the residual.** A value is removed from the
-residual and kept only in its shred when it round-trips losslessly through the
-shred type (a JSON string in a `VARCHAR` shred, an integer in a `BIGINT` shred).
-A value that does not fit — a string in a `BIGINT` shred, a number in a `VARCHAR`
-shred, a container, an explicit JSON `null`, a missing key, or a number whose
-shred type would re-encode it differently — stays in the residual with a `NULL`
-lane. Pure object-key scalar paths that round-trip through their shred type
-are removed from the residual; array-index paths and non-lossless shred values
-stay in the residual. A whole regular array is a separate case — see
+means the path is stripped from the residual.** Every shred path is a non-empty
+object-key chain — array-index and root `$` paths are rejected at bind and are
+not recognized by the layout parser, so a lane never shadows a value the residual
+also keeps. A value is removed from the residual and kept only in its shred when
+it round-trips losslessly through the shred type (a JSON string in a `VARCHAR`
+shred, an integer in a `BIGINT` shred). A value that does not fit — a string in a
+`BIGINT` shred, a number in a `VARCHAR` shred, a container, or a number whose
+shred type would re-encode it differently — stays in the residual and leaves the
+lane `NULL`. An explicit JSON `null` or a missing key also leaves the lane `NULL`
+(and stores nothing extra). A whole regular array is a separate case — see
 [Array shreds](#array-shreds-liststruct), which lift element subfields (object
 arrays) or whole scalar elements
 ([scalar arrays](#scalar-array-shreds-listtype)) while leaving a skeleton array in

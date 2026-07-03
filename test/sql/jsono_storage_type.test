@@ -136,11 +136,12 @@ SELECT jsono_storage_type('"$.body" BIGINT') = typeof(jsono('{"body":1}', shredd
 ----
 true
 
-# Array shreds must address the array by an object-key path, matching the constructor.
+# Every shred path must be an object-key chain, matching the constructor: an array-index step is
+# rejected whether the shred type is an array or a scalar.
 statement error
 SELECT jsono_storage_type('"$.a[0]" STRUCT(id BIGINT)[]');
 ----
-must address an array by an object-key path
+object-key path
 
 query I
 SELECT jsono_storage_type('"$.a" STRUCT(id BIGINT)[]')

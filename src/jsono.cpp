@@ -180,6 +180,12 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 	}
 	child_list_t<LogicalType> shreds;
 	for (idx_t i = 1; i < shred_fields.size(); i++) {
+		// A lane name that is not a non-empty pure object-key chain (an array-index or root '$' path)
+		// cannot be a shred: no writer produces one, and every reconstruct-based reader would throw on
+		// it. Rejecting it here keeps such a raw-cast / stored struct from being recognized as JSONO.
+		if (!ShredNameIsObjectKeyPath(shred_fields[i].first)) {
+			return false;
+		}
 		LogicalType value_type;
 		if (!UnwrapShredFieldType(shred_fields[i].second, value_type)) {
 			return false;
@@ -290,6 +296,11 @@ void JsonoValidateShredFieldName(const string &name) {
 	}
 	if (name == JSONO_SHRED_SET) {
 		throw BinderException("jsono shred: '%s' is a reserved layout field name", name);
+	}
+	if (!ShredNameIsObjectKeyPath(name)) {
+		throw BinderException("jsono shred: shred path '%s' must be a non-empty object-key path "
+		                      "(array-index and root '$' paths cannot be shredded)",
+		                      name);
 	}
 }
 
