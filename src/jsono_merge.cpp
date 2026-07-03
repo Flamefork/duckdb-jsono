@@ -1226,23 +1226,42 @@ bool ObjectKeyInShredSet(const JsonoView &view, const vector<MergeShred> &shreds
 	return false;
 }
 
-// Conflict between a value (folded residual or a plain input) and a NESTED object-key shred
-// path: the lane copy-through is valid only when the value neither carries the path's leaf nor
-// breaks the path's object skeleton. True when the path resolves to a PRESENT value (the value
-// shadows the lane, or an RFC 7396 null at the path would delete it) OR a node along the path
-// before the leaf is a present non-object (the lane cannot overlay into a scalar/array). An
-// absent key short-circuits to no-conflict — the lane safely owns/creates that subtree.
-bool ResidualConflictsWithShredPath(const JsonoView &view, const vector<PathStep> &steps) {
+// Outcome of following an object-key shred path from the root of a residual value. Absent: a key
+// along the path is missing from its (present) object parent — the shred safely owns/creates that
+// subtree. Present: the full path resolved to a present value — the residual shadows the shred (an
+// RFC 7396 null there would delete it). NonObjectPrefix: the root or a node before the leaf is a
+// present non-object — the shred cannot overlay into a scalar/array. The three direct-fold sites
+// (shadow-delete, combine adopt, finalize) plus the nested-conflict test all depend on this exact
+// three-way split agreeing, so the walk lives here once.
+enum class ResidualPathOutcome : uint8_t { Absent, Present, NonObjectPrefix };
+
+// `depth_reached` is the number of leading steps that resolved through objects before the walk
+// stopped: steps.size() on Present, and on NonObjectPrefix the count up to AND including the
+// non-object node (so a caller can reuse it as the prefix length to delete/rebuild). It is
+// meaningless on Absent (no caller reads it there).
+ResidualPathOutcome ClassifyResidualPath(const JsonoView &view, const vector<PathStep> &steps, idx_t &depth_reached) {
 	JsonoCursor cursor;
 	for (idx_t s = 0; s < steps.size(); s++) {
 		if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_START) {
-			return true; // need to descend into an object but found a non-object/empty
+			depth_reached = s; // the non-object sits at step s-1 (or is the root when s == 0)
+			return ResidualPathOutcome::NonObjectPrefix;
 		}
 		if (!LocatePathStep(nullptr, s, view, steps[s], cursor)) {
-			return false; // key absent at this level (the node is an object) → no conflict
+			depth_reached = s;
+			return ResidualPathOutcome::Absent;
 		}
 	}
-	return true; // full path resolved to a present value
+	depth_reached = steps.size();
+	return ResidualPathOutcome::Present;
+}
+
+// Conflict between a value (folded residual or a plain input) and a NESTED object-key shred path:
+// the lane copy-through is valid only when the value neither carries the path's leaf nor breaks the
+// path's object skeleton — i.e. only an absent key is safe (Present shadows the lane, NonObjectPrefix
+// cannot be overlaid into).
+bool ResidualConflictsWithShredPath(const JsonoView &view, const vector<PathStep> &steps) {
+	idx_t depth_reached;
+	return ClassifyResidualPath(view, steps, depth_reached) != ResidualPathOutcome::Absent;
 }
 
 // A scalar-array shred deliberately leaves an array skeleton at the shred path in the residual.
@@ -1977,6 +1996,18 @@ void FoldIntoGroupState(GroupMergeState &state, const JsonoView &incoming) {
 // ===== reconstructing each row to plain (the accumulator contract is documented on      =====
 // ===== DirectShreddedAcc above).                                                        =====
 
+// Lazily allocate the group's direct accumulator with its lanes sized to the bind shred count, so
+// every fold path indexes lanes by shred `f` directly (array/nested slots stay inactive). Sizing at
+// allocation — not in Initialize, which runs before bind data exists — keeps "lanes are bind-sized"
+// true by construction at all three fold entry points (SimpleUpdate, Update, Combine).
+DirectShreddedAcc &EnsureDirectAcc(GroupMergeState &state, const GroupMergeBindData &bind_data) {
+	if (!state.direct) {
+		state.direct = new DirectShreddedAcc();
+		state.direct->lanes.resize(bind_data.shreds.size());
+	}
+	return *state.direct;
+}
+
 // Chunk-level read handles for the direct fold. A type with array shreds first composes the
 // array paths to plain for the whole chunk (skeleton + lockstep lane -> plain array, via the
 // filtered reconstruct, which also verifies each row's manifest); scalar lanes are read from
@@ -2008,17 +2039,12 @@ void DirectShadowDeletePath(DirectShreddedAcc &acc, const vector<PathStep> &step
 	if (!acc_view.ParseHeader() || acc_view.Slots() == 0) {
 		return;
 	}
-	JsonoCursor cursor;
-	idx_t delete_depth = 0;
-	for (idx_t depth = 0; depth < steps.size(); depth++) {
-		if (!LocatePathStep(nullptr, depth, acc_view, steps[depth], cursor)) {
-			return; // path absent from the residual: nothing shadows the lane
-		}
-		delete_depth = depth + 1;
-		if (delete_depth < steps.size() && SlotTag(acc_view.SlotAt(cursor.pos)) != tag::OBJ_START) {
-			break; // non-object prefix: delete it whole so the finalize overlay can rebuild the chain
-		}
+	idx_t delete_depth;
+	if (ClassifyResidualPath(acc_view, steps, delete_depth) == ResidualPathOutcome::Absent) {
+		return; // path absent from the residual: nothing shadows the lane
 	}
+	// delete_depth is the whole path on Present and the prefix up to and including the non-object node
+	// on NonObjectPrefix — deleting that prefix lets the finalize overlay rebuild the object chain.
 	static thread_local JsonoBuilder patch_builder;
 	static thread_local OwnedJsonoBlob patch_blob;
 	static thread_local JsonoBuilder merged;
@@ -2075,7 +2101,12 @@ void DirectFoldRow(DirectShreddedAcc &acc, const JsonoView &incoming, const Grou
 		// The incoming residual carries members: IgnoreNulls-merge it into the accumulator. A
 		// fully-shredded row's empty residual skips the merge (and its re-serialize) entirely.
 		JsonoView acc_view = ViewOfBlob(acc.residual);
-		acc_view.ParseHeader();
+		// acc.residual is a self-built fold output (kind == Object): SerializeBuilderToBlob always emits
+		// a well-formed header, so the parse cannot fail. Assert the link; keep the call unconditional
+		// so it still runs in release, where D_ASSERT vanishes.
+		bool acc_parsed = acc_view.ParseHeader();
+		D_ASSERT(acc_parsed);
+		(void)acc_parsed;
 		scratch.Reset();
 		MergeTwoObjects(acc_view, JsonoCursor(), incoming, JsonoCursor(), scratch, MergeMode::IgnoreNulls, 0);
 		SerializeBuilderToBlob(scratch, acc.residual);
@@ -2148,7 +2179,11 @@ void DirectFoldState(DirectShreddedAcc &target, const DirectShreddedAcc &source,
 	D_ASSERT(source_parsed);
 	if (source_parsed && source_view.Slots() > 0 && ContainerChildCount(SlotPayload(source_view.SlotAt(0))) > 0) {
 		JsonoView target_view = ViewOfBlob(target.residual);
-		target_view.ParseHeader();
+		// target.residual is a self-built fold output (kind == Object): the parse cannot fail. Assert the
+		// link; keep the call unconditional so it still runs in release, where D_ASSERT vanishes.
+		bool target_parsed = target_view.ParseHeader();
+		D_ASSERT(target_parsed);
+		(void)target_parsed;
 		static thread_local JsonoBuilder scratch;
 		scratch.Reset();
 		MergeTwoObjects(target_view, JsonoCursor(), source_view, JsonoCursor(), scratch, MergeMode::IgnoreNulls, 0);
@@ -2209,16 +2244,13 @@ void JsonoGroupMergeSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input
 		JsonoRowReader reader;
 		vector<UnifiedVectorFormat> lane_fmt;
 		DirectFoldPrepare(inputs[0], count, bind_data, arrays_plain, reader, lane_fmt);
-		if (!state.direct) {
-			state.direct = new DirectShreddedAcc();
-			state.direct->lanes.resize(bind_data.shreds.size());
-		}
+		auto &direct = EnsureDirectAcc(state, bind_data);
 		for (idx_t row = 0; row < count; row++) {
 			JsonoBlobRow blob;
 			if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 				continue;
 			}
-			DirectFoldRow(*state.direct, view, bind_data, lane_fmt, row);
+			DirectFoldRow(direct, view, bind_data, lane_fmt, row);
 			state.has_input = true;
 		}
 		return;
@@ -2256,11 +2288,7 @@ void JsonoGroupMergeUpdate(Vector inputs[], AggregateInputData &aggr_input_data,
 				continue;
 			}
 			auto &state = *state_data[RowIndex(state_fmt, row)];
-			if (!state.direct) {
-				state.direct = new DirectShreddedAcc();
-				state.direct->lanes.resize(bind_data.shreds.size());
-			}
-			DirectFoldRow(*state.direct, view, bind_data, lane_fmt, row);
+			DirectFoldRow(EnsureDirectAcc(state, bind_data), view, bind_data, lane_fmt, row);
 			state.has_input = true;
 		}
 		return;
@@ -2292,11 +2320,7 @@ void JsonoGroupMergeCombine(Vector &source, Vector &target, AggregateInputData &
 				continue;
 			}
 			auto &target_state = *target_data[row];
-			if (!target_state.direct) {
-				target_state.direct = new DirectShreddedAcc();
-				target_state.direct->lanes.resize(bind_data.shreds.size());
-			}
-			DirectFoldState(*target_state.direct, *source_state.direct, bind_data);
+			DirectFoldState(EnsureDirectAcc(target_state, bind_data), *source_state.direct, bind_data);
 			target_state.has_input = true;
 		}
 		return;
@@ -2418,8 +2442,12 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 			continue;
 		}
 		JsonoView acc_view = ViewOfBlob(direct->residual);
-		acc_view.ParseHeader();
-		bool residual_has_members = acc_view.Slots() > 0 && SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START &&
+		// direct->residual is a self-built fold output (kind != Empty): the parse cannot fail. Fold the
+		// asserted parse flag into residual_has_members so the flag is used in both build configs.
+		bool acc_parsed = acc_view.ParseHeader();
+		D_ASSERT(acc_parsed);
+		bool residual_has_members = acc_parsed && acc_view.Slots() > 0 &&
+		                            SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START &&
 		                            ContainerChildCount(SlotPayload(acc_view.SlotAt(0))) > 0;
 		stripped_fields.clear();
 		D_ASSERT(direct->lanes.size() == bind_data.shreds.size());
@@ -2434,24 +2462,18 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 			int8_t complete = 1;
 			bool write_lane = false;
 			if (residual_has_members) {
-				JsonoCursor cursor;
-				bool found = true;
-				bool non_object_prefix = false;
-				for (idx_t depth = 0; depth < plan.steps.size(); depth++) {
-					if (!LocatePathStep(nullptr, depth, acc_view, plan.steps[depth], cursor)) {
-						found = false;
-						break;
+				idx_t depth_reached;
+				switch (ClassifyResidualPath(acc_view, plan.steps, depth_reached)) {
+				case ResidualPathOutcome::Present:
+					complete = 0; // a later diverted write outranks the older lane; the value lives in the residual
+					break;
+				case ResidualPathOutcome::Absent:
+					if (lane_active) {
+						write_lane = true;
 					}
-					if (depth + 1 < plan.steps.size() && SlotTag(acc_view.SlotAt(cursor.pos)) != tag::OBJ_START) {
-						found = false;
-						non_object_prefix = true;
-						break;
-					}
-				}
-				if (found) {
-					complete = 0;
-				} else if (!non_object_prefix && lane_active) {
-					write_lane = true;
+					break;
+				case ResidualPathOutcome::NonObjectPrefix:
+					break; // a parent was replaced by a scalar: drop the lane, complete stays 1 (replace semantics)
 				}
 			} else if (lane_active) {
 				write_lane = true;
