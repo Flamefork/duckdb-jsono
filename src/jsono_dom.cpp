@@ -163,9 +163,7 @@ constexpr uint64_t NUMBER_TEXT_SLOT = (tag::VAL_EXT << TAG_SHIFT) | ext_subtype:
 void SizeDomElement(yyjson_val *element, DomDirectState &s, size_t depth);
 
 // Decide what a trie leaf match means for its shred: capture-and-strip on an exact kind
-// match, ResidualFill for a VARCHAR shred over a non-string scalar (the `->>` text needs
-// the decoded value, so it is filled from the written residual), nothing otherwise (the
-// shred stays NULL and the value stays in the residual).
+// match, nothing otherwise (the shred stays NULL and the value stays in the residual).
 void CaptureShredLeaf(yyjson_val *value, JsonoScalarPrimitive kind, DomShredCapture &cap) {
 	switch (yyjson_get_type(value)) {
 	case YYJSON_TYPE_STR:
@@ -179,12 +177,8 @@ void CaptureShredLeaf(yyjson_val *value, JsonoScalarPrimitive kind, DomShredCapt
 		}
 		return;
 	case YYJSON_TYPE_RAW: {
-		if (kind == JsonoScalarPrimitive::Varchar) {
-			cap.state = DomShredCapture::State::ResidualFill;
-			return;
-		}
 		if (kind != JsonoScalarPrimitive::Bigint && kind != JsonoScalarPrimitive::Ubigint) {
-			// A text number is never stored as kind Double; DOUBLE/BOOLEAN shreds stay NULL —
+			// A text number is never stored as kind Double; VARCHAR/DOUBLE/BOOLEAN shreds stay NULL —
 			// a present number they did not capture is a residual-diverted scalar (case B).
 			cap.diverted_scalar = true;
 			return;
@@ -217,24 +211,16 @@ void CaptureShredLeaf(yyjson_val *value, JsonoScalarPrimitive kind, DomShredCapt
 			cap.state = DomShredCapture::State::Bool;
 			cap.stripped = true;
 			cap.bool_value = yyjson_get_bool(value);
-		} else if (kind == JsonoScalarPrimitive::Varchar) {
-			cap.state = DomShredCapture::State::ResidualFill;
 		} else {
-			// Present boolean at a numeric shred path: stays in the residual, shred NULL (case B).
+			// Present boolean at a non-boolean shred path: stays in the residual, shred NULL (case B).
 			cap.diverted_scalar = true;
 		}
 		return;
 	default:
 		if (yyjson_get_type(value) == YYJSON_TYPE_OBJ || yyjson_get_type(value) == YYJSON_TYPE_ARR) {
-			// Container: for a VARCHAR shred defer to the residual fill, which inlines a render-safe
-			// container's `->>` text into the lane (complete) or leaves it NULL+incomplete when
-			// render-unsafe; for a typed shred the lane cannot hold it, so the value stays in the
-			// residual and a bare typed read would miss the `->>` container text (not complete).
-			if (kind == JsonoScalarPrimitive::Varchar) {
-				cap.state = DomShredCapture::State::ResidualFill;
-			} else {
-				cap.diverted_scalar = true;
-			}
+			// Container: a scalar lane cannot hold it, so the value stays in the residual and a
+			// bare lane read would miss it (not complete).
+			cap.diverted_scalar = true;
 			return;
 		}
 		// null literal: shred NULL, value stays in the residual. A `->>` read yields NULL here too,

@@ -327,8 +327,8 @@ SELECT jsono_entries(
 [{'key': a, 'value': 1}]
 
 # A VARCHAR shred only strips a real JSON string; a non-string scalar (boolean, number) stays in the
-# residual and the shred keeps a read-copy for fast typed reads. jsono_entries must emit each such
-# leaf once (from the residual), not double it via the shred overlay.
+# residual with a NULL lane (a divert). jsono_entries must emit each such leaf once (from the
+# residual), with no shred-overlay double.
 query II
 SELECT u.key, u.value
 FROM (SELECT unnest(jsono_entries(jsono('{"x":false}', shredding := {'$.x':'VARCHAR'}))) u)

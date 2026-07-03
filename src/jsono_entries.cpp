@@ -286,10 +286,6 @@ struct EntriesWalkSink {
 	std::string &path;
 	JsonoEntriesKeyStyle style;
 	EntriesSink &sink;
-	// When set, every emitted leaf path is recorded so the VARCHAR-shred overlay can tell a
-	// stripped value (residual lacks the path) from a read-copy (residual keeps it). NULL when no
-	// VARCHAR shred is present, since only VARCHAR shreds store a read-copy of a non-string scalar.
-	std::unordered_set<std::string> *seen = nullptr;
 	// When set, an array-element path in it is a lifted scalar-array position — the residual carries
 	// only a VAL_NULL placeholder there, the value lives in the shred — so the walk skips it (the
 	// scalar-array shred overlay emits the real value). NULL when no scalar-array shred is present.
@@ -322,9 +318,6 @@ struct EntriesWalkSink {
 	void Scalar(const JsonoScalar &scalar) {
 		if (suppress && suppress->count(path)) {
 			return; // a lifted scalar-array placeholder; the shred overlay emits the real value
-		}
-		if (seen) {
-			seen->insert(path);
 		}
 		sink.Append(path, scalar);
 	}
@@ -455,30 +448,6 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 		InitShredLanes(args.data[0], count, layout.shreds, lanes);
 	}
 
-	// Only a VARCHAR shred keeps a read-copy of a non-string scalar (the value stays in the residual,
-	// the shred holds the `->>` text for a fast typed read). Such a value would be emitted twice — once
-	// by the residual walk, once by the shred overlay — so when any VARCHAR shred is present, the
-	// residual leaf paths are recorded and the overlay skips a path the residual already carries
-	// (residual is authoritative, matching the reconstruct overlay). JsonoScalarPrimitiveStoresReadCopy is
-	// the single owner of which kinds read-copy.
-	bool has_varchar_shred = false;
-	for (auto &lane : lanes) {
-		switch (lane.kind) {
-		case ShredKind::Scalar:
-			has_varchar_shred = has_varchar_shred || JsonoScalarPrimitiveStoresReadCopy(lane.scalar_kind);
-			break;
-		case ShredKind::Array:
-			for (auto sub_kind : lane.sub_kind) {
-				has_varchar_shred = has_varchar_shred || JsonoScalarPrimitiveStoresReadCopy(sub_kind);
-			}
-			break;
-		case ShredKind::ScalarArray:
-			// A scalar array lifts only conforming elements (a VARCHAR lane strips just real strings, no
-			// read-copy of non-strings), so a lifted element is never also in the residual — no dedup needed.
-			break;
-		}
-	}
-
 	// A scalar array leaves a VAL_NULL placeholder per lifted element in the residual skeleton; the
 	// generic walk would emit it as a `<base>[i]: null` leaf, duplicating the shred overlay's real
 	// value. When any scalar-array shred is present, the lifted positions are collected per row and
@@ -492,7 +461,6 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 	ListVector::SetListSize(result, 0);
 	std::string path;
 	std::string shred_scratch;
-	std::unordered_set<std::string> residual_paths;
 	std::unordered_set<std::string> suppress;
 	std::string suppress_scratch;
 	EntriesSink sink(result);
@@ -509,9 +477,6 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 			continue;
 		}
 		auto start = sink.next_child;
-		if (has_varchar_shred) {
-			residual_paths.clear();
-		}
 		if (has_scalar_array) {
 			// Collect this row's lifted scalar-array positions (`<base>[i]` for each valid element slot),
 			// built with the same key/index path builders the walk uses, so the strings match exactly.
@@ -546,9 +511,6 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 			}
 			JsonoCursor cursor;
 			EntriesWalkSink walk(path, style, sink);
-			if (has_varchar_shred) {
-				walk.seen = &residual_paths;
-			}
 			if (has_scalar_array) {
 				walk.suppress = &suppress;
 			}
@@ -566,10 +528,6 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 			auto &base_key = style == JsonoEntriesKeyStyle::JsonPath ? shreds[f].key_jsonpath : shreds[f].key_dotted;
 			switch (lane.kind) {
 			case ShredKind::Scalar: {
-				// A VARCHAR read-copy the residual still carries is the residual's to emit, not ours.
-				if (JsonoScalarPrimitiveStoresReadCopy(lane.scalar_kind) && residual_paths.count(base_key)) {
-					break;
-				}
 				auto value = FormatShredValue(lane.fmt, idx, lane.scalar_kind, shred_scratch);
 				sink.AppendText(nonstd::string_view(base_key.data(), base_key.size()), false, value);
 				break;
@@ -593,12 +551,6 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 						auto saved_key = path.size();
 						auto &sub_name = shreds[f].subfield_names[j];
 						AppendKeySegment(path, nonstd::string_view(sub_name.data(), sub_name.size()), style);
-						// A VARCHAR subfield read-copy the residual element still carries is the
-						// residual's to emit (the walk above already did), so skip it here.
-						if (JsonoScalarPrimitiveStoresReadCopy(lane.sub_kind[j]) && residual_paths.count(path)) {
-							path.resize(saved_key);
-							continue;
-						}
 						auto value = FormatShredValue(sub_fmt, sub_idx, lane.sub_kind[j], shred_scratch);
 						sink.AppendText(nonstd::string_view(path.data(), path.size()), false, value);
 						path.resize(saved_key);

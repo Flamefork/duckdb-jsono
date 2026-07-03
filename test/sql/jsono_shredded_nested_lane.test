@@ -64,9 +64,9 @@ WHERE (j->>'$.URL.scheme') IS DISTINCT FROM (jsono(to_json(j)::VARCHAR)->>'$.URL
 ----
 0
 
-# A container at a VARCHAR shred path: `->>` serializes the (sorted) JSON text. The shred stores that
-# text as a read copy so a bare lane read equals `->>`; reconstruction still rebuilds the value. This
-# was a silent wrong-NULL before: the lane held NULL and a bare (trusted-complete) read returned NULL.
+# A container (or a non-string scalar) at a VARCHAR shred path is a divert: the lane stays NULL with
+# complete = 0, the value stays in the residual, and `->>` serializes the (sorted) JSON text through
+# the residual fallback. This was once a silent wrong-NULL: a NULL lane trusted as complete read NULL.
 statement ok
 CREATE TABLE varchar_container AS
 SELECT i, jsono(json, shredding := {'$.a':'VARCHAR'}) AS j
@@ -89,8 +89,8 @@ SELECT i, j->>'$.a' FROM varchar_container ORDER BY i;
 4	NULL
 5	NULL
 
-# Same column round-tripped through Parquet, where the per-shred totality fast path applies: the lane
-# carries the container text, so the bare read still returns the serialized container (not NULL).
+# Same column round-tripped through Parquet: the diverted rows carry complete = 0, so the totality
+# fast path never drops the residual fallback and the read still returns the serialized container.
 statement ok
 COPY (SELECT * FROM varchar_container) TO '__TEST_DIR__/varchar_container.parquet' (FORMAT parquet);
 
@@ -104,8 +104,7 @@ SELECT i, j->>'$.a' FROM read_parquet('__TEST_DIR__/varchar_container.parquet') 
 4	NULL
 5	NULL
 
-# to_json reconstructs the original value (containers in the lane are read copies, ignored by the
-# residual-authoritative reconstruct).
+# to_json reconstructs the original value from the residual (the diverted lanes are NULL).
 query II
 SELECT i, to_json(j)::VARCHAR FROM read_parquet('__TEST_DIR__/varchar_container.parquet') ORDER BY i;
 ----

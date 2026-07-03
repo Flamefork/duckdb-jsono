@@ -1771,8 +1771,8 @@ private:
 	                                                const JsonoPathSpec &path_spec, const LogicalType &value_type,
 	                                                bool string_fn, const string &alias) {
 		auto shreds = CollectShreddedShreds(shredded_cast.child->return_type);
-		// Reconstruct-needed reads first, so a render-unsafe container (a shred lives strictly inside
-		// the read path, stripped from the residual) reconstructs rather than bare-reading the lane — a
+		// Reconstruct-needed reads first, so a container read with a shred living strictly inside the
+		// read path (stripped from the residual) reconstructs rather than bare-reading the lane — a
 		// bare read would miss the nested shred, and the residual alone misses it too. This also covers
 		// a json-valued extract of a shred, an array shred, and a read of a subtree holding a stripped
 		// leaf. The exact-scalar read below is then reached only when no shred forces reconstruct.

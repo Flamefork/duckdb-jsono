@@ -798,10 +798,12 @@ unique_ptr<FunctionData> JsonoDiffBind(ClientContext &context, ScalarFunction &b
 	auto &cur_type = arguments[1]->return_type;
 	if (IsShreddedJsonoType(prev_type) && prev_type == cur_type && TryBuildDiffLanePlan(prev_type, bind_data->lanes)) {
 		// Both sides share one all-scalar shredded type: diff directly — pairwise typed lanes plus a
-		// residual walk. Equal shredding places equal values identically (a value's fitting is a
-		// pure function of the value), so lane-vs-lane and residual-vs-residual comparisons are
-		// complete; a row whose lane presence differs on any path (fitting <-> diverted/absent/null
-		// transitions) falls back to per-row reconstruct inside the executor.
+		// residual walk. A set lane always means the path is stripped from the residual (a value is
+		// stored exactly once: in its lane when it fits the lane type, in the residual otherwise), and
+		// placement is a pure function of the value and the lane type — so under equal shredding equal
+		// values place identically and lane-vs-lane plus residual-vs-residual comparisons are complete;
+		// a row whose lane presence differs on any path (fitting <-> diverted/absent/null transitions)
+		// falls back to per-row reconstruct inside the executor.
 		bound_function.arguments[0] = prev_type;
 		bound_function.arguments[1] = cur_type;
 		return std::move(bind_data);

@@ -256,3 +256,35 @@ SELECT g, to_json(m)::VARCHAR FROM read_parquet('__TEST_DIR__/gm_direct.parquet'
 ----
 g1	{"extra":"a","k":2,"n":{"deep":10}}
 g2	{"extra":"b","k":"diverted","n":5}
+
+# A non-string scalar (or a container) at a VARCHAR lane is a divert: the value lives only in the
+# residual and the direct fold must carry it through typed as-is. This once re-typed the number to
+# its `->>` text (the lane held a redundant read copy and shadow-delete dropped the residual value).
+query I
+SELECT to_json(jsono_group_merge(j))
+FROM (VALUES (jsono('{"k":42}', shredding := {k:'VARCHAR'}))) t(j);
+----
+{"k":42}
+
+query I
+SELECT to_json(jsono_group_merge(j))
+FROM (VALUES (jsono('{"attrs":{"z":1}}', shredding := {attrs:'VARCHAR'}))) t(j);
+----
+{"attrs":{"z":1}}
+
+# LWW across divert <-> fit transitions: a later fitting string wins over an earlier divert (lane
+# activation shadow-deletes the stale residual value), and a later divert wins over an earlier lane
+# (the residual-authoritative finalize prefers the residual).
+query I
+SELECT to_json(jsono_group_merge(j ORDER BY ord))
+FROM (VALUES (1, jsono('{"k":42}', shredding := {k:'VARCHAR'})),
+             (2, jsono('{"k":"s"}', shredding := {k:'VARCHAR'}))) t(ord, j);
+----
+{"k":"s"}
+
+query I
+SELECT to_json(jsono_group_merge(j ORDER BY ord))
+FROM (VALUES (1, jsono('{"k":"s"}', shredding := {k:'VARCHAR'})),
+             (2, jsono('{"k":42}', shredding := {k:'VARCHAR'}))) t(ord, j);
+----
+{"k":42}

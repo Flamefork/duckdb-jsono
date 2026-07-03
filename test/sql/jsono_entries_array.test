@@ -97,8 +97,8 @@ SELECT e.key, e.value FROM (
 $.other	true
 
 # A VARCHAR subfield only strips a real JSON string; a non-string (here a boolean) stays in the
-# residual as a read-copy, so it must be emitted once (by the residual), not doubled by the shred
-# overlay. The stripped string subfield is emitted once by the overlay. No duplicate keys.
+# residual with a NULL slot, so it must be emitted once (by the residual). The stripped string
+# subfield is emitted once by the overlay. No duplicate keys.
 query II
 SELECT e.key, e.value FROM (
   SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":false},{"id":2,"name":"real"}]}',

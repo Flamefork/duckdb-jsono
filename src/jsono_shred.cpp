@@ -65,12 +65,6 @@ struct ShredField {
 	JsonoScalarPrimitive primitive;         // valid when kind == Scalar
 	vector<ShredArraySubfield> subfields;   // valid when kind == Array, element-struct order
 	JsonoScalarPrimitive element_primitive; // valid when kind == ScalarArray
-	// True when a VARCHAR scalar shred may inline a container's `->>` text into its lane (a read copy)
-	// so a bare lane read equals `->>`. False when another shred lives strictly inside this path: that
-	// nested shred is stripped from the residual, so the lane cannot hold the full container and the
-	// read must reconstruct (the optimizer routes such an exact `->>` to reconstruct). See
-	// MarkContainerRenderSafety. Irrelevant for typed / array shreds.
-	bool container_render_safe = true;
 };
 
 struct ShredBindData : public FunctionData {
@@ -140,37 +134,6 @@ bool IsObjectKeyPath(const vector<PathStep> &steps) {
 		}
 	}
 	return !steps.empty();
-}
-
-// True if `prefix` is a STRICT object-key prefix of `path` (every prefix step an object key equal to
-// path's, and path strictly longer). Marks a container shred render-unsafe: a shred living strictly
-// inside it is stripped from the residual, so the lane cannot hold the full container text.
-bool IsStrictObjectKeyPrefix(const vector<PathStep> &prefix, const vector<PathStep> &path) {
-	if (prefix.empty() || prefix.size() >= path.size()) {
-		return false;
-	}
-	for (idx_t i = 0; i < prefix.size(); i++) {
-		if (prefix[i].kind != PathStepKind::Key || path[i].kind != PathStepKind::Key || prefix[i].key != path[i].key) {
-			return false;
-		}
-	}
-	return true;
-}
-
-// Set each field's container_render_safe: false when another field's path lives strictly inside it.
-// A VARCHAR shred at a render-safe container path inlines the container's `->>` text into its lane;
-// at a render-unsafe path the lane stays NULL and the read reconstructs (the nested shred is stripped
-// from the residual, so neither the lane nor the residual alone holds the full container).
-void MarkContainerRenderSafety(vector<ShredField> &fields) {
-	for (idx_t i = 0; i < fields.size(); i++) {
-		fields[i].container_render_safe = true;
-		for (idx_t j = 0; j < fields.size(); j++) {
-			if (i != j && IsStrictObjectKeyPrefix(fields[i].path.steps, fields[j].path.steps)) {
-				fields[i].container_render_safe = false;
-				break;
-			}
-		}
-	}
 }
 
 LogicalType ShredFieldType(const ShredField &field) {
@@ -291,7 +254,6 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 	// shred order must agree — sort both here. The shred-set marker hash is order-independent regardless.
 	std::sort(bind_data->fields.begin(), bind_data->fields.end(),
 	          [](const ShredField &a, const ShredField &b) { return a.path.text < b.path.text; });
-	MarkContainerRenderSafety(bind_data->fields);
 	child_list_t<LogicalType> shreds;
 	for (auto &field : bind_data->fields) {
 		shreds.emplace_back(field.path.text, ShredFieldType(field));
@@ -416,14 +378,13 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 }
 
 // Write a scalar shred's VALUE lane for a field and return whether the original value is losslessly
-// captured by the shred type (so the path may be stripped from the residual). A VARCHAR shred stores
-// the `->>` text for any scalar but strips only a real JSON string; a typed shred stores the value
-// only when its kind matches exactly; a render-safe VARCHAR shred inlines a container's `->>` text as
-// a read copy (the residual keeps the container, so reconstruct ignores the copy).
+// captured by the shred type (so the path is stripped from the residual). A shred stores the value
+// only when it round-trips through the shred type exactly (a real JSON string in a VARCHAR shred, a
+// matching-kind scalar in a typed shred); everything else stays in the residual with a NULL lane, so
+// a set lane always means the path is stripped — the value is stored exactly once.
 // `complete` (optional out) is the per-shred, per-row flag a bare lane read may be trusted by: true
-// when the lane holds the full `->>` answer (absent path, explicit null, a fitting/read-copy scalar,
-// a render-safe container text), false when the value spilled to the residual (typed-divert, or a
-// typed/render-unsafe container) and the read must fall back to the residual / reconstruct.
+// when the lane holds the full `->>` answer (absent path, explicit null, a fitting scalar), false
+// when the value stayed in the residual (divert, container) and the read must fall back / reconstruct.
 bool WriteShred(const ShredField &field, const JsonoView &view, const JsonoPathLocation &location, Vector &shred,
                 idx_t row, std::string &scratch, bool *complete = nullptr) {
 	auto set_complete = [&](bool value) {
@@ -439,19 +400,8 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const JsonoPathL
 	}
 	auto value_tag = SlotTag(view.SlotAt(location.cursor.pos));
 	if (value_tag == tag::OBJ_START || value_tag == tag::ARR_START) {
-		if (field.primitive == JsonoScalarPrimitive::Varchar && field.container_render_safe) {
-			// Render the container's sorted `->>` text into the lane as a read copy (the container
-			// stays in the residual; reconstruct's residual-authoritative overlay ignores the copy).
-			// Byte-identical to the residual COALESCE fallback — both go through AppendJsonValueText.
-			scratch.clear();
-			JsonoCursor cursor = location.cursor;
-			AppendJsonValueText(view, cursor, scratch, 0);
-			WriteJsonoStringLane(shred, row, nonstd::string_view(scratch.data(), scratch.size()));
-			set_complete(true);
-			return false; // read copy: not stripped from the residual
-		}
-		// A typed shred, or a render-unsafe VARCHAR container: the lane cannot serve `->>`, so the
-		// value stays in the residual and the read reconstructs / falls back.
+		// A container never fits a scalar lane: it stays in the residual and the read
+		// reconstructs / falls back.
 		FlatVector::SetNull(shred, row, true);
 		set_complete(false);
 		return false;
@@ -464,19 +414,12 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const JsonoPathL
 		set_complete(true);
 		return false;
 	}
-	bool fits = JsonoScalarFitsPrimitive(scalar, field.primitive);
-	if (field.primitive == JsonoScalarPrimitive::Varchar) {
-		// A VARCHAR shred renders any scalar's ->> text (a read copy) but strips only a real JSON string.
-		WriteJsonoRenderedTextLane(shred, row, scalar, scratch);
-		set_complete(true);
-		return fits; // fits == (kind == String)
-	}
-	if (fits) {
+	if (JsonoScalarFitsPrimitive(scalar, field.primitive)) {
 		WriteJsonoFittingScalarLane(shred, row, scalar, field.primitive, scratch);
 		set_complete(true);
 		return true;
 	}
-	// A present scalar that did not match its typed shred's kind gate: the value stays in the
+	// A present scalar that did not match its shred's kind gate: the value stays in the
 	// residual, so a bare lane read would miss it — not complete.
 	FlatVector::SetNull(shred, row, true);
 	set_complete(false);
@@ -549,10 +492,6 @@ bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Jsono
 			    ShredField subfield;
 			    subfield.path.steps.push_back(PathStep {PathStepKind::Key, sub.name, 0});
 			    subfield.primitive = sub.primitive;
-			    // An array-element subfield has no per-shred completeness and is always reconstructed,
-			    // so it never inlines a container read copy (that lane is never bare-read): a container
-			    // subfield stays a NULL lane and lives in the skeleton residual.
-			    subfield.container_render_safe = false;
 			    JsonoCursor probe = elem;
 			    JsonoPathLocation subloc;
 			    if (LocatePathStep(nullptr, 0, view, subfield.path.steps[0], probe)) {
@@ -770,9 +709,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		if (bind_data.keep_src[f] != DConstants::INVALID_INDEX) {
 			VectorOperations::Copy(JsonoShredVector(input_vec, bind_data.keep_src[f]), *shred_out[f], count, 0, 0);
 			// Carry the kept shred's per-row completeness through verbatim (a source divert stays a
-			// divert). Render-safety is recomputed from the target type at read time, so a kept
-			// container shred the target makes render-unsafe is still handled (the optimizer
-			// reconstructs it regardless of the copied flag).
+			// divert).
 			if (complete_out[f]) {
 				auto &src_complete = JsonoShredCompleteVector(input_vec, bind_data.keep_src[f]);
 				if (src_complete.GetType().id() == complete_out[f]->GetType().id()) {
@@ -974,8 +911,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	jsono_dom::DomDirectState dom;
 
 	// Fill a shred from the row's written residual: the value was kept there, so the two-pass locate +
-	// render path applies verbatim — and reports the per-shred completeness (a render-safe container
-	// inlines its text here; a typed/render-unsafe one leaves the lane NULL and `complete` false).
+	// render path applies verbatim — and reports the per-shred completeness.
 	auto fill_from_residual = [&](const JsonoView &view, idx_t f, idx_t row) {
 		auto location = LocatePath(view, fields[f].path.steps);
 		bool complete = true;
@@ -1002,7 +938,6 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 		if (!doc) {
 			throw InvalidInputException("jsono: invalid JSON - %s", err.msg);
 		}
-		bool needs_residual_fill = !bind_data.residual_fill_fields.empty();
 		try {
 			jsono_dom::EmitDomRowDirect(yyjson_doc_get_root(doc), dom, writer, row, &ctx);
 			FlatVector::Validity(result).SetValid(row);
@@ -1010,8 +945,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 			for (idx_t f = 0; f < fields.size(); f++) {
 				auto &cap = ctx.captures[f];
 				// A captured value (or an absent path) is complete — a bare lane read equals `->>`. A
-				// typed-divert / typed-container (diverted_scalar) is not. A ResidualFill capture defers
-				// both value and completeness to fill_from_residual below.
+				// divert (diverted_scalar: a mismatched scalar or a container) is not.
 				bool complete = !cap.diverted_scalar;
 				switch (cap.state) {
 				case jsono_dom::DomShredCapture::State::Missing:
@@ -1029,9 +963,6 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 				case jsono_dom::DomShredCapture::State::Bool:
 					WriteJsonoBooleanLane(*shred_out[f], row, cap.bool_value);
 					break;
-				case jsono_dom::DomShredCapture::State::ResidualFill:
-					needs_residual_fill = true;
-					continue; // fill_from_residual writes both value and complete
 				}
 				FlatVector::GetData<int8_t>(*complete_out[f])[row] = complete ? 1 : 0;
 			}
@@ -1040,7 +971,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 			throw;
 		}
 		yyjson_doc_free(doc);
-		if (needs_residual_fill) {
+		if (!bind_data.residual_fill_fields.empty()) {
 			JsonoBlobRow blob {writer.data[BODY_SLOTS][row],       writer.data[BODY_KEY_HEAP][row],
 			                   writer.data[BODY_STRING_HEAP][row], writer.data[BODY_SKIPS][row],
 			                   writer.data[BODY_LENGTHS][row],     writer.data[BODY_NUMS][row]};
@@ -1048,11 +979,6 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 			if (view.ParseHeader()) {
 				for (auto f : bind_data.residual_fill_fields) {
 					fill_from_residual(view, f, row);
-				}
-				for (idx_t f = 0; f < fields.size(); f++) {
-					if (ctx.captures[f].state == jsono_dom::DomShredCapture::State::ResidualFill) {
-						fill_from_residual(view, f, row);
-					}
 				}
 			}
 		}
@@ -1223,7 +1149,6 @@ void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<strin
 		}
 		fields.push_back(std::move(field));
 	}
-	MarkContainerRenderSafety(fields);
 	ShredLocalState lstate;
 	ApplyShredFields(input, count, fields, result, lstate);
 }

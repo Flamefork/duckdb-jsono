@@ -367,7 +367,7 @@ Number lanes follow the `BIGINT` > `DOUBLE` > `BOOLEAN` > `VARCHAR` preference, 
 
 Aggregates an existing **shredded** column and reports, per shred, how well the shred set is working — as a `LIST<STRUCT(path VARCHAR, type VARCHAR, lane_rate DOUBLE, divert_rate DOUBLE, complete_rate DOUBLE)>` sorted by path:
 
-- `lane_rate` — fraction of non-`NULL` rows whose typed lane is populated (by a lifted value, or a read copy in a `VARCHAR` lane).
+- `lane_rate` — fraction of non-`NULL` rows whose typed lane is populated (by a lifted value).
 - `divert_rate` — fraction of rows where the lane is `NULL` because the value did not fit its shred type and stayed behind in the residual. A high divert rate means the shred type is too narrow. An explicit JSON `null` (a complete NULL lane) is lossless and does **not** count as a divert.
 - `complete_rate` — fraction of rows where a bare typed lane read is the full `->>` answer (a fit, an absent path, or an explicit `null`). Array shreds report `1.0`.
 

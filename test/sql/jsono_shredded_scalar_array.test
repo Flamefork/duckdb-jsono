@@ -57,7 +57,7 @@ SELECT to_json(jsono('{"a":["x","y","z"]}', shredding := {'$.a':'VARCHAR[]'}));
 ----
 {"a":["x","y","z"]}
 
-# VARCHAR lane lifts only real strings; a number stays verbatim (no read-copy).
+# VARCHAR lane lifts only real strings; a number stays verbatim in the skeleton.
 query I
 SELECT to_json(jsono('{"a":["x",5,"z"]}', shredding := {'$.a':'VARCHAR[]'}));
 ----

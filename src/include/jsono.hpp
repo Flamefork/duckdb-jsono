@@ -103,9 +103,9 @@ string JsonoShredSetName();
 
 // The two child names of a scalar shred pair STRUCT(value <scalar>, complete TINYINT). `value` is the
 // typed lane (the `->>` answer when complete); `complete` is the per-shred, per-row spill flag: 1 when
-// the lane holds the full `->>` answer (absent path, explicit null, a fitting scalar, a VARCHAR
-// read-copy, or a render-safe container text), 0 when the value spilled to the residual (typed-divert,
-// a typed/render-unsafe container) so the read must fall back / reconstruct. It is a TINYINT 1/0 flag,
+// the lane holds the full `->>` answer (absent path, explicit null, a fitting scalar), 0 when the
+// value stayed in the residual (a divert or a container) so the read must fall back / reconstruct.
+// It is a TINYINT 1/0 flag,
 // not a BOOLEAN, because DuckDB's Parquet statistics reader omits BOOLEAN page min/max — a BOOLEAN flag
 // would carry no zone-map on a Parquet scan and never prove per-shred totality there.
 string JsonoShredValueName();

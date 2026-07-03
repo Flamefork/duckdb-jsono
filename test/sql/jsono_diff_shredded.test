@@ -127,3 +127,38 @@ SELECT to_json(jsono_diff(jsono('{"k":"a","n":1}', shredding := {k:'VARCHAR'}),
                           jsono('{"k":"b","n":2}', shredding := {n:'BIGINT'})));
 ----
 {"k":"b","n":2}
+
+# A non-string scalar at a VARCHAR lane is a divert (NULL lane, value in the residual): equal
+# shredding with number-vs-number values diffs through the residual walk, and a number-vs-string
+# transition is a lane-presence mismatch that falls back to per-row reconstruct. Both once broke
+# when the lane held a redundant `->>` read copy of the residual value.
+query I
+SELECT to_json(jsono_diff(jsono('{"k":42}', shredding := {k:'VARCHAR'}),
+                          jsono('{"k":43}', shredding := {k:'VARCHAR'})));
+----
+{"k":43}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"k":42}', shredding := {k:'VARCHAR'}),
+                          jsono('{"k":"42"}', shredding := {k:'VARCHAR'})));
+----
+{"k":"42"}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"k":"42"}', shredding := {k:'VARCHAR'}),
+                          jsono('{"k":42}', shredding := {k:'VARCHAR'})));
+----
+{"k":42}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"k":42}', shredding := {k:'VARCHAR'}),
+                          jsono('{"k":42}', shredding := {k:'VARCHAR'})));
+----
+{}
+
+# A container at a VARCHAR lane diverts too: container-vs-container diffs via the residual walk.
+query I
+SELECT to_json(jsono_diff(jsono('{"a":{"x":1,"y":2}}', shredding := {a:'VARCHAR'}),
+                          jsono('{"a":{"x":1,"y":3}}', shredding := {a:'VARCHAR'})));
+----
+{"a":{"y":3}}

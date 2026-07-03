@@ -86,11 +86,6 @@ inline const char *JsonoScalarPrimitiveTypeName(JsonoScalarPrimitive primitive) 
 	throw InternalException("jsono: unhandled scalar primitive");
 }
 
-inline bool JsonoScalarPrimitiveStoresReadCopy(JsonoScalarPrimitive primitive) {
-	// Only VARCHAR renders the `->>` text of non-string scalars while leaving them in the residual.
-	return primitive == JsonoScalarPrimitive::Varchar;
-}
-
 inline bool JsonoScalarFitsPrimitive(const JsonoScalar &scalar, JsonoScalarPrimitive primitive) {
 	switch (primitive) {
 	case JsonoScalarPrimitive::Varchar:

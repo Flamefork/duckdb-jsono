@@ -125,25 +125,19 @@ columnar read) or whether it must fall back to / reconstruct from the residual:
 
 - absent path / explicit JSON `null`: `value` = `NULL`, `->>` = `NULL` →
   `complete = 1` (a bare `NULL` read is correct).
-- a scalar that round-trips through the shred type, or any scalar's `->>` text in
-  a `VARCHAR` shred (a read copy): `value` set → `complete = 1`.
-- a container at a **render-safe** `VARCHAR` shred path: the container's sorted
-  `->>` text is stored in `value` as a read copy (the residual keeps the
-  container; reconstruct ignores the copy) → `complete = 1`. *Render-safe* means
-  no other shred lives strictly inside `P`.
-- a typed-divert (a string at a `BIGINT` lane, …), a container at a typed shred,
-  or a container at a **render-unsafe** `VARCHAR` path (another shred lives
-  strictly inside `P`, so the residual cannot hold the full container either):
-  `value` = `NULL`, the value stays in the residual → `complete = 0`. The
-  optimizer routes an exact `->>` on a render-unsafe path to reconstruct.
+- a scalar that round-trips through the shred type: `value` set → `complete = 1`.
+- a divert (a string at a `BIGINT` lane, a number at a `VARCHAR` lane, …) or a
+  container at `P`: `value` = `NULL`, the value stays in the residual →
+  `complete = 0`, so the read falls back to the residual / reconstructs.
 
-**Lossless invariant: the residual holds everything a shred cannot reproduce
-exactly.** A value is removed from the residual and kept only in its shred when it
-round-trips losslessly through the shred type (a JSON string in a `VARCHAR` shred,
-an integer in a `BIGINT` shred). A value that does not fit — a string in a `BIGINT`
-shred, an explicit JSON `null`, a missing key, or a number whose shred type would
-re-encode it differently — stays in the residual, and its shred is a redundant
-read copy. Pure object-key scalar paths that round-trip through their shred type
+**Single-storage invariant: every value is stored exactly once, and a set lane
+means the path is stripped from the residual.** A value is removed from the
+residual and kept only in its shred when it round-trips losslessly through the
+shred type (a JSON string in a `VARCHAR` shred, an integer in a `BIGINT` shred).
+A value that does not fit — a string in a `BIGINT` shred, a number in a `VARCHAR`
+shred, a container, an explicit JSON `null`, a missing key, or a number whose
+shred type would re-encode it differently — stays in the residual with a `NULL`
+lane. Pure object-key scalar paths that round-trip through their shred type
 are removed from the residual; array-index paths and non-lossless shred values
 stay in the residual. A whole regular array is a separate case — see
 [Array shreds](#array-shreds-liststruct), which lift element subfields (object
@@ -153,9 +147,10 @@ the residual.
 
 The original value is recovered by overlaying the shreds onto the residual,
 **residual-authoritative**: a path absent from the residual is filled from its
-shred, and a path present in the residual wins (its shred is the redundant copy).
-Since the removed values are exactly those their shred reproduces byte-for-byte,
-the overlay reconstructs the value losslessly.
+shred, and a path present in the residual wins (a divert's lane is `NULL`, so the
+overlay never faces a live conflict on writer-produced data). Since the removed
+values are exactly those their shred reproduces byte-for-byte, the overlay
+reconstructs the value losslessly.
 
 ### Shred manifest
 
@@ -290,8 +285,8 @@ slot's *validity* is what disambiguates the two element states on reconstruction
 
 So a lifted element's placeholder `VAL_NULL` and an explicit JSON `null` element are
 never confused: the former always pairs with a non-`NULL` shred slot, the latter
-always with a `NULL` one. A `VARCHAR[]` lane stores no read-copy — it lifts (and so
-marks its slot non-`NULL`) only a real JSON string — keeping that invariant exact.
+always with a `NULL` one. A `VARCHAR[]` lane lifts (and so marks its slot
+non-`NULL`) only a real JSON string, like every lane — keeping that invariant exact.
 
 The manifest lists the array's object-key path with its `LIST<TYPE>` type string when
 at least one element was lifted, exactly as for the other shreds, so a raw cast that

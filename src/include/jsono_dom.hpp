@@ -247,17 +247,16 @@ struct DomDirectState {
 // One-pass shredded text write (jsono(text, shredding := ...)): pass 1 matches the spec's
 // object-key paths against each object's deduped sorted keys while sizing. A lossless leaf
 // (value kind matches the shred type exactly) is stripped from the emit plan — pass 2 then
-// never visits it — and captured below; a present-but-lossy leaf of a VARCHAR shred stays in
-// the residual and is marked ResidualFill, so the caller fills the shred from the written row
-// with the exact locate-and-render semantics of the two-pass path.
+// never visits it — and captured below; a present-but-lossy leaf stays in the residual with
+// a NULL, incomplete lane.
 struct DomShredCapture {
-	enum class State : uint8_t { Missing, String, Int, Uint, Bool, ResidualFill };
+	enum class State : uint8_t { Missing, String, Int, Uint, Bool };
 	State state = State::Missing;
 	bool stripped = false;
-	// A present scalar value at a typed (non-VARCHAR) shred path that the shred did not capture
-	// (kept in the residual, shred NULL): a bare struct_extract would read NULL while the residual
-	// `->>`+CAST would yield the value, so this shred is NOT complete on this row for the typed fast path.
-	// Absent paths and present null/container values stay false (both read NULL either way).
+	// A present value at a shred path that the shred did not capture — a mismatched scalar or a
+	// container (kept in the residual, shred NULL): a bare struct_extract would read NULL while the
+	// residual `->>` would yield the value, so this shred is NOT complete on this row.
+	// Absent paths and present nulls stay false (both read NULL either way).
 	bool diverted_scalar = false;
 	nonstd::string_view text;
 	int64_t int_value = 0;
