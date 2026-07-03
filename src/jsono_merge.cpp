@@ -1277,13 +1277,17 @@ bool ShredPathsStructurallyConflict(const vector<PathStep> &a, const vector<Path
 	return true;
 }
 
-// Copy a shred column from the winning input into the result shred, then null it where the
-// merged value is SQL NULL. Patch takes the last input that declares the shred (RFC 7396
-// last-wins); Overlay takes the first (base-authoritative).
+// Fill the result shred lane by selecting, PER ROW, the winning input's lane value. Every input
+// that declares the shred is a candidate; on a row the value lives in the input where the key is
+// present (its lane slot is valid). Patch/IgnoreNulls take the LAST such input (RFC 7396 last-wins),
+// Overlay the FIRST (base-authoritative). A per-INPUT winner would drop the value on a row where the
+// chosen input happens to lack the key. Present-null / diverted rows never reach here — the conflict
+// scan diverts them — so a NULL lane slot on a kept row always means the key is absent from that
+// input. All candidate lanes share the shred's type (the fast path bails a name declared with mixed
+// types), so they stage side by side for one gather.
 void FastCopyShred(DataChunk &args, idx_t ncols, idx_t count, MergeMode mode, const MergeShred &shred, Vector &dst,
                    const ValidityMask &result_validity) {
-	idx_t src_arg = DConstants::INVALID_INDEX;
-	idx_t src_child = 0;
+	vector<Vector *> lanes;
 	for (idx_t i = 0; i < ncols; i++) {
 		auto &t = args.data[i].GetType();
 		if (!IsShreddedJsonoType(t)) {
@@ -1292,23 +1296,53 @@ void FastCopyShred(DataChunk &args, idx_t ncols, idx_t count, MergeMode mode, co
 		JsonoLayoutType layout;
 		TryParseJsonoLayoutType(t, layout);
 		for (idx_t c = 0; c < layout.shreds.size(); c++) {
-			if (layout.shreds[c].first == shred.name &&
-			    (mode != MergeMode::Overlay || src_arg == DConstants::INVALID_INDEX)) {
-				src_arg = i;
-				src_child = c;
+			if (layout.shreds[c].first == shred.name) {
+				args.data[i].Flatten(count);
+				lanes.push_back(&JsonoShredVector(args.data[i], c));
 			}
 		}
 	}
 	dst.SetVectorType(VectorType::FLAT_VECTOR);
-	if (src_arg == DConstants::INVALID_INDEX) {
+	if (lanes.empty()) {
 		auto &dv = FlatVector::Validity(dst);
 		for (idx_t row = 0; row < count; row++) {
 			dv.SetInvalid(row);
 		}
 		return;
 	}
-	args.data[src_arg].Flatten(count);
-	VectorOperations::Copy(JsonoShredVector(args.data[src_arg], src_child), dst, count, 0, 0);
+	if (lanes.size() == 1) {
+		VectorOperations::Copy(*lanes[0], dst, count, 0, 0);
+	} else {
+		// Stage every candidate lane side by side ([candidate * count + row]) so one gather resolves
+		// the per-row winner. A row with no valid candidate points at candidate 0's slot, which is
+		// NULL there (no candidate carries the key), so the gather yields the correct NULL.
+		idx_t num = lanes.size();
+		Vector staging(dst.GetType(), num * count);
+		for (idx_t ci = 0; ci < num; ci++) {
+			VectorOperations::Copy(*lanes[ci], staging, count, 0, ci * count);
+		}
+		SelectionVector sel(count);
+		for (idx_t row = 0; row < count; row++) {
+			idx_t winner = 0;
+			if (mode == MergeMode::Overlay) {
+				for (idx_t ci = 0; ci < num; ci++) {
+					if (FlatVector::Validity(*lanes[ci]).RowIsValid(row)) {
+						winner = ci;
+						break;
+					}
+				}
+			} else {
+				for (idx_t ci = num; ci-- > 0;) {
+					if (FlatVector::Validity(*lanes[ci]).RowIsValid(row)) {
+						winner = ci;
+						break;
+					}
+				}
+			}
+			sel.set_index(row, winner * count + row);
+		}
+		VectorOperations::Copy(staging, dst, sel, count, 0, 0);
+	}
 	if (!result_validity.AllValid()) {
 		dst.Flatten(count);
 		auto &dv = FlatVector::Validity(dst);
@@ -1411,6 +1445,28 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			}
 		}
 	}
+	// A shred name declared with different types across inputs has incompatible lane layouts, so the
+	// per-row lane copy cannot stage its candidates together. The reshred fallback coerces every input
+	// to the merged (last-declared) type instead.
+	for (idx_t i = 0; i < ncols && fast_viable; i++) {
+		auto &t = args.data[i].GetType();
+		if (!IsShreddedJsonoType(t)) {
+			continue;
+		}
+		JsonoLayoutType layout;
+		TryParseJsonoLayoutType(t, layout);
+		for (auto &layout_shred : layout.shreds) {
+			for (auto &merge_shred : bind_data.shreds) {
+				if (merge_shred.name == layout_shred.first && merge_shred.type != layout_shred.second) {
+					fast_viable = false;
+					break;
+				}
+			}
+			if (!fast_viable) {
+				break;
+			}
+		}
+	}
 
 	auto run_reshred_fallback = [&](const vector<Vector *> &fallback_args, idx_t fallback_count,
 	                                Vector &fallback_result) {
@@ -1451,6 +1507,58 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		vector<idx_t> conflict_rows;
 		JsonoView pview;
 		JsonoBlobRow pblob {};
+		// The residual-conflict test for one shred against a residual view (the folded residual or a
+		// raw input's residual): a top-level key present, a nested path resolving to a present value or
+		// breaking its object skeleton, or a scalar-array path holding anything but its array skeleton.
+		auto residual_hits_shred = [&](const JsonoView &view, idx_t k) -> bool {
+			if (shred_kinds[k] == ShredKind::ScalarArray) {
+				return ResidualConflictsWithScalarArrayShredPath(view, shred_paths[k]);
+			}
+			if (shred_paths[k].size() == 1) {
+				return ResidualHasTopLevelKey(view, bind_data.shreds[k].name);
+			}
+			return ResidualConflictsWithShredPath(view, shred_paths[k]);
+		};
+		// A shredded input keeps a shred key in its OWN residual only for a present-null (explicit
+		// JSON null) or a diverted value — both cases the lane slot is NULL, so a valid lane means the
+		// key is stripped. Probing such an input's residual per row lets the fold divert those rows: a
+		// present-null delete that the residual fold erases (against a base that stripped the key) is
+		// invisible to the folded-residual scan, but the lane copy-through would wrongly keep the base
+		// value. A lane with no NULL slot in the whole chunk can never carry a residual key, so only
+		// lanes that actually have a NULL slot are probe candidates — the schema-stable case (every
+		// lane present) collects none and the per-row probe is skipped entirely.
+		struct ShreddedProbeInput {
+			idx_t arg;
+			vector<idx_t> shred_ks;
+			vector<UnifiedVectorFormat> lane_fmt;
+		};
+		vector<ShreddedProbeInput> probe_inputs;
+		for (idx_t i = 0; i < ncols; i++) {
+			auto &t = args.data[i].GetType();
+			if (!IsShreddedJsonoType(t)) {
+				continue;
+			}
+			JsonoLayoutType layout;
+			TryParseJsonoLayoutType(t, layout);
+			ShreddedProbeInput pin;
+			pin.arg = i;
+			for (idx_t c = 0; c < layout.shreds.size(); c++) {
+				for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
+					if (bind_data.shreds[k].name == layout.shreds[c].first) {
+						UnifiedVectorFormat fmt;
+						JsonoShredVector(args.data[i], c).ToUnifiedFormat(count, fmt);
+						if (!fmt.validity.AllValid()) {
+							pin.shred_ks.push_back(k);
+							pin.lane_fmt.push_back(std::move(fmt));
+						}
+						break;
+					}
+				}
+			}
+			if (!pin.shred_ks.empty()) {
+				probe_inputs.push_back(std::move(pin));
+			}
+		}
 		for (idx_t row = 0; row < count; row++) {
 			bool row_conflict = false;
 			JsonoBlobRow blob {};
@@ -1459,7 +1567,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			}
 			JsonoView v = MakeJsonoView(blob);
 			if (!v.ParseHeader()) {
-				continue;
+				throw InternalException("jsono merge fast path: malformed folded residual blob");
 			}
 			// A non-object merged value (a non-object plain patch replaced the document) carries no
 			// lanes; copying them would attach stale lanes to a scalar/array. The all-shredded case
@@ -1473,11 +1581,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				// non-object residual is handled by the plain-input gate above, preserving the
 				// all-shredded behaviour). A nested shred additionally conflicts if a node along
 				// its path is a present non-object (its lane cannot overlay into a scalar).
-				bool hit = shred_kinds[k] == ShredKind::ScalarArray
-				               ? ResidualConflictsWithScalarArrayShredPath(v, shred_paths[k])
-				               : (shred_paths[k].size() == 1 ? ResidualHasTopLevelKey(v, bind_data.shreds[k].name)
-				                                             : ResidualConflictsWithShredPath(v, shred_paths[k]));
-				if (hit) {
+				if (residual_hits_shred(v, k)) {
 					row_conflict = true;
 					break;
 				}
@@ -1516,6 +1620,35 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 						}
 					}
 					if (row_conflict) {
+						break;
+					}
+				}
+			}
+			for (auto &pin : probe_inputs) {
+				if (row_conflict) {
+					break;
+				}
+				// Only a NULL lane can hide a present key (present-null or divert) in the input's
+				// residual — a valid lane strips its key. Read the residual only when some declared
+				// shred is NULL on this row, and probe only those shreds.
+				bool any_null = false;
+				for (idx_t j = 0; j < pin.shred_ks.size(); j++) {
+					if (!RowIsValid(pin.lane_fmt[j], row)) {
+						any_null = true;
+						break;
+					}
+				}
+				if (!any_null) {
+					continue;
+				}
+				JsonoBlobRow rblob {};
+				JsonoView rview;
+				if (raw[pin.arg].Read(row, rblob, rview) != JsonoRowState::Value) {
+					continue;
+				}
+				for (idx_t j = 0; j < pin.shred_ks.size(); j++) {
+					if (!RowIsValid(pin.lane_fmt[j], row) && residual_hits_shred(rview, pin.shred_ks[j])) {
+						row_conflict = true;
 						break;
 					}
 				}
@@ -2009,8 +2142,11 @@ void DirectFoldState(DirectShreddedAcc &target, const DirectShreddedAcc &source,
 		return;
 	}
 	JsonoView source_view = ViewOfBlob(source.residual);
-	if (source_view.ParseHeader() && source_view.Slots() > 0 &&
-	    ContainerChildCount(SlotPayload(source_view.SlotAt(0))) > 0) {
+	// source.residual is a self-built fold output; ResidualConflictsWithShredPath below reads its
+	// slots and relies on this parse. Parse into a bool so the assert survives a release build.
+	bool source_parsed = source_view.ParseHeader();
+	D_ASSERT(source_parsed);
+	if (source_parsed && source_view.Slots() > 0 && ContainerChildCount(SlotPayload(source_view.SlotAt(0))) > 0) {
 		JsonoView target_view = ViewOfBlob(target.residual);
 		target_view.ParseHeader();
 		static thread_local JsonoBuilder scratch;

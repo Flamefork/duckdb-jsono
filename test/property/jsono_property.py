@@ -727,6 +727,41 @@ def test_merge_patch_shredded_plain_parity(base: dict[str, Any], patches: list[A
     )
 
 
+# EVERY input SHREDDED with the same spec must fold identically to the same all-PLAIN fold, for both
+# merge_patch (last-wins) and overlay (base-authoritative). This drives the all-shredded fast path's
+# PER-ROW lane winner: a shred key present in one input and absent (or explicit-null) in another,
+# where a single per-INPUT winner would drop the surviving value or keep a deleted one. Patches are
+# objects so their keys interact with the lanes (a None value is an RFC 7396 delete / overlay no-op).
+all_shred_patches = st.lists(merge_patch_objects, min_size=1, max_size=3)
+
+
+@settings(PROPERTY_SETTINGS)
+@example(base={"a": 1}, patches=[{}], spec_keys=["a"])  # patch omits the key: base lane survives
+@example(base={"a": 1}, patches=[{"a": None}], spec_keys=["a"])  # present-null deletes the base lane
+@example(base={"a": 1, "b": 2}, patches=[{"b": 3}], spec_keys=["a", "b"])  # winner differs per shred
+@example(base={"a": 1}, patches=[{"a": 2}, {}], spec_keys=["a"])  # a later patch omits: earlier wins
+@given(
+    base=merge_patch_base,
+    patches=all_shred_patches,
+    spec_keys=st.lists(merge_patch_keys, min_size=1, max_size=5, unique=True),
+)
+def test_merge_all_shredded_parity(base: dict[str, Any], patches: list[Any], spec_keys: list[str]) -> None:
+    spec_keys = [key for key in spec_keys if key in base]
+    if not spec_keys:
+        return
+    spec = shred_spec_sql({key: "VARCHAR" for key in spec_keys})
+    base_lit = sql_literal(json_dumps(base))
+    plain_args = ", ".join(f"jsono({sql_literal(json_dumps(patch))})" for patch in patches)
+    shred_args = ", ".join(f"jsono({sql_literal(json_dumps(patch))}, shredding := {spec})" for patch in patches)
+    for fn in ("jsono_merge_patch", "jsono_overlay"):
+        reference = SESSION.value(f"to_json({fn}(jsono({base_lit}), {plain_args}))")
+        candidate = SESSION.value(f"to_json({fn}(jsono({base_lit}, shredding := {spec}), {shred_args}))")
+        assert reference == candidate, (
+            f"all-shredded {fn} diverged from plain: base {base!r} patches {patches!r} "
+            f"spec {spec_keys!r}: plain {reference!r} != shredded {candidate!r}"
+        )
+
+
 # A jsono({...}) patch with a NESTED object auto-shreds its scalars into '$.path' lanes.
 # Merging it onto a shredded base puts nested shreds in the
 # merged set, which the fast path copies through as lanes overlaid at their paths. The same merge
@@ -1553,6 +1588,7 @@ PROPERTIES = [
     test_shred_lossless,
     test_reshred_lossless,
     test_merge_patch_shredded_plain_parity,
+    test_merge_all_shredded_parity,
     test_merge_patch_auto_shred_patch_parity,
     test_array_reader_parity,
     test_scalar_array_reader_parity,

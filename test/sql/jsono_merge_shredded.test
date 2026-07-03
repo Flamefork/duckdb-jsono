@@ -386,3 +386,169 @@ SELECT to_json(jsono_merge_patch(
 )) = to_json(jsono_merge_patch(jsono('{"a":false}'), jsono('{"a":{"a":true}}')));
 ----
 true
+
+# --- Per-ROW lane selection on the all-shredded fast path. FastCopyShred used to pick the winning
+# lane column per-INPUT (the last input declaring the shred for Patch, the first for Overlay), then
+# copy that one column verbatim. On a row where the chosen input's document lacks the key, its lane
+# slot is NULL, so an earlier/later input's lane value was silently dropped. The winner is per-ROW. ---
+
+# Patch: the patch omits the shred key (empty object) — RFC 7396 no-op, the base lane survives.
+# The last input (the patch) declared shred k but its lane is NULL on this row.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"k":"old"}', shredding := {k:'VARCHAR'}),
+  jsono('{}', shredding := {k:'VARCHAR'})
+));
+----
+{"k":"old"}
+
+# Patch: the patch carries a different key; the base's shred key is absent from the patch document.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"k":"old","x":1}', shredding := {k:'VARCHAR'}),
+  jsono('{"x":2}', shredding := {k:'VARCHAR'})
+));
+----
+{"k":"old","x":2}
+
+# Overlay mirror: the base omits the shred key, the patch supplies it — overlay fills an absent key.
+# The first input (the base) declared shred k but its lane is NULL on this row.
+query I
+SELECT to_json(jsono_overlay(
+  jsono('{"x":1}', shredding := {k:'VARCHAR'}),
+  jsono('{"k":"new"}', shredding := {k:'VARCHAR'})
+));
+----
+{"k":"new","x":1}
+
+# Overlay: the base owns the key, the patch omits it — base-authoritative, base lane preserved.
+query I
+SELECT to_json(jsono_overlay(
+  jsono('{"k":"base","x":1}', shredding := {k:'VARCHAR'}),
+  jsono('{"x":9}', shredding := {k:'VARCHAR'})
+));
+----
+{"k":"base","x":1}
+
+# Present-null delete (RFC 7396): a shredded patch with k=null deletes the base's shred value. The
+# explicit null lives in the patch residual, but the residual fold erases it against a base that
+# stripped k into its lane, so the folded-residual conflict scan cannot see it — such rows must
+# divert to the reshred fallback for the delete to win over the surviving base lane.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"k":"old","x":1}', shredding := {k:'VARCHAR'}),
+  jsono('{"k":null}', shredding := {k:'VARCHAR'})
+));
+----
+{"x":1}
+
+# Present-null delete on a typed (BIGINT) shred, same divert.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"n":5,"x":1}', shredding := {n:'BIGINT'}),
+  jsono('{"n":null}', shredding := {n:'BIGINT'})
+));
+----
+{"x":1}
+
+# Three inputs, present-null in the middle deletes; the last omits the key so the delete stands.
+query I
+SELECT to_json(jsono_merge_patch(
+  jsono('{"k":"old"}', shredding := {k:'VARCHAR'}),
+  jsono('{"k":null}', shredding := {k:'VARCHAR'}),
+  jsono('{"z":"1"}', shredding := {k:'VARCHAR'})
+));
+----
+{"z":"1"}
+
+# Multi-row vector: even rows have the patch lane set, odd rows have it absent — a single per-INPUT
+# winner cannot serve both, only per-ROW selection does.
+query II
+SELECT g, to_json(m) FROM (
+  SELECT g, jsono_merge_patch(
+    jsono('{"k":"base' || g || '"}', shredding := {k:'VARCHAR'}),
+    CASE WHEN g % 2 = 0 THEN jsono('{"k":"patch' || g || '"}', shredding := {k:'VARCHAR'})
+         ELSE jsono('{}', shredding := {k:'VARCHAR'}) END
+  ) AS m
+  FROM range(4) t(g)
+) ORDER BY g;
+----
+0	{"k":"patch0"}
+1	{"k":"base1"}
+2	{"k":"patch2"}
+3	{"k":"base3"}
+
+# A per-row SQL NULL patch nullifies just that row's result (existing SQL-NULL gating preserved).
+query II
+SELECT g, to_json(m) FROM (
+  SELECT g, jsono_merge_patch(
+    jsono('{"k":"b' || g || '"}', shredding := {k:'VARCHAR'}),
+    CASE WHEN g = 1 THEN NULL ELSE jsono('{"k":"p' || g || '"}', shredding := {k:'VARCHAR'}) END
+  ) AS m
+  FROM range(3) t(g)
+) ORDER BY g;
+----
+0	{"k":"p0"}
+1	NULL
+2	{"k":"p2"}
+
+# A per-row non-object plain patch replaces the whole document (existing non-object gating
+# preserved), while neighbouring rows keep the base lane through the fast path.
+query II
+SELECT g, to_json(m) FROM (
+  SELECT g, jsono_merge_patch(
+    jsono('{"k":"b' || g || '"}', shredding := {k:'VARCHAR'}),
+    CASE WHEN g = 1 THEN jsono('5') ELSE jsono('{}') END
+  ) AS m
+  FROM range(3) t(g)
+) ORDER BY g;
+----
+0	{"k":"b0"}
+1	5
+2	{"k":"b2"}
+
+# Parity oracle: the all-shredded fold (fast path + per-row selection + present-null divert) must
+# equal the plain RFC 7396 reference for every case. Zero rows may differ.
+query I
+SELECT count(*) FROM (
+  SELECT
+    to_json(jsono_merge_patch(jsono(a_txt, shredding := {k:'VARCHAR', n:'BIGINT'}),
+                              jsono(b_txt, shredding := {k:'VARCHAR', n:'BIGINT'}))) AS shredded,
+    to_json(jsono_merge_patch(jsono(a_txt), jsono(b_txt))) AS plain
+  FROM (VALUES
+    ('{"k":"old"}', '{}'),
+    ('{"k":"old","x":1}', '{"x":2}'),
+    ('{"k":"old"}', '{"k":"new"}'),
+    ('{"k":"old"}', '{"k":null}'),
+    ('{"k":"old","x":1}', '{"k":null}'),
+    ('{"x":1}', '{"k":"new"}'),
+    ('{"n":5,"x":1}', '{}'),
+    ('{"n":5}', '{"n":9}'),
+    ('{"n":5}', '{"n":null}'),
+    ('{"n":5,"x":1}', '{"n":null}'),
+    ('{}', '{}'),
+    ('{"k":"a","n":1}', '{"k":"b"}'),
+    ('{"k":"a","n":1}', '{"k":null,"n":9}')
+  ) t(a_txt, b_txt)
+) WHERE shredded IS DISTINCT FROM plain;
+----
+0
+
+# Overlay parity oracle: the all-shredded overlay must equal the plain overlay reference.
+query I
+SELECT count(*) FROM (
+  SELECT
+    to_json(jsono_overlay(jsono(a_txt, shredding := {k:'VARCHAR'}),
+                          jsono(b_txt, shredding := {k:'VARCHAR'}))) AS shredded,
+    to_json(jsono_overlay(jsono(a_txt), jsono(b_txt))) AS plain
+  FROM (VALUES
+    ('{"x":1}', '{"k":"new"}'),
+    ('{"k":"base","x":1}', '{"x":9}'),
+    ('{"k":"base"}', '{"k":"other"}'),
+    ('{}', '{"k":"fill"}'),
+    ('{"k":"base"}', '{}'),
+    ('{"k":null,"x":1}', '{"k":"fill"}')
+  ) t(a_txt, b_txt)
+) WHERE shredded IS DISTINCT FROM plain;
+----
+0
