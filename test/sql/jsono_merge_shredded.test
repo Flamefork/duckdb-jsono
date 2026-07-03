@@ -552,3 +552,23 @@ SELECT count(*) FROM (
 ) WHERE shredded IS DISTINCT FROM plain;
 ----
 0
+
+# A shred name declared with a DIFFERENT lane type across inputs has incompatible lane layouts, so
+# the per-row lane copy cannot stage its candidates together: the whole vector must take the reshred
+# fallback and still match the plain RFC 7396 reference. The second row is the loss-shaped case —
+# the BIGINT-declaring patch lacks the key, so a broken fallback would drop the base's VARCHAR k.
+query I
+SELECT count(*) FROM (
+  SELECT
+    to_json(jsono_merge_patch(jsono(a_txt, shredding := {k:'VARCHAR'}),
+                              jsono(b_txt, shredding := {k:'BIGINT'}))) AS shredded,
+    to_json(jsono_merge_patch(jsono(a_txt), jsono(b_txt))) AS plain
+  FROM (VALUES
+    ('{"k":"old"}', '{"k":42}'),
+    ('{"k":"old","x":1}', '{"x":2}'),
+    ('{"x":1}', '{"k":7}'),
+    ('{"k":"old"}', '{"k":null}')
+  ) t(a_txt, b_txt)
+) WHERE shredded IS DISTINCT FROM plain;
+----
+0

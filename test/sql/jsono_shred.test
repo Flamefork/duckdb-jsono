@@ -232,6 +232,32 @@ SELECT jsono('{"a":[7]}', shredding := {'$[0]':'BIGINT'});
 ----
 invalid path
 
+# Layout recognition enforces the same rule on stored/cast structs: a lane name that is not an
+# object-key chain keeps the struct from being recognized as JSONO (no writer produces such a lane),
+# so jsono functions refuse it at bind instead of reading a read-copy lane. The same layout with an
+# object-key lane is recognized and binds.
+statement ok
+CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.arr[0]" STRUCT("value" BIGINT, complete TINYINT)))));
+
+statement error
+SELECT jsono_array_length(x) FROM bad_lane_layout;
+----
+must be JSONO
+
+statement ok
+CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.arr" STRUCT("value" BIGINT, complete TINYINT)))));
+
+query I
+SELECT count(*) FROM (SELECT jsono_array_length(x) FROM good_lane_layout);
+----
+0
+
+statement ok
+DROP TABLE bad_lane_layout;
+
+statement ok
+DROP TABLE good_lane_layout;
+
 # No JSON key is reserved by the storage layout: keys that collide with layout names (body,
 # shreds, "jsono") or old flat field names shred and read back correctly — 'body' through its
 # path form (a bare 'body' shred name would duplicate the layout's residual field; see below).
