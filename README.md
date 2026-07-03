@@ -355,7 +355,7 @@ FROM events;
 Two named arguments tune the thresholds (both fractions in `[0.0, 1.0]`):
 
 - `min_presence` (default `0.5`) — keep a path only when it appears in at least this fraction of non-`NULL` rows. Sparse fields drop out.
-- `min_fit` (default `1.0`, fully lossless) — a lane type must fit at least this fraction of the path's present values. Lowering it accepts a majority type for a path with a few off-type values (which stay in the residual). An explicit JSON `null` is lossless in every lane (it stays complete in the residual), so it counts as fitting any type and never blocks a shred at `min_fit := 1.0`.
+- `min_fit` (default `1.0`, fully lossless) — a lane type must fit at least this fraction of the rows that carry the path. Every row where the key is present counts toward the denominator, including rows whose value is an object (or a nested container) that no lane can lift — so a key that is a scalar in some rows and an object in others drops at `min_fit := 1.0`. Lowering it accepts a majority type for a path with a few off-type values (which stay in the residual). An explicit JSON `null` is lossless in every lane (it stays complete in the residual), so it counts as fitting any type and never blocks a shred at `min_fit := 1.0`.
 
 ```sql
 SELECT jsono_suggest_shredding(payload, min_presence := 0.9, min_fit := 0.99) FROM events;
@@ -368,7 +368,7 @@ Number lanes follow the `BIGINT` > `DOUBLE` > `BOOLEAN` > `VARCHAR` preference, 
 Aggregates an existing **shredded** column and reports, per shred, how well the shred set is working — as a `LIST<STRUCT(path VARCHAR, type VARCHAR, lane_rate DOUBLE, divert_rate DOUBLE, complete_rate DOUBLE)>` sorted by path:
 
 - `lane_rate` — fraction of non-`NULL` rows whose typed lane is populated (by a lifted value).
-- `divert_rate` — fraction of rows where the lane is `NULL` because the value did not fit its shred type and stayed behind in the residual. A high divert rate means the shred type is too narrow. An explicit JSON `null` (a complete NULL lane) is lossless and does **not** count as a divert.
+- `divert_rate` — fraction of non-`NULL` rows where the lane is `NULL` because the value did not fit its shred type and stayed behind in the residual. A high divert rate means the shred type is too narrow. An explicit JSON `null` (a complete NULL lane) is lossless and does **not** count as a divert.
 - `complete_rate` — fraction of rows where a bare typed lane read is the full `->>` answer (a fit, an absent path, or an explicit `null`). Array shreds report `1.0`.
 
 ```sql

@@ -49,8 +49,9 @@ constexpr std::array<JsonoScalarPrimitive, 5> kPrimitivePreference = {
 // map silently would emit a partial spec that looks authoritative, so throw instead.
 constexpr idx_t kMaxCandidatePaths = 8192;
 
-// Per-lane-primitive counters keyed by the primitive's enum ordinal.
-using FitCounts = std::array<idx_t, 5>;
+// Per-lane-primitive counters keyed by the primitive's enum ordinal. Sized off kPrimitivePreference
+// so a new primitive can never index past the array (`fit[uint8_t(primitive)]` out-of-bounds).
+using FitCounts = std::array<idx_t, kPrimitivePreference.size()>;
 
 // One object-array element subfield's fit tally: how many object elements carry it, and how many
 // of those carry a scalar value fitting each lane primitive.
@@ -62,11 +63,17 @@ struct SubfieldStat {
 // Everything the advisor needs to decide one candidate path's shred role and lane type at finalize.
 // A path is observed as at most one of scalar / scalar-array / object-array in clean data; the
 // counters keep the three interpretations separate so a mixed path drops under min_fit instead of
-// silently picking one.
+// silently picking one. Occurrences that carry the path but fit no lane role (an object value under
+// a scalar key, or a nested `$.a.b` whose value is itself an object or array) land in
+// nonrole_present: they inflate the min_fit denominator without feeding any role's fit numerator, so
+// a path that is a scalar in some rows and an object in others drops at min_fit = 1.0.
 struct SuggestCandidate {
 	// Scalar leaf role (a top-level scalar key or a one-level-nested `$.a.b` scalar).
 	idx_t scalar_present = 0;
 	FitCounts scalar_fit {};
+
+	// Rows carrying the path with a value that maps to no liftable role (see the struct comment).
+	idx_t nonrole_present = 0;
 
 	// Array roles: present = the number of rows where the path is an array.
 	idx_t array_rows = 0;
@@ -293,7 +300,7 @@ void ClassifyTopLevelArray(const JsonoView &view, JsonoCursor &cursor, SuggestCa
 		for (auto &entry : row_subfields) {
 			auto &agg = GetSubfieldStat(candidate.subfields, entry.first);
 			agg.present += entry.second.present;
-			for (idx_t p = 0; p < 5; p++) {
+			for (idx_t p = 0; p < kPrimitivePreference.size(); p++) {
 				agg.fit[p] += entry.second.fit[p];
 			}
 		}
@@ -316,13 +323,23 @@ void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, nonstd::string
 		}
 		auto child_key = view.KeyAt(SlotPayload(key_slot));
 		auto child_tag = SlotTag(view.SlotAt(cursor.pos));
-		if (child_key.empty() || child_tag == tag::OBJ_START || child_tag == tag::ARR_START) {
+		if (child_key.empty()) {
+			// An empty nested key is out of the shred universe (its lane name would carry an empty quoted
+			// path step) — it names no candidate at all, so it is not even a nonrole occurrence.
+			SkipValueFast(view, cursor);
+			continue;
+		}
+		string path = base;
+		AppendJsonPathStep(path, child_key);
+		if (child_tag == tag::OBJ_START || child_tag == tag::ARR_START) {
+			// A two-or-more-levels-deep object, or a nested array, carries `$.a.b` but fits no scalar
+			// lane: count it into total_present without feeding the scalar role so a nested path that is
+			// a scalar in some rows and a container in others drops at min_fit = 1.0.
+			GetCandidate(paths, path).nonrole_present++;
 			SkipValueFast(view, cursor);
 			continue;
 		}
 		auto scalar = DecodeScalarAt(view, cursor);
-		string path = base;
-		AppendJsonPathStep(path, child_key);
 		RecordScalar(GetCandidate(paths, path), scalar);
 	}
 	if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
@@ -353,6 +370,10 @@ void AccumulateDocument(const JsonoView &view, std::map<string, SuggestCandidate
 		if (key.empty()) {
 			SkipValueFast(view, cursor);
 		} else if (value_tag == tag::OBJ_START) {
+			// The object value carries this top-level key but fits no scalar/array role (its children feed
+			// the nested `$.key.child` candidates instead), so record it as a nonrole occurrence of the
+			// parent path — a key that is a scalar in some rows and an object in others drops at min_fit.
+			GetCandidate(paths, TopLevelSpecName(key)).nonrole_present++;
 			WalkNestedObject(view, cursor, key, paths);
 		} else if (value_tag == tag::ARR_START) {
 			ClassifyTopLevelArray(view, cursor, GetCandidate(paths, TopLevelSpecName(key)));
@@ -431,14 +452,14 @@ string BuildObjectArrayType(const SuggestCandidate &candidate, double min_presen
 // Choose one candidate path's shred type string, or empty when no role qualifies. Roles compete by
 // presence (the count of rows the path appears in that role); scalar beats scalar-array beats
 // object-array on a tie. Each role must also clear min_presence over the group's non-NULL rows.
-// min_fit is measured over the path's TOTAL present occurrences across every role (scalar +
-// array_rows): a role that fits its own rows but covers only part of a mixed path falls below
-// min_fit, so a genuinely mixed path drops instead of a majority role silently winning.
+// min_fit is measured over the path's TOTAL present occurrences (every role plus nonrole_present): a
+// role that fits its own rows but covers only part of a mixed path falls below min_fit, so a
+// genuinely mixed path drops instead of a majority role silently winning.
 string ChooseShredType(const SuggestCandidate &candidate, idx_t non_null_rows, double min_presence, double min_fit) {
 	double presence_floor = min_presence * double(non_null_rows);
-	// A row observes the path as at most one role (scalar leaf or array), so the roles' row counts sum
-	// to the count of rows carrying this path.
-	idx_t total_present = candidate.scalar_present + candidate.array_rows;
+	// A row observes the path as exactly one of a scalar leaf, an array, or a nonrole value (an object,
+	// or a nested container), so these three counts sum to the count of rows carrying this path.
+	idx_t total_present = candidate.scalar_present + candidate.array_rows + candidate.nonrole_present;
 	string best;
 	idx_t best_present = 0;
 
@@ -584,19 +605,20 @@ void JsonoSuggestUpdate(Vector inputs[], AggregateInputData &, idx_t, Vector &st
 
 void MergeSuggestCandidate(SuggestCandidate &target, const SuggestCandidate &source) {
 	target.scalar_present += source.scalar_present;
+	target.nonrole_present += source.nonrole_present;
 	target.array_rows += source.array_rows;
 	target.saw_scalar_element |= source.saw_scalar_element;
 	target.saw_object_element |= source.saw_object_element;
 	target.oarray_object_rows += source.oarray_object_rows;
 	target.object_elements += source.object_elements;
-	for (idx_t p = 0; p < 5; p++) {
+	for (idx_t p = 0; p < kPrimitivePreference.size(); p++) {
 		target.scalar_fit[p] += source.scalar_fit[p];
 		target.sarray_fit[p] += source.sarray_fit[p];
 	}
 	for (auto &entry : source.subfields) {
 		auto &agg = GetSubfieldStat(target.subfields, entry.first);
 		agg.present += entry.second.present;
-		for (idx_t p = 0; p < 5; p++) {
+		for (idx_t p = 0; p < kPrimitivePreference.size(); p++) {
 			agg.fit[p] += entry.second.fit[p];
 		}
 	}

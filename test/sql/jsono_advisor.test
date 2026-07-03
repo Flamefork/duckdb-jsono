@@ -57,6 +57,31 @@ SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
 ----
 {big: 'UBIGINT'}
 
+# The DOUBLE lane is reachable only from a real Double-kind scalar: the text parser yields JSON
+# decimals (which never fit a scalar lane), so DOUBLE needs a value ingested as a struct DOUBLE. A
+# struct-ingested doc reconstructed back to PLAIN jsono keeps the Double kind, and the advisor picks
+# the DOUBLE lane over it (BIGINT/UBIGINT do not fit a non-integral double).
+statement ok
+CREATE TABLE double_docs AS
+SELECT CAST(jsono({'v': v}) AS
+  STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+) AS j
+FROM (VALUES (1.5::DOUBLE), (2.5::DOUBLE), (3.5::DOUBLE)) AS t(v);
+
+query I
+SELECT jsono_suggest_shredding(j) FROM double_docs;
+----
+{v: 'DOUBLE'}
+
+# The suggested DOUBLE spec is ready-to-paste over the plain (Double-carrying) value: the shred type
+# is a DOUBLE lane and the shredded value round-trips losslessly (the lane fits, so nothing diverts).
+query I
+SELECT count(*) FROM double_docs
+WHERE to_json(jsono(j, shredding := {v: 'DOUBLE'})) IS DISTINCT FROM to_json(j)
+   OR typeof(jsono(j, shredding := {v: 'DOUBLE'})) <> jsono_storage_type('v DOUBLE');
+----
+0
+
 # An explicit JSON null is lossless in every lane (it stays complete in the residual), so it counts
 # as fitting any type and does NOT drop a path at the default min_fit := 1.0. A scalar leaf that is
 # int in some rows and null in others is still suggested at its int lane.
@@ -114,13 +139,26 @@ SELECT jsono_suggest_shredding(jsono(d), min_fit := 0.75) FROM (VALUES
 ----
 {p: 'BIGINT'}
 
-# A path that is a scalar in some rows and an OBJECT in others: the object occurrences are not a
-# competing role (they feed the nested $.meta.n candidate instead), so the scalar lane fits every
-# scalar occurrence and both suggestions surface. The overlapping pair stays ready-to-paste — the
-# constructor accepts a shred inside another shred's path (the container lane becomes
-# render-unsafe) and the shredded value round-trips losslessly.
+# A path that is a scalar in some rows and an OBJECT in others is genuinely mixed. The object
+# occurrences count into the path's total_present (the min_fit denominator) but feed no scalar role,
+# so at min_fit := 1.0 the VARCHAR lane fits only 2/4 present rows and `meta` drops — only the nested
+# $.meta.n candidate (a real scalar leaf under the two object rows) survives.
 query I
 SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
+  ('{"meta":"s1"}'),
+  ('{"meta":"s2"}'),
+  ('{"meta":{"n":1}}'),
+  ('{"meta":{"n":2}}')
+) AS t(d);
+----
+{"$.meta.n": 'BIGINT'}
+
+# Lowering min_fit to 0.5 surfaces the majority VARCHAR (2/4 scalar rows clear the threshold) beside
+# the nested candidate. The overlapping pair (a shred inside another shred's path) stays ready-to-
+# paste — the constructor accepts the nested shred (the container lane becomes render-unsafe) and the
+# shredded value round-trips losslessly.
+query I
+SELECT jsono_suggest_shredding(jsono(d), min_fit := 0.5) FROM (VALUES
   ('{"meta":"s1"}'),
   ('{"meta":"s2"}'),
   ('{"meta":{"n":1}}'),
@@ -137,6 +175,18 @@ SELECT count(*) FROM (
 ) WHERE s IS DISTINCT FROM p;
 ----
 0
+
+# A corpus of only non-object root documents (scalars and arrays) names no key to shred: every
+# document is skipped at the OBJ_START gate, so no candidate is ever recorded and the result is NULL.
+query I
+SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
+  ('5'),
+  ('"str"'),
+  ('[1,2,3]'),
+  ('true')
+) AS t(d);
+----
+NULL
 
 # No qualifying paths (or no non-NULL rows) yields SQL NULL.
 query I
@@ -161,6 +211,18 @@ statement error
 SELECT jsono_suggest_shredding(j, min_presence := -0.1) FROM docs;
 ----
 min_presence
+
+# A non-constant threshold cannot be evaluated at bind, so it is rejected loud instead of silently
+# picking a row's value (random() is volatile and does not fold to a constant).
+statement error
+SELECT jsono_suggest_shredding(j, min_fit := random()) FROM docs;
+----
+must be constant
+
+statement error
+SELECT jsono_suggest_shredding(j, min_presence := random()) FROM docs;
+----
+must be constant
 
 statement error
 SELECT jsono_suggest_shredding(j, bogus := 0.5) FROM docs;
