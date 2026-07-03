@@ -353,6 +353,22 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
 ----
 [{"path":"tags","type":"BIGINT[]","lane_rate":0.5,"divert_rate":0.5,"complete_rate":1.0}]
 
+# An object-array shred (LIST<STRUCT> lane) reports lane / divert / complete the same way the scalar
+# array does: lane present when the value is a regular array (2/4 here), diverted when a scalar sits
+# at the path and stays whole in the residual (1/4), a missing key is neither (1/4), and array shreds
+# carry no completeness flag so complete_rate is always 1.0.
+query I
+SELECT to_json(jsono_shred_stats(j)) FROM (
+  SELECT jsono(d, shredding := {'items':'STRUCT(n BIGINT)[]'}) AS j FROM (VALUES
+    ('{"items":[{"n":1},{"n":2}]}'),
+    ('{"items":"oops"}'),
+    ('{"x":1}'),
+    ('{"items":[{"n":3}]}')
+  ) AS t(d)
+);
+----
+[{"path":"items","type":"STRUCT(n BIGINT)[]","lane_rate":0.5,"divert_rate":0.25,"complete_rate":1.0}]
+
 # Multiple shreds report in sorted path order.
 query I
 SELECT to_json(jsono_shred_stats(j)) FROM (

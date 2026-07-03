@@ -108,6 +108,23 @@ FROM pairs WHERE id = 13;
 ----
 {"extra":{"added":1,"removed":2},"n":2}	{"extra":{"added":[9],"removed":[1,2]},"n":2}
 
+# counts / elements array modes with a CHANGED lane ($.k) in the SAME object as the changed array
+# ($.extra): the direct path must merge the changed lane patch with the residual array-mode diff, not
+# just the residual (the id=13 case above holds the lane constant). Both modes are pinned for the
+# shredded build AND the plain build in one row, so columns 1/2 (counts) and 3/4 (elements) prove the
+# shredded array-mode diff is byte-identical to the plain diff even when a lane changes alongside.
+query IIII
+SELECT to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}', shredding := {k:'VARCHAR'}),
+                          jsono('{"k":"b","extra":[9],"n":2}',   shredding := {k:'VARCHAR'}), arrays := 'counts')),
+       to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}'),
+                          jsono('{"k":"b","extra":[9],"n":2}'),                               arrays := 'counts')),
+       to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}', shredding := {k:'VARCHAR'}),
+                          jsono('{"k":"b","extra":[9],"n":2}',   shredding := {k:'VARCHAR'}), arrays := 'elements')),
+       to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}'),
+                          jsono('{"k":"b","extra":[9],"n":2}'),                               arrays := 'elements'));
+----
+{"extra":{"added":1,"removed":2},"k":"b","n":2}	{"extra":{"added":1,"removed":2},"k":"b","n":2}	{"extra":{"added":[9],"removed":[1,2]},"k":"b","n":2}	{"extra":{"added":[9],"removed":[1,2]},"k":"b","n":2}
+
 # An array-shred type declines the direct path at bind (reconstruct-cast) but stays correct.
 query I
 SELECT count(*)

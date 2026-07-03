@@ -71,6 +71,12 @@ FROM (VALUES
 ----
 [{"event_name":"search","x":1},{"event_name":"page_view"}]
 
+# A non-JSONO value argument is rejected loudly at bind (the aggregate only collects JSONO values).
+statement error
+SELECT jsono_group_array(42);
+----
+jsono_group_array: argument must be JSONO
+
 # --- jsono_group_object: collect key -> value pairs into a JSONO object ---
 
 # Keys are emitted SORTED (format invariant), values collect verbatim.
@@ -100,6 +106,13 @@ statement error
 SELECT to_json(jsono_group_object(k, j)) FROM (VALUES (NULL, jsono('1'))) t(k, j);
 ----
 key cannot be NULL
+
+# A non-JSONO value argument is rejected loudly at bind (the value slot only collects JSONO values;
+# the key slot casts to VARCHAR, but the value must already be JSONO).
+statement error
+SELECT jsono_group_object('k', 42);
+----
+jsono_group_object: argument must be JSONO
 
 # Empty group returns SQL NULL.
 query I

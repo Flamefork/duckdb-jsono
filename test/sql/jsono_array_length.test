@@ -67,6 +67,14 @@ SELECT jsono_array_length('foo');
 ----
 jsono_array_length: argument must be JSONO
 
+# There is no {jsono, integer} overload (unlike jsono_array_elements, which registers {ANY, BIGINT}):
+# an integer second argument is a clean bind error, since an INTEGER literal does not implicitly cast
+# to the VARCHAR path argument. Callers index into an array with the '$[i]' path form instead.
+statement error
+SELECT jsono_array_length(jsono('[1,2,3]'), 0);
+----
+No function matches
+
 # Shredded round-trip: a value that shreds one scalar path ($.a) still answers array_length for an
 # array left in the residual, counted off the reconstructed document (array_length keeps the full
 # reconstruct-cast). The 1-arg call on the object root stays NULL.

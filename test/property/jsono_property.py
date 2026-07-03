@@ -549,6 +549,7 @@ FUZZ_READER_CALLS = {
     "diff_cur": lambda s: f"to_json(jsono_diff(jsono('{{}}'), {s}))",
     "group_merge": lambda s: f"(SELECT to_json(jsono_group_merge(v)) FROM (VALUES ({s}), (jsono('{{\"k\":1}}'))) t(v))",
     "group_array": lambda s: f"(SELECT to_json(jsono_group_array(v)) FROM (VALUES ({s}), (jsono('{{}}'))) t(v))",
+    "group_object": lambda s: f"(SELECT to_json(jsono_group_object(k, v)) FROM (VALUES ('a', {s}), ('b', jsono('{{}}'))) t(k, v))",
     "suggest_shredding": lambda s: f"(SELECT jsono_suggest_shredding(v) FROM (VALUES ({s}), (jsono('{{\"k\":1}}'))) t(v))",
 }
 fuzz_readers = st.sampled_from(sorted(FUZZ_READER_CALLS))
@@ -1513,6 +1514,9 @@ LANE_MUTATIONS = [
     "arr_truncate",
     "arr_extend",
     "arr_null",
+    "obj_arr_truncate",
+    "obj_arr_extend",
+    "obj_arr_null",
     "scalar_swap",
     "scalar_null",
     "complete_zero",
@@ -1523,9 +1527,10 @@ LANE_MUTATIONS = [
 
 
 def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
-    j = f"jsono({doc_sql}, shredding := {{'$.arr':'BIGINT[]', k:'BIGINT'}})"
+    j = f"jsono({doc_sql}, shredding := {{'$.arr':'BIGINT[]', k:'BIGINT', '$.items':'STRUCT(n BIGINT)[]'}})"
     marker = f'({j})."jsono".shreds."$jsono$set"'
     arr = f'({j})."jsono".shreds."$.arr"'
+    items = f'({j})."jsono".shreds."$.items"'
     k_value = f'({j})."jsono".shreds."k"."value"'
     k_complete = f'({j})."jsono".shreds."k".complete'
     if mutation == "arr_truncate":
@@ -1534,6 +1539,12 @@ def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
         arr = f"list_append(coalesce({arr}, []::BIGINT[]), 99)"
     elif mutation == "arr_null":
         arr = "NULL::BIGINT[]"
+    elif mutation == "obj_arr_truncate":
+        items = f"list_slice({items}, 1, greatest(len({items}) - 1, 0))"
+    elif mutation == "obj_arr_extend":
+        items = f"list_append(coalesce({items}, []::STRUCT(n BIGINT)[]), {{'n': 99}}::STRUCT(n BIGINT))"
+    elif mutation == "obj_arr_null":
+        items = "NULL::STRUCT(n BIGINT)[]"
     elif mutation == "scalar_swap":
         k_value = f"coalesce({k_value}, 0) + 7"
     elif mutation == "scalar_null":
@@ -1548,14 +1559,16 @@ def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
         f'struct_pack("jsono" := struct_pack(body := ({j})."jsono".body, '
         f'shreds := struct_pack("$jsono$set" := {marker}, '
         f'"$.arr" := {arr}, '
+        f'"$.items" := {items}, '
         f'"k" := struct_pack("value" := {k_value}, complete := {k_complete}))))'
     )
 
 
 lane_documents = st.builds(
-    lambda arr, k, extra: {"arr": arr, **({"k": k} if k is not None else {}), **extra},
+    lambda arr, k, items, extra: {"arr": arr, **({"k": k} if k is not None else {}), "items": items, **extra},
     st.lists(st.integers(min_value=-1000, max_value=1000), max_size=5),
     st.one_of(st.none(), st.integers(min_value=-1000, max_value=1000)),
+    st.lists(st.fixed_dictionaries({"n": st.integers(min_value=-1000, max_value=1000)}), max_size=4),
     st.dictionaries(shred_keys, json_scalars, max_size=2),
 )
 
@@ -1566,6 +1579,10 @@ lane_documents = st.builds(
 @example(doc={"arr": [], "k": 5}, mutation="arr_extend")
 @example(doc={"arr": [1], "k": 5}, mutation="marker_flip")
 @example(doc={"arr": [1], "k": None}, mutation="complete_zero")
+@example(doc={"arr": [1], "k": 5, "items": [{"n": 1}, {"n": 2}]}, mutation="obj_arr_truncate")
+@example(doc={"arr": [1], "k": 5, "items": [{"n": 1}, {"n": 2}]}, mutation="obj_arr_extend")
+@example(doc={"arr": [1], "k": 5, "items": []}, mutation="obj_arr_extend")
+@example(doc={"arr": [1], "k": 5, "items": [{"n": 1}]}, mutation="obj_arr_null")
 @given(doc=lane_documents, mutation=st.sampled_from(LANE_MUTATIONS))
 def test_fuzz_shredded_lanes_no_lie(doc: dict[str, Any], mutation: str) -> None:
     mutant = lane_mutant_sql(sql_literal(json_dumps(doc)), mutation)
