@@ -1,0 +1,197 @@
+# name: test/sql/jsono_setop_pushdown.test
+# description: constant-path extracts above a UNION ALL of differently-typed jsono branches are pushed into the branches: each branch reads its own lanes/residual natively (per-branch totality applies), and when the jsono column is unreferenced above it is dropped from the union output — no supertype reconciliation copy.
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE pu_shred AS SELECT jsono('{"a":"A' || i || '","n":' || i || '}', shredding := {'a':'VARCHAR'}) AS e FROM range(1000) t(i);
+
+statement ok
+CREATE TABLE pu_plain AS SELECT jsono('{"a":"P' || i || '","n":' || (i + 1000) || '}') AS e FROM range(1000) t(i);
+
+statement ok
+CREATE TABLE pu_shred_b AS SELECT jsono('{"a":"B' || i || '","b":"BB"}', shredding := {'b':'VARCHAR'}) AS e FROM range(1000) t(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# (a) facade read: the extract runs below the UNION in each branch — the shredded branch reads its
+# total lane bare, the plain branch extracts natively — and the jsono column itself is unreferenced
+# above the union, so it is dropped and no branch pays the supertype reconciliation. Plan-lock: no
+# residual COALESCE, no optimizer-internal residual/reconstruct helper, no struct re-pack anywhere.
+query II
+EXPLAIN SELECT e->>'a' FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain);
+----
+physical_plan	<!REGEX>:.*(COALESCE|__jsono_internal|struct_pack).*
+
+query II
+EXPLAIN SELECT e->>'a' FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain);
+----
+physical_plan	<REGEX>:.*UNION.*
+
+# The same read through the named function and through a filter is pushed too.
+query II
+EXPLAIN SELECT jsono_extract_string(e, 'a') FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain);
+----
+physical_plan	<!REGEX>:.*(COALESCE|__jsono_internal|struct_pack).*
+
+query II
+EXPLAIN SELECT count(*) FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain) WHERE (e->>'a') = 'A5';
+----
+physical_plan	<!REGEX>:.*(COALESCE|__jsono_internal|struct_pack).*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Values are byte-identical to the unpushed plan on both branches.
+query I
+SELECT e->>'a' FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain) ORDER BY 1 LIMIT 4;
+----
+A0
+A1
+A10
+A100
+
+query II
+SELECT MIN(e->>'a'), MAX(e->>'a') FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain);
+----
+A0
+P999
+
+query I
+SELECT count(*) FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain) WHERE (e->>'a') = 'A5';
+----
+1
+
+# A non-shred path reads each branch's residual natively (values; the shredded branch keeps its
+# residual machinery below the union, so no plan-lock here).
+query II
+SELECT MIN(CAST(e->>'n' AS BIGINT)), MAX(CAST(e->>'n' AS BIGINT)) FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain);
+----
+0	1999
+
+# (b) multi-way UNION ALL over three differently-typed branches. The pu_shred_b branch does not
+# shred $.a, so it legitimately reads its residual (the checked-residual machinery below the
+# union); the lock is only that no read is left above the union as a lane COALESCE.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT e->>'a' FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain UNION ALL SELECT e FROM pu_shred_b);
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query I
+SELECT count(DISTINCT e->>'a') FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain UNION ALL SELECT e FROM pu_shred_b);
+----
+3000
+
+# (c) json-valued extract family is pushed as well (values; an exact shred read under a json-valued
+# extract reconstructs per branch, so no plan-lock).
+query II
+SELECT MIN((e->'a')::VARCHAR), MAX((e->'a')::VARCHAR) FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain);
+----
+"A0"	"P999"
+
+# (d) the jsono column still referenced above: reads are pushed anyway, the column stays in the
+# union output, and both coexist.
+query II
+SELECT e->>'a', to_json(e)::VARCHAR FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain) ORDER BY 1 LIMIT 2;
+----
+A0	{"a":"A0","n":0}
+A1	{"a":"A1","n":1}
+
+# (e) NULL rows flow through the pushed read as NULL.
+query I
+SELECT e->>'a' FROM (SELECT jsono(NULL) AS e UNION ALL SELECT e FROM pu_shred) ORDER BY 1 NULLS FIRST LIMIT 2;
+----
+NULL
+A0
+
+# (f) UNION DISTINCT dedups on the full value: not pushed (the extract above keeps today's
+# reconciled-read form), values correct.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT e->>'a' FROM (SELECT e FROM pu_shred UNION SELECT e FROM pu_plain);
+----
+physical_plan	<REGEX>:.*(COALESCE|__jsono_internal).*
+
+statement ok
+PRAGMA explain_output='all';
+
+query I
+SELECT count(*) FROM (SELECT e FROM pu_shred UNION SELECT e FROM pu_plain) WHERE (e->>'a') = 'A5';
+----
+1
+
+# (g) a same-type UNION ALL (no branch reconciliation) is deliberately left unchanged: the extract
+# stays above the union and keeps the residual fallback (no per-branch totality over a union output).
+statement ok
+CREATE TABLE pu_shred_same AS SELECT jsono('{"a":"S' || i || '"}', shredding := {'a':'VARCHAR'}) AS e FROM range(100) t(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT e->>'a' FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_shred_same);
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT MIN(e->>'a'), MAX(e->>'a') FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_shred_same);
+----
+A0
+S99
+
+# (h) nested unions: the read is pushed through both levels (the inner union's branches diverge
+# too). The pu_shred_b branch reads its residual for $.a (not a shred there), so the lock is only
+# that no lane COALESCE survives above either union.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT e->>'a' FROM (
+  SELECT e FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_shred_b)
+  UNION ALL
+  SELECT e FROM pu_plain);
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query I
+SELECT count(DISTINCT e->>'a') FROM (
+  SELECT e FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_shred_b)
+  UNION ALL
+  SELECT e FROM pu_plain);
+----
+3000
+
+# (i) EXCEPT / INTERSECT compare whole rows: never pushed, values correct.
+query I
+SELECT count(*) FROM (
+  SELECT e->>'a' AS a FROM (SELECT e FROM pu_shred EXCEPT SELECT e FROM pu_plain)
+);
+----
+1000
+
+# (j) a non-constant path cannot be pushed (per-branch bind needs a constant path): values correct.
+query I
+SELECT count(*) FROM (
+  SELECT json_extract_string(e, p) AS v
+  FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain), (VALUES ('a'), ('n')) paths(p)
+) WHERE v IS NOT NULL;
+----
+4000

@@ -44,6 +44,7 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/struct_stats.hpp"
@@ -1653,6 +1654,45 @@ void CollectShredTotality(ClientContext &context, const LogicalOperator &op, Shr
 	}
 }
 
+bool IsExtractFunction(const string &name) {
+	return name == "->>" || name == "json_extract_string" || name == "->" || name == "json_extract" ||
+	       name == "jsono_extract" || name == "jsono_extract_string";
+}
+
+// The string-valued SUBSET of IsExtractFunction: these render a scalar leaf to text, while the
+// superset also covers the json-valued `->`/json_extract. Kept distinct on purpose — do not merge.
+bool IsStringExtractFunction(const string &name) {
+	return name == "->>" || name == "json_extract_string" || name == "jsono_extract_string";
+}
+
+// Bind a native jsono extract of the original path over `source` (a plain-JSONO expression: a
+// residual reinterpret, a full reconstruct, or a set-op branch column). Keeps `->>`/json_extract on
+// jsono's own renderer — text-preserving numbers, lowercase \u escapes — instead of core json's
+// STRUCT->JSON->extract path, which re-renders numbers and uppercases escapes (a visible
+// to_json-vs-extract divergence).
+unique_ptr<Expression> MakeNativeExtractOver(ClientContext &context, unique_ptr<Expression> source,
+                                             unique_ptr<Expression> path, const LogicalType &value_type, bool string_fn,
+                                             const string &alias) {
+	auto path_type = path->return_type;
+	vector<unique_ptr<Expression>> children;
+	children.push_back(std::move(source));
+	children.push_back(std::move(path));
+	FunctionBinder function_binder(context);
+	auto shred_path_type = path_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
+	if (string_fn) {
+		auto result =
+		    function_binder.BindScalarFunction(JsonoExtractStringFunction(shred_path_type), std::move(children));
+		result->SetAlias(alias);
+		return result;
+	}
+	// json-valued extract returns JSONO natively; cast back to the type the original extract
+	// produced — JSON for core `->`/json_extract, JSONO (a no-op) for jsono_extract.
+	auto extracted = function_binder.BindScalarFunction(JsonoExtractFunction(shred_path_type), std::move(children));
+	auto result = BoundCastExpression::AddCastToType(context, std::move(extracted), value_type);
+	result->SetAlias(alias);
+	return result;
+}
+
 class JsonoShreddedRewriter : public LogicalOperatorVisitor {
 public:
 	explicit JsonoShreddedRewriter(ClientContext &context, const ShredTotalityMap &totality)
@@ -1705,17 +1745,6 @@ protected:
 	}
 
 private:
-	static bool IsExtractFunction(const string &name) {
-		return name == "->>" || name == "json_extract_string" || name == "->" || name == "json_extract" ||
-		       name == "jsono_extract" || name == "jsono_extract_string";
-	}
-
-	// The string-valued SUBSET of IsExtractFunction: these render a scalar leaf to text, while the
-	// superset also covers the json-valued `->`/json_extract. Kept distinct on purpose — do not merge.
-	static bool IsStringExtractFunction(const string &name) {
-		return name == "->>" || name == "json_extract_string" || name == "jsono_extract_string";
-	}
-
 	// The extract argument is a CAST whose child is a shredded JSONO struct: either
 	// `CAST(shredded->JSON)` from core json's STRUCT->JSON path (the core-named extracts), or
 	// `CAST(shredded->JSONO)` from the jsono-named extracts' bind-time reconstruct cast. Return that
@@ -1971,40 +2000,14 @@ private:
 		return make_uniq<BoundCaseExpression>(std::move(is_null), std::move(null_jsono), std::move(residual));
 	}
 
-	// Bind a native jsono extract of the original path over `source` (a plain-JSONO expression: a
-	// residual reinterpret or a full reconstruct). Keeps `->>`/json_extract on jsono's own renderer
-	// — text-preserving numbers, lowercase \u escapes — instead of core json's STRUCT->JSON->extract
-	// path, which re-renders numbers and uppercases escapes (a visible to_json-vs-extract divergence).
-	unique_ptr<Expression> MakeNativeExtractOver(unique_ptr<Expression> source, unique_ptr<Expression> path,
-	                                             const LogicalType &value_type, bool string_fn, const string &alias) {
-		auto path_type = path->return_type;
-		vector<unique_ptr<Expression>> children;
-		children.push_back(std::move(source));
-		children.push_back(std::move(path));
-		FunctionBinder function_binder(context);
-		auto shred_path_type = path_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
-		if (string_fn) {
-			auto result =
-			    function_binder.BindScalarFunction(JsonoExtractStringFunction(shred_path_type), std::move(children));
-			result->SetAlias(alias);
-			return result;
-		}
-		// json-valued extract returns JSONO natively; cast back to the type the original extract
-		// produced — JSON for core `->`/json_extract, JSONO (a no-op) for jsono_extract.
-		auto extracted = function_binder.BindScalarFunction(JsonoExtractFunction(shred_path_type), std::move(children));
-		auto result = BoundCastExpression::AddCastToType(context, std::move(extracted), value_type);
-		result->SetAlias(alias);
-		return result;
-	}
-
 	// Extract a non-shred path natively from the residual JSONO, matching a
 	// non-shredded column's extract cost — no serialize/parse round-trip through core
 	// json. Correct because only shred leaves are stripped: a non-shred scalar keeps its
 	// value, and a json-valued read overlapping a stripped shred already reconstructed.
 	unique_ptr<Expression> MakeResidualExtract(BoundCastExpression &shredded_cast, unique_ptr<Expression> path,
 	                                           const LogicalType &value_type, bool string_fn, const string &alias) {
-		return MakeNativeExtractOver(ResidualReinterpret(*shredded_cast.child), std::move(path), value_type, string_fn,
-		                             alias);
+		return MakeNativeExtractOver(context, ResidualReinterpret(*shredded_cast.child), std::move(path), value_type,
+		                             string_fn, alias);
 	}
 
 	// A shredded read whose value the residual alone cannot serve — its leaf is stripped into a
@@ -2015,7 +2018,7 @@ private:
 	unique_ptr<Expression> MakeReconstructExtract(BoundCastExpression &shredded_cast, unique_ptr<Expression> path,
 	                                              const LogicalType &value_type, bool string_fn, const string &alias) {
 		auto reconstruct = BoundCastExpression::AddCastToType(context, shredded_cast.child->Copy(), JsonoType());
-		return MakeNativeExtractOver(std::move(reconstruct), std::move(path), value_type, string_fn, alias);
+		return MakeNativeExtractOver(context, std::move(reconstruct), std::move(path), value_type, string_fn, alias);
 	}
 
 	// Detect CAST(string-shred-extract AS T) where the shred's own type is exactly T, and
@@ -2351,6 +2354,245 @@ void NormalizeShreddedCasts(ClientContext &context, LogicalOperator &op) {
 	    op, [&](unique_ptr<Expression> *child) { NormalizeShreddedCastsInExpression(context, *child); });
 }
 
+//===--------------------------------------------------------------------===//
+// Set-operation extract pushdown
+//
+// A constant-path extract above a UNION ALL whose branches carry differently-typed jsono columns
+// reads the reconciled supertype: every branch row is first re-laid into the merged shredded type
+// (the lossless reconstruct+reshred of the cast normalization above), which costs a per-row copy
+// of the whole value and hides the branches' base-table statistics from the shred totality fold.
+// Pushing the extract into the branches turns it into per-branch homogeneous reads — the regular
+// shredded rewrite and totality fold then apply per branch — and when no reference to the jsono
+// column remains above the union, the built-in RemoveUnusedColumns pass drops the column and with
+// it the reconciliation itself. Results are unchanged by construction: the branch cast is
+// value-preserving, and an extract depends only on the value, not on its encoding.
+//
+// Guards (each fail-safe: on any mismatch the plan is left untouched): UNION ALL only (UNION
+// DISTINCT dedups on the full value, EXCEPT/INTERSECT compare whole rows); at least one branch
+// actually reconciles (a same-type union has no copy to remove); every branch column is a bare
+// jsono-typed column, possibly under the reconciling cast; the path is a bind-time constant the
+// jsono path dialect can serve.
+//===--------------------------------------------------------------------===//
+
+struct JsonoPushedSetOpRead {
+	idx_t source_column;
+	bool string_fn;
+	LogicalType return_type;
+	JsonoPathSpec path;
+	idx_t output_column;
+};
+
+class JsonoSetOpExtractPushdown : public LogicalOperatorVisitor {
+public:
+	explicit JsonoSetOpExtractPushdown(OptimizerExtensionInput &input) : input(input) {
+	}
+
+	// One pass: collect the UNION ALL nodes, then rewrite every pushable extract above them. A
+	// changed plan can expose new candidates (an extract pushed into a branch that is itself a
+	// union reads that union's output), so the caller loops this to a fixpoint.
+	bool Run(LogicalOperator &root) {
+		unions.clear();
+		pushed.clear();
+		CollectUnions(root);
+		if (unions.empty()) {
+			return false;
+		}
+		changed = false;
+		VisitOperator(root);
+		return changed;
+	}
+
+protected:
+	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *expr_ptr) override {
+		(void)expr_ptr;
+		return TryPushdown(expr);
+	}
+
+private:
+	void CollectUnions(LogicalOperator &op) {
+		for (auto &child : op.children) {
+			CollectUnions(*child);
+		}
+		if (op.type == LogicalOperatorType::LOGICAL_UNION) {
+			auto &setop = op.Cast<LogicalSetOperation>();
+			if (setop.setop_all) {
+				unions.emplace(setop.table_index, setop);
+			}
+		}
+	}
+
+	// The union output column an extract reads: a bare column reference, possibly under the
+	// JSON / JSONO argument cast the extract's own bind inserted over the merged column.
+	optional_ptr<BoundColumnRefExpression> ExtractSourceColumnRef(Expression &arg) {
+		auto *inner = &arg;
+		if (arg.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+			auto &cast = arg.Cast<BoundCastExpression>();
+			if (!IsJsonTextType(cast.return_type) && !IsJsonoType(cast.return_type)) {
+				return nullptr;
+			}
+			inner = cast.child.get();
+		}
+		if (inner->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return nullptr;
+		}
+		auto &colref = inner->Cast<BoundColumnRefExpression>();
+		if (colref.depth != 0 || (!IsJsonoType(colref.return_type) && !IsShreddedJsonoType(colref.return_type))) {
+			return nullptr;
+		}
+		return &colref;
+	}
+
+	// The branch-local jsono value feeding union column `column_index` of `child`, unwrapped from
+	// the reconciling cast when present. Branch alignment is by expression position: appending one
+	// read to every branch keeps the union positional, so the source count must equal the union's
+	// column_count (operator `types` are not resolved yet this early in optimization).
+	bool TryReadBranchSource(LogicalOperator &child, idx_t column_index, idx_t column_count,
+	                         unique_ptr<Expression> &source, bool &reconciles) {
+		if (child.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &expressions = child.Cast<LogicalProjection>().expressions;
+			if (expressions.size() != column_count) {
+				return false;
+			}
+			auto &branch_expr = *expressions[column_index];
+			if (branch_expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+				auto &cast = branch_expr.Cast<BoundCastExpression>();
+				if (cast.child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					return false;
+				}
+				source = cast.child->Copy();
+				reconciles = true;
+			} else if (branch_expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+				source = branch_expr.Copy();
+			} else {
+				return false;
+			}
+		} else {
+			// No reconciling projection on this branch: its output already matches the merged type.
+			child.ResolveOperatorTypes();
+			if (child.types.size() != column_count) {
+				return false;
+			}
+			source =
+			    make_uniq<BoundColumnRefExpression>(child.types[column_index], child.GetColumnBindings()[column_index]);
+		}
+		return IsJsonoType(source->return_type) || IsShreddedJsonoType(source->return_type);
+	}
+
+	idx_t FindPushedRead(idx_t table_index, idx_t source_column, bool string_fn, const LogicalType &return_type,
+	                     const JsonoPathSpec &path) {
+		auto entry = pushed.find(table_index);
+		if (entry == pushed.end()) {
+			return DConstants::INVALID_INDEX;
+		}
+		for (auto &read : entry->second) {
+			if (read.source_column == source_column && read.string_fn == string_fn && read.return_type == return_type &&
+			    JsonoPathSpecEqual(read.path, path)) {
+				return read.output_column;
+			}
+		}
+		return DConstants::INVALID_INDEX;
+	}
+
+	unique_ptr<Expression> TryPushdown(BoundFunctionExpression &expr) {
+		if (expr.children.size() != 2 || !IsExtractFunction(expr.function.name)) {
+			return nullptr;
+		}
+		auto colref = ExtractSourceColumnRef(*expr.children[0]);
+		if (!colref) {
+			return nullptr;
+		}
+		auto entry = unions.find(colref->binding.table_index);
+		if (entry == unions.end()) {
+			return nullptr;
+		}
+		auto &setop = entry->second.get();
+		auto column_index = colref->binding.column_index;
+		if (column_index >= setop.column_count) {
+			return nullptr;
+		}
+		JsonoPathSpec path;
+		if (!TryReadExtractPath(input.context, *expr.children[1], path)) {
+			return nullptr;
+		}
+		auto string_fn = IsStringExtractFunction(expr.function.name);
+		auto output_column = FindPushedRead(setop.table_index, column_index, string_fn, expr.return_type, path);
+		if (output_column == DConstants::INVALID_INDEX) {
+			output_column = PushRead(setop, column_index, *expr.children[1], string_fn, expr.return_type);
+			if (output_column == DConstants::INVALID_INDEX) {
+				return nullptr;
+			}
+			pushed[setop.table_index].push_back(
+			    JsonoPushedSetOpRead {column_index, string_fn, expr.return_type, std::move(path), output_column});
+		}
+		changed = true;
+		return make_uniq<BoundColumnRefExpression>(expr.GetAlias(), expr.return_type,
+		                                           ColumnBinding(setop.table_index, output_column));
+	}
+
+	// Append the per-branch extract to every branch and extend the union's column list; returns the
+	// new union output column, or INVALID_INDEX when a branch has no pushable source (nothing is
+	// mutated in that case — sources are validated for every branch before the first append).
+	idx_t PushRead(LogicalSetOperation &setop, idx_t column_index, Expression &path, bool string_fn,
+	               const LogicalType &return_type) {
+		vector<unique_ptr<Expression>> sources(setop.children.size());
+		auto reconciles = false;
+		for (idx_t branch = 0; branch < setop.children.size(); branch++) {
+			if (!TryReadBranchSource(*setop.children[branch], column_index, setop.column_count, sources[branch],
+			                         reconciles)) {
+				return DConstants::INVALID_INDEX;
+			}
+		}
+		if (!reconciles) {
+			// Same-type union: no reconciliation copy to remove; leave the plan untouched.
+			return DConstants::INVALID_INDEX;
+		}
+		for (idx_t branch = 0; branch < setop.children.size(); branch++) {
+			auto source = std::move(sources[branch]);
+			if (IsShreddedJsonoType(source->return_type)) {
+				// The same reconstruct cast the jsono-named extracts' bind inserts; the shredded
+				// rewrite below recognizes it and serves the path from the branch's lanes/residual.
+				source = BoundCastExpression::AddCastToType(input.context, std::move(source), JsonoType());
+			}
+			auto extract =
+			    MakeNativeExtractOver(input.context, std::move(source), path.Copy(), return_type, string_fn, string());
+			auto &child = setop.children[branch];
+			if (child->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+				// Interpose a passthrough projection so the branch has a place to compute the read
+				// (the union consumes its children positionally, so re-basing bindings is invisible).
+				auto bindings = child->GetColumnBindings();
+				vector<unique_ptr<Expression>> expressions;
+				expressions.reserve(bindings.size() + 1);
+				for (idx_t i = 0; i < bindings.size(); i++) {
+					expressions.push_back(make_uniq<BoundColumnRefExpression>(child->types[i], bindings[i]));
+				}
+				auto projection =
+				    make_uniq<LogicalProjection>(input.optimizer.binder.GenerateTableIndex(), std::move(expressions));
+				if (child->has_estimated_cardinality) {
+					projection->SetEstimatedCardinality(child->estimated_cardinality);
+				}
+				projection->children.push_back(std::move(child));
+				child = std::move(projection);
+			}
+			child->Cast<LogicalProjection>().expressions.push_back(std::move(extract));
+		}
+		auto output_column = setop.column_count;
+		setop.column_count++;
+		setop.ResolveOperatorTypes();
+		return output_column;
+	}
+
+	OptimizerExtensionInput &input;
+	unordered_map<idx_t, reference<LogicalSetOperation>> unions;
+	unordered_map<idx_t, vector<JsonoPushedSetOpRead>> pushed;
+	bool changed = false;
+};
+
+void PushdownSetOpExtracts(OptimizerExtensionInput &input, LogicalOperator &plan) {
+	JsonoSetOpExtractPushdown pushdown(input);
+	while (pushdown.Run(plan)) {
+	}
+}
+
 void RewriteShreddedJsono(ClientContext &context, unique_ptr<LogicalOperator> &plan, const ShredTotalityMap &totality) {
 	if (!plan) {
 		return;
@@ -2382,6 +2624,12 @@ void RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &pl
 }
 
 void JsonoOptimizerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	// Push extracts through UNION ALL branches before anything else, so a read over a reconciled
+	// set-op column becomes per-branch homogeneous reads the passes below serve natively (and cast
+	// normalization still sees the raw reconciling casts on the branches).
+	if (plan) {
+		PushdownSetOpExtracts(input, *plan);
+	}
 	// Collect per-shred totality from base-table statistics first, while column bindings still match
 	// the LogicalGet leaves (our own rewrites below interpose projections that would obscure them).
 	ShredTotalityMap totality;
