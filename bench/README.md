@@ -74,6 +74,11 @@ JSONO-only operations:
 - `object_json`: `json_object(key, value, ...)` on the same scalar object payload for comparison;
 - `validate`: `jsono_validate` on a pre-materialized `jsono` input, excluding parse cost;
 - `storage_size`: `jsono_storage_size` on a pre-materialized `jsono` input, excluding parse cost;
+- `setop_extract_string`: `jsono_extract_string` above a UNION ALL of a shredded and a plain
+  branch — times the set-op extract pushdown (no supertype reconciliation copy);
+- `multifile_extract_string`: `jsono_extract_string` over a `union_by_name` read of two Parquet
+  files with diverging shred sets, measured lane present in both — times the recovered-statistics
+  totality fold;
 - `transform`: `jsono_transform`;
 - `group_merge`: `to_json(jsono_group_merge(...))`;
 - `group_merge_jsono`: `jsono_group_merge`, the JSONO-native path.

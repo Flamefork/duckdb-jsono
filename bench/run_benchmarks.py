@@ -1093,6 +1093,64 @@ def build_jsono_extract_string_query(
     )
 
 
+def build_jsono_setop_extract_string_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    # Facade read: one shredded branch, one plain branch over the same dataset. The optimizer
+    # pushes the extract below the UNION ALL into per-branch native reads, so the timed query
+    # pays no supertype reconciliation copy (plan 033 part A).
+    json_column = scenario_config["json_column"]
+    result_sql = extract_call_sql("jsono_extract_string", "t", scenario_config["path"])
+    prepare_plain = f"""
+        CREATE OR REPLACE TEMP TABLE _bench_in_plain AS
+        SELECT jsono({json_column}::VARCHAR) AS t
+        FROM {table_sql(data_path)}
+    """
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path), prepare_plain),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {result_sql} AS r
+            FROM (SELECT t FROM _bench_in UNION ALL SELECT t FROM _bench_in_plain)
+        """,
+    )
+
+
+def build_jsono_multifile_extract_string_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    # union_by_name heterogeneous multi-file read: two files shredded on diverging specs with the
+    # measured lane present in both. Statistics recovery + null-aware totality (plan 033 parts
+    # B+C) fold the read to a bare lane scan; without them every row pays the residual fallback.
+    json_column = scenario_config["json_column"]
+    result_sql = extract_call_sql("jsono_extract_string", "t", scenario_config["path"])
+    copy_paths = [
+        sql_string(str(scenario_config[key])) for key in ("copy_path_a", "copy_path_b")
+    ]
+    prepare_sql = tuple(
+        f"""
+        COPY (
+            SELECT jsono({json_column}::VARCHAR, shredding := {sql_typed_literal(spec)}) AS t
+            FROM {table_sql(data_path)}
+        )
+        TO {copy_path}
+        (FORMAT parquet, OVERWRITE_OR_IGNORE true)
+        """
+        for copy_path, spec in zip(
+            copy_paths,
+            (scenario_config["shredding"], scenario_config["shredding_b"]),
+        )
+    )
+    return BenchmarkQuery(
+        prepare_sql=prepare_sql,
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {result_sql} AS r
+            FROM read_parquet([{", ".join(copy_paths)}], union_by_name=true)
+        """,
+    )
+
+
 def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     operation = scenario_config["operation"]
 
@@ -1163,6 +1221,12 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_extract_jsono_query(scenario_config, data_path)
         case "extract_string":
             return build_jsono_extract_string_query(scenario_config, data_path)
+        case "setop_extract_string":
+            return build_jsono_setop_extract_string_query(scenario_config, data_path)
+        case "multifile_extract_string":
+            return build_jsono_multifile_extract_string_query(
+                scenario_config, data_path
+            )
         case _:
             raise ValueError(f"jsono target does not support operation: {operation}")
 

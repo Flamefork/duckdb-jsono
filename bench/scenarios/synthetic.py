@@ -6,6 +6,11 @@ from config import (
     KEYED_PAIR_SIZES,
     KEYED_PAIR_WIDE_SHREDDING_SPEC,
     EXTRACT_CORE_SPEC,
+    MULTIFILE_EXTRACT_COPY_PATH_A,
+    MULTIFILE_EXTRACT_COPY_PATH_B,
+    MULTIFILE_EXTRACT_SHREDDING_A,
+    MULTIFILE_EXTRACT_SHREDDING_B,
+    SETOP_EXTRACT_SHREDDING_SPEC,
     FIELD_SAMPLE_JSONO_COMPRESSION,
     FIELD_SAMPLE_JSONO_COMPRESSION_LEVEL,
     FIELD_SAMPLE_JSONO_ROW_GROUP_SIZE,
@@ -271,6 +276,29 @@ SCENARIOS = [
         "base_path": "$.ec_items",
         "path": 0,
         "targets": ["jsono", "json"],
+    },
+    # Type-reconciliation boundaries (plan 033): the same lane extract measured across a
+    # facade UNION ALL (shredded ∪ plain) and a heterogeneous union_by_name multi-file read.
+    {
+        "operation": "setop_extract_string",
+        "scenario": "facade_shredded_plain",
+        "size": "100k",
+        "json_column": "json_nested",
+        "shredding": SETOP_EXTRACT_SHREDDING_SPEC,
+        "path": "event_name",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "multifile_extract_string",
+        "scenario": "hetero_lane_both_files",
+        "size": "100k",
+        "json_column": "json_nested",
+        "shredding": MULTIFILE_EXTRACT_SHREDDING_A,
+        "shredding_b": MULTIFILE_EXTRACT_SHREDDING_B,
+        "copy_path_a": MULTIFILE_EXTRACT_COPY_PATH_A,
+        "copy_path_b": MULTIFILE_EXTRACT_COPY_PATH_B,
+        "path": "event_name",
+        "targets": ["jsono"],
     },
     # Wide-flat page_view-class merge shape (~100 schema-stable scalar keys):
     # merge-family performance is shape-dependent, the nested merge scenarios

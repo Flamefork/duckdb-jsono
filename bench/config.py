@@ -435,6 +435,19 @@ PRUNE_FILTER_NATIVE_COLUMN = "event_ts_native"
 PRUNE_FILTER_BAND = (1_717_000_000, 1_717_120_000)
 PRUNE_FILTER_ROW_GROUP_SIZE = 12_000
 
+# Type-reconciliation boundary scenarios (plan 033): a facade UNION ALL over a shredded and a
+# plain branch, and a union_by_name multi-file read over files with diverging shred sets where
+# the measured lane is present in both. Both time the same lane extract; the win comes from the
+# set-op pushdown / recovered-statistics totality fold, not from a different operation contract.
+SETOP_EXTRACT_SHREDDING_SPEC = {"event_name": "VARCHAR"}
+MULTIFILE_EXTRACT_SHREDDING_A = {"event_name": "VARCHAR", "$.page.page_url": "VARCHAR"}
+MULTIFILE_EXTRACT_SHREDDING_B = {
+    "event_name": "VARCHAR",
+    "$.geo.geo_country": "VARCHAR",
+}
+MULTIFILE_EXTRACT_COPY_PATH_A = RESULTS_DIR / "synthetic_multifile_a.parquet"
+MULTIFILE_EXTRACT_COPY_PATH_B = RESULTS_DIR / "synthetic_multifile_b.parquet"
+
 FIELD_SAMPLE_STRUCT_PRODUCTS_SPEC = {
     "event_name": "VARCHAR",
     "url": "VARCHAR",
