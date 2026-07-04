@@ -15,6 +15,7 @@
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -1537,6 +1538,69 @@ struct ShredPatchNode {
 	}
 };
 
+// Align a per-file statistics object to the (merged) read type by struct-child NAME, recursively:
+// a child the file lacks — or whose type diverges from the read type — contributes fully unknown
+// stats ("may contain NULLs"), while a matching subtree is copied verbatim. The result always has
+// exactly the read type, so aligned per-file stats can be merged with BaseStatistics::Merge.
+BaseStatistics AlignStatsToReadType(const LogicalType &read_type, optional_ptr<const BaseStatistics> source) {
+	if (source && source->GetType() == read_type) {
+		return source->Copy();
+	}
+	if (!source || read_type.id() != LogicalTypeId::STRUCT || source->GetType().id() != LogicalTypeId::STRUCT) {
+		return BaseStatistics::CreateUnknown(read_type);
+	}
+	auto result = BaseStatistics::CreateUnknown(read_type);
+	auto &read_children = StructType::GetChildTypes(read_type);
+	auto &source_children = StructType::GetChildTypes(source->GetType());
+	for (idx_t i = 0; i < read_children.size(); i++) {
+		for (idx_t j = 0; j < source_children.size(); j++) {
+			if (source_children[j].first == read_children[i].first) {
+				StructStats::SetChildStats(
+				    result, i, AlignStatsToReadType(read_children[i].second, StructStats::GetChildStats(*source, j)));
+				break;
+			}
+		}
+	}
+	// This level describes the same rows in both shapes, so its own null flags carry over.
+	result.CopyValidity(*source);
+	return result;
+}
+
+// Recover column statistics for a union_by_name multi-file scan whose per-file column types
+// diverge. The engine's own merge (MultiFileScanStats in
+// duckdb/src/include/duckdb/common/multi_file/multi_file_function.hpp) bails to nullptr as soon as
+// two files disagree on the column TYPE — which is exactly what differing per-file shred sets do —
+// losing the statistics for every lane, including lanes present in all files. Recover per-file
+// stats through the core-public union readers (populated only under union_by_name; the virtual
+// GetStatistics dispatches into the parquet reader with no parquet headers included here), align
+// each to the read type by name and merge. Fail-safe: any doubt yields conservative unknowns.
+// Deletable shadow of the eventual upstream fix (relaxing the type gate to this name-based merge);
+// re-check the MultiFileBindData / union_readers contract on every duckdb submodule bump.
+unique_ptr<BaseStatistics> TryRecoverMultiFileColumnStats(ClientContext &context, const LogicalGet &get,
+                                                          idx_t column_index, const LogicalType &read_type) {
+	if (!get.bind_data) {
+		return nullptr;
+	}
+	auto multi_file = dynamic_cast<MultiFileBindData *>(get.bind_data.get());
+	if (!multi_file || !multi_file->initial_reader || multi_file->union_readers.empty() ||
+	    column_index >= get.names.size()) {
+		return nullptr;
+	}
+	auto &column_name = get.names[column_index];
+	// Mirror MultiFileScanStats' iteration: the first file is served by the initial reader, the
+	// remaining files by their union readers.
+	auto merged =
+	    AlignStatsToReadType(read_type, multi_file->initial_reader->GetStatistics(context, column_name).get());
+	for (idx_t i = 1; i < multi_file->union_readers.size(); i++) {
+		auto &union_data = multi_file->union_readers[i];
+		if (!union_data) {
+			return nullptr;
+		}
+		merged.Merge(AlignStatsToReadType(read_type, union_data->GetStatistics(context, column_name).get()));
+	}
+	return merged.ToUnique();
+}
+
 // Per shredded jsono column (keyed by its base table ColumnBinding), the totality of each shred:
 // entry[child_index] == false means a bare lane read serves the shred's full `->>` answer on every
 // row (no value spilled to the residual AND the file was written under exactly the read shred set).
@@ -1581,6 +1645,9 @@ void CollectShredTotality(ClientContext &context, const LogicalOperator &op, Shr
 			stats = get.function.statistics_extended(context, input);
 		} else {
 			stats = get.function.statistics(context, get.bind_data.get(), table_index);
+		}
+		if (!stats) {
+			stats = TryRecoverMultiFileColumnStats(context, get, table_index, returned_types[table_index]);
 		}
 		vector<bool> per_shred(shreds.size(), true);
 		if (stats && stats->GetType().id() == LogicalTypeId::STRUCT &&

@@ -1,0 +1,155 @@
+# name: test/sql/jsono_shredded_multifile_total.test
+# description: union_by_name multi-file reads recover per-file statistics when the engine drops them at its type-equality gate: a lane present and complete in EVERY file folds to a bare struct_extract (no COALESCE), while a lane absent from (or spilled in) any file keeps the safe residual fallback.
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+# File A shreds {$.a,$.b}, file B shreds {$.a,$.c}: the $.a lane is present, complete and non-NULL
+# in BOTH files, but the differing shred sets make the per-file column types unequal, so the
+# engine's multi-file stats merge bails and jsono recovers the stats through the union readers.
+statement ok
+COPY (SELECT jsono('{"a":"A' || i || '","b":"B","n":' || i || '}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS e FROM range(1000) t(i))
+TO '__TEST_DIR__/mft_a.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono('{"a":"X' || i || '","c":"C","n":' || (i + 1000) || '}', shredding := {'a':'VARCHAR','c':'VARCHAR'}) AS e FROM range(1000) t(i))
+TO '__TEST_DIR__/mft_b.parquet' (FORMAT parquet);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# (a) the lane present in both files reads COALESCE-free (bare lane struct_extract, prunable).
+query II
+EXPLAIN SELECT MIN(e->>'a') FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true);
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT MIN(e->>'a'), MAX(e->>'a')
+FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true);
+----
+A0	X999
+
+query I
+SELECT count(*)
+FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true)
+WHERE (e->>'a') = 'X42';
+----
+1
+
+# (b) a lane absent from one file keeps the COALESCE fallback (its values live in that file's
+# residual) and still reads every value.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(e->>'b') FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true);
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT MIN(e->>'b'), count(e->>'b')
+FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true);
+----
+B	1000
+
+# (c) a SQL NULL row in one file nulls its `complete` lane; without schema identity that blocks the
+# fold (conservative), and values stay correct.
+statement ok
+COPY (SELECT CASE WHEN i % 10 = 0 THEN jsono(NULL) ELSE jsono('{"a":"N' || i || '"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) END AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft_null.parquet' (FORMAT parquet);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(e->>'a') FROM read_parquet(['__TEST_DIR__/mft_null.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true);
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT count(e->>'a'), count(*)
+FROM read_parquet(['__TEST_DIR__/mft_null.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true);
+----
+1090	1100
+
+# (d) a spilled value (a string in a BIGINT lane) zeroes `complete` in its file; min==max==1 fails
+# and the fallback recovers the residual value.
+statement ok
+COPY (SELECT jsono('{"n":' || i || '}', shredding := {'$.n':'BIGINT'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft_num.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono(CASE WHEN i = 7 THEN '{"n":"spill"}' ELSE '{"n":' || (i + 100) || '}' END, shredding := {'$.n':'BIGINT','$.z':'BIGINT'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft_spill.parquet' (FORMAT parquet);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(e->>'$.n') FROM read_parquet(['__TEST_DIR__/mft_num.parquet', '__TEST_DIR__/mft_spill.parquet'], union_by_name=true);
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query I
+SELECT count(*)
+FROM read_parquet(['__TEST_DIR__/mft_num.parquet', '__TEST_DIR__/mft_spill.parquet'], union_by_name=true)
+WHERE (e->>'$.n') = 'spill';
+----
+1
+
+# (e) single file through the same reader path is unaffected (engine stats already serve it).
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(e->>'a') FROM read_parquet('__TEST_DIR__/mft_a.parquet');
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# (f) composition with the set-op pushdown: a facade UNION ALL over the heterogeneous multi-file
+# scan and a plain table pushes the read into both branches, and the multi-file branch folds its
+# lane through the recovered statistics — no COALESCE anywhere.
+statement ok
+CREATE TABLE mft_plain AS SELECT jsono('{"a":"P' || i || '"}') AS e FROM range(100) t(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT e->>'a' FROM (
+  SELECT e FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true)
+  UNION ALL
+  SELECT e FROM mft_plain);
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query I
+SELECT count(DISTINCT e->>'a') FROM (
+  SELECT e FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true)
+  UNION ALL
+  SELECT e FROM mft_plain);
+----
+2100
