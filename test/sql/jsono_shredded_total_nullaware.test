@@ -1,0 +1,134 @@
+# name: test/sql/jsono_shredded_total_nullaware.test
+# description: null-aware per-shred totality: a scalar shred is read COALESCE-free when its `complete` stats prove min==max==1 AND no NULLs — even when the shred-set marker cannot prove schema identity (mixed-marker rows). A NULL anywhere in `complete` (a row reconciled from a shred set lacking the lane) keeps the safe COALESCE fallback.
+# group: [sql]
+
+require jsono
+
+require json
+
+# (a) mixed markers, intact lane: rows raw-cast (extension optimizer off) from a WIDER shred set
+# {$.a,$.c} into a {$.a} column keep the $.a lane and its complete=1 but carry the source's
+# shred-set marker, so the marker identity gate fails. The per-shred proof (complete min==max==1,
+# provably no NULLs) folds the $.a read to a bare lane extract anyway — every row's answer is in
+# the lane.
+statement ok
+CREATE TABLE mixed_marker AS
+SELECT jsono('{"a":' || i || ',"b":"x"}', shredding := {'$.a':'BIGINT'}) AS j FROM range(500) t(i);
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO mixed_marker
+SELECT jsono('{"a":' || (i + 500) || ',"b":"y","c":1}', shredding := {'$.a':'BIGINT','$.c':'BIGINT'}) FROM range(500) t(i);
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.a' AS BIGINT)) FROM mixed_marker;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query III
+SELECT MIN(CAST(j->>'$.a' AS BIGINT)), MAX(CAST(j->>'$.a' AS BIGINT)), COUNT(*) FROM mixed_marker;
+----
+0	999	1000
+
+# The raw cast dropped $.c from the second half's rows; the fold of the intact $.a lane must not
+# mask the manifest guard on the dropped path.
+statement error
+SELECT count(j->>'$.c') FROM mixed_marker;
+----
+narrowed by a raw struct cast
+
+# (b) lane missing on a row subset (the union_by_name / schema-evolution signature): rows raw-cast
+# from a source shredded on a DIFFERENT set {$.b} carry that set's marker (identity breaks) and a
+# NULL-filled $.a pair — `complete` carries NULLs, exactly the "written under a shred set lacking
+# the lane" case. The read must keep the COALESCE fallback and recover the value from those rows'
+# residual. ($.b never occurs in the source docs, so nothing was stripped and no row is narrowed.)
+statement ok
+CREATE TABLE lane_missing AS
+SELECT jsono('{"a":' || i || '}', shredding := {'$.a':'BIGINT'}) AS j FROM range(500) t(i);
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO lane_missing SELECT jsono('{"a":' || (i + 500) || '}', shredding := {'$.b':'VARCHAR'}) FROM range(500) t(i);
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.a' AS BIGINT)) FROM lane_missing;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query III
+SELECT MIN(CAST(j->>'$.a' AS BIGINT)), MAX(CAST(j->>'$.a' AS BIGINT)), COUNT(*) FROM lane_missing;
+----
+0	999	1000
+
+# (c) SQL NULL rows on a homogeneous table do not demote totality (the marker identity fast path:
+# min/max ignore NULLs). Regression for the pre-B behavior.
+statement ok
+CREATE TABLE with_null_rows AS
+SELECT CASE WHEN i % 5 = 0 THEN jsono(NULL) ELSE jsono('{"a":' || i || '}', shredding := {'$.a':'BIGINT'}) END AS j
+FROM range(1000) t(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.a' AS BIGINT)) FROM with_null_rows;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query III
+SELECT MIN(CAST(j->>'$.a' AS BIGINT)), MAX(CAST(j->>'$.a' AS BIGINT)), COUNT(CAST(j->>'$.a' AS BIGINT)) FROM with_null_rows;
+----
+1	999	800
+
+# (d) mixed markers AND NULL rows: the identity gate fails, and the per-shred proof must also fail
+# (NULL rows put NULLs into `complete`), so the fallback stays and values are still correct.
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO with_null_rows
+SELECT jsono('{"a":' || (i + 1000) || ',"c":1}', shredding := {'$.a':'BIGINT','$.c':'BIGINT'}) FROM range(100) t(i);
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.a' AS BIGINT)) FROM with_null_rows;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT MIN(CAST(j->>'$.a' AS BIGINT)), MAX(CAST(j->>'$.a' AS BIGINT)) FROM with_null_rows;
+----
+1	1099

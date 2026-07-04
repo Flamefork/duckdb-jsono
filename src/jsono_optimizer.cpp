@@ -1594,47 +1594,50 @@ void CollectShredTotality(ClientContext &context, const LogicalOperator &op, Shr
 				if (shreds_stats.GetType().id() == LogicalTypeId::STRUCT &&
 				    StructType::GetChildCount(shreds_stats.GetType()) >= 1) {
 					auto shred_children = StructType::GetChildCount(shreds_stats.GetType());
-					// Schema identity: the marker carries a single min==max layout hash equal to the read
-					// type's, so every scanned row was written under EXACTLY the read shred set. A
-					// multi-file read unioning narrower shred sets (union_by_name, DuckLake evolution)
-					// carries a different hash per file (min!=max, or min==max!=read hash) and fails this,
-					// keeping the residual COALESCE fallback. SQL-NULL rows null the marker but min/max
-					// ignore nulls, so they do not block schema identity.
+					// Schema identity fast path: the marker carries a single min==max layout hash equal to
+					// the read type's, so every scanned row was written under EXACTLY the read shred set —
+					// a NULL `complete` can then only come from a SQL-NULL row (min/max ignore nulls), and
+					// per-shred completeness alone decides totality. Without identity (union_by_name /
+					// DuckLake evolution / mixed-marker rows), a NULL `complete` may instead mean "row
+					// reconciled from a shred set LACKING this lane, value in the residual" — then the
+					// shred is total only when statistics also prove `complete` carries no NULL at all.
 					auto &set_stats = StructStats::GetChildStats(shreds_stats, 0);
 					auto expected_hash = int64_t(JsonoLayoutHashOf(returned_types[table_index]));
 					bool schema_identity = NumericStats::HasMinMax(set_stats) &&
 					                       NumericStats::Min(set_stats).GetValue<int64_t>() == expected_hash &&
 					                       NumericStats::Max(set_stats).GetValue<int64_t>() == expected_hash;
-					if (schema_identity) {
-						for (auto &shred : shreds) {
-							// A scalar shred is total (COALESCE-free) when its own `complete` flag carries
-							// no 0 (min == 1): no row spilled this shred's value into the residual, so a
-							// bare struct_extract of the lane is the full `->>` answer even where the lane is
-							// NULL (absent path / explicit null). A divert on another shred never demotes
-							// this one — completeness is per-shred. `complete` is a TINYINT 1/0 flag, not a
-							// BOOLEAN, because the Parquet stats reader omits BOOLEAN min/max. Array shreds
-							// carry no `complete` (their stat child is a LIST, not a pair) and stay non-total
-							// (always reconstructed). !HasMinMax → conservative (keep COALESCE).
-							idx_t shred_index = 1 + shred.child_index;
-							if (shred_index >= shred_children) {
-								continue;
-							}
-							auto &shred_stats = StructStats::GetChildStats(shreds_stats, shred_index);
-							if (shred_stats.GetType().id() != LogicalTypeId::STRUCT ||
-							    StructType::GetChildCount(shred_stats.GetType()) < 2) {
-								continue;
-							}
-							auto &complete_stats = StructStats::GetChildStats(shred_stats, 1);
-							// Total only when every row's `complete` is exactly 1 (no spill anywhere). Require
-							// min == max == 1, not merely min != 0: `complete` is a 1/0 flag, so a malformed or
-							// out-of-domain value (e.g. 2 from a hand-built struct) must keep the safe COALESCE
-							// fallback rather than be trusted as total. Read as int64 so a non-canonical integer
-							// width (the parser tolerates any integral `complete`) cannot overflow the compare.
-							if (NumericStats::HasMinMax(complete_stats) &&
-							    NumericStats::Min(complete_stats).GetValue<int64_t>() == 1 &&
-							    NumericStats::Max(complete_stats).GetValue<int64_t>() == 1) {
-								per_shred[shred.child_index] = false;
-							}
+					for (auto &shred : shreds) {
+						// A scalar shred is total (COALESCE-free) when its own `complete` flag carries
+						// no 0 (min == 1): no row spilled this shred's value into the residual, so a
+						// bare struct_extract of the lane is the full `->>` answer even where the lane is
+						// NULL (absent path / explicit null). A divert on another shred never demotes
+						// this one — completeness is per-shred. `complete` is a TINYINT 1/0 flag, not a
+						// BOOLEAN, because the Parquet stats reader omits BOOLEAN min/max. Array shreds
+						// carry no `complete` (their stat child is a LIST, not a pair) and stay non-total
+						// (always reconstructed). !HasMinMax → conservative (keep COALESCE).
+						idx_t shred_index = 1 + shred.child_index;
+						if (shred_index >= shred_children) {
+							continue;
+						}
+						auto &shred_stats = StructStats::GetChildStats(shreds_stats, shred_index);
+						if (shred_stats.GetType().id() != LogicalTypeId::STRUCT ||
+						    StructType::GetChildCount(shred_stats.GetType()) < 2) {
+							continue;
+						}
+						auto &complete_stats = StructStats::GetChildStats(shred_stats, 1);
+						// Total only when every row's `complete` is exactly 1 (no spill anywhere). Require
+						// min == max == 1, not merely min != 0: `complete` is a 1/0 flag, so a malformed or
+						// out-of-domain value (e.g. 2 from a hand-built struct) must keep the safe COALESCE
+						// fallback rather than be trusted as total. Read as int64 so a non-canonical integer
+						// width (the parser tolerates any integral `complete`) cannot overflow the compare.
+						// Without the identity fast path, additionally require proven-no-NULL `complete`:
+						// reconciliation NULL-fills the lanes a row's writing shred set lacked, and those
+						// NULLs are invisible to min/max — the no-NULL proof closes exactly that hole.
+						if (NumericStats::HasMinMax(complete_stats) &&
+						    NumericStats::Min(complete_stats).GetValue<int64_t>() == 1 &&
+						    NumericStats::Max(complete_stats).GetValue<int64_t>() == 1 &&
+						    (schema_identity || !complete_stats.CanHaveNull())) {
+							per_shred[shred.child_index] = false;
 						}
 					}
 				}
