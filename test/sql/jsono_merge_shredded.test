@@ -492,6 +492,22 @@ SELECT g, to_json(m) FROM (
 1	NULL
 2	{"k":"p2"}
 
+# Vector-scale SQL-NULL results on the all-shredded fast path: both inputs SQL NULL on a row
+# (i % 4 = 0) fold to a SQL-NULL result. The fast path must null the intermediate layout/body
+# struct levels of those rows, not only the top-level marker and the shreds subtree — a debug
+# struct Verify (every child of a NULL struct row must itself be NULL) trips otherwise. The read
+# back walks the nulled levels; the FILTER pins that surviving rows still carry the patch value.
+query III
+SELECT count(*), count(m), count(*) FILTER (WHERE (m ->> 'k') = 'p' || i) FROM (
+  SELECT i, jsono_merge_patch(
+    jsono(CASE WHEN i % 4 = 0 THEN NULL ELSE '{"k":"b' || i || '"}' END, shredding := {k:'VARCHAR'}),
+    jsono(CASE WHEN i % 4 = 0 THEN NULL ELSE '{"k":"p' || i || '"}' END, shredding := {k:'VARCHAR'})
+  ) AS m
+  FROM range(2000) t(i)
+);
+----
+2000	1500	1500
+
 # A per-row non-object plain patch replaces the whole document (existing non-object gating
 # preserved), while neighbouring rows keep the base lane through the fast path.
 query II

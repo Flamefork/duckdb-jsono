@@ -153,3 +153,92 @@ SELECT count(DISTINCT e->>'a') FROM (
   SELECT e FROM mft_plain);
 ----
 2100
+
+# (g) the SAME lane carried at a DIVERGENT value type across files (union_by_name widens the BIGINT
+# lane to VARCHAR). The name-aligned stats recovery reads the lane's `complete` (which does not
+# diverge) and folds the STRING extract COALESCE-free: its answer is text either way, and the widened
+# lane renders identically to the residual. But a json-valued read cannot — the number-vs-string
+# distinction is lost in the widened lane, so the raw-cast manifest guard fails it loudly rather than
+# fabricate a value. This pins the correctness-critical `AlignStatsToReadType` divergent-type branch.
+statement ok
+COPY (SELECT jsono('{"a":"A' || i || '"}', shredding := {'a':'VARCHAR'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft_dv_a.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono('{"a":' || (i + 100) || '}', shredding := {'a':'BIGINT'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft_dv_b.parquet' (FORMAT parquet);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(e->>'a') FROM read_parquet(['__TEST_DIR__/mft_dv_a.parquet', '__TEST_DIR__/mft_dv_b.parquet'], union_by_name=true);
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# String extract: file A rows are strings, file B numbers rendered as text; MIN is a digit-leading
+# string, values correct.
+query III
+SELECT count(*), MIN(e->>'a'), MAX(e->>'a')
+FROM read_parquet(['__TEST_DIR__/mft_dv_a.parquet', '__TEST_DIR__/mft_dv_b.parquet'], union_by_name=true);
+----
+200	100	A99
+
+# Json-valued read over the widened lane cannot reproduce the original number and fails loudly.
+statement error
+SELECT count(e->'a') FROM read_parquet(['__TEST_DIR__/mft_dv_a.parquet', '__TEST_DIR__/mft_dv_b.parquet'], union_by_name=true);
+----
+converted by a raw struct cast
+
+# (h) three files with DIVERGING shred sets ($.x / $.y / $.z) drop the engine's stats, so recovery
+# runs. It must merge every file (initial_reader + union_readers[1] + union_readers[2]): $.n total in
+# all three folds; a value spilled ONLY in the third file has to block the fold, proving the loop is
+# not truncated to the first two files.
+statement ok
+COPY (SELECT jsono('{"n":' || i || ',"x":' || i || '}', shredding := {'$.n':'BIGINT','$.x':'BIGINT'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft3_a.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono('{"n":' || (i + 100) || ',"y":' || i || '}', shredding := {'$.n':'BIGINT','$.y':'BIGINT'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft3_b.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono('{"n":' || (i + 200) || ',"z":' || i || '}', shredding := {'$.n':'BIGINT','$.z':'BIGINT'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft3_c.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono(CASE WHEN i = 3 THEN '{"n":"spill","z":' || i || '}' ELSE '{"n":' || (i + 200) || ',"z":' || i || '}' END, shredding := {'$.n':'BIGINT','$.z':'BIGINT'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft3_spill.parquet' (FORMAT parquet);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# All three total: folds (stats merged across all three readers).
+query II
+EXPLAIN SELECT MIN(e->>'$.n') FROM read_parquet(['__TEST_DIR__/mft3_a.parquet', '__TEST_DIR__/mft3_b.parquet', '__TEST_DIR__/mft3_c.parquet'], union_by_name=true);
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+# Spill in the third file: the fold must be blocked (recovery has to reach union_readers[2]).
+query II
+EXPLAIN SELECT MIN(e->>'$.n') FROM read_parquet(['__TEST_DIR__/mft3_a.parquet', '__TEST_DIR__/mft3_b.parquet', '__TEST_DIR__/mft3_spill.parquet'], union_by_name=true);
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query III
+SELECT count(*), MIN(CAST(e->>'$.n' AS BIGINT)), MAX(CAST(e->>'$.n' AS BIGINT))
+FROM read_parquet(['__TEST_DIR__/mft3_a.parquet', '__TEST_DIR__/mft3_b.parquet', '__TEST_DIR__/mft3_c.parquet'], union_by_name=true);
+----
+300	0	299
+
+query I
+SELECT count(*) FROM read_parquet(['__TEST_DIR__/mft3_a.parquet', '__TEST_DIR__/mft3_b.parquet', '__TEST_DIR__/mft3_spill.parquet'], union_by_name=true)
+WHERE (e->>'$.n') = 'spill';
+----
+1

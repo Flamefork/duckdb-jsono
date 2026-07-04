@@ -99,6 +99,14 @@ SELECT MIN((e->'a')::VARCHAR), MAX((e->'a')::VARCHAR) FROM (SELECT e FROM pu_shr
 ----
 "A0"	"P999"
 
+# (c2) the named json-valued jsono_extract is pushed too. It returns JSONO natively (a no-op arg
+# cast, distinct from the JSON cast core ->/json_extract carry), so this exercises the other branch
+# of MakeNativeExtractOver's value-type handling; values match.
+query II
+SELECT MIN(jsono_extract(e, 'a')::VARCHAR), MAX(jsono_extract(e, 'a')::VARCHAR) FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain);
+----
+"A0"	"P999"
+
 # (d) the jsono column still referenced above: reads are pushed anyway, the column stays in the
 # union output, and both coexist.
 query II
@@ -107,12 +115,34 @@ SELECT e->>'a', to_json(e)::VARCHAR FROM (SELECT e FROM pu_shred UNION ALL SELEC
 A0	{"a":"A0","n":0}
 A1	{"a":"A1","n":1}
 
-# (e) NULL rows flow through the pushed read as NULL.
+# (e) A constant `jsono(NULL)` branch is not a bare column source, so this union is NOT pushed (the
+# extract stays above as a reconciled read); the NULL row still resolves correctly.
 query I
 SELECT e->>'a' FROM (SELECT jsono(NULL) AS e UNION ALL SELECT e FROM pu_shred) ORDER BY 1 NULLS FIRST LIMIT 2;
 ----
 NULL
 A0
+
+# (e2) A nullable shredded column IS a bare source and gets pushed: on a SQL-NULL row the pushed
+# per-branch read yields NULL. Plan-lock (pushed, COALESCE-free) plus the NULL count through it.
+statement ok
+CREATE TABLE pu_nullable AS SELECT jsono(CASE WHEN i % 10 = 0 THEN NULL ELSE '{"a":"N' || i || '"}' END, shredding := {'a':'VARCHAR'}) AS e FROM range(1000) t(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT e->>'a' FROM (SELECT e FROM pu_nullable UNION ALL SELECT e FROM pu_plain);
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query III
+SELECT count(*), count(e->>'a'), count(*) FILTER (WHERE (e->>'a') IS NULL) FROM (SELECT e FROM pu_nullable UNION ALL SELECT e FROM pu_plain);
+----
+2000	1900	100
 
 # (f) UNION DISTINCT dedups on the full value: not pushed (the extract above keeps today's
 # reconciled-read form), values correct.
