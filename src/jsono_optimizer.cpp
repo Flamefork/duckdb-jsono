@@ -1583,10 +1583,12 @@ unique_ptr<BaseStatistics> TryRecoverMultiFileColumnStats(ClientContext &context
 	}
 	auto multi_file = dynamic_cast<MultiFileBindData *>(get.bind_data.get());
 	if (!multi_file || !multi_file->initial_reader || multi_file->union_readers.empty() ||
-	    column_index >= get.names.size()) {
+	    column_index >= multi_file->names.size()) {
 		return nullptr;
 	}
-	auto &column_name = get.names[column_index];
+	// Resolve the name off the same source MultiFileScanStats uses (`bind_data.names`), not
+	// `get.names`, so the mirror of the engine iteration stays exact across a submodule bump.
+	auto &column_name = multi_file->names[column_index];
 	// Mirror MultiFileScanStats' iteration: the first file is served by the initial reader, the
 	// remaining files by their union readers.
 	auto merged =
