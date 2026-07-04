@@ -1701,6 +1701,10 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			auto &result_validity = FlatVector::Validity(result);
 			for (idx_t row = 0; row < count; row++) {
 				if (!result_validity.RowIsValid(row)) {
+					// The layout/body levels must go NULL with the row (struct Verify requires every
+					// child of a NULL struct row to be NULL); the blob copies above only carry the
+					// residual's own child validity, not the intermediate struct levels.
+					writer.SetRowNull(row);
 					JsonoSetRowMarkerNull(result, row);
 				}
 			}
