@@ -1023,6 +1023,19 @@ SELECT jsono_extract_string(j, '$.b') AS b, jsono_extract_string(j, '$.c') AS c 
 ----
 narrowed by a raw struct cast
 
+# --- json_quote over a PLAIN jsono value serializes the logical JSON document, exactly like to_json.
+#     Both must resolve to the jsono-struct overload; without a json_quote(jsono) overload core json's
+#     json_quote(ANY) dumps the raw six-BLOB layout struct instead of the document. The value is plain
+#     (a VARCHAR/JSON constructor never auto-shreds), so the optimizer's to_json/json_quote reconstruct
+#     branch does not fire — this exercises the registered overload directly. ---
+query II
+SELECT json_quote(jsono('{"kind":"commit","n":7,"o":{"x":1}}'))::VARCHAR
+         = to_json(jsono('{"kind":"commit","n":7,"o":{"x":1}}'))::VARCHAR,
+       json_quote(jsono('{"kind":"commit","n":7,"o":{"x":1}}'))::VARCHAR
+         = '{"kind":"commit","n":7,"o":{"x":1}}';
+----
+true	true
+
 # --- json_quote over a shredded value takes the SAME whole-value reconstruct rewrite as to_json
 #     (the optimizer's to_json/json_quote branch), so json_quote(shredded) == to_json(shredded). Reuses
 #     the jsono_extract_shredded fixture ({"kind":"commit","n":7,"o":{"x":1}} shredded on kind + n). ---
