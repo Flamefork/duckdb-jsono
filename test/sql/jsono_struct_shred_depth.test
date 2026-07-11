@@ -24,13 +24,31 @@ SELECT
 ----
 g	{"URL":{"query_params":{"utm_source":"g"}}}
 
-# A leaf one level too deep (depth 4) is NOT lifted — it stays in the residual, still read correctly.
+# Auto-shred descends nested structs up to a deliberately high cap (JSONO_AUTO_SHRED_MAX_DEPTH = 16),
+# far above realistic nesting, so a depth-4 leaf lifts too.
+query I
+SELECT typeof(jsono({'a':{'b':{'c':{'d':'x'}}}})) LIKE '%"$.a.b.c.d"%';
+----
+true
+
+# The cap exists only to stop a pathologically deep value from making a whole-value reconstruct
+# super-linear (each nested lane merges back into the residual): a leaf AT the cap depth (16) lifts,
+# one strictly deeper (17) stays in the residual.
 query II
 SELECT
-  typeof(jsono({'a':{'b':{'c':{'d':'x'}}}})) LIKE '%a.b.c.d%',
-  jsono({'a':{'b':{'c':{'d':'x'}}}}) ->> '$.a.b.c.d';
+  typeof(jsono({'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x'}}}}}}}}}}}}}}}})) LIKE '%"$.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.l"%',
+  typeof(jsono({'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x'}}}}}}}}}}}}}}}}})) LIKE '%"$.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.l"%';
 ----
-false	x
+true	false
+
+# An over-cap deep leaf still reads correctly (from the residual), and the value round-trips losslessly
+# (compared through jsono on both sides so key order is canonical).
+query II
+SELECT
+  jsono({'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x'}}}}}}}}}}}}}}}}}}}}) ->> '$.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.l',
+  to_json(jsono({'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x'}}}}}}}}}}}}}}}}}}}})) = to_json(jsono('{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x","a":{"l":"x"}}}}}}}}}}}}}}}}}}}}'));
+----
+x	true
 
 # Only a depth-1 field named 'body'/'$jsono$set' collides with a layout name; a nested $.URL.body
 # is a safe lane.
@@ -90,12 +108,14 @@ SELECT jsono_suggest_shredding(ep, min_presence := 0.005) FROM (
 ----
 {"$.URL.query_params.rare": 'VARCHAR'}
 
-# Advisor drops a deep key whose type diverges across rows (scalar in some, object in others) at
-# min_fit = 1.0 — the intermediate object is recorded as a nonrole occurrence before recursing.
+# Advisor drops a deep key whose type diverges across rows (scalar in 90%, object in 10%) at
+# min_fit = 1.0 — the intermediate object is recorded as a nonrole occurrence before recursing, so
+# $.URL.qp.x's fit falls below 1.0. The rare object's own child ($.URL.qp.x.nested, present 10%) is
+# below min_presence, so nothing is suggested.
 query I
 SELECT jsono_suggest_shredding(ep) FROM (
   SELECT jsono('{"URL":{"qp":' ||
-    CASE WHEN i % 2 = 0 THEN '{"x":"s"}' ELSE '{"x":{"nested":1}}' END || '}}') AS ep
+    CASE WHEN i % 10 = 0 THEN '{"x":{"nested":1}}' ELSE '{"x":"s"}' END || '}}') AS ep
   FROM range(2000) t(i)
 ) LIMIT 1;
 ----

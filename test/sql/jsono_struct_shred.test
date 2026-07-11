@@ -36,15 +36,16 @@ SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 
 ----
 STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.commit.collection" STRUCT("value" VARCHAR, complete TINYINT), "$.commit.operation" STRUCT("value" VARCHAR, complete TINYINT), did STRUCT("value" VARCHAR, complete TINYINT), kind STRUCT("value" VARCHAR, complete TINYINT))))
 
-# The walk descends to JSONO_AUTO_SHRED_MAX_DEPTH (3): a scalar strictly deeper stays in the residual
-# (a deep schema would otherwise lift many cold leaves). $.b.c and $.b.d.e are shredded; $.b.d.f.g
-# (depth 4) is not.
+# The walk descends nested structs up to a deliberately high cap (JSONO_AUTO_SHRED_MAX_DEPTH), well
+# above realistic nesting, so every scalar leaf here lifts: $.b.c, $.b.d.e, and $.b.d.f.g. The cap
+# only exists to stop a pathologically deep value from making reconstruct super-linear (see the
+# depth-boundary case in jsono_struct_shred_depth.test).
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep', 'f': {'g': 'deeper'}}}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.b.c" STRUCT("value" VARCHAR, complete TINYINT), "$.b.d.e" STRUCT("value" VARCHAR, complete TINYINT), a STRUCT("value" BIGINT, complete TINYINT))))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.b.c" STRUCT("value" VARCHAR, complete TINYINT), "$.b.d.e" STRUCT("value" VARCHAR, complete TINYINT), "$.b.d.f.g" STRUCT("value" VARCHAR, complete TINYINT), a STRUCT("value" BIGINT, complete TINYINT))))
 
-# Losslessness holds for the un-shredded deep leaf too: $.b.d.f.g round-trips through the residual.
+# The nested shreds round-trip losslessly.
 query I
 SELECT to_json(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep', 'f': {'g': 'deeper'}}}}))::VARCHAR;
 ----

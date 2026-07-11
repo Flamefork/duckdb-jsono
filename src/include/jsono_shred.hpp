@@ -16,14 +16,20 @@ class ExtensionLoader;
 class ScalarFunction;
 
 // How deep auto-shred (the struct constructor) and jsono_suggest_shredding descend when lifting
-// nested scalar leaves into shreds: leaves at key depth 1..N are lifted (`$.a`, `$.a.b`, `$.a.b.c`
-// for N=3), a leaf strictly deeper stays in the residual. Web-event marts keep hot leaves at depth 3
-// (`$.URL.query_params.utm_source`, `$.params.*`). The bound is a fixed cap, not configurable: the
-// constructor has no per-row frequency signal at bind, so depth is the only honest lever against a
-// wide-schema lane blowup; the advisor is additionally presence/fit-gated but shares the cap so a
-// pasted suggestion and the auto path agree. Deeper or sparser lanes go through the explicit
-// `shredding := {...}` spec (unbounded). The read/write/manifest machinery is depth-agnostic.
-constexpr idx_t JSONO_AUTO_SHRED_MAX_DEPTH = 3;
+// nested scalar leaves into shreds: leaves at key depth 1..N are lifted (`$.a`, `$.a.b`, … up to N),
+// a leaf strictly deeper stays in the residual. The cap is set DELIBERATELY HIGH — far above any
+// realistic analytical nesting (web-event hot leaves sit at depth 3: `$.URL.query_params.utm_source`,
+// `$.params.*`; deeper analytical leaves are rare) — while still cutting a real pathology: shredding a
+// deeply-nested value makes a whole-value reconstruct (`to_json`/`::JSON`/`::VARCHAR`) super-linear in
+// depth (each nested lane merges back into the residual skeleton), 6× slower than the plain value at
+// depth 8 and 15×+ by depth 48, catastrophic (seconds) past ~100. Point-path shred reads stay cheap
+// at any depth; only reconstruct pays. So the bound exists to stop unbounded depth from silently
+// turning a deep value's reconstruct into a super-linear cost, not to limit realistic use. It is a
+// fixed cap, not configurable: the constructor has no per-row frequency signal at bind, so depth is
+// the only honest lever; the advisor is additionally presence/fit-gated but shares the cap so a
+// pasted suggestion and the auto path agree. Deeper lanes go through explicit `shredding := {...}`
+// (no cap). The read/write/manifest machinery itself is depth-agnostic.
+constexpr idx_t JSONO_AUTO_SHRED_MAX_DEPTH = 16;
 
 // The category of a shred column: one scalar value, a LIST<STRUCT> array shred (every element an
 // object whose subfields lift), or a LIST<scalar> array shred (every element a scalar that lifts as
