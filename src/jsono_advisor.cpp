@@ -1,5 +1,6 @@
 #include "jsono.hpp"
 #include "jsono_locate.hpp"
+#include "jsono_memory.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_render.hpp"
@@ -18,6 +19,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 #include "string_view.hpp"
 
@@ -92,16 +94,43 @@ struct SuggestCandidate {
 struct SuggestState {
 	std::map<string, SuggestCandidate> *paths;
 	idx_t non_null_rows;
+	JsonoMemoryReservation mem;
 };
+
+// Approximate std::map (red-black tree) node bookkeeping per entry; the accounting only needs a faithful,
+// monotone proxy for the map footprint, not byte-exactness.
+constexpr idx_t kMapNodeOverhead = 48;
+
+// Owned-heap footprint of the candidate-path map (each path entry plus its object-array subfield map).
+// Bounded by kMaxCandidatePaths, but walked per Update/Combine call (via AccountDistinctStates) rather
+// than per row.
+idx_t SuggestFootprint(const SuggestState &state) {
+	if (!state.paths) {
+		return 0;
+	}
+	idx_t bytes = 0;
+	for (auto &entry : *state.paths) {
+		bytes += kMapNodeOverhead + entry.first.capacity() + sizeof(SuggestCandidate);
+		for (auto &subfield : entry.second.subfields) {
+			bytes += kMapNodeOverhead + subfield.first.capacity() + sizeof(SubfieldStat);
+		}
+	}
+	return bytes;
+}
 
 struct SuggestBindData : public FunctionData {
 	double min_presence;
 	double min_fit;
+	// Carried into Update/Combine so the candidate map's growth is accounted. Unlike the merge bind_data
+	// this type has a serialize callback (named args do not survive re-bind), so it is re-fetched in the
+	// deserialize path rather than by a re-run bind.
+	BufferManager &buffer_manager;
 
-	SuggestBindData(double min_presence_p, double min_fit_p) : min_presence(min_presence_p), min_fit(min_fit_p) {
+	SuggestBindData(double min_presence_p, double min_fit_p, BufferManager &buffer_manager)
+	    : min_presence(min_presence_p), min_fit(min_fit_p), buffer_manager(buffer_manager) {
 	}
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<SuggestBindData>(min_presence, min_fit);
+		return make_uniq<SuggestBindData>(min_presence, min_fit, buffer_manager);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<SuggestBindData>();
@@ -123,7 +152,8 @@ void SuggestSerialize(Serializer &serializer, const optional_ptr<FunctionData> b
 unique_ptr<FunctionData> SuggestDeserialize(Deserializer &deserializer, AggregateFunction &function) {
 	auto min_presence = deserializer.ReadProperty<double>(100, "min_presence");
 	auto min_fit = deserializer.ReadProperty<double>(101, "min_fit");
-	return make_uniq<SuggestBindData>(min_presence, min_fit);
+	auto &context = deserializer.Get<ClientContext &>();
+	return make_uniq<SuggestBindData>(min_presence, min_fit, BufferManager::GetBufferManager(context));
 }
 
 // Tally one present scalar into a lane's fit counters. A JSON null is losslessly captured by every
@@ -511,9 +541,12 @@ struct SuggestAggregate {
 	static void Initialize(SuggestState &state) {
 		state.paths = nullptr;
 		state.non_null_rows = 0;
+		state.mem.reserved = 0;
+		state.mem.buffer_manager = nullptr;
 	}
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
+		state.mem.Release();
 		delete state.paths;
 		state.paths = nullptr;
 	}
@@ -570,7 +603,7 @@ unique_ptr<FunctionData> JsonoSuggestBind(ClientContext &context, AggregateFunct
 		throw BinderException("jsono_suggest_shredding: input must be plain JSONO");
 	}
 	function.arguments[0] = JsonoType();
-	return make_uniq<SuggestBindData>(min_presence, min_fit);
+	return make_uniq<SuggestBindData>(min_presence, min_fit, BufferManager::GetBufferManager(context));
 }
 
 void SuggestAccumulate(SuggestState &state, Vector &input, idx_t count) {
@@ -590,11 +623,16 @@ void SuggestAccumulate(SuggestState &state, Vector &input, idx_t count) {
 	}
 }
 
-void JsonoSuggestSimpleUpdate(Vector inputs[], AggregateInputData &, idx_t, data_ptr_t state_ptr, idx_t count) {
-	SuggestAccumulate(*reinterpret_cast<SuggestState *>(state_ptr), inputs[0], count);
+void JsonoSuggestSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t, data_ptr_t state_ptr,
+                              idx_t count) {
+	auto &state = *reinterpret_cast<SuggestState *>(state_ptr);
+	SuggestAccumulate(state, inputs[0], count);
+	auto &bind_data = aggr_input_data.bind_data->Cast<SuggestBindData>();
+	state.mem.Resize(bind_data.buffer_manager, SuggestFootprint(state));
 }
 
-void JsonoSuggestUpdate(Vector inputs[], AggregateInputData &, idx_t, Vector &states, idx_t count) {
+void JsonoSuggestUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t, Vector &states, idx_t count) {
+	auto &bind_data = aggr_input_data.bind_data->Cast<SuggestBindData>();
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<SuggestState *>(state_fmt);
@@ -614,6 +652,11 @@ void JsonoSuggestUpdate(Vector inputs[], AggregateInputData &, idx_t, Vector &st
 		state.non_null_rows++;
 		AccumulateDocument(view, *state.paths);
 	}
+	// Account each distinct state once per chunk (the candidate-map footprint walk is too costly per row).
+	AccountDistinctStates<SuggestState>(
+	    count, bind_data.buffer_manager,
+	    [&](idx_t row) -> SuggestState & { return *state_data[state_fmt.sel->get_index(row)]; },
+	    [](const SuggestState &s) { return SuggestFootprint(s); });
 }
 
 void MergeSuggestCandidate(SuggestCandidate &target, const SuggestCandidate &source) {
@@ -637,7 +680,8 @@ void MergeSuggestCandidate(SuggestCandidate &target, const SuggestCandidate &sou
 	}
 }
 
-void JsonoSuggestCombine(Vector &source, Vector &target, AggregateInputData &, idx_t count) {
+void JsonoSuggestCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
+	auto &bind_data = aggr_input_data.bind_data->Cast<SuggestBindData>();
 	UnifiedVectorFormat source_fmt;
 	source.ToUnifiedFormat(count, source_fmt);
 	auto source_data = UnifiedVectorFormat::GetData<SuggestState *>(source_fmt);
@@ -656,6 +700,10 @@ void JsonoSuggestCombine(Vector &source, Vector &target, AggregateInputData &, i
 			MergeSuggestCandidate(GetCandidate(*target_state.paths, entry.first), entry.second);
 		}
 	}
+	// Only targets grow (sources are merged in, not moved out); account each distinct target once.
+	AccountDistinctStates<SuggestState>(
+	    count, bind_data.buffer_manager, [&](idx_t row) -> SuggestState & { return *target_data[row]; },
+	    [](const SuggestState &s) { return SuggestFootprint(s); });
 }
 
 void JsonoSuggestFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
@@ -708,7 +756,17 @@ struct ShredStatCounters {
 struct ShredStatsState {
 	std::vector<ShredStatCounters> *counters;
 	idx_t non_null_rows;
+	JsonoMemoryReservation mem;
 };
+
+// The counters vector is allocated once to the (fixed) shred count and never grows, so its footprint is a
+// single constant term.
+idx_t ShredStatsFootprint(const ShredStatsState &state) {
+	if (!state.counters) {
+		return 0;
+	}
+	return state.counters->capacity() * sizeof(ShredStatCounters);
+}
 
 // One shred of the input type: its output path/type strings plus the residual path steps used to
 // detect a diverted value (lane NULL but the path is still present in the residual).
@@ -721,9 +779,15 @@ struct ShredStatDescriptor {
 
 struct ShredStatsBindData : public FunctionData {
 	vector<ShredStatDescriptor> shreds;
+	// Carried into Update/Combine to account the counters vector; re-captured on plan round-trips (no
+	// serialize callback, so deserialize re-runs the bind).
+	BufferManager &buffer_manager;
+
+	explicit ShredStatsBindData(BufferManager &buffer_manager) : buffer_manager(buffer_manager) {
+	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		auto copy = make_uniq<ShredStatsBindData>();
+		auto copy = make_uniq<ShredStatsBindData>(buffer_manager);
 		copy->shreds = shreds;
 		return std::move(copy);
 	}
@@ -745,9 +809,12 @@ struct ShredStatsAggregate {
 	static void Initialize(ShredStatsState &state) {
 		state.counters = nullptr;
 		state.non_null_rows = 0;
+		state.mem.reserved = 0;
+		state.mem.buffer_manager = nullptr;
 	}
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
+		state.mem.Release();
 		delete state.counters;
 		state.counters = nullptr;
 	}
@@ -777,7 +844,7 @@ unique_ptr<FunctionData> JsonoShredStatsBind(ClientContext &context, AggregateFu
 	}
 	JsonoLayoutType layout;
 	TryParseJsonoLayoutType(type, layout);
-	auto bind_data = make_uniq<ShredStatsBindData>();
+	auto bind_data = make_uniq<ShredStatsBindData>(BufferManager::GetBufferManager(context));
 	for (auto &shred : layout.shreds) {
 		ShredStatDescriptor descriptor;
 		descriptor.path = shred.first;
@@ -869,6 +936,7 @@ void JsonoShredStatsSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input
 		}
 		AccumulateShredStatsRow(state, bind_data, lanes, row, row_state, view);
 	}
+	state.mem.Resize(bind_data.buffer_manager, ShredStatsFootprint(state));
 }
 
 void JsonoShredStatsUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t, Vector &states, idx_t count) {
@@ -891,6 +959,10 @@ void JsonoShredStatsUpdate(Vector inputs[], AggregateInputData &aggr_input_data,
 		}
 		AccumulateShredStatsRow(state, bind_data, lanes, row, row_state, view);
 	}
+	AccountDistinctStates<ShredStatsState>(
+	    count, bind_data.buffer_manager,
+	    [&](idx_t row) -> ShredStatsState & { return *state_data[state_fmt.sel->get_index(row)]; },
+	    [](const ShredStatsState &s) { return ShredStatsFootprint(s); });
 }
 
 void JsonoShredStatsCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
@@ -915,6 +987,10 @@ void JsonoShredStatsCombine(Vector &source, Vector &target, AggregateInputData &
 			(*target_state.counters)[f].complete += (*source_state.counters)[f].complete;
 		}
 	}
+	// A target's counters are allocated on first touch (fixed size); account each distinct target once.
+	AccountDistinctStates<ShredStatsState>(
+	    count, bind_data.buffer_manager, [&](idx_t row) -> ShredStatsState & { return *target_data[row]; },
+	    [](const ShredStatsState &s) { return ShredStatsFootprint(s); });
 }
 
 void JsonoShredStatsFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,

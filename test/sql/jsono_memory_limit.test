@@ -46,3 +46,37 @@ statement error
 SELECT jsono_group_object(CAST(range AS VARCHAR), jsono('"' || repeat('x', 2000) || '"')) FROM range(300000);
 ----
 Out of Memory Error
+
+# ===== jsono_group_merge (non-keyed) ORDER BY-in-aggregate =====
+
+# The ORDER BY buffers and replays rows into Update (bypassing Combine). Under a generous limit it must
+# succeed -- a balance check that the buffered-then-replayed reservations do not spuriously OOM.
+statement ok
+SET max_memory='2GB';
+
+query T
+SELECT jsono_group_merge(jsono('{"a":"' || repeat('x', 100) || '"}') ORDER BY range) IS NOT NULL FROM range(5000);
+----
+true
+
+# ===== jsono_group_merge_max (keyed) =====
+
+# Window case: PRESERVE_INPUT combine copies source partials across frames. Under a generous limit the
+# copy-accounting must stay balanced (no spurious OOM); count(m) forces the window to materialize.
+query I
+SELECT count(m) FROM (
+	SELECT jsono_group_merge_max(v, k) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS m
+	FROM (SELECT jsono('{"a":"' || repeat('x', 100) || '"}') AS v, range AS k FROM range(3000)) src
+) w;
+----
+3000
+
+# Enforcement: a high-cardinality GROUP BY accumulates one keyed LWW state per group; under a small limit
+# the per-state reservations trip the engine OOM.
+statement ok
+SET max_memory='40MB';
+
+statement error
+SELECT jsono_group_merge_max(jsono('{"a":"' || repeat('x', 500) || '"}'), range) FROM range(300000) GROUP BY range;
+----
+Out of Memory Error

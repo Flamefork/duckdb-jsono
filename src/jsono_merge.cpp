@@ -2,6 +2,7 @@
 #include "jsono.hpp"
 #include "jsono_copy.hpp"
 #include "jsono_locate.hpp"
+#include "jsono_memory.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_row_read.hpp"
@@ -19,6 +20,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 #include "string_view.hpp"
 
@@ -1828,8 +1830,12 @@ struct GroupMergeBindData : public FunctionData {
 	// per-chunk array composition pass.
 	vector<GroupMergeShredPlan> shred_plan;
 	vector<idx_t> array_shred_filter;
+	// Carried into Update/Combine so the accumulator's residual/lane growth is accounted; re-captured on
+	// plan round-trips because this bind_data has no serialize callback (deserialize re-runs the bind).
+	BufferManager &buffer_manager;
 
-	explicit GroupMergeBindData(MergeMode merge_mode) : merge_mode(merge_mode) {
+	GroupMergeBindData(MergeMode merge_mode, BufferManager &buffer_manager)
+	    : merge_mode(merge_mode), buffer_manager(buffer_manager) {
 	}
 
 	void BuildShredPlan() {
@@ -1855,7 +1861,7 @@ struct GroupMergeBindData : public FunctionData {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		auto result = make_uniq<GroupMergeBindData>(merge_mode);
+		auto result = make_uniq<GroupMergeBindData>(merge_mode, buffer_manager);
 		result->shreds = shreds;
 		result->BuildShredPlan();
 		return std::move(result);
@@ -1897,17 +1903,39 @@ struct GroupMergeState {
 	OwnedJsonoBlob *acc;
 	DirectShreddedAcc *direct;
 	bool has_input;
+	JsonoMemoryReservation mem;
 };
+
+// Current owned-heap footprint of a non-keyed group_merge accumulator (plain acc blob and/or the direct
+// shredded accumulator's residual + scalar lanes). BlobBytes is O(1), so this is O(shred count) -- cheap
+// enough to re-measure per fold on the hot path.
+idx_t GroupMergeFootprint(const GroupMergeState &state) {
+	idx_t bytes = 0;
+	if (state.acc) {
+		bytes += sizeof(OwnedJsonoBlob) + BlobBytes(*state.acc);
+	}
+	if (state.direct) {
+		bytes += sizeof(DirectShreddedAcc) + BlobBytes(state.direct->residual);
+		bytes += state.direct->lanes.capacity() * sizeof(DirectLaneSlot);
+		for (auto &lane : state.direct->lanes) {
+			bytes += lane.s.capacity();
+		}
+	}
+	return bytes;
+}
 
 struct GroupMergeFunction {
 	static void Initialize(GroupMergeState &state) {
 		state.acc = nullptr;
 		state.direct = nullptr;
 		state.has_input = false;
+		state.mem.reserved = 0;
+		state.mem.buffer_manager = nullptr;
 	}
 
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
+		state.mem.Release();
 		delete state.acc;
 		state.acc = nullptr;
 		delete state.direct;
@@ -1927,7 +1955,7 @@ unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFu
 	}
 	auto &type = arg.return_type;
 	JsonoRequireExtensionOptimizerForShredded(context, type, "jsono_group_merge");
-	auto bind_data = make_uniq<GroupMergeBindData>(MergeMode::IgnoreNulls);
+	auto bind_data = make_uniq<GroupMergeBindData>(MergeMode::IgnoreNulls, BufferManager::GetBufferManager(context));
 	if (IsShreddedJsonoType(type)) {
 		// Capture the shreds (clean names, the type's canonical order) as the sticky shredded return
 		// type — like jsono_merge_patch, the result stays shredded across the aggregation. They also
@@ -2234,6 +2262,7 @@ void JsonoGroupMergeSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input
                                  data_ptr_t state_ptr, idx_t count) {
 	(void)input_count;
 	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeBindData>();
+	auto &bm = bind_data.buffer_manager;
 	auto &state = *reinterpret_cast<GroupMergeState *>(state_ptr);
 	JsonoView view;
 	if (!bind_data.shreds.empty()) {
@@ -2251,6 +2280,7 @@ void JsonoGroupMergeSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input
 			}
 			DirectFoldRow(direct, view, bind_data, lane_fmt, row);
 			state.has_input = true;
+			state.mem.Resize(bm, GroupMergeFootprint(state));
 		}
 		return;
 	}
@@ -2263,6 +2293,7 @@ void JsonoGroupMergeSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input
 			continue;
 		}
 		FoldIntoGroupState(state, view);
+		state.mem.Resize(bm, GroupMergeFootprint(state));
 	}
 }
 
@@ -2270,6 +2301,7 @@ void JsonoGroupMergeUpdate(Vector inputs[], AggregateInputData &aggr_input_data,
                            idx_t count) {
 	(void)input_count;
 	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeBindData>();
+	auto &bm = bind_data.buffer_manager;
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<GroupMergeState *>(state_fmt);
@@ -2289,6 +2321,7 @@ void JsonoGroupMergeUpdate(Vector inputs[], AggregateInputData &aggr_input_data,
 			auto &state = *state_data[RowIndex(state_fmt, row)];
 			DirectFoldRow(EnsureDirectAcc(state, bind_data), view, bind_data, lane_fmt, row);
 			state.has_input = true;
+			state.mem.Resize(bm, GroupMergeFootprint(state));
 		}
 		return;
 	}
@@ -2300,18 +2333,22 @@ void JsonoGroupMergeUpdate(Vector inputs[], AggregateInputData &aggr_input_data,
 		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
 			continue;
 		}
-		auto state_idx = RowIndex(state_fmt, row);
-		FoldIntoGroupState(*state_data[state_idx], view);
+		auto &state = *state_data[RowIndex(state_fmt, row)];
+		FoldIntoGroupState(state, view);
+		state.mem.Resize(bm, GroupMergeFootprint(state));
 	}
 }
 
 void JsonoGroupMergeCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
 	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeBindData>();
+	auto &bm = bind_data.buffer_manager;
 	UnifiedVectorFormat source_fmt;
 	source.ToUnifiedFormat(count, source_fmt);
 	auto source_data = UnifiedVectorFormat::GetData<GroupMergeState *>(source_fmt);
 	auto target_data = FlatVector::GetData<GroupMergeState *>(target);
 
+	// Only targets grow here (a source is folded in, never moved out), so accounting the target per fold
+	// is sufficient.
 	if (!bind_data.shreds.empty()) {
 		for (idx_t row = 0; row < count; row++) {
 			auto &source_state = *source_data[RowIndex(source_fmt, row)];
@@ -2321,6 +2358,7 @@ void JsonoGroupMergeCombine(Vector &source, Vector &target, AggregateInputData &
 			auto &target_state = *target_data[row];
 			DirectFoldState(EnsureDirectAcc(target_state, bind_data), *source_state.direct, bind_data);
 			target_state.has_input = true;
+			target_state.mem.Resize(bm, GroupMergeFootprint(target_state));
 		}
 		return;
 	}
@@ -2333,7 +2371,9 @@ void JsonoGroupMergeCombine(Vector &source, Vector &target, AggregateInputData &
 		if (!source_view.ParseHeader() || source_view.Slots() == 0) {
 			continue;
 		}
-		FoldIntoGroupState(*target_data[row], source_view);
+		auto &target_state = *target_data[row];
+		FoldIntoGroupState(target_state, source_view);
+		target_state.mem.Resize(bm, GroupMergeFootprint(target_state));
 	}
 }
 
@@ -2550,12 +2590,16 @@ struct GroupMergeLWWBindData : public FunctionData {
 	// Same sticky-shredded contract as jsono_group_merge: a shredded input reshreds back to its
 	// own type in Finalize (empty for a plain input).
 	vector<std::pair<string, LogicalType>> shreds;
+	// Carried into Update/Combine to account the LWW tree/lane growth; re-captured on plan round-trips
+	// (no serialize callback, so deserialize re-runs the bind).
+	BufferManager &buffer_manager;
 
-	explicit GroupMergeLWWBindData(OrderModifiers modifiers) : modifiers(modifiers) {
+	GroupMergeLWWBindData(OrderModifiers modifiers, BufferManager &buffer_manager)
+	    : modifiers(modifiers), buffer_manager(buffer_manager) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		auto result = make_uniq<GroupMergeLWWBindData>(modifiers);
+		auto result = make_uniq<GroupMergeLWWBindData>(modifiers, buffer_manager);
 		result->shreds = shreds;
 		return std::move(result);
 	}
@@ -2610,6 +2654,7 @@ struct GroupMergeLWWState {
 	idx_t list_lane_count;
 	vector<string> *lane_sort_keys;
 	bool has_input;
+	JsonoMemoryReservation mem;
 };
 
 struct GroupMergeLWWFunction {
@@ -2623,10 +2668,13 @@ struct GroupMergeLWWFunction {
 		state.list_lane_count = 0;
 		state.lane_sort_keys = nullptr;
 		state.has_input = false;
+		state.mem.reserved = 0;
+		state.mem.buffer_manager = nullptr;
 	}
 
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
+		state.mem.Release();
 		delete state.root;
 		delete[] state.scalar_lanes;
 		delete[] state.scalar_texts;
@@ -2668,6 +2716,52 @@ struct LWWTreeScratch {
 	JsonoBuilder builder;
 	OwnedJsonoBlob candidate;
 };
+
+// Owned-heap bytes of one LWW tree node (its winning value blob, sort key, and object children,
+// recursively). Walks the whole subtree, so keyed group_merge accounts per Update/Combine call rather
+// than per row (see AccountDistinctStates).
+idx_t LWWTreeNodeBytes(const LWWTreeNode &node) {
+	idx_t bytes = sizeof(LWWTreeNode) + node.sort_key.capacity() + BlobBytes(node.value);
+	bytes += node.children.capacity() * sizeof(LWWObjectChild);
+	for (auto &child : node.children) {
+		bytes += child.key.capacity();
+		if (child.node) {
+			bytes += LWWTreeNodeBytes(*child.node);
+		}
+	}
+	return bytes;
+}
+
+idx_t GroupMergeLWWFootprint(const GroupMergeLWWState &state) {
+	idx_t bytes = 0;
+	if (state.root) {
+		bytes += LWWTreeNodeBytes(*state.root);
+	}
+	bytes += state.scalar_lane_count * sizeof(LWWScalarLane);
+	if (state.scalar_texts) {
+		for (idx_t i = 0; i < state.scalar_text_lane_count; i++) {
+			bytes += state.scalar_texts[i].capacity();
+		}
+	}
+	bytes += state.list_lane_count * sizeof(LWWListLane);
+	if (state.list_lanes) {
+		for (idx_t i = 0; i < state.list_lane_count; i++) {
+			auto &lane = state.list_lanes[i];
+			bytes += BlobBytes(lane.value.skeleton);
+			bytes += lane.value.elements.capacity() * sizeof(LWWListElement);
+			for (auto &element : lane.value.elements) {
+				bytes += element.text.capacity();
+			}
+		}
+	}
+	if (state.lane_sort_keys) {
+		bytes += state.lane_sort_keys->capacity() * sizeof(string);
+		for (auto &key : *state.lane_sort_keys) {
+			bytes += key.capacity();
+		}
+	}
+	return bytes;
+}
 
 int CompareRawBytes(const char *a, size_t na, const char *b, size_t nb) {
 	auto n = std::min(na, nb);
@@ -4327,7 +4421,8 @@ unique_ptr<FunctionData> JsonoGroupMergeLWWBind(ClientContext &context, Aggregat
 	}
 	auto &type = arguments[0]->return_type;
 	JsonoRequireExtensionOptimizerForShredded(context, type, function.name);
-	auto bind_data = make_uniq<GroupMergeLWWBindData>(OrderModifiers(direction, OrderByNullType::NULLS_FIRST));
+	auto bind_data = make_uniq<GroupMergeLWWBindData>(OrderModifiers(direction, OrderByNullType::NULLS_FIRST),
+	                                                  BufferManager::GetBufferManager(context));
 	if (IsShreddedJsonoType(type)) {
 		// Sticky shredding, same as jsono_group_merge: keep the shredded argument native (Update
 		// reconstructs it to plain) and capture the shreds so Finalize reshreds back to this type.
@@ -4394,12 +4489,14 @@ void JsonoGroupMergeLWWSimpleUpdate(Vector inputs[], AggregateInputData &aggr_in
 	UnifiedVectorFormat sk_fmt;
 	sort_keys.ToUnifiedFormat(count, sk_fmt);
 	auto sk_data = UnifiedVectorFormat::GetData<string_t>(sk_fmt);
+	auto &state = *reinterpret_cast<GroupMergeLWWState *>(state_ptr);
 	if (JsonoGroupMergeLWWSimpleUpdateDirectShredded(inputs, bind_data, state_ptr, count, sk_fmt, sk_data)) {
+		state.mem.Resize(bind_data.buffer_manager, GroupMergeLWWFootprint(state));
 		return;
 	}
-	auto &state = *reinterpret_cast<GroupMergeLWWState *>(state_ptr);
 	JsonoGroupMergeLWWReconstructFold(inputs, count, sk_fmt, sk_data,
 	                                  [&](idx_t) -> GroupMergeLWWState & { return state; });
+	state.mem.Resize(bind_data.buffer_manager, GroupMergeLWWFootprint(state));
 }
 
 void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &states,
@@ -4414,12 +4511,22 @@ void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_da
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<GroupMergeLWWState *>(state_fmt);
+	// Account each distinct group state once after the chunk folds (the LWW footprint walk is O(tree), too
+	// costly to repeat per row).
+	auto account = [&]() {
+		AccountDistinctStates<GroupMergeLWWState>(
+		    count, bind_data.buffer_manager,
+		    [&](idx_t row) -> GroupMergeLWWState & { return *state_data[RowIndex(state_fmt, row)]; },
+		    [](const GroupMergeLWWState &s) { return GroupMergeLWWFootprint(s); });
+	};
 	if (JsonoGroupMergeLWWUpdateDirectShredded(inputs, bind_data, count, sk_fmt, sk_data, state_fmt, state_data)) {
+		account();
 		return;
 	}
 	JsonoGroupMergeLWWReconstructFold(inputs, count, sk_fmt, sk_data, [&](idx_t row) -> GroupMergeLWWState & {
 		return *state_data[RowIndex(state_fmt, row)];
 	});
+	account();
 }
 
 void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
@@ -4490,6 +4597,18 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 			MergeLWWListLanes(tgt, src, list_shreds, false);
 		}
 	}
+	auto &bm = bind_data.buffer_manager;
+	// Targets grow; a destructive combine also shrinks sources by moving their trees/lanes out. Account
+	// sources (freeing the transferred bytes) only in the destructive case, then targets (reserving them),
+	// so the transfer nets to zero and a PRESERVE_INPUT window combine only reserves the copy.
+	if (destructive) {
+		AccountDistinctStates<GroupMergeLWWState>(
+		    count, bm, [&](idx_t row) -> GroupMergeLWWState & { return *source_data[RowIndex(source_fmt, row)]; },
+		    [](const GroupMergeLWWState &s) { return GroupMergeLWWFootprint(s); });
+	}
+	AccountDistinctStates<GroupMergeLWWState>(
+	    count, bm, [&](idx_t row) -> GroupMergeLWWState & { return *target_data[row]; },
+	    [](const GroupMergeLWWState &s) { return GroupMergeLWWFootprint(s); });
 }
 
 // Serialize each group's tree (or an empty object for an empty group) into `out`.

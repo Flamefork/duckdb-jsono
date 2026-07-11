@@ -5,6 +5,8 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 
+#include <unordered_set>
+
 namespace duckdb {
 
 // Accounted-memory tracker for one jsono aggregate state. jsono aggregates accumulate on the raw C++ heap;
@@ -57,11 +59,40 @@ struct JsonoMemoryReservation {
 		reserved += source.reserved;
 		source.reserved = 0;
 	}
+
+	// Sync the reservation to the state's current footprint (rewrite-style accumulators re-measure their
+	// footprint rather than tracking append deltas). Growth reserves the delta and may throw the engine's
+	// OOM; shrink frees the delta. Absolute-footprint syncing makes mis-pairing structurally impossible:
+	// `reserved` always tracks the last measured footprint, and Destroy frees exactly that.
+	void Resize(BufferManager &bm, idx_t new_total) {
+		buffer_manager = &bm;
+		if (new_total > reserved) {
+			bm.ReserveMemory(new_total - reserved);
+			reserved = new_total;
+		} else if (new_total < reserved) {
+			bm.FreeReservedMemory(reserved - new_total);
+			reserved = new_total;
+		}
+	}
 };
+
+// Resize the reservation of every DISTINCT state touched in a grouped chunk to its current footprint,
+// measuring each state once even when many rows in the chunk share it. Used by the rewrite-style
+// accumulators whose footprint walk (an LWW tree, a candidate-path map) is too costly to repeat per row.
+template <class STATE, class StateFor, class Footprint>
+void AccountDistinctStates(idx_t count, BufferManager &bm, StateFor state_for, Footprint footprint) {
+	std::unordered_set<STATE *> seen;
+	for (idx_t row = 0; row < count; row++) {
+		STATE *state = &state_for(row);
+		if (seen.insert(state).second) {
+			state->mem.Resize(bm, footprint(*state));
+		}
+	}
+}
 
 // Heap bytes an owned jsono document occupies (the six owned byte streams). This is the dominant term of a
 // collected/accumulated element's footprint; callers add per-element container overhead on top.
-inline idx_t BlobBytes(const OwnedJsonoBlob &blob) {
+inline idx_t BlobBytes(const jsono::OwnedJsonoBlob &blob) {
 	return blob.slots.size() + blob.key_heap.size() + blob.string_heap.size() + blob.skips.size() +
 	       blob.lengths.size() + blob.nums.size();
 }
