@@ -28,26 +28,27 @@ SELECT j.jsono.shreds."$.x".value IS NULL, to_json(j)::VARCHAR FROM (SELECT json
 ----
 true	{"$.x":"v","y":1}
 
-# Type-driven auto-shred descends one struct level: top-level scalars keep their bare name, scalars
-# directly inside a nested STRUCT are lifted under their $.parent.child JSON path. The shred set is
-# a pure function of the input type (known at bind), so the constructor's return type carries them.
+# Type-driven auto-shred descends nested structs: top-level scalars keep their bare name, scalars
+# inside a nested STRUCT are lifted under their $.parent.child JSON path. The shred set is a pure
+# function of the input type (known at bind), so the constructor's return type carries them.
 query I
 SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}));
 ----
 STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.commit.collection" STRUCT("value" VARCHAR, complete TINYINT), "$.commit.operation" STRUCT("value" VARCHAR, complete TINYINT), did STRUCT("value" VARCHAR, complete TINYINT), kind STRUCT("value" VARCHAR, complete TINYINT))))
 
-# The walk stops after one level: a scalar two or more levels deep stays in the residual (a deep
-# schema would otherwise lift many cold leaves). Only $.b.c is shredded; $.b.d.e is not.
+# The walk descends to JSONO_AUTO_SHRED_MAX_DEPTH (3): a scalar strictly deeper stays in the residual
+# (a deep schema would otherwise lift many cold leaves). $.b.c and $.b.d.e are shredded; $.b.d.f.g
+# (depth 4) is not.
 query I
-SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep'}}}));
+SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep', 'f': {'g': 'deeper'}}}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.b.c" STRUCT("value" VARCHAR, complete TINYINT), a STRUCT("value" BIGINT, complete TINYINT))))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.b.c" STRUCT("value" VARCHAR, complete TINYINT), "$.b.d.e" STRUCT("value" VARCHAR, complete TINYINT), a STRUCT("value" BIGINT, complete TINYINT))))
 
-# Losslessness holds for the un-shredded deep leaf too: $.b.d.e round-trips through the residual.
+# Losslessness holds for the un-shredded deep leaf too: $.b.d.f.g round-trips through the residual.
 query I
-SELECT to_json(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep'}}}))::VARCHAR;
+SELECT to_json(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep', 'f': {'g': 'deeper'}}}}))::VARCHAR;
 ----
-{"a":1,"b":{"c":"x","d":{"e":"deep"}}}
+{"a":1,"b":{"c":"x","d":{"e":"deep","f":{"g":"deeper"}}}}
 
 # Nested auto-shred is lossless: the reconstructed document equals the plain parse, nesting intact.
 query I

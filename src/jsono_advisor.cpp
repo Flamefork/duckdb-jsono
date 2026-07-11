@@ -68,7 +68,8 @@ struct SubfieldStat {
 // nonrole_present: they inflate the min_fit denominator without feeding any role's fit numerator, so
 // a path that is a scalar in some rows and an object in others drops at min_fit = 1.0.
 struct SuggestCandidate {
-	// Scalar leaf role (a top-level scalar key or a one-level-nested `$.a.b` scalar).
+	// Scalar leaf role (a top-level scalar key or a nested `$.a.b`(`.c`) scalar up to the auto-shred
+	// depth cap).
 	idx_t scalar_present = 0;
 	FitCounts scalar_fit {};
 
@@ -307,13 +308,14 @@ void ClassifyTopLevelArray(const JsonoView &view, JsonoCursor &cursor, SuggestCa
 	}
 }
 
-// Walk a nested object one level deep, recording each nested scalar leaf under `$.parent.child`.
-// Non-scalar nested values (two or more levels deep) are out of the auto-shred universe and skipped.
-// The cursor arrives at the nested OBJ_START and is advanced past the whole object.
-void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, nonstd::string_view parent_key,
-                      std::map<string, SuggestCandidate> &paths) {
-	string base = "$";
-	AppendJsonPathStep(base, parent_key);
+// Walk a nested object, recording each nested scalar leaf under its `$.parent.child` path and
+// descending into further nested objects while `depth` (the 1-based key depth of the children being
+// scanned) stays below JSONO_AUTO_SHRED_MAX_DEPTH — so it mirrors what auto-shred lifts. `base` is
+// the already-built path prefix of this object (`$.URL` for the object at key URL). An object too
+// deep to descend, or any nested array, is recorded as a nonrole occurrence and skipped. The cursor
+// arrives at the nested OBJ_START and is advanced past the whole object.
+void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, const string &base,
+                      std::map<string, SuggestCandidate> &paths, idx_t depth) {
 	auto layout = ReadObjectLayout(view, cursor.pos);
 	cursor.pos = layout.value_start;
 	for (size_t i = 0; i < layout.key_count; i++) {
@@ -331,10 +333,18 @@ void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, nonstd::string
 		}
 		string path = base;
 		AppendJsonPathStep(path, child_key);
+		if (child_tag == tag::OBJ_START && depth < JSONO_AUTO_SHRED_MAX_DEPTH) {
+			// A nested object still within shred depth: record it as a nonrole occurrence of its own path
+			// (so a path that is a scalar in some rows and an object in others drops at min_fit = 1.0) and
+			// descend, exactly as AccumulateDocument does for a top-level object.
+			GetCandidate(paths, path).nonrole_present++;
+			WalkNestedObject(view, cursor, path, paths, depth + 1);
+			continue;
+		}
 		if (child_tag == tag::OBJ_START || child_tag == tag::ARR_START) {
-			// A two-or-more-levels-deep object, or a nested array, carries `$.a.b` but fits no scalar
-			// lane: count it into total_present without feeding the scalar role so a nested path that is
-			// a scalar in some rows and a container in others drops at min_fit = 1.0.
+			// A too-deep object (out of the auto-shred universe) or any nested array carries `$.a.b` but
+			// fits no scalar lane: count it into total_present without feeding the scalar role so a nested
+			// path that is a scalar in some rows and a container in others drops at min_fit = 1.0.
 			GetCandidate(paths, path).nonrole_present++;
 			SkipValueFast(view, cursor);
 			continue;
@@ -349,7 +359,8 @@ void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, nonstd::string
 }
 
 // Accumulate one document's contributions over the auto-shred universe: top-level scalar keys
-// (bare name), one-level-nested scalar keys (`$.parent.child`), and top-level array keys (scalar-
+// (bare name), nested scalar keys (`$.parent.child`(`.grandchild`) up to JSONO_AUTO_SHRED_MAX_DEPTH),
+// and top-level array keys (scalar-
 // or object-array). A non-object document contributes nothing (no key to name a shred). Empty keys
 // (at any level) are out of the universe: their lane name would carry an empty quoted path step
 // (`$.""`), which the shredded readers do not support.
@@ -374,7 +385,9 @@ void AccumulateDocument(const JsonoView &view, std::map<string, SuggestCandidate
 			// the nested `$.key.child` candidates instead), so record it as a nonrole occurrence of the
 			// parent path — a key that is a scalar in some rows and an object in others drops at min_fit.
 			GetCandidate(paths, TopLevelSpecName(key)).nonrole_present++;
-			WalkNestedObject(view, cursor, key, paths);
+			string base = "$";
+			AppendJsonPathStep(base, key);
+			WalkNestedObject(view, cursor, base, paths, 2);
 		} else if (value_tag == tag::ARR_START) {
 			ClassifyTopLevelArray(view, cursor, GetCandidate(paths, TopLevelSpecName(key)));
 		} else {

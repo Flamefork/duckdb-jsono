@@ -1,0 +1,102 @@
+# name: test/sql/jsono_struct_shred_depth.test
+# description: Auto-shred and jsono_suggest_shredding lift nested scalar leaves up to JSONO_AUTO_SHRED_MAX_DEPTH (3) — e.g. $.URL.query_params.utm_source — so web-event hot leaves read from their shred lane; a leaf strictly deeper stays in the residual. The advisor stays presence/fit-gated at every depth.
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+# Depth-3 scalar leaf is lifted into a lane ($.URL.query_params.utm_source), alongside depth-2 and
+# top-level leaves.
+query I
+SELECT typeof(jsono({'URL':{'query_params':{'utm_source':'g','utm_medium':'c'},'path':'/x'},'kind':'view'}))
+       LIKE '%"$.URL.query_params.utm_source"%';
+----
+true
+
+# The depth-3 leaf reads from its shred lane and round-trips byte-identical.
+query II
+SELECT
+  jsono({'URL':{'query_params':{'utm_source':'g'}}}) ->> '$.URL.query_params.utm_source',
+  to_json(jsono({'URL':{'query_params':{'utm_source':'g'}}}));
+----
+g	{"URL":{"query_params":{"utm_source":"g"}}}
+
+# A leaf one level too deep (depth 4) is NOT lifted — it stays in the residual, still read correctly.
+query II
+SELECT
+  typeof(jsono({'a':{'b':{'c':{'d':'x'}}}})) LIKE '%a.b.c.d%',
+  jsono({'a':{'b':{'c':{'d':'x'}}}}) ->> '$.a.b.c.d';
+----
+false	x
+
+# Only a depth-1 field named 'body'/'$jsono$set' collides with a layout name; a nested $.URL.body
+# is a safe lane.
+query II
+SELECT
+  typeof(jsono({'URL':{'body':'z'}})) LIKE '%"$.URL.body"%',
+  jsono({'URL':{'body':'z'}}) ->> '$.URL.body';
+----
+true	z
+
+# --- Read parity + Parquet round-trip over a stored depth-3 shredded column.
+statement ok
+CREATE TABLE ev AS
+SELECT i, jsono({'URL':{'query_params':{'utm_source':'s' || (i % 20)},'path':'/p' || (i % 100)},'kind':'view'}) AS ep
+FROM range(3000) tt(i);
+
+query I
+SELECT count(*) FROM ev
+WHERE (ep ->> '$.URL.query_params.utm_source') IS DISTINCT FROM ('s' || (i % 20));
+----
+0
+
+statement ok
+COPY (SELECT ep FROM ev) TO '__TEST_DIR__/depth3.parquet' (FORMAT parquet);
+
+query I
+SELECT count(ep ->> '$.URL.query_params.utm_source') FROM read_parquet('__TEST_DIR__/depth3.parquet');
+----
+3000
+
+# --- Advisor: jsono_suggest_shredding now emits depth-3 nested leaves (in canonical sorted order).
+query I
+SELECT jsono_suggest_shredding(ep) FROM (
+  SELECT jsono('{"URL":{"query_params":{"utm_source":"u' || (i % 20) || '"},"path":"/p' || (i % 100) || '"}}') AS ep
+  FROM range(2000) t(i)
+) LIMIT 1;
+----
+{"$.URL.path": 'VARCHAR', "$.URL.query_params.utm_source": 'VARCHAR'}
+
+# Advisor stays presence-gated at depth: a depth-3 key present in 1% of rows is NOT suggested at the
+# default min_presence, but IS at a low min_presence — proving depth is gated by presence, not the cap.
+query I
+SELECT jsono_suggest_shredding(ep) FROM (
+  SELECT jsono('{"URL":{"query_params":' ||
+    CASE WHEN i % 100 = 0 THEN '{"rare":"r"}' ELSE '{}' END || '}}') AS ep
+  FROM range(2000) t(i)
+) LIMIT 1;
+----
+NULL
+
+query I
+SELECT jsono_suggest_shredding(ep, min_presence := 0.005) FROM (
+  SELECT jsono('{"URL":{"query_params":' ||
+    CASE WHEN i % 100 = 0 THEN '{"rare":"r"}' ELSE '{}' END || '}}') AS ep
+  FROM range(2000) t(i)
+) LIMIT 1;
+----
+{"$.URL.query_params.rare": 'VARCHAR'}
+
+# Advisor drops a deep key whose type diverges across rows (scalar in some, object in others) at
+# min_fit = 1.0 — the intermediate object is recorded as a nonrole occurrence before recursing.
+query I
+SELECT jsono_suggest_shredding(ep) FROM (
+  SELECT jsono('{"URL":{"qp":' ||
+    CASE WHEN i % 2 = 0 THEN '{"x":"s"}' ELSE '{"x":{"nested":1}}' END || '}}') AS ep
+  FROM range(2000) t(i)
+) LIMIT 1;
+----
+NULL

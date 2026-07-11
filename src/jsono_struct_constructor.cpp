@@ -1132,27 +1132,31 @@ LogicalType PromoteAutoShredType(const LogicalType &type) {
 }
 
 // Type-driven auto-shred: lift shred-eligible scalar fields into typed shreds. Top-level scalars
-// keep their bare key name (the fast one-pass shred path); a scalar one level down inside a nested
-// STRUCT is lifted under its `$.parent.child` JSON path so the existing path-aware two-pass shred
-// writer captures it. The walk descends exactly one struct level: a leaf two or more levels deep
-// stays in the residual. The schema is the only signal available at bind (the return type is a pure
-// function of the input type, no per-row inference), and depth alone does not tell a hot path from a
-// cold one — a deep schema would lift dozens of sparse leaves that are never queried while paying
-// the full write and reconstruct cost. The one-level bound keeps the analytically addressed paths
-// (a named object's direct fields) shredded without that blowup; frequency-aware budgeting of deeper
-// paths belongs to a sampling ingest path, not the bind-time type walk.
-void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix, bool top_level,
+// (depth 1) keep their bare key name (the fast one-pass shred path); a scalar deeper inside nested
+// STRUCTs is lifted under its `$.parent.child` JSON path so the existing path-aware two-pass shred
+// writer captures it. `depth` is the 1-based key depth of the children being scanned (initial call
+// depth 1). The walk descends nested structs while depth < JSONO_AUTO_SHRED_MAX_DEPTH, so leaves at
+// depth 1..N are lifted and a leaf strictly deeper stays in the residual. The schema is the only
+// signal available at bind (the return type is a pure function of the input type, no per-row
+// inference), so depth is a fixed cap — see JSONO_AUTO_SHRED_MAX_DEPTH. The bound keeps analytically
+// addressed paths (`$.URL.query_params.utm_source`) shredded; deeper leaves go through explicit
+// `shredding := {...}`.
+void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix, idx_t depth,
                        vector<pair<string, LogicalType>> &shreds) {
 	for (auto &child : StructType::GetChildTypes(struct_type)) {
 		// A top-level field named 'body' or the reserved shred-set marker would collide with a layout
 		// field name, so it stays in the residual instead of becoming a shred (auto-shred must not
-		// error on field names).
-		if (top_level && (child.first == "body" || child.first == JsonoShredSetName())) {
+		// error on field names). Only depth-1 names collide: a nested `$.URL.body` lane is safe.
+		if (depth == 1 && (child.first == "body" || child.first == JsonoShredSetName())) {
 			continue;
 		}
 		auto shred_type = PromoteAutoShredType(child.second);
-		if (IsShredValueType(shred_type)) {
-			if (top_level) {
+		// A scalar leaf, or a regular array shred — fixed-shape objects (LIST<STRUCT<scalars>>) lifting
+		// their element subfields, or scalars (LIST<UBIGINT>, LIST<VARCHAR>, …) lifting each whole
+		// element — into a parallel typed list shred, leaving a skeleton array in the residual. Lifted
+		// at depth 1 by bare name, deeper under its `$.parent.child` path.
+		if (IsShredValueType(shred_type) || IsShredListType(shred_type)) {
+			if (depth == 1) {
 				shreds.emplace_back(child.first, shred_type);
 			} else {
 				string path = path_prefix;
@@ -1161,24 +1165,10 @@ void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix
 			}
 			continue;
 		}
-		// A regular array shred — fixed-shape objects (LIST<STRUCT<scalars>>) lifting their element
-		// subfields, or scalars (LIST<UBIGINT>, LIST<VARCHAR>, …) lifting each whole element — into a
-		// parallel typed list shred, leaving a skeleton array in the residual. Lifted at the top level
-		// by bare name and one struct level deep under `$.parent.items`, like a scalar leaf.
-		if (IsShredListType(shred_type)) {
-			if (top_level) {
-				shreds.emplace_back(child.first, shred_type);
-			} else {
-				string path = path_prefix;
-				AppendShredPathStep(path, child.first);
-				shreds.emplace_back(std::move(path), shred_type);
-			}
-			continue;
-		}
-		if (top_level && child.second.id() == LogicalTypeId::STRUCT) {
-			string path = "$";
+		if (depth < JSONO_AUTO_SHRED_MAX_DEPTH && child.second.id() == LogicalTypeId::STRUCT) {
+			string path = depth == 1 ? "$" : path_prefix;
 			AppendShredPathStep(path, child.first);
-			CollectAutoShreds(child.second, path, false, shreds);
+			CollectAutoShreds(child.second, path, depth + 1, shreds);
 		}
 	}
 }
@@ -1225,7 +1215,7 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 	bound_function.arguments[0] = input_type;
 	auto bind_data = make_uniq<JsonoStructBindData>(std::move(plan));
 	if (allow_shred) {
-		CollectAutoShreds(input_type, string(), true, bind_data->shreds);
+		CollectAutoShreds(input_type, string(), 1, bind_data->shreds);
 		DropCollidingAutoShreds(bind_data->shreds);
 	}
 	if (!bind_data->shreds.empty()) {

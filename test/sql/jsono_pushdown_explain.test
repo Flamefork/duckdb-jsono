@@ -1,0 +1,63 @@
+# name: test/sql/jsono_pushdown_explain.test
+# description: Plan-lock the pushdown-classification tokens the README "Is my read pushed down?" section documents, so an optimizer rename that would falsify the doc fails the suite. PUSHED = struct_extract_at on shreds; RESIDUAL = jsono_extract_string / __jsono_internal_project; RECONSTRUCT = jsono_overlay / __jsono_reconstruct.
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE tot AS
+SELECT jsono({'kind':'k' || (i % 9),'URL':{'path':'/p' || (i % 100)}}) AS ep
+FROM range(3000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# PUSHED (projection): a total scalar shred lane is pushed into the scan as a bare `.shreds."<path>"`
+# column read — no COALESCE, no extract function, no reconstruct.
+query II
+EXPLAIN SELECT ep ->> '$.URL.path' FROM tot;
+----
+physical_plan	<REGEX>:.*shreds.*URL.*path.*
+
+query II
+EXPLAIN SELECT ep ->> '$.URL.path' FROM tot;
+----
+physical_plan	<!REGEX>:.*(jsono?_extract|COALESCE|reconstruct|overlay).*
+
+# PUSHED (filter/aggregate): the same lane read surfaces as a struct_extract_at over the shred column,
+# still COALESCE-free and prunable.
+query II
+EXPLAIN SELECT count(*) FROM tot WHERE ep ->> '$.URL.path' = '/p1';
+----
+physical_plan	<REGEX>:.*struct_extract_at.*
+
+query II
+EXPLAIN SELECT count(*) FROM tot WHERE ep ->> '$.URL.path' = '/p1';
+----
+physical_plan	<!REGEX>:.*(jsono?_extract|COALESCE|reconstruct|overlay).*
+
+# RESIDUAL single: a path with no shred is a single jsono_extract_string over the body.
+query II
+EXPLAIN SELECT ep ->> '$.no_such_key' FROM tot;
+----
+physical_plan	<REGEX>:.*jsono_extract_string.*
+
+# RESIDUAL fused: two unshredded paths on one column fuse into a __jsono_internal_project walk.
+query II
+EXPLAIN SELECT ep ->> '$.no_a', ep ->> '$.no_b' FROM tot;
+----
+physical_plan	<REGEX>:.*__jsono_internal_project.*
+
+# RECONSTRUCT overlay: a whole-value read as JSON overlays shreds onto the residual.
+query II
+EXPLAIN SELECT to_json(ep) FROM tot;
+----
+physical_plan	<REGEX>:.*jsono_overlay.*
+
+# RECONSTRUCT explicit: a jsono_transform field descending into an array shred shows a named
+# __jsono_reconstruct operator — plan-locked in jsono_reconstruct_explain.test.
+
+statement ok
+PRAGMA explain_output='all';

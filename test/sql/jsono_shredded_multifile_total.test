@@ -242,3 +242,23 @@ SELECT count(*) FROM read_parquet(['__TEST_DIR__/mft3_a.parquet', '__TEST_DIR__/
 WHERE (e->>'$.n') = 'spill';
 ----
 1
+
+# (i) the plain multi-file glob WITHOUT union_by_name is the engine boundary: the multi-file stats
+# function returns no per-file statistics, so even two identically-shredded files keep the safe
+# COALESCE fallback (the lane is read but not prunable). This is intended, not a bug — union_by_name
+# is the recipe (README). Values stay correct either way; only the plan (prunability) differs.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(e->>'a') FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_a.parquet']);
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT MIN(e->>'a'), count(*) FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_a.parquet']);
+----
+A0	2000
