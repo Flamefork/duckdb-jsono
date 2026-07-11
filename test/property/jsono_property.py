@@ -532,10 +532,19 @@ hex_blob = st.text(alphabet="0123456789ABCDEF", min_size=0, max_size=48).map(
 # memcpy (corrupt value on either side), the diff recursion, entries in both array styles,
 # transform's shape-plan walk, the introspection walks, the collect/array-elements emitters, and the
 # shredding advisor's plain-tape AccumulateDocument (jsono_suggest_shredding walks slots per row).
+# Also covered: the `->` subtree extract (its OWN bulk ContainerSpan / checkpoint-records memcpy,
+# distinct from the scalar extract_string reader), jsono_overlay (the shredded-reconstruction
+# primitive), the keyed last-write-wins group_merge_max/_min state fold, the shred-manifest tail
+# walk, and the storage_size blob/manifest reader. jsono_shred_stats folds only a SHREDDED input, so
+# over these plain forged structs it exercises the bind-time rejection rather than the decoder (the
+# harness forges plain layouts only; a shredded forge would be a harness change). jsono_storage_type
+# is deliberately absent: it has no jsono-value overload (only `jsono_storage_type()` and the
+# `(VARCHAR)` shreds-spec form), so it can never receive forged value bytes.
 FUZZ_READER_CALLS = {
     "to_json": lambda s: f"to_json({s})",
     "validate": lambda s: f"jsono_validate({s})",
     "extract_string": lambda s: f"jsono_extract_string({s}, '$.a')",
+    "extract": lambda s: f"to_json(jsono_extract({s}, '$.a'))",
     "type": lambda s: f"jsono_type({s})",
     "keys": lambda s: f"jsono_keys({s})",
     "array_length": lambda s: f"jsono_array_length({s}, '$.a')",
@@ -545,12 +554,18 @@ FUZZ_READER_CALLS = {
     "transform": lambda s: f"jsono_transform({s}, {{a: 'VARCHAR'}})",
     "merge_patch_target": lambda s: f"to_json(jsono_merge_patch({s}, jsono('{{\"k\":1}}')))",
     "merge_patch_patch": lambda s: f"to_json(jsono_merge_patch(jsono('{{\"k\":1}}'), {s}))",
+    "overlay": lambda s: f"to_json(jsono_overlay({s}, jsono('{{\"k\":1}}')))",
     "diff_prev": lambda s: f"to_json(jsono_diff({s}, jsono('{{}}')))",
     "diff_cur": lambda s: f"to_json(jsono_diff(jsono('{{}}'), {s}))",
     "group_merge": lambda s: f"(SELECT to_json(jsono_group_merge(v)) FROM (VALUES ({s}), (jsono('{{\"k\":1}}'))) t(v))",
+    "group_merge_max": lambda s: f"(SELECT to_json(jsono_group_merge_max(v, k)) FROM (VALUES ({s}, 1), (jsono('{{\"k\":1}}'), 2)) t(v, k))",
+    "group_merge_min": lambda s: f"(SELECT to_json(jsono_group_merge_min(v, k)) FROM (VALUES ({s}, 1), (jsono('{{\"k\":1}}'), 2)) t(v, k))",
     "group_array": lambda s: f"(SELECT to_json(jsono_group_array(v)) FROM (VALUES ({s}), (jsono('{{}}'))) t(v))",
     "group_object": lambda s: f"(SELECT to_json(jsono_group_object(k, v)) FROM (VALUES ('a', {s}), ('b', jsono('{{}}'))) t(k, v))",
     "suggest_shredding": lambda s: f"(SELECT jsono_suggest_shredding(v) FROM (VALUES ({s}), (jsono('{{\"k\":1}}'))) t(v))",
+    "shred_manifest": lambda s: f"jsono_shred_manifest({s})",
+    "shred_stats": lambda s: f"(SELECT jsono_shred_stats(v) FROM (VALUES ({s}), (jsono('{{\"k\":1}}'))) t(v))",
+    "storage_size": lambda s: f"jsono_storage_size({s})",
 }
 fuzz_readers = st.sampled_from(sorted(FUZZ_READER_CALLS))
 
