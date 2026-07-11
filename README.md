@@ -54,6 +54,7 @@ Inspect:
 - [`jsono_storage_size(value)`](#introspection) — physical byte sizes (body blobs, shreds, total) as a `STRUCT`.
 - [`jsono_storage_type()`](#introspection) — DDL of the physical `STRUCT` backing a JSONO value.
 - [`jsono_shred_manifest(value)`](#introspection) — paths stripped into shred columns and their types as a `LIST<STRUCT(path, type)>`.
+- [`jsono_version()`](#introspection) — the current JSONO binary format version as `INTEGER`.
 
 ## Quick Start
 
@@ -84,6 +85,13 @@ FROM events;
 ## Installation
 
 > **Note:** This extension is not yet published in DuckDB's extension repository, and the JSONO binary format and SQL API are still being designed. Build it from source and load the produced local extension.
+
+### Prerequisites
+
+- [`uv`](https://docs.astral.sh/uv/) — drives the build and the Python tooling.
+- A C++17 toolchain and CMake.
+- [Ninja](https://ninja-build.org/) — the build defaults to the Ninja generator; pass `GEN=make` to fall back to Make.
+- `ccache` (optional) — speeds up incremental rebuilds.
 
 ### CLI
 
@@ -648,6 +656,7 @@ jsono_validate(value)             -> BOOLEAN    -- strict current-format validat
 jsono_storage_size(value)         -> STRUCT     -- physical byte sizes (body blobs + shreds + total)
 jsono_storage_type()              -> VARCHAR    -- DDL of the physical STRUCT backing JSONO
 jsono_shred_manifest(value)       -> STRUCT[]   -- paths stripped into shred columns, with their types
+jsono_version()                   -> INTEGER    -- current JSONO binary format version
 ```
 
 `jsono_type` and `jsono_keys` inspect the shape of unknown JSON before extracting it with `jsono_transform`. The optional `path` is a constant JSONPath (same grammar as `jsono_transform`, without wildcards) that points at a nested position; a missing path yields `NULL`.
@@ -759,7 +768,7 @@ The current surface is intentionally small. The following are not implemented:
 
 - No cast from JSONO to a scalar type (`jsono('42')::INTEGER` is unsupported). Project string values out with `->>` / `jsono_extract_string` or typed fields with `jsono_transform`.
 - No cast from JSONO to an arbitrary `STRUCT`. Only the physical six-BLOB shape is interchangeable with JSONO; field extraction goes through `jsono_transform`.
-- No dedicated table function that unnests a JSONO array or object into rows. Use `unnest(jsono_entries(...))` for flattened scalar leaves.
+- No dedicated table function that unnests a JSONO array or object into rows. Use `unnest(jsono_entries(...))` for flattened scalar leaves, or `unnest(jsono_array_elements(...))` for array elements as rows.
 - Object key order is not preserved: keys are stored and emitted in sorted byte order (see [Error Handling and Caveats](#error-handling-and-caveats)).
 
 ## Contributing

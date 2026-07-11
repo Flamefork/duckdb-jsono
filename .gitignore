@@ -8,3 +8,7 @@ __pycache__
 .Rhistory
 bench/optimization-log/
 plans
+.venv/
+.pytest_cache/
+.hypothesis/
+.cache/
