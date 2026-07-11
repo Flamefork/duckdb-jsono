@@ -20,10 +20,28 @@ using namespace jsono;
 using namespace duckdb_yyjson;
 
 // Shape-hash helpers (HashMix64/HashBytes/HashKey, HASH_SEED/HASH_PRIME) live in
-// jsono.hpp and are visible via `using namespace jsono`. The DOM builder hashes
-// each object's DOM-order key sequence into a 64-bit fingerprint and looks it up
-// in JsonoBuilder.shape_cache; on hit, the precomputed sort permutation is reused
-// and std::sort is skipped. 64-bit collision risk is negligible (~5e-20 per row).
+// jsono.hpp and are visible via `using namespace jsono`. The DOM builder hashes each
+// object's DOM-order key sequence into a 64-bit fingerprint and looks it up in the
+// shape_cache; on hit the cached sort/dedup permutation is applied to THIS object's keys
+// and std::sort is skipped.
+//
+// This is the ONE site in the extension that trusts a hash match authoritatively: the
+// permutation is reused with no key re-check (every read-side cache instead re-confirms
+// the key per hit, so a collision there only costs a recompute). A collision here writes a
+// PERSISTED blob whose object keys are not sorted, and the readers' binary search
+// (jsono_locate/jsono_trie) then returns wrong or NULL values SILENTLY — the rank-cache
+// boundary check only self-corrects to the same unsorted binary search, it does not raise;
+// only an explicit jsono_validate catches it (strict sort-order check + shape_hash
+// recompute). perm[i] stays in [0,N) and the n_keys==N guard holds, so the corruption is
+// purely logical, never a crash.
+//
+// Random 64-bit collisions are accepted (~5e-20 per object pair, full-hash compare). But
+// the mixer is NOT keyed (fixed HASH_SEED/HASH_PRIME), so equal-key-count adversarial key
+// sets can be CONSTRUCTED to collide; the lookup fingerprint is therefore salted with a
+// per-builder-state random shape_salt (folded into the HASH_SEED start state for
+// ShapeCacheFind/Insert only, see jsono_dom.cpp) so the target slot is unpredictable. The
+// salt never reaches the persisted ContainerSpan.shape_hash (computed separately from the
+// sorted KEY slots) — output bytes stay salt-independent, only cache keying changes.
 
 struct ShapeCacheEntry {
 	uint64_t hash = 0;

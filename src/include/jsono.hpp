@@ -393,11 +393,19 @@ constexpr size_t JSONO_MAX_NESTING_DEPTH = 512;
 constexpr size_t JSONO_MAX_NESTING_DEPTH = 1000;
 #endif
 
-// Shape-hash helpers — short-input wyhash-inspired mixer. Both the writer (per
-// object shape fingerprint stored in ContainerSpan) and the DOM builder (DOM-order
-// key fingerprint for its shape cache) hash key bytes; one definition shared here.
-// 64-bit collision risk is negligible (~5e-20 per object) at any realistic scale,
-// so a matching shape_hash is treated as authoritative without re-validation.
+// Shape-hash helpers — short-input wyhash-inspired mixer. Both the writer (per-object
+// shape fingerprint stored in ContainerSpan) and the DOM builder (DOM-order key
+// fingerprint for its shape cache) hash key bytes; one definition shared here.
+//
+// The two consumers trust a hash match differently. The persisted ContainerSpan.shape_hash
+// is always re-validated: read caches (RankCache/JsonoTrieRankCache) use it only as a
+// prefilter and re-confirm the actual key on every hit, and jsono_validate recomputes it —
+// a collision costs a recompute, never a wrong answer. The DOM shape-cache LOOKUP
+// fingerprint is the one site that trusts a hash match authoritatively (a hit reuses the
+// cached key permutation with no re-check); its collision failure mode and the per-builder
+// salt that guards against constructed collisions are documented in jsono_dom.hpp. The
+// mixer is NOT keyed (fixed seed/prime below) — which is exactly why that lookup is salted
+// while the re-validated persisted hash is not.
 inline uint64_t HashMix64(uint64_t a, uint64_t b) {
 #if defined(__SIZEOF_INT128__)
 	__uint128_t r = static_cast<__uint128_t>(a) * b;
