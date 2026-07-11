@@ -1,6 +1,7 @@
 #include "jsono_ops.hpp"
 #include "jsono.hpp"
 #include "jsono_copy.hpp"
+#include "jsono_memory.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_row_read.hpp"
 #include "jsono_writer.hpp"
@@ -11,6 +12,7 @@
 #include "duckdb/function/function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 #include "string_view.hpp"
 
@@ -23,6 +25,28 @@ namespace duckdb {
 namespace {
 
 using namespace jsono;
+
+// Carries the buffer manager into the collect aggregates' Update/Combine/Destroy so their unbounded
+// element storage is accounted (see JsonoMemoryReservation). Captured at bind time; on plan round-trips the
+// bind re-runs (no serialize callback), re-capturing the buffer manager from the deserialize context.
+struct JsonoCollectBindData : public FunctionData {
+	explicit JsonoCollectBindData(BufferManager &buffer_manager) : buffer_manager(buffer_manager) {
+	}
+	BufferManager &buffer_manager;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<JsonoCollectBindData>(buffer_manager);
+	}
+	bool Equals(const FunctionData &) const override {
+		// The buffer manager is environmental, not a semantic parameter: two collect aggregates over the
+		// same database share it, so equality holds by construction.
+		return true;
+	}
+};
+
+BufferManager &CollectBufferManager(AggregateInputData &aggr_input_data) {
+	return aggr_input_data.bind_data->Cast<JsonoCollectBindData>().buffer_manager;
+}
 
 // A collected element of a jsono_group_array / jsono_group_object group is a standalone JSONO document
 // stored in an OwnedJsonoBlob (six owned byte streams: header + metadata framing), so Finalize can view
@@ -50,15 +74,19 @@ void SerializeRowValue(JsonoRowReader &reader, idx_t row, JsonoBuilder &scratch,
 
 struct CollectArrayState {
 	std::vector<CollectBlob> *elements;
+	JsonoMemoryReservation mem;
 };
 
 struct CollectArrayFunction {
 	static void Initialize(CollectArrayState &state) {
 		state.elements = nullptr;
+		state.mem.reserved = 0;
+		state.mem.buffer_manager = nullptr;
 	}
 
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
+		state.mem.Release();
 		delete state.elements;
 		state.elements = nullptr;
 	}
@@ -72,36 +100,44 @@ unique_ptr<FunctionData> JsonoGroupArrayBind(ClientContext &context, AggregateFu
 	// reconstruct=true: a shredded input is cast to plain JSONO by the binder, so Update reads whole
 	// plain documents. The return type is always plain, so there is no sticky-shredded re-bind hazard.
 	function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_group_array", true);
-	return nullptr;
+	return make_uniq<JsonoCollectBindData>(BufferManager::GetBufferManager(context));
 }
 
-void AppendArrayElement(CollectArrayState &state, JsonoRowReader &reader, idx_t row, JsonoBuilder &scratch) {
+void AppendArrayElement(CollectArrayState &state, BufferManager &buffer_manager, JsonoRowReader &reader, idx_t row,
+                        JsonoBuilder &scratch) {
 	if (!state.elements) {
 		state.elements = new std::vector<CollectBlob>();
 	}
-	state.elements->emplace_back();
-	SerializeRowValue(reader, row, scratch, state.elements->back());
+	CollectBlob blob;
+	SerializeRowValue(reader, row, scratch, blob);
+	// Reserve before storing so the reservation (and any OOM throw) precedes the growth. Element footprint
+	// = the six owned byte streams plus one CollectBlob slot amortizing the vector backing.
+	state.mem.Reserve(buffer_manager, BlobBytes(blob) + sizeof(CollectBlob));
+	state.elements->push_back(std::move(blob));
 }
 
-void JsonoGroupArraySimpleUpdate(Vector inputs[], AggregateInputData &, idx_t, data_ptr_t state_ptr, idx_t count) {
+void JsonoGroupArraySimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t, data_ptr_t state_ptr,
+                                 idx_t count) {
 	JsonoRowReader reader;
 	reader.Init(inputs[0], count);
 	auto &state = *reinterpret_cast<CollectArrayState *>(state_ptr);
+	auto &buffer_manager = CollectBufferManager(aggr_input_data);
 	JsonoBuilder scratch;
 	for (idx_t row = 0; row < count; row++) {
-		AppendArrayElement(state, reader, row, scratch);
+		AppendArrayElement(state, buffer_manager, reader, row, scratch);
 	}
 }
 
-void JsonoGroupArrayUpdate(Vector inputs[], AggregateInputData &, idx_t, Vector &states, idx_t count) {
+void JsonoGroupArrayUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t, Vector &states, idx_t count) {
 	JsonoRowReader reader;
 	reader.Init(inputs[0], count);
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<CollectArrayState *>(state_fmt);
+	auto &buffer_manager = CollectBufferManager(aggr_input_data);
 	JsonoBuilder scratch;
 	for (idx_t row = 0; row < count; row++) {
-		AppendArrayElement(*state_data[RowIndex(state_fmt, row)], reader, row, scratch);
+		AppendArrayElement(*state_data[RowIndex(state_fmt, row)], buffer_manager, reader, row, scratch);
 	}
 }
 
@@ -111,6 +147,7 @@ void JsonoGroupArrayCombine(Vector &source, Vector &target, AggregateInputData &
 	auto source_data = UnifiedVectorFormat::GetData<CollectArrayState *>(source_fmt);
 	auto target_data = FlatVector::GetData<CollectArrayState *>(target);
 	auto destructive = aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE;
+	auto &buffer_manager = CollectBufferManager(aggr_input_data);
 	for (idx_t row = 0; row < count; row++) {
 		auto &src = *source_data[RowIndex(source_fmt, row)];
 		if (!src.elements || src.elements->empty()) {
@@ -129,7 +166,11 @@ void JsonoGroupArrayCombine(Vector &source, Vector &target, AggregateInputData &
 				tgt.elements->push_back(std::move(elem));
 			}
 			src.elements->clear();
+			// The bytes moved from source to target; transfer the reservation without a global change.
+			tgt.mem.AbsorbFrom(src.mem);
 		} else {
+			// A copy duplicates the source footprint; reserve it before growing the target.
+			tgt.mem.Reserve(buffer_manager, src.mem.reserved);
 			for (const auto &elem : *src.elements) {
 				tgt.elements->push_back(elem);
 			}
@@ -176,15 +217,19 @@ struct CollectObjectEntry {
 
 struct CollectObjectState {
 	std::vector<CollectObjectEntry> *entries;
+	JsonoMemoryReservation mem;
 };
 
 struct CollectObjectFunction {
 	static void Initialize(CollectObjectState &state) {
 		state.entries = nullptr;
+		state.mem.reserved = 0;
+		state.mem.buffer_manager = nullptr;
 	}
 
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
+		state.mem.Release();
 		delete state.entries;
 		state.entries = nullptr;
 	}
@@ -197,38 +242,42 @@ unique_ptr<FunctionData> JsonoGroupObjectBind(ClientContext &context, AggregateF
 	}
 	function.arguments[0] = LogicalType::VARCHAR;
 	function.arguments[1] = JsonoResolveJsonoArgument(context, *arguments[1], "jsono_group_object", true);
-	return nullptr;
+	return make_uniq<JsonoCollectBindData>(BufferManager::GetBufferManager(context));
 }
 
-void AppendObjectEntry(CollectObjectState &state, const string_t &key, JsonoRowReader &reader, idx_t row,
-                       JsonoBuilder &scratch) {
+void AppendObjectEntry(CollectObjectState &state, BufferManager &buffer_manager, const string_t &key,
+                       JsonoRowReader &reader, idx_t row, JsonoBuilder &scratch) {
 	if (!state.entries) {
 		state.entries = new std::vector<CollectObjectEntry>();
 	}
-	state.entries->emplace_back();
-	auto &entry = state.entries->back();
+	CollectObjectEntry entry;
 	entry.key.assign(key.GetData(), key.GetSize());
 	SerializeRowValue(reader, row, scratch, entry.value);
+	// Reserve before storing: key bytes + the value's six byte streams + one entry slot for the vector.
+	state.mem.Reserve(buffer_manager, entry.key.size() + BlobBytes(entry.value) + sizeof(CollectObjectEntry));
+	state.entries->push_back(std::move(entry));
 }
 
-void JsonoGroupObjectSimpleUpdate(Vector inputs[], AggregateInputData &, idx_t, data_ptr_t state_ptr, idx_t count) {
+void JsonoGroupObjectSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t, data_ptr_t state_ptr,
+                                  idx_t count) {
 	UnifiedVectorFormat key_fmt;
 	inputs[0].ToUnifiedFormat(count, key_fmt);
 	auto key_data = UnifiedVectorFormat::GetData<string_t>(key_fmt);
 	JsonoRowReader reader;
 	reader.Init(inputs[1], count);
 	auto &state = *reinterpret_cast<CollectObjectState *>(state_ptr);
+	auto &buffer_manager = CollectBufferManager(aggr_input_data);
 	JsonoBuilder scratch;
 	for (idx_t row = 0; row < count; row++) {
 		auto kidx = RowIndex(key_fmt, row);
 		if (!key_fmt.validity.RowIsValid(kidx)) {
 			throw InvalidInputException("jsono_group_object: key cannot be NULL");
 		}
-		AppendObjectEntry(state, key_data[kidx], reader, row, scratch);
+		AppendObjectEntry(state, buffer_manager, key_data[kidx], reader, row, scratch);
 	}
 }
 
-void JsonoGroupObjectUpdate(Vector inputs[], AggregateInputData &, idx_t, Vector &states, idx_t count) {
+void JsonoGroupObjectUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t, Vector &states, idx_t count) {
 	UnifiedVectorFormat key_fmt;
 	inputs[0].ToUnifiedFormat(count, key_fmt);
 	auto key_data = UnifiedVectorFormat::GetData<string_t>(key_fmt);
@@ -237,13 +286,14 @@ void JsonoGroupObjectUpdate(Vector inputs[], AggregateInputData &, idx_t, Vector
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<CollectObjectState *>(state_fmt);
+	auto &buffer_manager = CollectBufferManager(aggr_input_data);
 	JsonoBuilder scratch;
 	for (idx_t row = 0; row < count; row++) {
 		auto kidx = RowIndex(key_fmt, row);
 		if (!key_fmt.validity.RowIsValid(kidx)) {
 			throw InvalidInputException("jsono_group_object: key cannot be NULL");
 		}
-		AppendObjectEntry(*state_data[RowIndex(state_fmt, row)], key_data[kidx], reader, row, scratch);
+		AppendObjectEntry(*state_data[RowIndex(state_fmt, row)], buffer_manager, key_data[kidx], reader, row, scratch);
 	}
 }
 
@@ -253,6 +303,7 @@ void JsonoGroupObjectCombine(Vector &source, Vector &target, AggregateInputData 
 	auto source_data = UnifiedVectorFormat::GetData<CollectObjectState *>(source_fmt);
 	auto target_data = FlatVector::GetData<CollectObjectState *>(target);
 	auto destructive = aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE;
+	auto &buffer_manager = CollectBufferManager(aggr_input_data);
 	for (idx_t row = 0; row < count; row++) {
 		auto &src = *source_data[RowIndex(source_fmt, row)];
 		if (!src.entries || src.entries->empty()) {
@@ -270,7 +321,11 @@ void JsonoGroupObjectCombine(Vector &source, Vector &target, AggregateInputData 
 				tgt.entries->push_back(std::move(entry));
 			}
 			src.entries->clear();
+			// The bytes moved from source to target; transfer the reservation without a global change.
+			tgt.mem.AbsorbFrom(src.mem);
 		} else {
+			// A copy duplicates the source footprint; reserve it before growing the target.
+			tgt.mem.Reserve(buffer_manager, src.mem.reserved);
 			for (const auto &entry : *src.entries) {
 				tgt.entries->push_back(entry);
 			}

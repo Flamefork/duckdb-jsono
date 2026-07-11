@@ -1,0 +1,48 @@
+# name: test/sql/jsono_memory_limit.test
+# description: jsono aggregate state is accounted against the engine memory manager (SET max_memory enforced)
+# group: [sql]
+
+require jsono
+
+# ===== jsono_group_array =====
+
+# Control: the aggregate accumulates a modest group under a generous limit and completes (no spurious OOM).
+# IS NOT NULL forces the aggregate to be materialized (a bare count(*) would let the planner prune it).
+statement ok
+SET max_memory='2GB';
+
+query T
+SELECT jsono_group_array(jsono('"' || repeat('x', 2000) || '"')) IS NOT NULL FROM range(5000);
+----
+true
+
+# Enforcement: the same aggregate over multi-hundred-MB of input trips the engine's OOM once its accounted
+# state grows past the small limit -- a clean error instead of an OS OOM that kills the process.
+statement ok
+SET max_memory='40MB';
+
+statement error
+SELECT jsono_group_array(jsono('"' || repeat('x', 2000) || '"')) FROM range(300000);
+----
+Out of Memory Error
+
+# ===== jsono_group_object =====
+
+# Control: keyed collection completes under a generous limit.
+statement ok
+SET max_memory='2GB';
+
+query T
+SELECT jsono_group_object(CAST(range AS VARCHAR), jsono('"' || repeat('x', 2000) || '"')) IS NOT NULL
+FROM range(5000);
+----
+true
+
+# Enforcement: unbounded group_object growth trips the small limit.
+statement ok
+SET max_memory='40MB';
+
+statement error
+SELECT jsono_group_object(CAST(range AS VARCHAR), jsono('"' || repeat('x', 2000) || '"')) FROM range(300000);
+----
+Out of Memory Error
