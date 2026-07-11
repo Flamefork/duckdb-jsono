@@ -80,6 +80,10 @@ struct JsonoEntriesBindData : public FunctionData {
 	}
 };
 
+// Defined below with the walk-side path builders; the bind rebuilds each shred lane's entry keys
+// through the same builders so a shredded value keys identically to a plain parse.
+void AppendKeySegment(std::string &path, nonstd::string_view key, JsonoEntriesKeyStyle style);
+
 unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments) {
 	auto style = JsonoEntriesKeyStyle::JsonPath;
@@ -135,12 +139,15 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 		for (idx_t i = 0; i < layout.shreds.size(); i++) {
 			auto &name = layout.shreds[i].first;
 			EntriesShred shred {i, layout.shreds[i].second, "", "", {}};
-			if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
-				shred.key_jsonpath = name;
-				shred.key_dotted = name.substr(2);
-			} else {
-				shred.key_jsonpath = "$." + name;
-				shred.key_dotted = name;
+			// Rebuild both key styles segment-by-segment through the walk's builders (via ShredNamePath),
+			// so a quotable object key (containing . [ ] ") keys exactly as a plain parse does — jsonpath
+			// quotes/escapes it, dotted joins it raw. A lane name is always a non-empty pure object-key
+			// chain (enforced at spec parse and layout recognition), so every step is a Key.
+			shred.key_jsonpath = "$";
+			for (auto &step : ShredNamePath(name, "jsono_entries")) {
+				auto key = nonstd::string_view(step.key.data(), step.key.size());
+				AppendKeySegment(shred.key_jsonpath, key, JsonoEntriesKeyStyle::JsonPath);
+				AppendKeySegment(shred.key_dotted, key, JsonoEntriesKeyStyle::Dotted);
 			}
 			if (ClassifyShredKind(shred.type) == ShredKind::Array) {
 				for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(shred.type))) {
