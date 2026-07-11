@@ -110,6 +110,14 @@ void RegisterJsonoToJson(ExtensionLoader &loader) {
 		f.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 		loader.RegisterFunction(f);
 	}
+	// json_quote is a core json alias of to_json, so a plain JSONO value must serialize to the logical
+	// document, not fall to core json's json_quote(ANY) which would dump the raw six-BLOB layout struct.
+	// (Shredded json_quote stays the optimizer's job — its type is not jsono_type, so this never matches.)
+	{
+		ScalarFunction f("json_quote", {jsono_type}, LogicalType::JSON(), JsonoToJsonExecute);
+		f.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+		loader.RegisterFunction(f);
+	}
 	for (auto &target : {LogicalType::JSON(), LogicalType(LogicalType::VARCHAR)}) {
 		loader.RegisterCastFunction(jsono_type, target, BoundCastInfo(JsonoCastToJson), -1);
 	}
