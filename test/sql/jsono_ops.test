@@ -196,9 +196,9 @@ FROM (VALUES
 ----
 {"a":1,"b":{"x":1,"y":2,"z":3},"c":4}
 
-# Empty/all-NULL group merge returns an empty object, matching json_group_merge.
+# An all-NULL group has zero non-NULL inputs and returns SQL NULL (DEFAULT_NULL_HANDLING).
 query I
 SELECT to_json(jsono_group_merge(patch))
 FROM (VALUES (jsono(NULL))) AS t(patch);
 ----
-{}
+NULL

@@ -87,7 +87,8 @@ SELECT DISTINCT m ->> 'k' FROM (
 ----
 b
 
-# A group whose only value is NULL reshreds to an empty object with a NULL shred.
+# A group whose only value is NULL has zero non-NULL inputs and finalizes to SQL NULL
+# (DEFAULT_NULL_HANDLING); typeof still reports the sticky shredded type on the NULL value.
 query III
 SELECT to_json(m), m ->> 'k', typeof(m) = jsono_storage_type('k VARCHAR')
 FROM (
@@ -97,7 +98,7 @@ FROM (
   )
 );
 ----
-{}	NULL	true
+NULL	NULL	true
 
 # A non-object value replaces the accumulator wholesale; reshredding a scalar yields a
 # scalar residual with a NULL shred (still the shredded type).

@@ -2393,9 +2393,10 @@ void WriteOwnedBlobRow(JsonoBodyWriter &writer, idx_t rid, const OwnedJsonoBlob 
 // into the result at the chunk offset) and the shredded finalize (writes a temp at base 0).
 void FinalizePlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMergeState *const *state_data, idx_t count,
                          idx_t base) {
-	// Writes at rows [base, base+count) and produces no SQL NULLs (an empty group becomes an
-	// empty object). JsonoBodyWriter only flattens and resolves data pointers — it touches no
-	// validity — so writing at a base offset is safe.
+	// Writes at rows [base, base+count). A group with zero non-NULL inputs (has_input false)
+	// finalizes to SQL NULL, honoring the aggregate's DEFAULT_NULL_HANDLING; a group that had
+	// input but whose merge collapsed to an empty object writes {}. `out` is always plain here
+	// (this runs only when shreds are empty), so SetRowNull alone nulls the whole row.
 	JsonoBodyWriter writer;
 	writer.Init(out);
 	JsonoBuilder empty_builder;
@@ -2403,7 +2404,11 @@ void FinalizePlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMerge
 	for (idx_t i = 0; i < count; i++) {
 		auto rid = i + base;
 		auto &state = *state_data[RowIndex(state_fmt, i)];
-		if (!state.has_input || !state.acc) {
+		if (!state.has_input) {
+			writer.SetRowNull(rid);
+			continue;
+		}
+		if (!state.acc) {
 			empty_builder.Reset();
 			empty_builder.EmitObjectStart(0);
 			empty_builder.EmitObjectEnd();
@@ -2464,10 +2469,17 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		auto rid = offset + i;
 		auto &state = *state_data[RowIndex(state_fmt, i)];
 		auto *direct = state.direct;
-		bool live = state.has_input && direct && direct->kind != DirectShreddedAcc::Kind::Empty;
+		if (!state.has_input) {
+			// Zero non-NULL inputs -> SQL NULL (DEFAULT_NULL_HANDLING). Null the body and the whole
+			// shreds subtree so DuckDB's struct Verify sees every child of the NULL row NULL too.
+			writer.SetRowNull(rid);
+			JsonoSetRowMarkerNull(result, rid);
+			continue;
+		}
+		bool live = direct && direct->kind != DirectShreddedAcc::Kind::Empty;
 		set_data[rid] = layout_hash;
 		if (!live) {
-			// An empty/all-NULL group finalizes to {} with NULL shreds (complete = 1: absent), as before.
+			// The group had input but folded to an empty object -> {} with NULL shreds (complete = 1: absent).
 			empty_builder.Reset();
 			empty_builder.EmitObjectStart(0);
 			empty_builder.EmitObjectEnd();
@@ -4308,8 +4320,8 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		for (auto *shred : shred_out) {
 			FlatVector::SetNull(*shred, rid, true);
 		}
-		// Shred-set marker on every value row (group_merge never emits a SQL-NULL row — an empty
-		// state emits `{}`); each scalar shred's completeness starts true and a divert clears it below.
+		// Shred-set marker on every value row (a no-input group emits SQL NULL below, which re-nulls
+		// this marker); each scalar shred's completeness starts true and a divert clears it below.
 		FlatVector::Validity(*set_out).SetValid(rid);
 		FlatVector::GetData<int64_t>(*set_out)[rid] = int64_t(manifest_layout_hash);
 		for (auto *complete : complete_out) {
@@ -4325,9 +4337,10 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		stripped_shred_indices.clear();
 		list_override_indices.clear();
 		if (!state.has_input) {
-			builder.EmitObjectStart(0);
-			builder.EmitObjectEnd();
-			writer.WriteRow(rid, builder);
+			// Zero non-NULL inputs -> SQL NULL (DEFAULT_NULL_HANDLING): null the body and the whole
+			// shreds subtree (set marker + every shred field) so struct Verify sees a fully-NULL row.
+			writer.SetRowNull(rid);
+			JsonoSetRowMarkerNull(result, rid);
 			continue;
 		}
 		if (!state.root) {
@@ -4622,9 +4635,10 @@ void FinalizeLWWPlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMe
 		auto &state = *state_data[RowIndex(state_fmt, i)];
 		builder.Reset();
 		if (!state.has_input) {
-			builder.EmitObjectStart(0);
-			builder.EmitObjectEnd();
-			writer.WriteRow(rid, builder);
+			// Zero non-NULL inputs -> SQL NULL (DEFAULT_NULL_HANDLING). `out` is plain here (shreds
+			// empty, or the reshred-fallback's plain temp, where JsonoShredFromSpec carries the NULL
+			// row through into the shredded result).
+			writer.SetRowNull(rid);
 			continue;
 		}
 		if (!state.root) {

@@ -136,7 +136,8 @@ FROM (VALUES ('{"a":"diverted"}')) v(doc);
 ----
 []
 
-# Groups whose every row is NULL finalize to {} with NULL shreds (unchanged contract).
+# Groups whose every row is NULL have zero non-NULL inputs and finalize to SQL NULL
+# (DEFAULT_NULL_HANDLING); the shreds subtree is NULL too, so the field read stays NULL.
 query II
 SELECT to_json(m), m.jsono.shreds."a".value IS NULL
 FROM (
@@ -144,7 +145,7 @@ FROM (
   FROM (VALUES (NULL), (NULL)) v(doc)
 );
 ----
-{}	true
+NULL	true
 
 # Multi-group ordered parity over a mixed workload: shredded fold equals the plain fold per group,
 # and the manifest-carrying result reads back. NOTE: the in-aggregate ORDER BY routes through
