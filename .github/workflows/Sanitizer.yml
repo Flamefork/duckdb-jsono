@@ -86,6 +86,59 @@ jobs:
           JSONO_EXTENSION: build/debug/extension/jsono/jsono.duckdb_extension
         run: uv run --frozen test/pruning/jsono_pruning.py
 
+  # Release-build fuzz leg. The property/fuzz harness is env-pointable at any build, so this runs the
+  # same corrupt-blob sweep against an -O2 optimizer-enabled build: release codegen inlines and
+  # reorders the reader's bound checks differently than the sanitizer Debug build, and if that single
+  # job is ever disabled this keeps a fuzz pass alive. The SQLLogic suite is intentionally NOT re-run
+  # here (the distribution pipeline owns it); this leg is only the property harness + pruning guard.
+  release-fuzz:
+    name: Release fuzz (linux_amd64)
+    runs-on: ubuntu-latest
+    env:
+      # Plain release build: default toolchain (gcc), no sanitizer flags.
+      GEN: ninja
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      # Distinct ccache key: release objects never collide with the sanitizer job's instrumented
+      # objects (different compile flags), so the two caches stay independent.
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: release-fuzz
+          max-size: 1G
+
+      - name: Build (Release)
+        env:
+          EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        run: make release
+
+      # Example budget tiered exactly like the sanitizer job: push/PR runs a fast sweep, the weekly
+      # `schedule` run cranks it up for a deep pass. Cost is linear in the example count.
+      - name: Property + fuzz harness (release)
+        env:
+          JSONO_DUCKDB_BIN: build/release/duckdb
+          JSONO_EXTENSION: build/release/extension/jsono/jsono.duckdb_extension
+          JSONO_PROPERTY_MAX_EXAMPLES: ${{ github.event_name == 'schedule' && '2000' || '100' }}
+        run: uv run --frozen test/property/jsono_property.py
+
+      - name: Row-group pruning guard (release)
+        env:
+          JSONO_DUCKDB_BIN: build/release/duckdb
+          JSONO_EXTENSION: build/release/extension/jsono/jsono.duckdb_extension
+        run: uv run --frozen test/pruning/jsono_pruning.py
+
   # UBSan-only companion: ASan's fat stack frames force the nesting-depth limit down to 32, so
   # depths 33-1000 of every recursive walker never run under the ASan job. A UBSan-only build on
   # Linux keeps the full 1000-depth limit (worker threads get the platform-default 8 MiB stack;
