@@ -1,0 +1,115 @@
+# name: test/sql/jsono_chained_extract.test
+# description: Chained operator navigation `(shredded -> 'k1') ->> 'k2'` fuses to one deep-path shred read, matching the `->> '$.k1.k2'` JSONPath form for both value and plan. The fuse also routes the leaf through jsono's native extract (which folds correctly) instead of core json's extract over the optimizer-only STRUCT->JSON reconstruct cast (which folds to a silent NULL) — so a chain over any bound value (column / VALUES / subquery) is correct.
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+# --- Correctness over a bound value: chained equals the canonical JSONPath form and core json.
+# (VALUES makes `ep` a bound column — the fuse fires. A fully-inlined jsono literal chain is a
+# separate, pre-existing limitation: the whole expression const-folds before any optimizer runs,
+# through the raw STRUCT->JSON cast, so it cannot be fused here — real reads are over columns.)
+query III
+SELECT
+  ep -> 'URL' ->> 'path',
+  ep ->> '$.URL.path',
+  '{"URL":{"path":"/p"}}'::JSON -> 'URL' ->> 'path'
+FROM (VALUES (jsono({'URL':{'path':'/p','hostname':'h'}}))) t(ep);
+----
+/p	/p	/p
+
+# Depth-3 chain.
+query II
+SELECT ep -> 'URL' -> 'qp' ->> 'utm', ep ->> '$.URL.qp.utm'
+FROM (VALUES (jsono({'URL':{'qp':{'utm':'s'}}}))) t(ep);
+----
+s	s
+
+# A json-valued leaf (`-> 'path'`) chain stays correct.
+query I
+SELECT (ep -> 'URL' -> 'path')::VARCHAR FROM (VALUES (jsono({'URL':{'path':'/p'}}))) t(ep);
+----
+"/p"
+
+# A literal key carrying a dot must stay one step: `-> 'a.b'` reads the literal key "a.b", it is NOT
+# split into $.a.b. The fused deep path quotes it so it round-trips.
+query II
+SELECT ep -> 'a.b' ->> 'c', ep ->> '$."a.b".c'
+FROM (VALUES (jsono({'a.b':{'c':'y'}}))) t(ep);
+----
+y	y
+
+# --- Column parity over a shredded table, with the nested leaf explicitly shredded so the lane
+# exists across heterogeneous rows: absent parent, absent leaf, and a scalar (non-object) parent.
+statement ok
+CREATE TABLE t AS
+SELECT i, jsono(
+  CASE i % 4
+    WHEN 0 THEN '{"URL":{"path":"/p' || i || '","hostname":"h' || i || '"}}'  -- normal
+    WHEN 1 THEN '{"URL":{"hostname":"h' || i || '"}}'                          -- leaf absent
+    WHEN 2 THEN '{"other":1}'                                                  -- parent absent
+    ELSE       '{"URL":"scalar"}'                                             -- parent is a scalar
+  END, shredding := {'$.URL.path':'VARCHAR'}) AS ep
+FROM range(2000) tt(i);
+
+# The explicitly shredded nested leaf is a shred lane.
+query I
+SELECT typeof(ep) LIKE '%"$.URL.path"%' FROM t LIMIT 1;
+----
+true
+
+# Every row: chained == JSONPath. Zero divergences.
+query I
+SELECT count(*) FROM t WHERE (ep -> 'URL' ->> 'path') IS DISTINCT FROM (ep ->> '$.URL.path');
+----
+0
+
+# Non-null counts agree (500 normal rows carry URL.path).
+query II
+SELECT count(ep -> 'URL' ->> 'path'), count(ep ->> '$.URL.path') FROM t;
+----
+500	500
+
+# --- Plan (perf): over a table whose nested lane is total (every row carries URL.path), the chained
+# form lowers to the same bare shred-column read as the JSONPath form — it reads the `$.URL.path`
+# shred lane directly, with no extract function (no per-row reconstruct) and no residual COALESCE.
+# Previously the chain reconstructed the URL subtree per row.
+statement ok
+CREATE TABLE tot AS
+SELECT jsono('{"URL":{"path":"/p' || i || '","hostname":"h"}}', shredding := {'$.URL.path':'VARCHAR'}) AS ep
+FROM range(2000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT ep -> 'URL' ->> 'path' FROM tot;
+----
+physical_plan	<REGEX>:.*shreds.*URL.*path.*
+
+query II
+EXPLAIN SELECT ep -> 'URL' ->> 'path' FROM tot;
+----
+physical_plan	<!REGEX>:.*(jsono?_extract|COALESCE).*
+
+query II
+EXPLAIN SELECT ep ->> '$.URL.path' FROM tot;
+----
+physical_plan	<!REGEX>:.*(jsono?_extract|COALESCE).*
+
+statement ok
+PRAGMA explain_output='all';
+
+# --- Parquet round-trip: the fused shred read survives a Parquet write/read, matching the JSONPath
+# form on value.
+statement ok
+COPY (SELECT ep FROM t) TO '__TEST_DIR__/chained.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM read_parquet('__TEST_DIR__/chained.parquet')
+WHERE (ep -> 'URL' ->> 'path') IS DISTINCT FROM (ep ->> '$.URL.path');
+----
+0

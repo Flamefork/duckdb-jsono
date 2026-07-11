@@ -216,6 +216,54 @@ inline bool JsonoPathSpecEqual(const JsonoPathSpec &left, const JsonoPathSpec &r
 // also shares a branch. Used to decide, conservatively, whether a read could touch a shredded
 // array path (read it, descend into it, or sit on a container subtree that holds it) — whose
 // lifted element values are stripped from the residual and so demand a reconstruct.
+// Serialize object-key / array-index steps back to a `$`-rooted JSONPath that ParseJsonoPath
+// round-trips (the inverse of ParseJsonoPath). A key is quoted when a bare `.key` step would
+// mis-parse (empty, or a delimiter/quote/backslash inside it), so a literal key carrying a dot
+// stays one step. Fails for a leading non-key step or any wildcard, which ParseJsonoPath cannot
+// root — the caller then declines rather than emit an unparseable path.
+inline bool TryStepsToJsonPath(const vector<PathStep> &steps, string &out) {
+	if (steps.empty() || steps[0].kind != PathStepKind::Key) {
+		return false;
+	}
+	string path = "$";
+	for (auto &step : steps) {
+		switch (step.kind) {
+		case PathStepKind::Key: {
+			bool needs_quote = step.key.empty();
+			for (char c : step.key) {
+				if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
+					needs_quote = true;
+					break;
+				}
+			}
+			path.push_back('.');
+			if (!needs_quote) {
+				path.append(step.key);
+				break;
+			}
+			path.push_back('"');
+			for (char c : step.key) {
+				if (c == '"' || c == '\\') {
+					path.push_back('\\');
+				}
+				path.push_back(c);
+			}
+			path.push_back('"');
+			break;
+		}
+		case PathStepKind::Index:
+			path.push_back('[');
+			path.append(std::to_string(step.index));
+			path.push_back(']');
+			break;
+		case PathStepKind::Wildcard:
+			return false;
+		}
+	}
+	out = std::move(path);
+	return true;
+}
+
 inline bool PathStepsMayShareBranch(const vector<PathStep> &read, const vector<PathStep> &key_path) {
 	idx_t shared = read.size() < key_path.size() ? read.size() : key_path.size();
 	for (idx_t i = 0; i < shared; i++) {

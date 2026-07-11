@@ -1788,6 +1788,30 @@ protected:
 			if (shredded_cast) {
 				return RewriteShreddedExtract(expr, *shredded_cast);
 			}
+			// Chained navigation `(shredded -> k1) -> ... ->> kN`: the outer extract's arg0 is a chain
+			// of json-valued extracts over a shredded value. Fuse it to one deep-path extract so the
+			// leaf reads its shred lane instead of each `->` reconstructing a parent subtree. This also
+			// fixes a constant chain: without the fuse the leaf binds to core json's extract over the
+			// optimizer-only STRUCT->JSON reconstruct cast, which const-folds (raw struct dump) to a
+			// silent NULL; the fused native jsono extract folds to the correct value.
+			vector<PathStep> steps;
+			auto chain_base = ShreddedExtractChain(*expr.children[0], steps);
+			if (chain_base) {
+				JsonoPathSpec leaf;
+				string text;
+				if (TryReadExtractPath(context, *expr.children[1], leaf)) {
+					for (auto &s : leaf.steps) {
+						steps.push_back(s);
+					}
+					if (TryStepsToJsonPath(steps, text)) {
+						JsonoPathSpec combined(text, std::move(steps));
+						auto path = make_uniq<BoundConstantExpression>(Value(combined.text));
+						bool string_fn = IsStringExtractFunction(expr.function.name);
+						return BuildShreddedPathExtract(*chain_base, std::move(path), combined, expr.return_type,
+						                                string_fn, expr.GetAlias());
+					}
+				}
+			}
 		}
 		// Introspection (jsono_type / jsono_keys) off a shredded value: feed the residual natively
 		// instead of reconstructing when that is value-equivalent (mutates the argument in place).
@@ -1831,6 +1855,50 @@ private:
 			return &cast;
 		}
 		return nullptr;
+	}
+
+	// Recognize `arg` (an extract's arg0) as a chain of one or more json-valued extracts over a
+	// shredded value, bottoming out at a shredded cast. Fills `prefix` with the accumulated path steps
+	// (deepest first) and returns the base shredded cast, or null when `arg` is not such a chain. This
+	// is the deforestation hook behind fusing `shredded -> 'a' ->> 'b'`: each json-valued `-> 'k'`
+	// materializes its parent subtree only to have the next step index into it, so the chain reads as
+	// one deep path off the shred lanes instead. A link is a json-valued extract function
+	// (`->`/json_extract, which core json binds over `CAST(shredded AS JSON)`), optionally already
+	// wrapped in a CAST-to-JSON/JSONO by an earlier rewrite of an inner link — we run top-down, so the
+	// outer sees links raw, but the unwrap keeps recursion robust to either order.
+	optional_ptr<BoundCastExpression> ShreddedExtractChain(Expression &arg, vector<PathStep> &prefix) {
+		Expression *node = &arg;
+		if (node->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+			auto &cast = node->Cast<BoundCastExpression>();
+			if (IsJsonTextType(cast.return_type) || IsJsonoType(cast.return_type)) {
+				node = cast.child.get();
+			}
+		}
+		if (node->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+			return nullptr;
+		}
+		auto &fn = node->Cast<BoundFunctionExpression>();
+		// Only json-valued extract links form the chain: a string-valued extract is the leaf, not a
+		// link (it can only sit at the top, handled by the caller).
+		if (!IsExtractFunction(fn.function.name) || IsStringExtractFunction(fn.function.name) ||
+		    fn.children.size() != 2) {
+			return nullptr;
+		}
+		JsonoPathSpec step;
+		if (!TryReadExtractPath(context, *fn.children[1], step)) {
+			return nullptr;
+		}
+		auto base = ShreddedJsonCast(*fn.children[0]);
+		if (!base) {
+			base = ShreddedExtractChain(*fn.children[0], prefix);
+			if (!base) {
+				return nullptr;
+			}
+		}
+		for (auto &s : step.steps) {
+			prefix.push_back(s);
+		}
+		return base;
 	}
 
 	// A constant-path read off a shredded value. A string extract of a shred reads the shred
