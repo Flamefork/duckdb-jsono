@@ -154,3 +154,19 @@ SELECT jsono_storage_type('"$.ids" UBIGINT[]')
      = typeof(jsono('{"ids":[1,2]}', shredding := {'$.ids':'UBIGINT[]'}));
 ----
 true
+
+# ---- NULL spec edges ----
+
+# A NULL spec argument folds to SQL NULL (DEFAULT null handling), not an error or a bogus type string.
+# The typed NULL::VARCHAR behaves the same.
+query I
+SELECT jsono_storage_type(NULL) IS NULL AND jsono_storage_type(NULL::VARCHAR) IS NULL;
+----
+true
+
+# An all-NULL spec column maps every row to NULL — no row fabricates a stray DDL string.
+query I
+SELECT count(*) FILTER (WHERE jsono_storage_type(s) IS NOT NULL)
+FROM (VALUES (NULL::VARCHAR), (NULL::VARCHAR), (NULL::VARCHAR)) t(s);
+----
+0

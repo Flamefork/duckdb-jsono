@@ -179,3 +179,29 @@ SELECT to_json(jsono_diff(jsono('{"a":{"x":1,"y":2}}', shredding := {a:'VARCHAR'
                           jsono('{"a":{"x":1,"y":3}}', shredding := {a:'VARCHAR'})));
 ----
 {"a":{"y":3}}
+
+# ── Parquet round-trip: shredded operands (typed lane pairs + residual skeleton) are written to
+# Parquet and read back before the diff. The lanes and residual must reassemble byte-identical, so
+# the direct-path diff over the Parquet-backed columns matches the in-memory result above. ──
+
+require parquet
+
+statement ok
+CREATE TABLE diff_shred_pairs AS SELECT * FROM (VALUES
+  (1, jsono('{"k":"a","n":1,"m":{"deep":10},"other":true}',  shredding := {k:'VARCHAR', n:'BIGINT', '$.m.deep':'BIGINT'}),
+      jsono('{"k":"b","n":1,"m":{"deep":11},"other":false}', shredding := {k:'VARCHAR', n:'BIGINT', '$.m.deep':'BIGINT'})),
+  (2, jsono('{"k":"x","n":1,"d":9.75}', shredding := {k:'VARCHAR', n:'BIGINT', d:'DOUBLE'}),
+      jsono('{"k":"x","n":1}',          shredding := {k:'VARCHAR', n:'BIGINT', d:'DOUBLE'}))
+) v(id, prev, cur);
+
+statement ok
+COPY diff_shred_pairs TO '__TEST_DIR__/jsono_diff_shred_pairs.parquet' (FORMAT parquet);
+
+# The changed-lane fast path (id=1, matching the in-memory case above) and a removed typed lane
+# (id=2, the DOUBLE `d` lane dropped) diff to the same values over the Parquet-backed operands.
+query II
+SELECT id, to_json(jsono_diff(prev, cur))
+FROM read_parquet('__TEST_DIR__/jsono_diff_shred_pairs.parquet') ORDER BY id;
+----
+1	{"k":"b","m":{"deep":11},"other":false}
+2	{"d":null}

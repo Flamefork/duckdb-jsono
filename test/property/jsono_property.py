@@ -8,6 +8,7 @@ from select import select
 from subprocess import PIPE
 from subprocess import Popen
 from sys import stderr
+from tempfile import mkdtemp
 from tempfile import TemporaryFile
 from typing import Any
 
@@ -400,6 +401,16 @@ VALIDISH_PROPERTY_SETTINGS = settings(
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow],
 )
+# The Parquet round-trip property writes and reads a file per example, so it runs on a smaller budget
+# than the pure in-memory properties (file I/O is the expensive part, not the SQL).
+PARQUET_PROPERTY_SETTINGS = settings(
+    max_examples=max(25, MAX_EXAMPLES // 6),
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+# One temp dir for the Parquet round-trip property; a single file is overwritten each example (COPY TO
+# replaces the target), so nothing accumulates across examples.
+PARQUET_ROUNDTRIP_DIR = mkdtemp(prefix="jsono_parquet_prop_")
 
 interesting_json_keys = [
     "a.b",
@@ -680,6 +691,35 @@ def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
         f"to_json(jsono(jsono({sql_literal(text)}, shredding := {first}), shredding := {second}))"
     )
     assert plain == reshredded, f"reshred changed the value: {text!r} {first} -> {second}: {plain!r} -> {reshredded!r}"
+
+
+@settings(PARQUET_PROPERTY_SETTINGS)
+@given(doc=shred_documents, data=st.data())
+def test_parquet_round_trip_to_json_parity(doc: dict[str, Any], data: Any) -> None:
+    # A jsono column — both a plain value and one shredded spec — survives a real Parquet write/read:
+    # the six body blobs (and the shred lanes) must reassemble to the byte-identical struct, so to_json
+    # over the Parquet-backed value equals to_json over the in-memory original. This exercises the
+    # physical vector shapes Parquet produces (per-column null masks, blob children) that the in-memory
+    # constructor never builds — the rest of the harness only simulates the physical shape.
+    text = json_dumps(doc)
+    keys = sorted(doc.keys())
+    paths = data.draw(st.lists(st.sampled_from(keys), min_size=1, max_size=4, unique=True))
+    spec = shred_spec_sql({path: data.draw(shred_types) for path in paths})
+    expected = SESSION.value(f"to_json(jsono({sql_literal(text)}))")
+    path = f"{PARQUET_ROUNDTRIP_DIR}/round_trip.parquet"
+    SESSION.statement(
+        f"COPY (SELECT jsono({sql_literal(text)}) AS plain, "
+        f"jsono({sql_literal(text)}, shredding := {spec}) AS shredded) "
+        f"TO '{path}' (FORMAT parquet);"
+    )
+    plain_back = SESSION.value(f"(SELECT to_json(plain) FROM read_parquet('{path}'))")
+    shredded_back = SESSION.value(f"(SELECT to_json(shredded) FROM read_parquet('{path}'))")
+    assert (
+        plain_back == expected
+    ), f"plain Parquet round-trip changed the value: {text!r}: {expected!r} -> {plain_back!r}"
+    assert (
+        shredded_back == expected
+    ), f"shredded Parquet round-trip changed the value: {text!r} spec {spec!r}: {expected!r} -> {shredded_back!r}"
 
 
 # merge_patch over a SHREDDED base with PLAIN patch arguments must fold identically to the same
@@ -1619,6 +1659,7 @@ PROPERTIES = [
     test_keys_sorted,
     test_shred_lossless,
     test_reshred_lossless,
+    test_parquet_round_trip_to_json_parity,
     test_merge_patch_shredded_plain_parity,
     test_merge_all_shredded_parity,
     test_merge_patch_auto_shred_patch_parity,

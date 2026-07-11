@@ -283,3 +283,42 @@ SELECT sum(to_json(e)::VARCHAR::BIGINT)
 FROM (SELECT unnest(jsono_array_elements(j)) AS e FROM big_arr);
 ----
 12497500
+
+# ── Parquet round-trip: the value is written to Parquet and read back before jsono_array_elements, so
+# the six body blobs (and the array-shred lane) reassemble byte-identical through the physical Parquet
+# vectors. The per-element documents match the in-memory cases above, plain and shredded. ──
+
+require parquet
+
+statement ok
+CREATE TABLE ae_plain_pq AS SELECT jsono('[10,20,30]') AS j;
+
+statement ok
+COPY ae_plain_pq TO '__TEST_DIR__/ae_plain.parquet' (FORMAT parquet);
+
+# Root-array elements over the Parquet-backed value, in array order.
+query II
+WITH a AS (SELECT jsono_array_elements(j) AS arr FROM read_parquet('__TEST_DIR__/ae_plain.parquet'))
+SELECT i, to_json(arr[i]) FROM a, range(1, 4) t(i) ORDER BY i;
+----
+1	10
+2	20
+3	30
+
+statement ok
+CREATE TABLE ae_shred_pq AS
+SELECT jsono('{"items":[{"name":"a","cat":"x"},{"name":"b","cat":"y"}]}',
+             shredding := {'$.items': 'STRUCT(name VARCHAR, cat VARCHAR)[]'}) AS j;
+
+statement ok
+COPY ae_shred_pq TO '__TEST_DIR__/ae_shred.parquet' (FORMAT parquet);
+
+# An array-shredded path reconstructs the same elements from the Parquet-backed value.
+query II
+WITH a AS (
+  SELECT jsono_array_elements(j, '$.items') AS arr FROM read_parquet('__TEST_DIR__/ae_shred.parquet')
+)
+SELECT i, to_json(arr[i]) FROM a, range(1, 3) t(i) ORDER BY i;
+----
+1	{"cat":"x","name":"a"}
+2	{"cat":"y","name":"b"}

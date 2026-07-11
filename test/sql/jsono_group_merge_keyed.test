@@ -285,6 +285,39 @@ SELECT DISTINCT to_json(m) FROM (
 ----
 {"k":"b"}
 
+# The min direction of the same full-frame window picks the earliest-key value — the inverse winner
+# of the _max case above ({"k":"a"} instead of {"k":"b"}).
+query I
+SELECT DISTINCT to_json(m) FROM (
+  SELECT jsono_group_merge_min(j, ts) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS m
+  FROM (VALUES
+    (jsono('{"k":"a"}'), 1),
+    (jsono('{"k":"b"}'), 2)
+  ) t(j, ts)
+);
+----
+{"k":"a"}
+
+# --- FILTER threads through the keyed merge: only passing rows fold ---
+
+# A FILTER drops a row before the fold, so the per-leaf winners come only from the kept rows (the
+# 'drop' row's higher-key {"a":9} never overwrites {"a":1}). Oracle: the equivalent pre-filtered
+# subquery merges the identical rows, for both directions.
+query IIII
+SELECT to_json(jsono_group_merge_max(j, ts) FILTER (WHERE g = 'keep')),
+       to_json(jsono_group_merge_max(j, ts) FILTER (WHERE g = 'keep'))
+     = (SELECT to_json(jsono_group_merge_max(j, ts))
+        FROM (VALUES ('keep', jsono('{"a":1}'), 1), ('drop', jsono('{"a":9}'), 2), ('keep', jsono('{"b":2}'), 3)) s(g, j, ts)
+        WHERE g = 'keep'),
+       to_json(jsono_group_merge_min(j, ts) FILTER (WHERE g = 'keep')),
+       to_json(jsono_group_merge_min(j, ts) FILTER (WHERE g = 'keep'))
+     = (SELECT to_json(jsono_group_merge_min(j, ts))
+        FROM (VALUES ('keep', jsono('{"a":1}'), 1), ('drop', jsono('{"a":9}'), 2), ('keep', jsono('{"b":2}'), 3)) s(g, j, ts)
+        WHERE g = 'keep')
+FROM (VALUES ('keep', jsono('{"a":1}'), 1), ('drop', jsono('{"a":9}'), 2), ('keep', jsono('{"b":2}'), 3)) t(g, j, ts);
+----
+{"a":1,"b":2}	true	{"a":1,"b":2}	true
+
 # --- Return contract: plain input stays plain; a bare NULL keeps the plain contract ---
 
 query I

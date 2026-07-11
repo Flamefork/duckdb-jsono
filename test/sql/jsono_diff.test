@@ -370,3 +370,37 @@ statement error
 SELECT jsono_diff(42, jsono('{}'));
 ----
 argument must be JSONO
+
+# ── Parquet round-trip: both operands are written to Parquet and read back before the diff, so the
+# six body blobs must reassemble to byte-identical structs (the physical vector shapes Parquet
+# produces — blob children, per-column masks — never hit the diff on in-memory literals). The diff
+# results are the same expected values as the in-memory cases above. ──
+
+require parquet
+
+statement ok
+CREATE TABLE diff_pairs AS SELECT * FROM (VALUES
+  (1, jsono('{"x":{"p":1,"q":2}}'), jsono('{"x":{"p":1,"q":9}}')),
+  (2, jsono('{"a":1,"b":2}'),       jsono('{"a":1}')),
+  (3, jsono('{"items":[1,1,2]}'),   jsono('{"items":[1,2,2]}'))
+) v(id, prev, cur);
+
+statement ok
+COPY diff_pairs TO '__TEST_DIR__/jsono_diff_pairs.parquet' (FORMAT parquet);
+
+# Nested recurse (id=1) and a removed key (id=2), over Parquet-backed operands.
+query II
+SELECT id, to_json(jsono_diff(prev, cur))
+FROM read_parquet('__TEST_DIR__/jsono_diff_pairs.parquet')
+WHERE id IN (1, 2) ORDER BY id;
+----
+1	{"x":{"q":9}}
+2	{"b":null}
+
+# The 'counts' multiset delta (id=3), over Parquet-backed operands.
+query I
+SELECT to_json(jsono_diff(prev, cur, arrays := 'counts'))
+FROM read_parquet('__TEST_DIR__/jsono_diff_pairs.parquet')
+WHERE id = 3;
+----
+{"items":{"added":1,"removed":1}}

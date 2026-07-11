@@ -486,3 +486,29 @@ SELECT jsono_suggest_shredding(j, min_presence := 0.25, min_fit := 0.5) FROM doc
 
 statement ok
 PRAGMA disable_verify_serializer;
+
+# ---- Parquet round-trip: both advisor aggregates read the physical vector shapes Parquet produces
+#      (blob children, per-column null masks) rather than the in-memory constructor's vectors, and
+#      must yield the identical suggestion / stats. Asserted by equality with the in-memory result. ----
+
+require parquet
+
+statement ok
+COPY docs TO '__TEST_DIR__/jsono_advisor_docs.parquet' (FORMAT parquet);
+
+# jsono_suggest_shredding over the Parquet-backed plain corpus equals the in-memory suggestion.
+query I
+SELECT jsono_suggest_shredding(j) = (SELECT jsono_suggest_shredding(j) FROM docs)
+FROM read_parquet('__TEST_DIR__/jsono_advisor_docs.parquet');
+----
+true
+
+statement ok
+COPY shredded TO '__TEST_DIR__/jsono_advisor_shredded.parquet' (FORMAT parquet);
+
+# jsono_shred_stats over the Parquet-backed shredded column equals the in-memory stats.
+query I
+SELECT to_json(jsono_shred_stats(j)) = (SELECT to_json(jsono_shred_stats(j)) FROM shredded)
+FROM read_parquet('__TEST_DIR__/jsono_advisor_shredded.parquet');
+----
+true

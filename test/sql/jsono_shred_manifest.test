@@ -84,6 +84,26 @@ SELECT len(jsono_shred_manifest(
 ----
 2
 
+# A bare NULL literal (untyped) folds to SQL NULL, like the NULL row above — a constant NULL argument
+# is not an error.
+query I
+SELECT jsono_shred_manifest(NULL) IS NULL;
+----
+true
+
+# An all-NULL shredded column maps every row to NULL — no row fabricates a manifest.
+statement ok
+CREATE TABLE allnull_manifest AS
+SELECT jsono('{"a":1}', shredding := {'a':'BIGINT'}) AS e WHERE 1=0;
+
+statement ok
+INSERT INTO allnull_manifest VALUES (NULL), (NULL), (NULL);
+
+query I
+SELECT count(*) FILTER (WHERE jsono_shred_manifest(e) IS NOT NULL) FROM allnull_manifest;
+----
+0
+
 # The manifest survives a Parquet round-trip: written shredded, read back, the per-row claim is intact.
 require parquet
 

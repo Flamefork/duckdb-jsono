@@ -245,3 +245,40 @@ SELECT (SELECT count(*) FROM (
           SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'tags.raw':'VARCHAR[]'})))));
 ----
 0
+
+# =====================================================================================
+# Parquet round-trip: an array-shredded value (the LIST<STRUCT> lane + residual skeleton) is written
+# to Parquet and read back before jsono_entries. The lane and residual must reassemble byte-identical
+# through the physical Parquet vectors, so entries expands the SAME leaf set as the in-memory cases.
+# =====================================================================================
+
+require parquet
+
+statement ok
+CREATE TABLE arr_entries_pq AS
+SELECT jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
+             shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}) AS j;
+
+statement ok
+COPY arr_entries_pq TO '__TEST_DIR__/jsono_entries_array.parquet' (FORMAT parquet);
+
+# Leaf expansion (default jsonpath keys) over the Parquet-backed array shred.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(j)) AS e
+  FROM read_parquet('__TEST_DIR__/jsono_entries_array.parquet')
+) ORDER BY ALL;
+----
+$.products[0].id	1
+$.products[0].name	a
+$.products[1].id	2
+$.products[1].name	b
+
+# whole_json array_style over the Parquet-backed array shred renders the one whole-array leaf.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(j, array_style := 'whole_json')) AS e
+  FROM read_parquet('__TEST_DIR__/jsono_entries_array.parquet')
+) ORDER BY ALL;
+----
+$.products	[{"id":1,"name":"a"},{"id":2,"name":"b"}]

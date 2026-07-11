@@ -4,6 +4,10 @@
 
 require jsono
 
+# json_quote (a core json alias of to_json) is exercised by the shredded json_quote rewrite block at
+# the end of this file; the rest of the file stays on jsono-native functions.
+require json
+
 statement ok
 CREATE TABLE jsono_optimizer_probe AS
 SELECT jsono(payload) AS j
@@ -1018,3 +1022,37 @@ statement error
 SELECT jsono_extract_string(j, '$.b') AS b, jsono_extract_string(j, '$.c') AS c FROM jsono_matcher_narrow;
 ----
 narrowed by a raw struct cast
+
+# --- json_quote over a shredded value takes the SAME whole-value reconstruct rewrite as to_json
+#     (the optimizer's to_json/json_quote branch), so json_quote(shredded) == to_json(shredded). Reuses
+#     the jsono_extract_shredded fixture ({"kind":"commit","n":7,"o":{"x":1}} shredded on kind + n). ---
+
+# Value parity on a shredded fixture: json_quote reconstructs the same document to_json does, and both
+# equal the plain-equivalent to_json (compared against the plain literal, like the extract block above,
+# because json_quote over a shredded value is only correct with the optimizer). Cast to VARCHAR so the
+# comparison is over the rendered text.
+query II
+SELECT json_quote(j)::VARCHAR = to_json(j)::VARCHAR,
+       json_quote(j)::VARCHAR = to_json(jsono('{"kind":"commit","n":7,"o":{"x":1}}'))::VARCHAR
+FROM jsono_extract_shredded;
+----
+true	true
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# Both to_json and json_quote fire the whole-value reconstruct: the plan overlays shreds onto the
+# residual (the RECONSTRUCT jsono_overlay token, as jsono_pushdown_explain.test locks for to_json),
+# proving json_quote gets the same optimizer rewrite as to_json.
+query II
+EXPLAIN SELECT to_json(j) FROM jsono_extract_shredded;
+----
+physical_plan	<REGEX>:.*jsono_overlay.*
+
+query II
+EXPLAIN SELECT json_quote(j) FROM jsono_extract_shredded;
+----
+physical_plan	<REGEX>:.*jsono_overlay.*
+
+statement ok
+PRAGMA explain_output='all';

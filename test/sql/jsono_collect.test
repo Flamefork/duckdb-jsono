@@ -142,3 +142,44 @@ SELECT (jsono_group_array(j ORDER BY ts)) ->> 1
 FROM (VALUES (jsono('"x"'), 1), (jsono('"y"'), 2)) t(j, ts);
 ----
 y
+
+# --- FILTER threads through the collect aggregates: only passing rows fold ---
+
+# jsono_group_array FILTER: only rows passing the predicate contribute, and a kept NULL row still
+# renders as JSON null. Oracle: the equivalent pre-filtered subquery collects the identical sequence.
+query II
+SELECT to_json(jsono_group_array(j ORDER BY ts) FILTER (WHERE keep)),
+       to_json(jsono_group_array(j ORDER BY ts) FILTER (WHERE keep))
+     = (SELECT to_json(jsono_group_array(j ORDER BY ts))
+        FROM (VALUES (jsono('1'),1,true),(NULL,2,true),(jsono('3'),3,false),(jsono('4'),4,true)) s(j,ts,keep)
+        WHERE keep)
+FROM (VALUES (jsono('1'),1,true),(NULL,2,true),(jsono('3'),3,false),(jsono('4'),4,true)) t(j,ts,keep);
+----
+[1,null,4]	true
+
+# A fully-filtered group is an empty group, so jsono_group_array returns SQL NULL (matching the
+# empty-group contract above), not an empty array.
+query I
+SELECT to_json(jsono_group_array(j) FILTER (WHERE false)) IS NULL
+FROM (VALUES (jsono('1')), (jsono('2'))) t(j);
+----
+true
+
+# jsono_group_object FILTER: only passing rows contribute a key, and a kept NULL value stays JSON
+# null. Oracle: the equivalent pre-filtered subquery builds the identical object.
+query II
+SELECT to_json(jsono_group_object(k, j ORDER BY ts) FILTER (WHERE keep)),
+       to_json(jsono_group_object(k, j ORDER BY ts) FILTER (WHERE keep))
+     = (SELECT to_json(jsono_group_object(k, j ORDER BY ts))
+        FROM (VALUES ('a',jsono('1'),1,true),('b',NULL,2,true),('c',jsono('3'),3,false)) s(k,j,ts,keep)
+        WHERE keep)
+FROM (VALUES ('a',jsono('1'),1,true),('b',NULL,2,true),('c',jsono('3'),3,false)) t(k,j,ts,keep);
+----
+{"a":1,"b":null}	true
+
+# A fully-filtered object collect is likewise an empty group -> SQL NULL.
+query I
+SELECT to_json(jsono_group_object(k, j) FILTER (WHERE false)) IS NULL
+FROM (VALUES ('a',jsono('1')), ('b',jsono('2'))) t(k,j);
+----
+true
