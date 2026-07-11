@@ -62,7 +62,9 @@ bool EmitDomObject(yyjson_val *obj, DomJsonoBuilder &b) {
 	size_t kv_offset = b.kvs.size();
 	size_t idx_offset = b.indices.size();
 
-	uint64_t shape_hash = HASH_SEED;
+	// Salt the LOOKUP fingerprint only (cache keying); the persisted sorted_hash below is
+	// computed from plain HASH_SEED, so output bytes are unaffected. See jsono_dom.hpp.
+	uint64_t shape_hash = HASH_SEED ^ b.shape_salt;
 	size_t N = CollectObjectKvs(b, obj, kv_offset, idx_offset, shape_hash);
 
 	// Shape cache lookup. On hit we copy the cached (deduplicated) permutation into this
@@ -251,7 +253,9 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 
 	// Same collect+hash pass as EmitDomObject; the kvs stay retained for the
 	// whole row so pass 2 can replay them.
-	uint64_t shape_hash = HASH_SEED;
+	// Salt the LOOKUP fingerprint only (cache keying); the persisted sorted_hash below is
+	// computed from plain HASH_SEED, so output bytes are unaffected. See jsono_dom.hpp.
+	uint64_t shape_hash = HASH_SEED ^ s.shape_salt;
 	size_t N = CollectObjectKvs(s, obj, kv_offset, idx_offset, shape_hash);
 
 	// An empty object has no keys: emit_count stays 0, sorted_hash stays the empty-sequence

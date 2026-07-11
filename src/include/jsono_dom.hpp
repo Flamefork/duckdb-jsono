@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -85,6 +86,17 @@ inline size_t ShapeCacheSize() {
 	return sz;
 }
 
+// Per-local-state random salt for the shape-cache LOOKUP fingerprint ONLY (see the
+// shape-hash trust comment at the top of this file). std::random_device gives one
+// non-deterministic draw per state init; two draws fill the full 64 bits. This salt is
+// never folded into the persisted ContainerSpan.shape_hash, so output bytes stay
+// salt-independent — it only makes the target cache slot unpredictable to an adversary
+// who controls incoming keys.
+inline uint64_t MakeShapeSalt() {
+	std::random_device rd;
+	return (uint64_t(rd()) << 32) ^ uint64_t(rd());
+}
+
 // Slot/heap buffers carry across rows and across chunks (via FunctionLocalState)
 // so the vectors' capacity stabilises after a warmup chunk and per-document
 // emission becomes pure appends.
@@ -114,6 +126,8 @@ struct DomJsonoBuilder : public JsonoBuilder {
 	// hash & shape_cache_mask → slot index.
 	std::vector<ShapeCacheEntry> shape_cache;
 	uint64_t shape_cache_mask = 0;
+	// Salts the LOOKUP fingerprint only (never the persisted hash) — see MakeShapeSalt().
+	uint64_t shape_salt = MakeShapeSalt();
 
 	DomJsonoBuilder() {
 		size_t sz = ShapeCacheSize();
@@ -226,6 +240,8 @@ struct DomDirectState {
 	// instance because entries here also carry the sorted-key hash.
 	std::vector<ShapeCacheEntry> shape_cache;
 	uint64_t shape_cache_mask = 0;
+	// Salts the LOOKUP fingerprint only (never the persisted hash) — see MakeShapeSalt().
+	uint64_t shape_salt = MakeShapeSalt();
 
 	DomDirectState() {
 		size_t cache_size = ShapeCacheSize();
