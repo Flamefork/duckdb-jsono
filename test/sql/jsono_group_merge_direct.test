@@ -288,3 +288,30 @@ FROM (VALUES (1, jsono('{"k":"s"}', shredding := {k:'VARCHAR'})),
              (2, jsono('{"k":42}', shredding := {k:'VARCHAR'}))) t(ord, j);
 ----
 {"k":42}
+
+# --- Empty group over shredded input -> SQL NULL (DEFAULT_NULL_HANDLING, direct shredded finalize) ---
+
+# Ungrouped empty group (WHERE false) over shredded input -> SQL NULL, not {} with null shreds.
+query I
+SELECT jsono_group_merge(j) IS NULL
+FROM (VALUES (jsono('{"a":1}', shredding := {a:'BIGINT'}))) t(j) WHERE false;
+----
+true
+
+# GROUP BY over shredded input: the all-NULL group is NULL, the fed group is not.
+query II
+SELECT g, jsono_group_merge(j) IS NULL
+FROM (VALUES ('x', jsono('{"a":1}', shredding := {a:'BIGINT'})),
+             ('y', NULL), ('y', NULL)) t(g, j)
+GROUP BY g ORDER BY g;
+----
+x	false
+y	true
+
+# Regression guard: a fed group that strips to {} (a null member under IGNORE NULLS) stays {}, NOT
+# NULL — it had input, so the empty object is the legitimate result.
+query II
+SELECT to_json(jsono_group_merge(j)), jsono_group_merge(j) IS NULL
+FROM (VALUES (jsono('{"a":null}', shredding := {a:'BIGINT'}))) t(j);
+----
+{}	false

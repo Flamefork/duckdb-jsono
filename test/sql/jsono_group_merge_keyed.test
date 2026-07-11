@@ -438,3 +438,36 @@ statement error
 SELECT jsono_group_merge_max('not json', 1);
 ----
 value argument must be JSONO
+
+# --- Empty group -> SQL NULL (DEFAULT_NULL_HANDLING): zero non-NULL inputs finalize to NULL, not {} ---
+
+# Ungrouped empty group (WHERE false) over plain input -> SQL NULL, both directions.
+query II
+SELECT jsono_group_merge_max(j, ts) IS NULL, jsono_group_merge_min(j, ts) IS NULL
+FROM (VALUES (jsono('{"a":1}'), 1)) t(j, ts) WHERE false;
+----
+true	true
+
+# Ungrouped empty group over shredded input -> SQL NULL (direct shredded finalize), both directions.
+query II
+SELECT jsono_group_merge_max(j, ts) IS NULL, jsono_group_merge_min(j, ts) IS NULL
+FROM (VALUES (jsono('{"event_name":"x"}', shredding := {'event_name':'VARCHAR'}), 1)) t(j, ts) WHERE false;
+----
+true	true
+
+# GROUP BY: the all-NULL group is NULL, the fed sibling is not (both directions).
+query III
+SELECT g, jsono_group_merge_max(j, ts) IS NULL, jsono_group_merge_min(j, ts) IS NULL
+FROM (VALUES ('a', jsono('{"k":1}'), 1), ('b', NULL, 1), ('b', NULL, 2)) t(g, j, ts)
+GROUP BY g ORDER BY g;
+----
+a	false	false
+b	true	true
+
+# Regression guard: has_input is true but the tree collapses to an empty object -> {} (NOT NULL).
+# A lone {"a":null} strips its null member to {} under IGNORE NULLS; the row was still input.
+query II
+SELECT to_json(jsono_group_merge_max(j, ts)), jsono_group_merge_max(j, ts) IS NULL
+FROM (VALUES (jsono('{"a":null}'), 1)) t(j, ts);
+----
+{}	false

@@ -156,3 +156,42 @@ query I
 SELECT typeof(jsono_group_merge(NULL)) = jsono_storage_type();
 ----
 true
+
+# --- Empty group -> SQL NULL (DEFAULT_NULL_HANDLING): a group with zero non-NULL inputs has ---
+# --- nothing to fold and must finalize to SQL NULL, not to {}. ---
+
+# Ungrouped empty group (WHERE false) over plain input -> SQL NULL.
+query I
+SELECT jsono_group_merge(j) IS NULL FROM (VALUES (jsono('{"a":1}'))) t(j) WHERE false;
+----
+true
+
+# to_json of that NULL is SQL NULL (this exact query INTERNAL-errors in a debug build before the fix).
+query I
+SELECT to_json(jsono_group_merge(j)) FROM (VALUES (jsono('{"a":1}'))) t(j) WHERE false;
+----
+NULL
+
+# GROUP BY: an all-NULL group is NULL; a sibling group with a non-NULL row is not.
+query II
+SELECT g, jsono_group_merge(j) IS NULL
+FROM (VALUES ('a', jsono('{"k":1}')), ('b', NULL), ('b', NULL)) t(g, j)
+GROUP BY g ORDER BY g;
+----
+a	false
+b	true
+
+# Regression guard: has_input is true but the merge collapses to an empty object -> {} (NOT NULL).
+# A lone {} folds to {}; a lone {"a":null} strips the null member to {} under IGNORE NULLS. Both had
+# input, so the result is the legitimate empty object, distinct from the no-input NULL above.
+query II
+SELECT to_json(jsono_group_merge(j)), jsono_group_merge(j) IS NULL
+FROM (VALUES (jsono('{}'))) t(j);
+----
+{}	false
+
+query II
+SELECT to_json(jsono_group_merge(j)), jsono_group_merge(j) IS NULL
+FROM (VALUES (jsono('{"a":null}'))) t(j);
+----
+{}	false
