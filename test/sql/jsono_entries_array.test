@@ -194,3 +194,54 @@ SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM p)) +
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT ALL SELECT * FROM s));
 ----
 0
+
+# =====================================================================================
+# plan 039: a scalar-array shred whose lane name needs quoting must derive its base key
+# through ShredNamePath + the walk builders. A mismatched base key makes the placeholder-
+# suppression set miss its walk-built paths, so each lifted element is emitted TWICE — the
+# residual `null` placeholder AND the shred overlay value.
+# =====================================================================================
+
+# quoted spec spelling ($."tags.raw"): the dotted base key must not carry JSONPath quotes;
+# a mismatch double-emits (residual null + shred value) under key_style := 'dotted'.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'$."tags.raw"':'VARCHAR[]'}),
+                              key_style := 'dotted')) AS e
+) ORDER BY ALL;
+----
+k	1
+tags.raw.0	a
+tags.raw.1	b
+
+# bare-literal spec spelling (tags.raw): the jsonpath base key must quote the dotted key;
+# a mismatch double-emits under the default jsonpath style.
+query II
+SELECT e.key, e.value FROM (
+  SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'tags.raw':'VARCHAR[]'}))) AS e
+) ORDER BY ALL;
+----
+$."tags.raw"[0]	a
+$."tags.raw"[1]	b
+$.k	1
+
+# parity-with-plain oracle: each lifted element appears exactly once, every spelling × style.
+query I
+SELECT (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'$."tags.raw"':'VARCHAR[]'}), key_style := 'dotted'))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}'), key_style := 'dotted'))))
+     + (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}'), key_style := 'dotted'))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'$."tags.raw"':'VARCHAR[]'}), key_style := 'dotted'))))
+     + (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'tags.raw':'VARCHAR[]'})))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}')))))
+     + (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}')))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'tags.raw':'VARCHAR[]'})))));
+----
+0

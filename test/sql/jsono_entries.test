@@ -365,3 +365,95 @@ query I
 SELECT to_json(jsono(jsono({a: 1.5::DOUBLE}), shredding := {'a':'DOUBLE'}));
 ----
 {"a":1.5}
+
+# =====================================================================================
+# plan 039: shred-lane keys for quotable object keys (containing . [ ] ") must equal the
+# keys the SAME document produces via a plain parse. The shred overlay must derive entry
+# keys through ShredNamePath + the walk's segment builders, not naive string surgery.
+# =====================================================================================
+
+# --- case 1: quoted spec spelling ($."utm.source") — both key styles match a plain parse ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := {'$."utm.source"':'VARCHAR'}))) u)
+ORDER BY u.key;
+----
+$."utm.source"	g
+$.kind	x
+
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := {'$."utm.source"':'VARCHAR'}), key_style := 'dotted')) u)
+ORDER BY u.key;
+----
+kind	x
+utm.source	g
+
+# --- case 2: bare-literal spec spelling (utm.source) — jsonpath must quote it, NOT nest ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := {'utm.source':'VARCHAR'}))) u)
+ORDER BY u.key;
+----
+$."utm.source"	g
+$.kind	x
+
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := {'utm.source':'VARCHAR'}), key_style := 'dotted')) u)
+ORDER BY u.key;
+----
+kind	x
+utm.source	g
+
+# --- case 3: bracket / embedded-quote keys — jsonpath quotes and escapes like the plain walk ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a[0]":"v"}', shredding := {'a[0]':'VARCHAR'}))) u)
+ORDER BY u.key;
+----
+$."a[0]"	v
+
+# parity-with-plain oracle (jsonpath) over quotable keys, including an embedded quote.
+query I
+SELECT (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := {'a[0]':'VARCHAR','q"x':'VARCHAR'})))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}')))))
+     + (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}')))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := {'a[0]':'VARCHAR','q"x':'VARCHAR'})))));
+----
+0
+
+# parity-with-plain oracle (dotted) over the same quotable keys.
+query I
+SELECT (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := {'a[0]':'VARCHAR','q"x':'VARCHAR'}), key_style := 'dotted'))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}'), key_style := 'dotted'))))
+     + (SELECT count(*) FROM (
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}'), key_style := 'dotted'))
+          EXCEPT ALL
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := {'a[0]':'VARCHAR','q"x':'VARCHAR'}), key_style := 'dotted'))));
+----
+0
+
+# --- case 5 (control): a multi-step lane ($.a.b) and a plain-identifier lane (kind) are
+# byte-identical to the plain parse — these must NOT change across the fix ---
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":7},"kind":"x"}', shredding := {'$.a.b':'BIGINT','kind':'VARCHAR'}))) u)
+ORDER BY u.key;
+----
+$.a.b	7
+$.kind	x
+
+query II
+SELECT u.key, u.value
+FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":7},"kind":"x"}', shredding := {'$.a.b':'BIGINT','kind':'VARCHAR'}), key_style := 'dotted')) u)
+ORDER BY u.key;
+----
+a.b	7
+kind	x
