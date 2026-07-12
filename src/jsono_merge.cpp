@@ -2667,6 +2667,12 @@ struct GroupMergeLWWState {
 	vector<string> *lane_sort_keys;
 	bool has_input;
 	JsonoMemoryReservation mem;
+	// Additions-only accounting for keyed Update: every fold that grows the state adds the exact growth to
+	// `mem_pending`; the account step reserves that (throwing OOM) and periodically trues up. `mem_unmeasured`
+	// is the bytes reserved since the last exact footprint walk, and drives the geometric re-measure. Combine
+	// stays walk-based and resets both after its exact Resize.
+	idx_t mem_pending;
+	idx_t mem_unmeasured;
 };
 
 struct GroupMergeLWWFunction {
@@ -2682,6 +2688,8 @@ struct GroupMergeLWWFunction {
 		state.has_input = false;
 		state.mem.reserved = 0;
 		state.mem.buffer_manager = nullptr;
+		state.mem_pending = 0;
+		state.mem_unmeasured = 0;
 	}
 
 	template <class STATE>
@@ -2701,6 +2709,8 @@ struct GroupMergeLWWFunction {
 		state.list_lane_count = 0;
 		state.lane_sort_keys = nullptr;
 		state.has_input = false;
+		state.mem_pending = 0;
+		state.mem_unmeasured = 0;
 	}
 };
 
@@ -2727,6 +2737,9 @@ struct LWWTreeNode {
 struct LWWTreeScratch {
 	JsonoBuilder builder;
 	OwnedJsonoBlob candidate;
+	// Owned-heap growth accumulated by one MergeIncomingLWWNode call, so a per-row fold can add it to the
+	// group's mem_pending without re-walking the tree. Reset before each top-level merge (see FoldRowLWW).
+	idx_t bytes_added = 0;
 };
 
 // Owned-heap bytes of one LWW tree node (its winning value blob, sort key, and object children,
@@ -2740,6 +2753,17 @@ idx_t LWWTreeNodeBytes(const LWWTreeNode &node) {
 		if (child.node) {
 			bytes += LWWTreeNodeBytes(*child.node);
 		}
+	}
+	return bytes;
+}
+
+// Owned-heap bytes of one direct list-shred lane value (its skeleton blob and element texts). Shared by
+// the footprint walk and the incremental MergeLWWListLane delta so both measure the lane identically.
+idx_t LWWListValueBytes(const LWWListValue &value) {
+	idx_t bytes = BlobBytes(value.skeleton);
+	bytes += value.elements.capacity() * sizeof(LWWListElement);
+	for (auto &element : value.elements) {
+		bytes += element.text.capacity();
 	}
 	return bytes;
 }
@@ -2758,12 +2782,7 @@ idx_t GroupMergeLWWFootprint(const GroupMergeLWWState &state) {
 	bytes += state.list_lane_count * sizeof(LWWListLane);
 	if (state.list_lanes) {
 		for (idx_t i = 0; i < state.list_lane_count; i++) {
-			auto &lane = state.list_lanes[i];
-			bytes += BlobBytes(lane.value.skeleton);
-			bytes += lane.value.elements.capacity() * sizeof(LWWListElement);
-			for (auto &element : lane.value.elements) {
-				bytes += element.text.capacity();
-			}
+			bytes += LWWListValueBytes(state.list_lanes[i].value);
 		}
 	}
 	if (state.lane_sort_keys) {
@@ -2773,6 +2792,38 @@ idx_t GroupMergeLWWFootprint(const GroupMergeLWWState &state) {
 		}
 	}
 	return bytes;
+}
+
+// Re-walk the exact footprint only after this many bytes of additions-only drift have been reserved (or
+// after the state has doubled, whichever is larger). Keeps the O(tree) footprint walk amortized O(1) per
+// growing chunk while bounding how far the additions-only over-estimate can drift above the true size.
+constexpr idx_t kRemeasureMinBytes = 64 * 1024;
+
+// Incremental accounting for keyed group_merge Update. Each fold pushes its owned-heap growth into
+// state.mem_pending; here we Reserve that (which throws the engine OOM if it breaches max_memory), then
+// periodically Resize to the exact footprint to shed the additions-only over-estimate. The pending == 0
+// fast path makes steady-state LWW (rows that lose the merge and grow nothing) skip the footprint walk
+// entirely -- that is what removes the per-row O(tree) cost regression. Dedupe across rows sharing a state
+// is free: the first row reserves its pending and zeroes it, so later rows on the same state short-circuit.
+template <class StateFor>
+void AccountLWWUpdateStates(idx_t count, BufferManager &bm, StateFor state_for) {
+	for (idx_t row = 0; row < count; row++) {
+		auto &s = state_for(row);
+		if (s.mem_pending == 0) {
+			continue;
+		}
+		// Additions-only over-bound: reserved + pending must never be below the true footprint. A breach
+		// means a growth site forgot to add to mem_pending -- fix the site, do not relax this.
+		D_ASSERT(GroupMergeLWWFootprint(s) <= s.mem.reserved + s.mem_pending);
+		s.mem.Reserve(bm, s.mem_pending);
+		s.mem_unmeasured += s.mem_pending;
+		s.mem_pending = 0;
+		idx_t baseline = s.mem.reserved - s.mem_unmeasured;
+		if (s.mem_unmeasured >= MaxValue<idx_t>(kRemeasureMinBytes, baseline)) {
+			s.mem.Resize(bm, GroupMergeLWWFootprint(s));
+			s.mem_unmeasured = 0;
+		}
+	}
 }
 
 int CompareRawBytes(const char *a, size_t na, const char *b, size_t nb) {
@@ -2814,7 +2865,9 @@ uint32_t StoreLWWLaneSortKey(GroupMergeLWWState &state, nonstd::string_view K) {
 	}
 	string copy;
 	AssignBytes(copy, K);
+	idx_t cap_before = keys.capacity();
 	keys.push_back(std::move(copy));
+	state.mem_pending += keys.back().capacity() + (keys.capacity() - cap_before) * sizeof(string);
 	return uint32_t(keys.size() - 1);
 }
 
@@ -3147,8 +3200,14 @@ void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cu
 				AssignBytes(key_copy, key);
 				auto child = make_uniq<LWWTreeNode>();
 				BuildIncomingLWWNode(*child, V, vc, K, scratch, depth + 1, root_skip_keys);
+				// Whole fresh subtree counted once here (its interior grows are BuildIncoming-owned and left
+				// uninstrumented); plus the inserted key bytes and any children-vector reallocation growth.
+				idx_t cap_before = node.children.capacity();
 				node.children.insert(node.children.begin() + child_idx,
 				                     LWWObjectChild(std::move(key_copy), std::move(child)));
+				auto &inserted = node.children[child_idx];
+				scratch.bytes_added += LWWTreeNodeBytes(*inserted.node) + inserted.key.capacity() +
+				                       (node.children.capacity() - cap_before) * sizeof(LWWObjectChild);
 				child_pos = child_idx + 1;
 			}
 		}
@@ -3168,12 +3227,18 @@ void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cu
 		return;
 	}
 	if (key_cmp < 0) {
+		idx_t before = node.sort_key.capacity() + BlobBytes(node.value);
 		StoreLWWLeafFromIncoming(node, V, cursor, K, scratch, depth);
+		idx_t after = node.sort_key.capacity() + BlobBytes(node.value);
+		scratch.bytes_added += (after > before ? after - before : 0);
 		return;
 	}
 	SerializeIncomingLWWLeaf(V, cursor, scratch.candidate, scratch, depth);
 	if (CompareBlobValueTie(node.value, scratch.candidate) < 0) {
+		idx_t before = BlobBytes(node.value);
 		node.value = scratch.candidate;
+		idx_t after = BlobBytes(node.value);
+		scratch.bytes_added += (after > before ? after - before : 0);
 	}
 }
 
@@ -3515,12 +3580,15 @@ void FoldRowLWW(GroupMergeLWWState &state, const JsonoView &V, nonstd::string_vi
 		state.root = new LWWTreeNode();
 		BuildIncomingLWWNode(*state.root, V, cursor, K, scratch, 0, root_skip_keys);
 		state.has_input = true;
+		state.mem_pending += LWWTreeNodeBytes(*state.root);
 		return;
 	}
 	if (!state.root) {
 		throw InternalException("jsono_group_merge: missing keyed aggregate root");
 	}
+	scratch.bytes_added = 0;
 	MergeIncomingLWWNode(*state.root, V, cursor, K, scratch, 0, root_skip_keys);
+	state.mem_pending += scratch.bytes_added;
 }
 
 vector<idx_t> LWWScalarTextLaneIndices(const vector<ReconShred> &shreds) {
@@ -3563,9 +3631,15 @@ void EnsureLWWScalarLanes(GroupMergeLWWState &state, idx_t count, idx_t text_cou
 	}
 	state.scalar_lanes = new LWWScalarLane[count];
 	state.scalar_lane_count = count;
+	state.mem_pending += count * sizeof(LWWScalarLane);
 	if (text_count > 0) {
 		state.scalar_texts = new string[text_count];
 		state.scalar_text_lane_count = text_count;
+		// Footprint counts each text string's capacity(), which is non-zero even when empty (SSO); account the
+		// fresh strings' capacity here so per-write deltas only add growth beyond it.
+		for (idx_t i = 0; i < text_count; i++) {
+			state.mem_pending += state.scalar_texts[i].capacity();
+		}
 	}
 }
 
@@ -3584,6 +3658,7 @@ void EnsureLWWListLanes(GroupMergeLWWState &state, idx_t count) {
 	}
 	state.list_lanes = new LWWListLane[count];
 	state.list_lane_count = count;
+	state.mem_pending += count * sizeof(LWWListLane);
 }
 
 void StorePrimitiveLaneValueBits(const LogicalType &type, const UnifiedVectorFormat &fmt, idx_t idx, uint64_t &out,
@@ -3628,8 +3703,12 @@ void MergeLWWScalarLane(GroupMergeLWWState &state, idx_t lane_idx, const vector<
 	auto *lane = FindLWWScalarLane(state, lane_idx);
 	if (!lane) {
 		lane = &FindOrCreateLWWScalarLane(state, lane_idx);
-		StoreLWWScalarLane(*lane, EnsureLWWScalarLaneText(state, text_indices, lane_idx), candidate_bits,
-		                   candidate_text, ResolveLWWRowSortKey(state, K, sort_key_id));
+		auto *lane_text = EnsureLWWScalarLaneText(state, text_indices, lane_idx);
+		idx_t before = lane_text ? lane_text->capacity() : 0;
+		StoreLWWScalarLane(*lane, lane_text, candidate_bits, candidate_text,
+		                   ResolveLWWRowSortKey(state, K, sort_key_id));
+		idx_t after = lane_text ? lane_text->capacity() : 0;
+		state.mem_pending += (after > before ? after - before : 0);
 		return;
 	}
 	auto *lane_text = RequireLWWScalarLaneText(state, text_indices, lane_idx);
@@ -3639,8 +3718,11 @@ void MergeLWWScalarLane(GroupMergeLWWState &state, idx_t lane_idx, const vector<
 	}
 	if (key_cmp < 0 ||
 	    CompareLWWScalarLaneValueTie(*lane, LWWScalarTextView(lane_text), type, candidate_bits, candidate_text) < 0) {
+		idx_t before = lane_text ? lane_text->capacity() : 0;
 		StoreLWWScalarLane(*lane, lane_text, candidate_bits, candidate_text,
 		                   ResolveLWWRowSortKey(state, K, sort_key_id));
+		idx_t after = lane_text ? lane_text->capacity() : 0;
+		state.mem_pending += (after > before ? after - before : 0);
 	}
 }
 
@@ -3703,7 +3785,10 @@ void StoreLWWListLane(LWWListLane &lane, const LWWListValue &value, uint32_t sor
 void MergeLWWListLane(GroupMergeLWWState &state, LWWListLane &lane, const LWWListValue &candidate,
                       const LogicalType &type, nonstd::string_view K, uint32_t &sort_key_id) {
 	if (!lane.has_value) {
+		idx_t before = LWWListValueBytes(lane.value);
 		StoreLWWListLane(lane, candidate, ResolveLWWRowSortKey(state, K, sort_key_id));
+		idx_t after = LWWListValueBytes(lane.value);
+		state.mem_pending += (after > before ? after - before : 0);
 		return;
 	}
 	int key_cmp = CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), K);
@@ -3711,7 +3796,10 @@ void MergeLWWListLane(GroupMergeLWWState &state, LWWListLane &lane, const LWWLis
 		return;
 	}
 	if (key_cmp < 0 || CompareLWWListValueTie(lane.value, candidate, type) < 0) {
+		idx_t before = LWWListValueBytes(lane.value);
 		StoreLWWListLane(lane, candidate, ResolveLWWRowSortKey(state, K, sort_key_id));
+		idx_t after = LWWListValueBytes(lane.value);
+		state.mem_pending += (after > before ? after - before : 0);
 	}
 }
 
@@ -4503,13 +4591,16 @@ void JsonoGroupMergeLWWSimpleUpdate(Vector inputs[], AggregateInputData &aggr_in
 	sort_keys.ToUnifiedFormat(count, sk_fmt);
 	auto sk_data = UnifiedVectorFormat::GetData<string_t>(sk_fmt);
 	auto &state = *reinterpret_cast<GroupMergeLWWState *>(state_ptr);
+	auto account = [&]() {
+		AccountLWWUpdateStates(count, bind_data.buffer_manager, [&](idx_t) -> GroupMergeLWWState & { return state; });
+	};
 	if (JsonoGroupMergeLWWSimpleUpdateDirectShredded(inputs, bind_data, state_ptr, count, sk_fmt, sk_data)) {
-		state.mem.Resize(bind_data.buffer_manager, GroupMergeLWWFootprint(state));
+		account();
 		return;
 	}
 	JsonoGroupMergeLWWReconstructFold(inputs, count, sk_fmt, sk_data,
 	                                  [&](idx_t) -> GroupMergeLWWState & { return state; });
-	state.mem.Resize(bind_data.buffer_manager, GroupMergeLWWFootprint(state));
+	account();
 }
 
 void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &states,
@@ -4524,13 +4615,12 @@ void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_da
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<GroupMergeLWWState *>(state_fmt);
-	// Account each distinct group state once after the chunk folds (the LWW footprint walk is O(tree), too
-	// costly to repeat per row).
+	// Reserve each state's additions-only pending bytes after the chunk folds; the pending == 0 fast path
+	// skips the O(tree) footprint walk for states no incoming row grew (the common steady-state LWW case).
 	auto account = [&]() {
-		AccountDistinctStates<GroupMergeLWWState>(
-		    count, bind_data.buffer_manager,
-		    [&](idx_t row) -> GroupMergeLWWState & { return *state_data[RowIndex(state_fmt, row)]; },
-		    [](const GroupMergeLWWState &s) { return GroupMergeLWWFootprint(s); });
+		AccountLWWUpdateStates(count, bind_data.buffer_manager, [&](idx_t row) -> GroupMergeLWWState & {
+			return *state_data[RowIndex(state_fmt, row)];
+		});
 	};
 	if (JsonoGroupMergeLWWUpdateDirectShredded(inputs, bind_data, count, sk_fmt, sk_data, state_fmt, state_data)) {
 		account();
@@ -4622,6 +4712,22 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 	AccountDistinctStates<GroupMergeLWWState>(
 	    count, bm, [&](idx_t row) -> GroupMergeLWWState & { return *target_data[row]; },
 	    [](const GroupMergeLWWState &s) { return GroupMergeLWWFootprint(s); });
+	// The exact-footprint Resize above is authoritative: reserved now equals the true size, so the pending
+	// deltas the transfer bumped (lane sort keys) are already counted and the additions-only drift is zero.
+	// Reset both counters on every accounted state -- sources only in the destructive case, mirroring the
+	// walk above (a PRESERVE_INPUT window combine leaves the untouched source's own counters intact).
+	for (idx_t row = 0; row < count; row++) {
+		auto &tgt = *target_data[row];
+		tgt.mem_pending = 0;
+		tgt.mem_unmeasured = 0;
+	}
+	if (destructive) {
+		for (idx_t row = 0; row < count; row++) {
+			auto &src = *source_data[RowIndex(source_fmt, row)];
+			src.mem_pending = 0;
+			src.mem_unmeasured = 0;
+		}
+	}
 }
 
 // Serialize each group's tree (or an empty object for an empty group) into `out`.
