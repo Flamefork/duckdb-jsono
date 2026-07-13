@@ -220,9 +220,29 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::UHUGEINT:
 	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::BIGNUM:
 		// Integers past INT64 don't round-trip through BIGINT. Cast to text and reuse the
 		// parse-path classifier (INT60/INT64/UINT64/NUMBER) so construction matches jsono('...').
 		plan.strategy = StructValueStrategy::NumberText;
+		plan.bound_type = LogicalType::VARCHAR;
+		return plan;
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIME_TZ:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::UUID:
+	case LogicalTypeId::ENUM:
+	case LogicalTypeId::INTERVAL:
+	case LogicalTypeId::BLOB:
+	case LogicalTypeId::BIT:
+		// Types JSON has no native representation for render as strings. The engine's VARCHAR
+		// cast is the same StringCast core to_json renders through, so the emitted JSON string
+		// is byte-identical to core's.
+		plan.strategy = StructValueStrategy::String;
 		plan.bound_type = LogicalType::VARCHAR;
 		return plan;
 	case LogicalTypeId::DECIMAL:
@@ -1117,6 +1137,22 @@ LogicalType PromoteAutoShredType(const LogicalType &type) {
 		return LogicalType::BIGINT;
 	case LogicalTypeId::FLOAT:
 		return LogicalType::DOUBLE;
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIME_TZ:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::UUID:
+	case LogicalTypeId::ENUM:
+	case LogicalTypeId::INTERVAL:
+	case LogicalTypeId::BLOB:
+	case LogicalTypeId::BIT:
+		// The residual carries these as their rendered text (BuildStructConstructorPlan casts them
+		// to VARCHAR), so a VARCHAR lane stores exactly the value the residual would have carried.
+		return LogicalType::VARCHAR;
 	case LogicalTypeId::LIST:
 		return LogicalType::LIST(PromoteAutoShredType(ListType::GetChildType(type)));
 	case LogicalTypeId::STRUCT: {
