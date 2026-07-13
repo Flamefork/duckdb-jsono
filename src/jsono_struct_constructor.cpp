@@ -45,6 +45,7 @@ enum class StructValueStrategy : uint8_t {
 	Jsono,
 	List,
 	Struct,
+	Map,
 	NumberText,
 	Decimal
 };
@@ -64,6 +65,7 @@ bool IsPrimitiveConstructorStrategy(StructValueStrategy strategy) {
 	case StructValueStrategy::Jsono:
 	case StructValueStrategy::List:
 	case StructValueStrategy::Struct:
+	case StructValueStrategy::Map:
 	case StructValueStrategy::NumberText:
 	case StructValueStrategy::Decimal:
 		return false;
@@ -149,6 +151,11 @@ struct JsonoStructLocalState : public FunctionLocalState {
 	// the subtree re-emit drops the manifest, so a narrowed value must fail loud here instead
 	// of laundering the loss. Plain values carry no shreds, so the signature set is empty.
 	jsono::ShredManifestVerifier embedded_jsono_verifier;
+	// Key-sort scratch for MAP emit, one entry per nesting level (a map value may be a map), so
+	// the sort allocates only on the first row that reaches each level. Reached strictly by index,
+	// never by a reference held across the recursive emit: growing the pool moves its elements.
+	vector<vector<std::pair<nonstd::string_view, idx_t>>> map_key_pool;
+	idx_t map_depth = 0;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -358,6 +365,19 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 		plan.bound_type = LogicalType::LIST(plan.children[0].bound_type);
 		return plan;
 	}
+	case LogicalTypeId::MAP: {
+		plan.strategy = StructValueStrategy::Map;
+		// Keys are object names, not subtrees: whatever the key type, the engine renders it to text
+		// (as core to_json does), so a JSON-aliased key degrades to a plain string too.
+		auto key_plan = BuildStructConstructorPlan(MapType::KeyType(source_type), function_name);
+		key_plan.strategy = StructValueStrategy::String;
+		key_plan.bound_type = LogicalType::VARCHAR;
+		key_plan.children.clear();
+		plan.children.push_back(std::move(key_plan));
+		plan.children.push_back(BuildStructConstructorPlan(MapType::ValueType(source_type), function_name));
+		plan.bound_type = LogicalType::MAP(LogicalType::VARCHAR, plan.children[1].bound_type);
+		return plan;
+	}
 	default:
 		throw BinderException("%s: unsupported value type '%s'", function_name, source_type.ToString());
 	}
@@ -412,6 +432,15 @@ void InitStructConstructorVectorData(Vector &input, idx_t count, const JsonoStru
 			data.children.emplace_back();
 			InitStructConstructorVectorData(*struct_children[i], count, plan.children[i], data.children.back());
 		}
+		break;
+	}
+	case StructValueStrategy::Map: {
+		// MAP is physically LIST(STRUCT(key, value)): the entries index into the key/value children.
+		data.list_entries = UnifiedVectorFormat::GetData<list_entry_t>(data.fmt);
+		auto entry_count = ListVector::GetListSize(input);
+		data.children.resize(2);
+		InitStructConstructorVectorData(MapVector::GetKeys(input), entry_count, plan.children[0], data.children[0]);
+		InitStructConstructorVectorData(MapVector::GetValues(input), entry_count, plan.children[1], data.children[1]);
 		break;
 	}
 	case StructValueStrategy::Null:
@@ -524,6 +553,7 @@ void EmitConstructorPrimitiveList(const JsonoStructVectorData &child, idx_t offs
 	case StructValueStrategy::Jsono:
 	case StructValueStrategy::List:
 	case StructValueStrategy::Struct:
+	case StructValueStrategy::Map:
 	case StructValueStrategy::NumberText:
 	case StructValueStrategy::Decimal:
 		throw InternalException("jsono constructor: non-primitive child in primitive list emitter");
@@ -561,6 +591,7 @@ bool EmitConstructorScalarValue(const JsonoStructVectorData &data, idx_t row, Do
 	case StructValueStrategy::Jsono:
 	case StructValueStrategy::List:
 	case StructValueStrategy::Struct:
+	case StructValueStrategy::Map:
 	case StructValueStrategy::NumberText:
 	case StructValueStrategy::Decimal:
 		return false;
@@ -723,6 +754,7 @@ void EmitConstructorFlatScalarObject(const JsonoStructVectorData &data, idx_t ro
 		case StructValueStrategy::Jsono:
 		case StructValueStrategy::List:
 		case StructValueStrategy::Struct:
+		case StructValueStrategy::Map:
 		case StructValueStrategy::NumberText:
 		case StructValueStrategy::Decimal:
 			break;
@@ -805,6 +837,57 @@ void EmitConstructorObject(const JsonoStructVectorData &data, idx_t row, JsonoSt
 		EmitConstructorValue(data.children[field_idx], row, lstate, builder);
 	}
 	builder.EmitObjectEnd();
+}
+
+// A MAP is an object whose keys are data, not schema: they are sorted per row (the format's
+// unique-sorted-key invariant) with the same byte-wise comparator the parse path uses, so a
+// map-built object is byte-identical to the same pairs parsed from text. Map keys are unique and
+// non-NULL by DuckDB's own construction check, but that check ran on the TYPED keys: two distinct
+// typed keys that render to the same text would collapse two entries into one, so this boundary —
+// where the text keys come into being — fails loud rather than dropping a value.
+void EmitConstructorMap(const JsonoStructVectorData &data, idx_t row, JsonoStructLocalState &lstate,
+                        DomJsonoBuilder &builder) {
+	auto entry = data.list_entries[RowIndex(data.fmt, row)];
+	auto &keys = data.children[0];
+	auto &values = data.children[1];
+
+	auto depth = lstate.map_depth++;
+	if (lstate.map_key_pool.size() <= depth) {
+		lstate.map_key_pool.resize(depth + 1);
+	}
+	{
+		// The pool entry may be held by reference only here: nothing below recurses, and a nested
+		// map (further down) grows the pool, which moves its elements.
+		auto &order = lstate.map_key_pool[depth];
+		order.clear();
+		for (idx_t child_i = entry.offset; child_i < entry.offset + entry.length; child_i++) {
+			// By reference: an inlined string_t stores its bytes inside itself, so a copy's
+			// GetData() would leave the sorted string_view pointing at dead stack.
+			auto &key = keys.string_data[RowIndex(keys.fmt, child_i)];
+			order.emplace_back(nonstd::string_view(key.GetData(), key.GetSize()), child_i);
+		}
+		std::sort(order.begin(), order.end(),
+		          [](const std::pair<nonstd::string_view, idx_t> &left,
+		             const std::pair<nonstd::string_view, idx_t> &right) { return left.first < right.first; });
+		for (idx_t i = 1; i < order.size(); i++) {
+			if (order[i - 1].first == order[i].first) {
+				throw InvalidInputException("jsono: MAP keys collide after rendering to text: '%s'",
+				                            string(order[i].first.data(), order[i].first.size()));
+			}
+		}
+	}
+
+	auto key_count = lstate.map_key_pool[depth].size();
+	builder.EmitObjectStart(key_count);
+	for (idx_t i = 0; i < key_count; i++) {
+		builder.EmitKeySlot(lstate.map_key_pool[depth][i].first);
+	}
+	for (idx_t i = 0; i < key_count; i++) {
+		builder.EmitObjectChildStart();
+		EmitConstructorValue(values, lstate.map_key_pool[depth][i].second, lstate, builder);
+	}
+	builder.EmitObjectEnd();
+	lstate.map_depth--;
 }
 
 void EmitConstructorValue(const JsonoStructVectorData &data, idx_t row, JsonoStructLocalState &lstate,
@@ -891,6 +974,9 @@ void EmitConstructorValue(const JsonoStructVectorData &data, idx_t row, JsonoStr
 	}
 	case StructValueStrategy::Struct:
 		EmitConstructorObject(data, row, lstate, builder);
+		return;
+	case StructValueStrategy::Map:
+		EmitConstructorMap(data, row, lstate, builder);
 		return;
 	case StructValueStrategy::Null:
 	case StructValueStrategy::Jsono:
@@ -1235,8 +1321,8 @@ void DropCollidingAutoShreds(vector<pair<string, LogicalType>> &shreds) {
 
 unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
                                                vector<unique_ptr<Expression>> &arguments, bool allow_shred) {
-	if (arguments.empty() || arguments[0]->return_type.id() != LogicalTypeId::STRUCT) {
-		throw BinderException("jsono() STRUCT constructor requires a STRUCT argument");
+	if (arguments.empty()) {
+		throw BinderException("jsono() constructor requires an argument");
 	}
 	auto &input_type = arguments[0]->return_type;
 	auto plan = BuildStructConstructorPlan(input_type, "jsono()");
@@ -1250,7 +1336,9 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 	// execution instead (JsonoStructExecute), mirroring the cast entry point.
 	bound_function.arguments[0] = input_type;
 	auto bind_data = make_uniq<JsonoStructBindData>(std::move(plan));
-	if (allow_shred) {
+	// Shredding lifts named top-level object fields, which only a STRUCT root has: a MAP root's keys
+	// are per-row data and a LIST root is not an object, so those construct plain jsono.
+	if (allow_shred && input_type.id() == LogicalTypeId::STRUCT) {
 		CollectAutoShreds(input_type, string(), 1, bind_data->shreds);
 		DropCollidingAutoShreds(bind_data->shreds);
 	}
@@ -1686,9 +1774,17 @@ void RegisterJsonoStructConstructor(ExtensionLoader &loader) {
 		struct_ctor.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 		set.AddFunction(struct_ctor);
 
+		ScalarFunction map_ctor({LogicalType::MAP(LogicalType::ANY, LogicalType::ANY)}, jsono_type, JsonoStructExecute,
+		                        JsonoStructBind, nullptr, nullptr, JsonoStructLocalState::Init);
+		map_ctor.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		map_ctor.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+		set.AddFunction(map_ctor);
+
 		loader.RegisterFunction(set);
 	}
 	loader.RegisterCastFunction(LogicalType::STRUCT({{"any", LogicalType::ANY}}), jsono_type, JsonoStructCastBind, -1);
+	loader.RegisterCastFunction(LogicalType::MAP(LogicalType::ANY, LogicalType::ANY), jsono_type, JsonoStructCastBind,
+	                            -1);
 }
 
 } // namespace duckdb
