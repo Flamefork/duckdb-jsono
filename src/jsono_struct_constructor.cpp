@@ -367,12 +367,11 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 	}
 	case LogicalTypeId::MAP: {
 		plan.strategy = StructValueStrategy::Map;
-		// Keys are object names, not subtrees: whatever the key type, the engine renders it to text
-		// (as core to_json does), so a JSON-aliased key degrades to a plain string too.
-		auto key_plan = BuildStructConstructorPlan(MapType::KeyType(source_type), function_name);
+		// Keys are object names, not subtrees: whatever the key type, it renders to text through the
+		// engine cast (as core to_json does), so the key child is a plain string regardless of type.
+		JsonoStructPlan key_plan;
 		key_plan.strategy = StructValueStrategy::String;
 		key_plan.bound_type = LogicalType::VARCHAR;
-		key_plan.children.clear();
 		plan.children.push_back(std::move(key_plan));
 		plan.children.push_back(BuildStructConstructorPlan(MapType::ValueType(source_type), function_name));
 		plan.bound_type = LogicalType::MAP(LogicalType::VARCHAR, plan.children[1].bound_type);
@@ -1776,9 +1775,9 @@ void RegisterJsonoStructConstructor(ExtensionLoader &loader) {
 
 		// A document root need not be an object: a MAP, LIST or ARRAY root builds a plain value.
 		// (A VARCHAR root is the text parser by contract, so scalars stay unregistered.)
-		for (auto &root_type : {LogicalType::MAP(LogicalType::ANY, LogicalType::ANY),
-		                        LogicalType::LIST(LogicalType::ANY),
-		                        LogicalType::ARRAY(LogicalType::ANY, optional_idx())}) {
+		for (auto &root_type :
+		     {LogicalType::MAP(LogicalType::ANY, LogicalType::ANY), LogicalType::LIST(LogicalType::ANY),
+		      LogicalType::ARRAY(LogicalType::ANY, optional_idx())}) {
 			ScalarFunction root_ctor({root_type}, jsono_type, JsonoStructExecute, JsonoStructBind, nullptr, nullptr,
 			                         JsonoStructLocalState::Init);
 			root_ctor.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
