@@ -882,8 +882,8 @@ void EmitConstructorObject(const JsonoStructVectorData &data, idx_t row, JsonoSt
 }
 
 // A MAP is an object whose keys are data, not schema: they are sorted per row (the format's
-// unique-sorted-key invariant) with the same byte-wise comparator the parse path uses, so a
-// map-built object is byte-identical to the same pairs parsed from text. Map keys are unique and
+// unique-sorted-key invariant) with the same byte-wise comparator the parse path uses, so the keys
+// land in the same order the same pairs would land in when parsed from text. Map keys are unique and
 // non-NULL by DuckDB's own construction check, but that check ran on the TYPED keys: two distinct
 // typed keys that render to the same text would collapse two entries into one, so this boundary —
 // where the text keys come into being — fails loud rather than dropping a value.
