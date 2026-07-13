@@ -263,7 +263,11 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 		plan.bound_type = IsJsonType(source_type) ? LogicalType::JSON() : LogicalType::VARCHAR;
 		return plan;
 	case LogicalTypeId::STRUCT: {
-		if (IsJsonoType(source_type)) {
+		// A shredded value is the same document with some paths lifted into lanes, so it embeds as a
+		// document too: bind it to the plain layout and let the argument cast (JsonoShreddedReconstructCast)
+		// overlay the lanes back. Without this it falls through to the generic struct walk, which reads the
+		// layout as data and emits the six body blobs as the document.
+		if (IsJsonoType(source_type) || IsShreddedJsonoType(source_type)) {
 			plan.strategy = StructValueStrategy::Jsono;
 			plan.bound_type = JsonoType();
 			return plan;
@@ -1271,6 +1275,13 @@ void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix
 		if (depth == 1 && (child.first == "body" || child.first == JsonoShredSetName())) {
 			continue;
 		}
+		// An embedded jsono value is a subtree the constructor copies whole, not an object to walk: its
+		// layout fields are storage, not document paths (and the body blobs promote to VARCHAR lanes),
+		// so descending would lift `$.<field>.jsono.body.slots` and friends into shreds of paths the
+		// document does not have. It stays in the residual.
+		if (IsJsonoType(child.second) || IsShreddedJsonoType(child.second)) {
+			continue;
+		}
 		auto shred_type = PromoteAutoShredType(child.second);
 		// A scalar leaf, or a regular array shred — fixed-shape objects (LIST<STRUCT<scalars>>) lifting
 		// their element subfields, or scalars (LIST<UBIGINT>, LIST<VARCHAR>, …) lifting each whole
@@ -1320,9 +1331,6 @@ void DropCollidingAutoShreds(vector<pair<string, LogicalType>> &shreds) {
 
 unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
                                                vector<unique_ptr<Expression>> &arguments, bool allow_shred) {
-	if (arguments.empty()) {
-		throw BinderException("jsono() constructor requires an argument");
-	}
 	auto &input_type = arguments[0]->return_type;
 	auto plan = BuildStructConstructorPlan(input_type, "jsono()");
 	idx_t next_key_cache_index = 0;
@@ -1335,9 +1343,11 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 	// execution instead (JsonoStructExecute), mirroring the cast entry point.
 	bound_function.arguments[0] = input_type;
 	auto bind_data = make_uniq<JsonoStructBindData>(std::move(plan));
-	// Shredding lifts named top-level object fields, which only a STRUCT root has: a MAP root's keys
-	// are per-row data and a LIST root is not an object, so those construct plain jsono.
-	if (allow_shred && input_type.id() == LogicalTypeId::STRUCT) {
+	// Shredding lifts named top-level object fields, which only a struct root has: a MAP root's keys
+	// are per-row data, a LIST root is not an object, and a jsono root is a document the constructor
+	// copies through — all three construct plain jsono. The plan's strategy is the authority here,
+	// since a jsono value is physically a STRUCT too.
+	if (allow_shred && bind_data->plan.strategy == StructValueStrategy::Struct) {
 		CollectAutoShreds(input_type, string(), 1, bind_data->shreds);
 		DropCollidingAutoShreds(bind_data->shreds);
 	}

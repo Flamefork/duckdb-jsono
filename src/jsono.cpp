@@ -26,11 +26,6 @@ void RegisterJsonoToJson(ExtensionLoader &loader);
 
 namespace {
 
-void JsonoIdentityExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	(void)state;
-	result.Reference(args.data[0]);
-}
-
 // jsono_storage_type() -> the DDL string of the physical STRUCT that a jsono value is.
 // DuckLake rejects user-defined type aliases (the reason jsono carries none), so writers
 // declare storage columns with this struct; exposing it here keeps the layout owned by the
@@ -375,13 +370,6 @@ LogicalType JsonoType() {
 }
 
 void RegisterJsonoType(ExtensionLoader &loader) {
-	auto jsono_type = JsonoType();
-
-	{
-		ScalarFunctionSet set("jsono");
-		set.AddFunction(ScalarFunction({jsono_type}, jsono_type, JsonoIdentityExecute));
-		loader.RegisterFunction(set);
-	}
 	{
 		ScalarFunctionSet set("jsono_storage_type");
 		set.AddFunction(ScalarFunction({}, LogicalType::VARCHAR, JsonoStorageTypeExecute));
