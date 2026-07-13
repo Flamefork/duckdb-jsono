@@ -1774,16 +1774,25 @@ void RegisterJsonoStructConstructor(ExtensionLoader &loader) {
 		struct_ctor.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 		set.AddFunction(struct_ctor);
 
-		ScalarFunction map_ctor({LogicalType::MAP(LogicalType::ANY, LogicalType::ANY)}, jsono_type, JsonoStructExecute,
-		                        JsonoStructBind, nullptr, nullptr, JsonoStructLocalState::Init);
-		map_ctor.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-		map_ctor.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-		set.AddFunction(map_ctor);
+		// A document root need not be an object: a MAP, LIST or ARRAY root builds a plain value.
+		// (A VARCHAR root is the text parser by contract, so scalars stay unregistered.)
+		for (auto &root_type : {LogicalType::MAP(LogicalType::ANY, LogicalType::ANY),
+		                        LogicalType::LIST(LogicalType::ANY),
+		                        LogicalType::ARRAY(LogicalType::ANY, optional_idx())}) {
+			ScalarFunction root_ctor({root_type}, jsono_type, JsonoStructExecute, JsonoStructBind, nullptr, nullptr,
+			                         JsonoStructLocalState::Init);
+			root_ctor.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+			root_ctor.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+			set.AddFunction(root_ctor);
+		}
 
 		loader.RegisterFunction(set);
 	}
 	loader.RegisterCastFunction(LogicalType::STRUCT({{"any", LogicalType::ANY}}), jsono_type, JsonoStructCastBind, -1);
 	loader.RegisterCastFunction(LogicalType::MAP(LogicalType::ANY, LogicalType::ANY), jsono_type, JsonoStructCastBind,
+	                            -1);
+	loader.RegisterCastFunction(LogicalType::LIST(LogicalType::ANY), jsono_type, JsonoStructCastBind, -1);
+	loader.RegisterCastFunction(LogicalType::ARRAY(LogicalType::ANY, optional_idx()), jsono_type, JsonoStructCastBind,
 	                            -1);
 }
 
