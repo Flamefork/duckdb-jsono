@@ -161,3 +161,39 @@ query I
 SELECT to_json(CAST(MAP {'x': 1} AS STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))))::VARCHAR;
 ----
 {"x":1}
+
+# A LIST or ARRAY root builds an array document (a JSON document need not be an object).
+query IIII
+SELECT to_json(jsono([1, 2, 3]))::VARCHAR,
+       to_json(jsono(array_value(1, 2, 3)))::VARCHAR,
+       to_json(jsono([]::INTEGER[]))::VARCHAR,
+       to_json(jsono([{'b': 2, 'a': 1}, MAP {'k': 'v'}, NULL]))::VARCHAR;
+----
+[1,2,3]	[1,2,3]	[]	[{"a":1,"b":2},{"k":"v"},null]
+
+# Shredding lifts top-level object fields, so an array root constructs plain jsono - even when
+# its elements are objects with shreddable fields.
+query II
+SELECT typeof(jsono([{'a': 1}])), typeof(jsono([{'a': 1}])) = jsono_storage_type();
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))	true
+
+query I
+SELECT jsono(NULL::INTEGER[]) IS NULL;
+----
+true
+
+query I
+SELECT to_json(jsono([1, 2, 3]))::VARCHAR = to_json(jsono('[1,2,3]'))::VARCHAR;
+----
+true
+
+# A LIST casts to jsono storage, so INSERT of a list into a jsono column works.
+statement ok
+INSERT INTO map_docs SELECT [1, 2];
+
+query I
+SELECT to_json(j)::VARCHAR FROM map_docs ORDER BY 1;
+----
+[1,2]
+{"a":1,"b":2}
