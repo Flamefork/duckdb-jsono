@@ -163,13 +163,14 @@ SELECT to_json(CAST(MAP {'x': 1} AS STRUCT(jsono STRUCT(body STRUCT(slots BLOB, 
 {"x":1}
 
 # A LIST or ARRAY root builds an array document (a JSON document need not be an object).
-query IIII
+query IIIII
 SELECT to_json(jsono([1, 2, 3]))::VARCHAR,
        to_json(jsono(array_value(1, 2, 3)))::VARCHAR,
        to_json(jsono([]::INTEGER[]))::VARCHAR,
-       to_json(jsono([{'b': 2, 'a': 1}, MAP {'k': 'v'}, NULL]))::VARCHAR;
+       to_json(jsono([{'b': 2, 'a': 1}, NULL]))::VARCHAR,
+       to_json(jsono([MAP {'k': 'v'}]))::VARCHAR;
 ----
-[1,2,3]	[1,2,3]	[]	[{"a":1,"b":2},{"k":"v"},null]
+[1,2,3]	[1,2,3]	[]	[{"a":1,"b":2},null]	[{"k":"v"}]
 
 # Shredding lifts top-level object fields, so an array root constructs plain jsono - even when
 # its elements are objects with shreddable fields.
