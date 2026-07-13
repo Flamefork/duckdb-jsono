@@ -9,3 +9,5 @@ duckdb_extension_load(jsono
 # Any extra extensions that should be built
 duckdb_extension_load(parquet)
 duckdb_extension_load(json)
+# icu: the TIMESTAMPTZ tests need a session TimeZone, which is what ICU registers
+duckdb_extension_load(icu)

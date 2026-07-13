@@ -29,3 +29,41 @@ query I
 SELECT to_json(jsono({'eo': jsono('{}'), 'ea': jsono('[]')}));
 ----
 {"ea":[],"eo":{}}
+
+# An embedded jsono value is a subtree, not a SQL struct: auto-shred must not descend into its
+# layout. The six body blobs are BLOB, which promotes to a VARCHAR lane, so descending would lift
+# `$.nested.jsono.body.slots` and friends into shreds of a document that has no such paths.
+query I
+SELECT typeof(jsono({'z': 1, 'nested': jsono('{"a":1}')}));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, z STRUCT("value" BIGINT, complete TINYINT))))
+
+# A shredded value embeds as its document at every position the constructor takes it: struct field,
+# MAP value, LIST element, and the document root. Only the plain layout is recognized structurally,
+# so a shredded input read as a bare struct would emit its six blobs as the document itself.
+query IIII
+SELECT to_json(jsono({'k': jsono({'a': 1, 'b': 'x'})}))::VARCHAR,
+       to_json(jsono(MAP {'k': jsono({'a': 1, 'b': 'x'})}))::VARCHAR,
+       to_json(jsono([jsono({'a': 1, 'b': 'x'})]))::VARCHAR,
+       to_json(jsono(jsono({'a': 1, 'b': 'x'})))::VARCHAR;
+----
+{"k":{"a":1,"b":"x"}}	{"k":{"a":1,"b":"x"}}	[{"a":1,"b":"x"}]	{"a":1,"b":"x"}
+
+# The embedded shreds are overlaid back onto the residual, so the document reads by path and the
+# outer value carries no lane of the inner one.
+query II
+SELECT jsono({'k': jsono({'a': 1, 'b': 'x'})})->>'$.k.b',
+       typeof(jsono({'k': jsono({'a': 1, 'b': 'x'})})) = jsono_storage_type();
+----
+x	true
+
+# The same over a real column (the constructed value is shredded by default), not a folded constant.
+statement ok
+CREATE TABLE embedded_source AS SELECT jsono({'a': i, 'b': 'x'}) AS doc FROM range(3) t(i);
+
+query I
+SELECT to_json(jsono({'k': doc}))::VARCHAR FROM embedded_source ORDER BY 1;
+----
+{"k":{"a":0,"b":"x"}}
+{"k":{"a":1,"b":"x"}}
+{"k":{"a":2,"b":"x"}}

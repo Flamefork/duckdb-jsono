@@ -1,0 +1,50 @@
+# name: test/sql/jsono_constructor_timestamptz.test
+# description: TIMESTAMPTZ renders UTC-fixed, not through the session TimeZone (needs ICU to set one)
+# group: [sql]
+
+require jsono
+
+require json
+
+require icu
+
+# A document is storage, not a render: the same instant must produce the same bytes - and the same
+# shred lane text, whose Parquet min/max drives row-group pruning - whatever TimeZone the writing
+# session runs in. ICU overrides TIMESTAMPTZ -> VARCHAR in the cast set with a session render, so the
+# constructor renders through DefaultCast instead, which is the cast set core to_json renders through.
+
+statement ok
+SET TimeZone='America/New_York';
+
+query III
+SELECT to_json(jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'}))::VARCHAR,
+       jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'})->>'ts',
+       to_json(jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'}))::VARCHAR
+       = to_json({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'})::VARCHAR;
+----
+{"ts":"2024-01-01 12:00:00+00"}	2024-01-01 12:00:00+00	true
+
+# Two sessions, one instant, one document: the value written under a non-UTC TimeZone equals the one
+# written under UTC, so a filter on the lane finds both rows rather than one.
+statement ok
+CREATE TABLE tz_docs AS SELECT jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00', 'w': 'east'}) AS j;
+
+statement ok
+SET TimeZone='UTC';
+
+statement ok
+INSERT INTO tz_docs SELECT jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00', 'w': 'utc'});
+
+query I
+SELECT count(*) FROM tz_docs WHERE (j->>'ts') = '2024-01-01 12:00:00+00';
+----
+2
+
+# The MAP key path renders through the same cast: a TIMESTAMPTZ key is UTC text too.
+statement ok
+SET TimeZone='Europe/Madrid';
+
+query I
+SELECT to_json(jsono(MAP {TIMESTAMPTZ '2024-01-01 12:00:00+00': 1}))::VARCHAR;
+----
+{"2024-01-01 12:00:00+00":1}

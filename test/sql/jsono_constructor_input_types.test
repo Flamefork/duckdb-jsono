@@ -98,6 +98,62 @@ SELECT jsono({'u': union_value(num := 2)});
 ----
 unsupported value type
 
+# TIME_NS is a string type like the rest of the temporal row, and renders like core's.
+query I
+SELECT to_json(jsono({'t': TIME_NS '12:00:00.123456789'}))::VARCHAR
+       = to_json({'t': TIME_NS '12:00:00.123456789'})::VARCHAR;
+----
+true
+
+# The residual carries the same UTC text the lane does: a plain cast (no shredding) must render it
+# identically, or a shredded column and a plain one would disagree on the same value.
+query I
+SELECT to_json(CAST({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00',
+                     'd': DATE '2024-01-01',
+                     'bl': '\xAA'::BLOB} AS STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))))::VARCHAR
+       = to_json(jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00',
+                        'd': DATE '2024-01-01',
+                        'bl': '\xAA'::BLOB}))::VARCHAR;
+----
+true
+
+# An ARRAY field gets the same list lane a LIST field gets: the residual holds a plain JSON array
+# either way, so the fixed size is a SQL-side detail, not a document one.
+query III
+SELECT typeof(jsono({'a': array_value(1, 2), 'n': 5})) = typeof(jsono({'a': [1, 2], 'n': 5})),
+       to_json(jsono({'a': array_value(1, 2), 'n': 5}))::VARCHAR,
+       jsono({'a': array_value(1, 2), 'n': 5})->>'$.a[1]';
+----
+true	{"a":[1,2],"n":5}	2
+
+# MAP keys that collide only after rendering to text: DuckDB accepts the typed keys (distinct UNION
+# tags), both render to "1", and one entry would silently overwrite the other. Fail loud instead.
+statement error
+SELECT jsono(MAP([union_value(a := 1)::UNION(a INT, b INT), union_value(b := 1)::UNION(a INT, b INT)], [10, 20]));
+----
+MAP keys collide after rendering to text
+
+# The new inputs on a real (flat, multi-row, filtered) vector rather than a folded constant: NULL
+# rows, maps of different widths, and per-row keys all index through the same child offsets.
+statement ok
+CREATE TABLE rows_source AS
+SELECT i AS rid,
+       CASE WHEN i % 4 = 0 THEN NULL
+            ELSE map_from_entries([('k' || (9 - i % 3), i), ('a', i * 2)])
+       END AS m,
+       TIMESTAMP '2024-01-01 00:00:00' + INTERVAL (i) HOUR AS ts
+FROM range(9) t(i);
+
+query III
+SELECT rid, to_json(jsono({'m': m, 'ts': ts}))::VARCHAR, jsono({'m': m, 'ts': ts})->>'ts'
+FROM rows_source
+WHERE rid % 3 = 0
+ORDER BY rid;
+----
+0	{"m":null,"ts":"2024-01-01 00:00:00"}	2024-01-01 00:00:00
+3	{"m":{"a":6,"k9":3},"ts":"2024-01-01 03:00:00"}	2024-01-01 03:00:00
+6	{"m":{"a":12,"k9":6},"ts":"2024-01-01 06:00:00"}	2024-01-01 06:00:00
+
 # A MAP builds a JSON object per row. Keys sort (the format's unique-sorted-key invariant),
 # which diverges from core to_json's insertion order - the pairs are the same.
 query I
