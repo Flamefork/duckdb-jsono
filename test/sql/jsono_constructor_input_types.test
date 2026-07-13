@@ -1,0 +1,98 @@
+# name: test/sql/jsono_constructor_input_types.test
+# description: Constructor input-type coverage - string-rendered scalars (temporal/UUID/ENUM/INTERVAL/BLOB/BIT) and VARINT bignums
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+# Types that JSON renders as strings go through the engine's VARCHAR cast, which is the same
+# StringCast core to_json uses - so the rendering is byte-identical to core.
+query I
+SELECT to_json(jsono({'bl': '\xAA\xBB'::BLOB,
+                      'bt': '101'::BIT,
+                      'd': DATE '2024-01-01',
+                      'e': 'happy'::mood,
+                      'iv': INTERVAL '3 days 2 hours',
+                      't': TIME '12:34:56.789',
+                      'ts': TIMESTAMP '2024-01-01 12:34:56.789',
+                      'ts_ms': TIMESTAMP_MS '2024-01-01 12:34:56.789',
+                      'ts_ns': TIMESTAMP_NS '2024-01-01 12:34:56.123456789',
+                      'ts_s': TIMESTAMP_S '2024-01-01 12:34:56',
+                      'ttz': TIMETZ '12:34:56+02',
+                      'u': UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd'}))::VARCHAR;
+----
+{"bl":"\\xAA\\xBB","bt":"101","d":"2024-01-01","e":"happy","iv":"3 days 02:00:00","t":"12:34:56.789","ts":"2024-01-01 12:34:56.789","ts_ms":"2024-01-01 12:34:56.789","ts_ns":"2024-01-01 12:34:56.123456789","ts_s":"2024-01-01 12:34:56","ttz":"12:34:56+02","u":"4ac7a9e9-607c-4c8a-84f3-843f0191e3fd"}
+
+# TIMESTAMPTZ rendering depends on the session TimeZone, so assert parity with core to_json
+# (both sides render through the same session-dependent cast) instead of a pinned literal.
+query I
+SELECT to_json(jsono({'tstz': TIMESTAMPTZ '2024-01-01 12:34:56+00'}))::VARCHAR
+       = to_json({'tstz': TIMESTAMPTZ '2024-01-01 12:34:56+00'})::VARCHAR;
+----
+true
+
+# The constructed document is byte-identical to the same document parsed from text.
+query I
+SELECT to_json(jsono({'d': DATE '2024-01-01', 'u': UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd'}))::VARCHAR
+       = to_json(jsono('{"d":"2024-01-01","u":"4ac7a9e9-607c-4c8a-84f3-843f0191e3fd"}'))::VARCHAR;
+----
+true
+
+# NULL fields of the new types stay lossless explicit JSON nulls.
+query I
+SELECT to_json(jsono({'bl': NULL::BLOB, 'd': NULL::DATE, 'u': NULL::UUID}))::VARCHAR;
+----
+{"bl":null,"d":null,"u":null}
+
+# VARINT joins the NumberText group: the exact digits reach the number ladder, losslessly, past
+# what HUGEINT can hold. Build it from text - a bare numeric literal would go through DOUBLE.
+query I
+SELECT to_json(jsono({'v': ('1' || repeat('0', 45))::VARINT}))::VARCHAR;
+----
+{"v":1000000000000000000000000000000000000000000000}
+
+query I
+SELECT to_json(jsono({'v': ('1' || repeat('0', 45))::VARINT}))::VARCHAR
+       = to_json(jsono('{"v":' || ('1' || repeat('0', 45)) || '}'))::VARCHAR;
+----
+true
+
+# String-rendered types auto-shred into VARCHAR lanes: the lane carries exactly the text the
+# residual would have carried, so ->> reads it back and to_json reconstructs unchanged.
+query I
+SELECT typeof(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789', 'u': UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd'}));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, ts STRUCT("value" VARCHAR, complete TINYINT), u STRUCT("value" VARCHAR, complete TINYINT))))
+
+query III
+SELECT jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789', 'u': UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd'})->>'ts',
+       jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789', 'u': UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd'})->>'u',
+       to_json(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789', 'u': UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd'}))::VARCHAR;
+----
+2024-01-01 12:34:56.789	4ac7a9e9-607c-4c8a-84f3-843f0191e3fd	{"ts":"2024-01-01 12:34:56.789","u":"4ac7a9e9-607c-4c8a-84f3-843f0191e3fd"}
+
+# VARINT/HUGEINT stay in the residual (NumberText is not a lane type), so a struct mixing them
+# with a shreddable field shreds only the field that has a lane.
+query II
+SELECT typeof(jsono({'v': ('1' || repeat('0', 45))::VARINT, 'ts': TIMESTAMP '2024-01-01 12:34:56.789'})),
+       to_json(jsono({'v': ('1' || repeat('0', 45))::VARINT, 'ts': TIMESTAMP '2024-01-01 12:34:56.789'}))::VARCHAR;
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, ts STRUCT("value" VARCHAR, complete TINYINT))))	{"ts":"2024-01-01 12:34:56.789","v":1000000000000000000000000000000000000000000000}
+
+# The explicit shredding spec accepts the new types too (it binds through the same plan).
+query II
+SELECT typeof(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789'}, shredding := {'$.ts': 'VARCHAR'})),
+       to_json(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789'}, shredding := {'$.ts': 'VARCHAR'}))::VARCHAR;
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.ts" STRUCT("value" VARCHAR, complete TINYINT))))	{"ts":"2024-01-01 12:34:56.789"}
+
+# UNION stays a loud bind error: core renders it as a tagged object, which the VARCHAR cast
+# does not reproduce, so there is no parity to be had from a text rendering.
+statement error
+SELECT jsono({'u': union_value(num := 2)});
+----
+unsupported value type
