@@ -40,6 +40,9 @@ enum class StructValueStrategy : uint8_t {
 	Int,
 	Double,
 	String,
+	// A string the emit renders itself through DefaultCast, because the cast set's own cast is
+	// session-dependent (TIMESTAMP_TZ under ICU) and a document is storage, not a render.
+	StringDefaultCast,
 	RawJson,
 	Bool,
 	Jsono,
@@ -59,6 +62,7 @@ bool IsPrimitiveConstructorStrategy(StructValueStrategy strategy) {
 	case StructValueStrategy::Int:
 	case StructValueStrategy::Double:
 	case StructValueStrategy::String:
+	case StructValueStrategy::StringDefaultCast:
 	case StructValueStrategy::Bool:
 		return true;
 	case StructValueStrategy::RawJson:
@@ -187,6 +191,10 @@ struct JsonoStructVectorData {
 	const bool *bool_data = nullptr;
 	const list_entry_t *list_entries = nullptr;
 	JsonoVectorData jsono_data;
+	// The DefaultCast render of a StringDefaultCast child (string_data points into it, so it must
+	// outlive the emit). Held indirectly: `children` moves its elements, and fmt/string_data keep
+	// pointing at the Vector's own buffers only if the Vector itself does not move.
+	unique_ptr<Vector> rendered;
 	vector<JsonoStructVectorData> children;
 };
 
@@ -235,22 +243,31 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 		return plan;
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIME_NS:
 	case LogicalTypeId::TIME_TZ:
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_TZ:
 	case LogicalTypeId::UUID:
 	case LogicalTypeId::ENUM:
 	case LogicalTypeId::INTERVAL:
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::BIT:
-		// Types JSON has no native representation for render as strings. The engine's VARCHAR
-		// cast is the same StringCast core to_json renders through, so the emitted JSON string
-		// is byte-identical to core's.
+		// Types JSON has no native representation for render as strings, through the same VARCHAR
+		// cast core to_json renders through, so the emitted JSON string is byte-identical to core's.
+		// TIMESTAMP_TZ is not in this list: its cast is session-dependent, see below.
 		plan.strategy = StructValueStrategy::String;
 		plan.bound_type = LogicalType::VARCHAR;
+		return plan;
+	case LogicalTypeId::TIMESTAMP_TZ:
+		// The document is storage, not a render: the same instant must produce the same bytes in every
+		// session. ICU overrides TIMESTAMP_TZ -> VARCHAR in the cast set with a session-TimeZone render,
+		// so the plan keeps the native type and the emit renders through DefaultCast — the cast set core
+		// to_json renders through (json_create.cpp), which is UTC-fixed. Hence parity with core holds
+		// under any session TimeZone, and the lane text (and its Parquet min/max) stays deterministic.
+		plan.strategy = StructValueStrategy::StringDefaultCast;
+		plan.bound_type = LogicalType::TIMESTAMP_TZ;
 		return plan;
 	case LogicalTypeId::DECIMAL:
 		// Keep the native (mantissa, scale) and emit VAL_DEC60 straight from it (no VARCHAR
@@ -297,6 +314,7 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 			case StructValueStrategy::Int:
 			case StructValueStrategy::Double:
 			case StructValueStrategy::String:
+			case StructValueStrategy::StringDefaultCast:
 			case StructValueStrategy::Bool:
 				break;
 			default:
@@ -372,13 +390,19 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 	case LogicalTypeId::MAP: {
 		plan.strategy = StructValueStrategy::Map;
 		// Keys are object names, not subtrees: whatever the key type, it renders to text through the
-		// engine cast (as core to_json does), so the key child is a plain string regardless of type.
+		// engine cast (as core to_json does), so the key child is a plain string regardless of type —
+		// except TIMESTAMP_TZ, which renders through DefaultCast for the same reason it does as a value.
 		JsonoStructPlan key_plan;
-		key_plan.strategy = StructValueStrategy::String;
-		key_plan.bound_type = LogicalType::VARCHAR;
+		if (MapType::KeyType(source_type).id() == LogicalTypeId::TIMESTAMP_TZ) {
+			key_plan.strategy = StructValueStrategy::StringDefaultCast;
+			key_plan.bound_type = LogicalType::TIMESTAMP_TZ;
+		} else {
+			key_plan.strategy = StructValueStrategy::String;
+			key_plan.bound_type = LogicalType::VARCHAR;
+		}
 		plan.children.push_back(std::move(key_plan));
 		plan.children.push_back(BuildStructConstructorPlan(MapType::ValueType(source_type), function_name));
-		plan.bound_type = LogicalType::MAP(LogicalType::VARCHAR, plan.children[1].bound_type);
+		plan.bound_type = LogicalType::MAP(plan.children[0].bound_type, plan.children[1].bound_type);
 		return plan;
 	}
 	default:
@@ -403,6 +427,15 @@ void InitStructConstructorVectorData(Vector &input, idx_t count, const JsonoStru
 	}
 	if (plan.strategy == StructValueStrategy::Jsono) {
 		InitJsonoVectorData(input, count, data.jsono_data);
+		return;
+	}
+	if (plan.strategy == StructValueStrategy::StringDefaultCast) {
+		// Render here rather than through the plan's bound type: the argument cast goes through the
+		// cast set, which ICU overrides for TIMESTAMP_TZ with a session-TimeZone render.
+		data.rendered = make_uniq<Vector>(LogicalType::VARCHAR, count);
+		VectorOperations::DefaultCast(input, *data.rendered, count);
+		data.rendered->ToUnifiedFormat(count, data.fmt);
+		data.string_data = UnifiedVectorFormat::GetData<string_t>(data.fmt);
 		return;
 	}
 	input.ToUnifiedFormat(count, data.fmt);
@@ -448,6 +481,9 @@ void InitStructConstructorVectorData(Vector &input, idx_t count, const JsonoStru
 	}
 	case StructValueStrategy::Null:
 	case StructValueStrategy::Jsono:
+	case StructValueStrategy::StringDefaultCast:
+		// Returned above: these bind their data before the unified format is taken.
+		break;
 	case StructValueStrategy::Decimal:
 		// fmt (set above) carries the native mantissa; EmitConstructorDecimal reads it per row.
 		break;
@@ -532,6 +568,7 @@ void EmitConstructorPrimitiveList(const JsonoStructVectorData &child, idx_t offs
 		}
 		return;
 	case StructValueStrategy::String:
+	case StructValueStrategy::StringDefaultCast:
 		for (idx_t child_i = offset; child_i < offset + length; child_i++) {
 			auto child_idx = RowIndex(child.fmt, child_i);
 			if (!child_all_valid && !child.fmt.validity.RowIsValid(child_idx)) {
@@ -580,7 +617,8 @@ bool EmitConstructorScalarValue(const JsonoStructVectorData &data, idx_t row, Do
 	case StructValueStrategy::Double:
 		builder.EmitDouble(data.double_data[idx]);
 		return true;
-	case StructValueStrategy::String: {
+	case StructValueStrategy::String:
+	case StructValueStrategy::StringDefaultCast: {
 		auto value = data.string_data[idx];
 		builder.EmitString(nonstd::string_view(value.GetData(), value.GetSize()));
 		return true;
@@ -744,7 +782,8 @@ void EmitConstructorFlatScalarObject(const JsonoStructVectorData &data, idx_t ro
 		case StructValueStrategy::Double:
 			builder.EmitDouble(child.double_data[idx]);
 			break;
-		case StructValueStrategy::String: {
+		case StructValueStrategy::String:
+		case StructValueStrategy::StringDefaultCast: {
 			auto value = child.string_data[idx];
 			builder.EmitString(nonstd::string_view(value.GetData(), value.GetSize()));
 			break;
@@ -928,7 +967,8 @@ void EmitConstructorValue(const JsonoStructVectorData &data, idx_t row, JsonoStr
 	case StructValueStrategy::Double:
 		builder.EmitDouble(data.double_data[idx]);
 		return;
-	case StructValueStrategy::String: {
+	case StructValueStrategy::String:
+	case StructValueStrategy::StringDefaultCast: {
 		auto value = data.string_data[idx];
 		builder.EmitString(nonstd::string_view(value.GetData(), value.GetSize()));
 		return;
@@ -1427,6 +1467,9 @@ struct ShredColumnSource {
 	StructValueStrategy strategy = StructValueStrategy::Null;
 	bool raw_uint = false;
 	UnifiedVectorFormat fmt;
+	// The DefaultCast render of a StringDefaultCast field: the lane must carry the same text the
+	// residual would have carried, and the cast set's own render is session-dependent.
+	unique_ptr<Vector> rendered;
 	const string_t *string_data = nullptr;
 	const int64_t *int_data = nullptr;
 	const double *double_data = nullptr;
@@ -1467,8 +1510,16 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			continue;
 		}
 		auto &child = *casted_children[field_idx];
-		child.ToUnifiedFormat(count, src.fmt);
 		src.strategy = plan.children[field_idx].strategy;
+		if (src.strategy == StructValueStrategy::StringDefaultCast) {
+			src.rendered = make_uniq<Vector>(LogicalType::VARCHAR, count);
+			VectorOperations::DefaultCast(child, *src.rendered, count);
+			src.rendered->ToUnifiedFormat(count, src.fmt);
+			src.string_data = UnifiedVectorFormat::GetData<string_t>(src.fmt);
+			StringVector::AddHeapReference(*shred_out[f], *src.rendered);
+			continue;
+		}
+		child.ToUnifiedFormat(count, src.fmt);
 		switch (src.strategy) {
 		case StructValueStrategy::String:
 			src.string_data = UnifiedVectorFormat::GetData<string_t>(src.fmt);
@@ -1566,6 +1617,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			}
 			switch (src.strategy) {
 			case StructValueStrategy::String:
+			case StructValueStrategy::StringDefaultCast:
 				FlatVector::GetData<string_t>(*shred_out[f])[row] = src.string_data[idx];
 				break;
 			case StructValueStrategy::Int:
