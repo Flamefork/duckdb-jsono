@@ -97,3 +97,67 @@ statement error
 SELECT jsono({'u': union_value(num := 2)});
 ----
 unsupported value type
+
+# A MAP builds a JSON object per row. Keys sort (the format's unique-sorted-key invariant),
+# which diverges from core to_json's insertion order - the pairs are the same.
+query I
+SELECT to_json(jsono(MAP {'b': 2, 'a': 1}))::VARCHAR;
+----
+{"a":1,"b":2}
+
+# Nested MAP fields sit next to ordinary fields; MAP values recurse into any supported type.
+query IIII
+SELECT to_json(jsono({'m': MAP {'k': 1}, 'z': 2}))::VARCHAR,
+       to_json(jsono(MAP {'k': {'b': 2, 'a': 1}}))::VARCHAR,
+       to_json(jsono(MAP {'k': [1, 2]}))::VARCHAR,
+       to_json(jsono(MAP {'o': MAP {'i': 1}}))::VARCHAR;
+----
+{"m":{"k":1},"z":2}	{"k":{"a":1,"b":2}}	{"k":[1,2]}	{"o":{"i":1}}
+
+# Non-VARCHAR keys render as their text (as in core), and sort as text: "1" < "10" < "2".
+query I
+SELECT to_json(jsono(MAP {1: 'x', 10: 'y', 2: 'z'}))::VARCHAR;
+----
+{"1":"x","10":"y","2":"z"}
+
+# Empty map, empty-string key, NULL map value, NULL map field, NULL map root.
+query IIIII
+SELECT to_json(jsono(MAP {}::MAP(VARCHAR, INTEGER)))::VARCHAR,
+       to_json(jsono(MAP {'': 1}))::VARCHAR,
+       to_json(jsono(MAP {'k': NULL::INTEGER}))::VARCHAR,
+       to_json(jsono({'m': NULL::MAP(VARCHAR, INTEGER), 'z': 1}))::VARCHAR,
+       jsono(NULL::MAP(VARCHAR, INTEGER)) IS NULL;
+----
+{}	{"":1}	{"k":null}	{"m":null,"z":1}	true
+
+# A map-built document is byte-identical to the same document parsed from text.
+query I
+SELECT to_json(jsono(MAP {'b': 2, 'a': 1}))::VARCHAR = to_json(jsono('{"a":1,"b":2}'))::VARCHAR;
+----
+true
+
+# A MAP field is not shred-eligible and stays in the residual; the other fields still shred,
+# and the map content reads back out of the residual by path.
+query III
+SELECT typeof(jsono({'m': MAP {'k': 'v'}, 'n': 5})),
+       jsono({'m': MAP {'k': 'v'}, 'n': 5})->>'$.m.k',
+       jsono({'m': MAP {'k': 'v'}, 'n': 5})->>'n';
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, n STRUCT("value" BIGINT, complete TINYINT))))	v	5
+
+# A MAP casts to jsono storage, so INSERT of a MAP into a jsono column works.
+statement ok
+CREATE TABLE map_docs(j STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+
+statement ok
+INSERT INTO map_docs SELECT MAP {'b': 2, 'a': 1};
+
+query I
+SELECT to_json(j)::VARCHAR FROM map_docs;
+----
+{"a":1,"b":2}
+
+query I
+SELECT to_json(CAST(MAP {'x': 1} AS STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))))::VARCHAR;
+----
+{"x":1}
