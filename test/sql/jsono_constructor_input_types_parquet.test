@@ -1,0 +1,60 @@
+# name: test/sql/jsono_constructor_input_types_parquet.test
+# description: Documents built from the new constructor inputs (string-rendered scalars, MAP, LIST roots) survive a Parquet round-trip
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+statement ok
+CREATE TABLE docs AS
+SELECT 1 AS rid, jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789',
+                        'u': UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd',
+                        'n': 7}) AS j
+UNION ALL
+SELECT 2, jsono({'ts': TIMESTAMP '2024-06-30 00:00:00', 'u': NULL::UUID, 'n': 8});
+
+statement ok
+CREATE TABLE map_docs AS SELECT jsono(MAP {'b': 2, 'a': 1}) AS j;
+
+statement ok
+CREATE TABLE list_docs AS SELECT jsono([1, 2, 3]) AS j;
+
+statement ok
+COPY docs TO '__TEST_DIR__/jsono_input_types.parquet' (FORMAT parquet);
+
+statement ok
+COPY map_docs TO '__TEST_DIR__/jsono_input_types_map.parquet' (FORMAT parquet);
+
+statement ok
+COPY list_docs TO '__TEST_DIR__/jsono_input_types_list.parquet' (FORMAT parquet);
+
+# The VARCHAR lanes the string-rendered types promote into survive the Parquet schema.
+query I
+SELECT typeof(j) FROM '__TEST_DIR__/jsono_input_types.parquet' LIMIT 1;
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, n STRUCT("value" BIGINT, complete TINYINT), ts STRUCT("value" VARCHAR, complete TINYINT), u STRUCT("value" VARCHAR, complete TINYINT))))
+
+# The documents read back byte-identically, and the lanes still answer ->> after the round-trip
+# (a NULL lane value falls back to the residual's explicit null).
+query III
+SELECT to_json(j)::VARCHAR, j->>'ts', j->>'u'
+FROM '__TEST_DIR__/jsono_input_types.parquet'
+ORDER BY rid;
+----
+{"n":7,"ts":"2024-01-01 12:34:56.789","u":"4ac7a9e9-607c-4c8a-84f3-843f0191e3fd"}	2024-01-01 12:34:56.789	4ac7a9e9-607c-4c8a-84f3-843f0191e3fd
+{"n":8,"ts":"2024-06-30 00:00:00","u":null}	2024-06-30 00:00:00	NULL
+
+# A map-built document is plain jsono and round-trips with its keys sorted, as written.
+query II
+SELECT to_json(j)::VARCHAR, j->>'a' FROM '__TEST_DIR__/jsono_input_types_map.parquet';
+----
+{"a":1,"b":2}	1
+
+# An array-root document round-trips too.
+query II
+SELECT to_json(j)::VARCHAR, j->>1 FROM '__TEST_DIR__/jsono_input_types_list.parquet';
+----
+[1,2,3]	2
