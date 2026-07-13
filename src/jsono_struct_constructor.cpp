@@ -1284,6 +1284,10 @@ LogicalType PromoteAutoShredType(const LogicalType &type) {
 		return LogicalType::VARCHAR;
 	case LogicalTypeId::LIST:
 		return LogicalType::LIST(PromoteAutoShredType(ListType::GetChildType(type)));
+	case LogicalTypeId::ARRAY:
+		// The residual carries a fixed-size array as a plain JSON array (BuildStructConstructorPlan
+		// binds ARRAY to LIST), so its lane is the same list lane a LIST field would get.
+		return LogicalType::LIST(PromoteAutoShredType(ArrayType::GetChildType(type)));
 	case LogicalTypeId::STRUCT: {
 		child_list_t<LogicalType> children;
 		for (auto &child : StructType::GetChildTypes(type)) {
