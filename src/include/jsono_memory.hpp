@@ -76,6 +76,16 @@ struct JsonoMemoryReservation {
 	}
 };
 
+// A reservation owned by a heap payload rather than by an aggregate state: it frees in its destructor, so the
+// bytes stay accounted for exactly as long as the payload is alive. Used where several states share one
+// immutable payload (the collect aggregates' elements): the payload accounts its own bytes once, and the last
+// state to drop it releases them.
+struct JsonoOwnedReservation : JsonoMemoryReservation {
+	~JsonoOwnedReservation() {
+		Release();
+	}
+};
+
 // Resize the reservation of every DISTINCT state touched in a grouped chunk to its current footprint,
 // measuring each state once even when many rows in the chunk share it. Used by the rewrite-style
 // accumulators whose footprint walk (an LWW tree, a candidate-path map) is too costly to repeat per row.

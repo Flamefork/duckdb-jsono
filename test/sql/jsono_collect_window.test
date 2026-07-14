@@ -13,6 +13,13 @@ require json
 # reuses that source produces a malformed JSONO. These parity checks stay green only if the combine
 # copies the source instead of moving it.
 
+# The preserving combine duplicates the source's element list into every frame's accumulator, so the
+# combine graph is quadratic in the partition. Copying element references keeps that quadratic term in
+# 16-byte handles; copying documents would put it in whole blobs and blow past this limit (the same
+# window needed more than 5 GB before the elements became shared).
+statement ok
+SET memory_limit='4GB';
+
 statement ok
 CREATE TABLE w AS
   SELECT i AS ts, i % 4 AS g, CAST(i AS VARCHAR) AS k, jsono(CAST(i AS VARCHAR)) AS j

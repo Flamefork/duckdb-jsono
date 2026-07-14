@@ -6,6 +6,8 @@
 #include "jsono_row_read.hpp"
 #include "jsono_writer.hpp"
 
+#include "duckdb/common/helper.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/function/aggregate_function.hpp"
@@ -72,8 +74,23 @@ void SerializeRowValue(JsonoRowReader &reader, idx_t row, JsonoBuilder &scratch,
 
 // ===== jsono_group_array(value [ORDER BY ...]) -> JSONO array of the group's values, fold order =====
 
+// An element is written once by Update and read-only afterwards, so states reference it instead of owning a
+// copy of its document. A PRESERVE_INPUT combine (window segment tree / distinct aggregator) duplicates the
+// source's whole element list into every frame's accumulator, and that combine graph is quadratic in the
+// partition: sharing keeps the quadratic term in reference slots rather than in document bytes -- hundreds of
+// megabytes instead of gigabytes on a five-thousand-row window. The element carries the reservation of its own
+// bytes and frees it when the last state referencing it drops it, so the accounted total tracks live bytes.
+struct CollectArrayElement {
+	CollectBlob blob;
+	JsonoOwnedReservation mem;
+};
+
+using CollectArrayElementRef = shared_ptr<const CollectArrayElement>;
+
 struct CollectArrayState {
-	std::vector<CollectBlob> *elements;
+	std::vector<CollectArrayElementRef> *elements;
+	// Covers only the reference slots this state duplicated in a preserving combine: an element pays for its
+	// document and for the one slot its creator stores.
 	JsonoMemoryReservation mem;
 };
 
@@ -106,14 +123,17 @@ unique_ptr<FunctionData> JsonoGroupArrayBind(ClientContext &context, AggregateFu
 void AppendArrayElement(CollectArrayState &state, BufferManager &buffer_manager, JsonoRowReader &reader, idx_t row,
                         JsonoBuilder &scratch) {
 	if (!state.elements) {
-		state.elements = new std::vector<CollectBlob>();
+		state.elements = new std::vector<CollectArrayElementRef>();
 	}
-	CollectBlob blob;
-	SerializeRowValue(reader, row, scratch, blob);
-	// Reserve before storing so the reservation (and any OOM throw) precedes the growth. Element footprint
-	// = the six owned byte streams plus one CollectBlob slot amortizing the vector backing.
-	state.mem.Reserve(buffer_manager, BlobBytes(blob) + sizeof(CollectBlob));
-	state.elements->push_back(std::move(blob));
+	auto element = make_shared_ptr<CollectArrayElement>();
+	SerializeRowValue(reader, row, scratch, element->blob);
+	// Reserve before storing so the reservation (and any OOM throw) precedes the growth. The element pays for
+	// its own footprint -- the six owned byte streams, the element object and the first reference slot (the
+	// one its creator stores) -- and releases all of it when the last state referencing it drops it. Further
+	// slots are paid by the state that duplicates them in a preserving combine.
+	element->mem.Reserve(buffer_manager,
+	                     BlobBytes(element->blob) + sizeof(CollectArrayElement) + sizeof(CollectArrayElementRef));
+	state.elements->push_back(std::move(element));
 }
 
 void JsonoGroupArraySimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t, data_ptr_t state_ptr,
@@ -155,25 +175,24 @@ void JsonoGroupArrayCombine(Vector &source, Vector &target, AggregateInputData &
 		}
 		auto &tgt = *target_data[row];
 		if (!tgt.elements) {
-			tgt.elements = new std::vector<CollectBlob>();
+			tgt.elements = new std::vector<CollectArrayElementRef>();
 		}
 		// Fold order: the source partial's elements follow the target's, matching how the ordered
 		// aggregate replays sorted partials into one accumulator. A PRESERVE_INPUT combine (window
 		// segment tree / distinct aggregator) reuses the source across frames, so only a destructive
-		// combine may move its blobs out; the moved-from container is then cleared to stay valid.
+		// combine may move its references out; the moved-from container is then cleared to stay valid.
 		if (destructive) {
 			for (auto &elem : *src.elements) {
 				tgt.elements->push_back(std::move(elem));
 			}
 			src.elements->clear();
-			// The bytes moved from source to target; transfer the reservation without a global change.
+			// The reference slots moved from source to target; transfer the reservation without a global change.
 			tgt.mem.AbsorbFrom(src.mem);
 		} else {
-			// A copy duplicates the source footprint; reserve it before growing the target.
-			tgt.mem.Reserve(buffer_manager, src.mem.reserved);
-			for (const auto &elem : *src.elements) {
-				tgt.elements->push_back(elem);
-			}
+			// A preserving combine shares the source's elements: only the reference slots are duplicated,
+			// so only they are reserved. The documents stay accounted once, by the elements themselves.
+			tgt.mem.Reserve(buffer_manager, src.elements->size() * sizeof(CollectArrayElementRef));
+			tgt.elements->insert(tgt.elements->end(), src.elements->begin(), src.elements->end());
 		}
 	}
 }
@@ -196,7 +215,7 @@ void JsonoGroupArrayFinalize(Vector &states, AggregateInputData &, Vector &resul
 		builder.Reset();
 		builder.EmitArrayStart();
 		for (auto &elem : *state.elements) {
-			JsonoView view = ViewOfBlob(elem);
+			JsonoView view = ViewOfBlob(elem->blob);
 			if (!view.ParseHeader()) {
 				throw InternalException("jsono_group_array: malformed collected element blob");
 			}
@@ -210,13 +229,19 @@ void JsonoGroupArrayFinalize(Vector &states, AggregateInputData &, Vector &resul
 
 // ===== jsono_group_object(key, value) -> JSONO object mapping key -> value =====
 
+// Shared and self-accounting for the same reason as CollectArrayElement.
 struct CollectObjectEntry {
 	std::string key;
 	CollectBlob value;
+	JsonoOwnedReservation mem;
 };
 
+using CollectObjectEntryRef = shared_ptr<const CollectObjectEntry>;
+
 struct CollectObjectState {
-	std::vector<CollectObjectEntry> *entries;
+	std::vector<CollectObjectEntryRef> *entries;
+	// Covers only the reference slots this state duplicated in a preserving combine: an entry pays for its key,
+	// its document and the one slot its creator stores.
 	JsonoMemoryReservation mem;
 };
 
@@ -248,13 +273,16 @@ unique_ptr<FunctionData> JsonoGroupObjectBind(ClientContext &context, AggregateF
 void AppendObjectEntry(CollectObjectState &state, BufferManager &buffer_manager, const string_t &key,
                        JsonoRowReader &reader, idx_t row, JsonoBuilder &scratch) {
 	if (!state.entries) {
-		state.entries = new std::vector<CollectObjectEntry>();
+		state.entries = new std::vector<CollectObjectEntryRef>();
 	}
-	CollectObjectEntry entry;
-	entry.key.assign(key.GetData(), key.GetSize());
-	SerializeRowValue(reader, row, scratch, entry.value);
-	// Reserve before storing: key bytes + the value's six byte streams + one entry slot for the vector.
-	state.mem.Reserve(buffer_manager, entry.key.size() + BlobBytes(entry.value) + sizeof(CollectObjectEntry));
+	auto entry = make_shared_ptr<CollectObjectEntry>();
+	entry->key.assign(key.GetData(), key.GetSize());
+	SerializeRowValue(reader, row, scratch, entry->value);
+	// Reserve before storing: the entry pays for its key bytes, the value's six byte streams, the entry object
+	// and the first reference slot (the one its creator stores). Further slots are paid by the state that
+	// duplicates them in a preserving combine.
+	entry->mem.Reserve(buffer_manager, entry->key.size() + BlobBytes(entry->value) + sizeof(CollectObjectEntry) +
+	                                       sizeof(CollectObjectEntryRef));
 	state.entries->push_back(std::move(entry));
 }
 
@@ -311,24 +339,23 @@ void JsonoGroupObjectCombine(Vector &source, Vector &target, AggregateInputData 
 		}
 		auto &tgt = *target_data[row];
 		if (!tgt.entries) {
-			tgt.entries = new std::vector<CollectObjectEntry>();
+			tgt.entries = new std::vector<CollectObjectEntryRef>();
 		}
 		// A PRESERVE_INPUT combine (window segment tree / distinct aggregator) reuses the source across
-		// frames, so only a destructive combine may move its entries out; the moved-from container is
+		// frames, so only a destructive combine may move its references out; the moved-from container is
 		// then cleared to stay valid.
 		if (destructive) {
 			for (auto &entry : *src.entries) {
 				tgt.entries->push_back(std::move(entry));
 			}
 			src.entries->clear();
-			// The bytes moved from source to target; transfer the reservation without a global change.
+			// The reference slots moved from source to target; transfer the reservation without a global change.
 			tgt.mem.AbsorbFrom(src.mem);
 		} else {
-			// A copy duplicates the source footprint; reserve it before growing the target.
-			tgt.mem.Reserve(buffer_manager, src.mem.reserved);
-			for (const auto &entry : *src.entries) {
-				tgt.entries->push_back(entry);
-			}
+			// A preserving combine shares the source's entries: only the reference slots are duplicated,
+			// so only they are reserved. The keys and documents stay accounted once, by the entries themselves.
+			tgt.mem.Reserve(buffer_manager, src.entries->size() * sizeof(CollectObjectEntryRef));
+			tgt.entries->insert(tgt.entries->end(), src.entries->begin(), src.entries->end());
 		}
 	}
 }
@@ -352,7 +379,7 @@ void JsonoGroupObjectFinalize(Vector &states, AggregateInputData &, Vector &resu
 		// last value per key — last-wins in fold order, then sorted.
 		std::map<std::string, idx_t> last_by_key;
 		for (idx_t e = 0; e < state.entries->size(); e++) {
-			last_by_key[(*state.entries)[e].key] = e;
+			last_by_key[(*state.entries)[e]->key] = e;
 		}
 		builder.Reset();
 		builder.EmitObjectStart(last_by_key.size());
@@ -361,7 +388,7 @@ void JsonoGroupObjectFinalize(Vector &states, AggregateInputData &, Vector &resu
 		}
 		for (auto &kv : last_by_key) {
 			builder.EmitObjectChildStart();
-			JsonoView view = ViewOfBlob((*state.entries)[kv.second].value);
+			JsonoView view = ViewOfBlob((*state.entries)[kv.second]->value);
 			if (!view.ParseHeader()) {
 				throw InternalException("jsono_group_object: malformed collected value blob");
 			}
