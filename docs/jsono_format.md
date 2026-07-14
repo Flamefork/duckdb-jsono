@@ -104,22 +104,30 @@ columnar read) or whether it must fall back to / reconstruct from the residual:
   type's layout hash was written under exactly the read shred set. A multi-file
   read that unions narrower/retyped shred sets (`union_by_name`, DuckLake schema
   evolution) carries a different hash per file (`min != max`), which keeps the
-  residual fallback so a reader-NULL-filled lane is read from the residual, not as
-  a silent `NULL`. The hash is **order-independent** (the marker identifies the
-  set, not the field order, so a set-op/reorder cast that permutes the shreds
-  still matches). It is `NULL` only on a SQL-NULL row; a divert never nulls it.
-  It is a signed `BIGINT`, not `UBIGINT`, because DuckDB's Parquet writer omits
-  min/max stats for unsigned integers — a `UBIGINT` marker would carry no zone-map
-  on a Parquet scan.
+  residual fallback — unless the per-shred `complete` proof below applies — so a
+  reader-NULL-filled lane is read from the residual, not as a silent `NULL`. The
+  hash is **order-independent** (the marker identifies the set, not the field
+  order, so a set-op/reorder cast that permutes the shreds still matches). It is
+  `NULL` only on a SQL-NULL row; a divert never nulls it. It is a signed `BIGINT`,
+  not `UBIGINT`, because DuckDB's Parquet writer omits min/max stats for unsigned
+  integers — a `UBIGINT` marker would carry no zone-map on a Parquet scan.
 - **`shreds.<path>.complete`** (`TINYINT`, per scalar shred, per row): `1` when the
   `value` lane holds the complete `->>` answer for this row, `0` when the value
   spilled to the residual. Per-shred, so a divert on one shred never demotes
-  another. A scan whose `complete` zone-map proves `min == 1` (no spill) AND whose
-  marker proves schema identity reads that shred bare. It is a `TINYINT` 1/0 flag,
-  not a `BOOLEAN`, because DuckDB's Parquet statistics reader does not transform
-  `BOOLEAN` page min/max into zone-map statistics — a `BOOLEAN` flag would never
-  prove totality on a Parquet scan. Array shreds carry no `complete` (they are
-  always reconstructed, never bare-read).
+  another. A shred is read bare (the residual COALESCE arm is dropped) when its
+  `complete` zone-map proves `min == max == 1` (no spill anywhere) **and either**
+  the marker proves schema identity **or** the `complete` stats prove no `NULL` at
+  all. The second path is what survives shred-set evolution: a lane every file
+  wrote and filled (`complete` all `1`, no `NULL`) stays total even when the
+  marker cannot prove identity (`min != max` across set-op / `union_by_name` /
+  DuckLake-evolved files), while a reconciliation that `NULL`-fills a lane on the
+  rows whose writing shred set lacked it puts `NULL`s into `complete` — invisible
+  to `min`/`max` — so the no-`NULL` proof fails and the residual fallback is
+  correctly kept. It is a `TINYINT` 1/0 flag, not a `BOOLEAN`, because DuckDB's
+  Parquet statistics reader does not transform `BOOLEAN` page min/max into
+  zone-map statistics — a `BOOLEAN` flag would never prove totality on a Parquet
+  scan. Array shreds carry no `complete` (they are always reconstructed, never
+  bare-read).
 
 `complete` by case, for a scalar shred at path `P`:
 
