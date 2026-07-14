@@ -8,6 +8,8 @@
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
 #include "jsono_scalar_write.hpp"
+#include "jsono_trie.hpp"
+#include "jsono_trie_walk.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -84,6 +86,13 @@ struct ShredBindData : public FunctionData {
 	// Duplicate paths in the spec (e.g. '$.a' and 'a') fall back to the two-pass path.
 	bool one_pass_text = false;
 	std::vector<jsono_dom::DomShredTrieNode> trie;
+	// One-pass jsono write (ApplyShredFields over a plain jsono input): the same idea against the
+	// binary body — one sorted-merge trie walk of the document captures and nulls every scalar shred,
+	// replacing the O(shreds) per-row LocatePath loop with an O(document) walk. Eligible whenever every
+	// shred is a scalar (array shreds keep the per-path locate loop, like one_pass_text). The residual
+	// still emits through the shared strip-emit pass. Built from the same scalar object-key paths.
+	bool one_pass_jsono = false;
+	JsonoTrie jsono_trie;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<ShredBindData>(*this);
@@ -102,6 +111,9 @@ struct ShredLocalState : public FunctionLocalState {
 	JsonoBuilder builder;
 	std::string text;
 	std::vector<const std::vector<PathStep> *> strip_paths;
+	// Per-node rank cache for the one-pass jsono trie walk; sized to the bind-time trie on first use
+	// and reused across chunks (it survives in the local state, the whole point of the cache).
+	JsonoTrieRankCache jsono_rank_cache;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -297,6 +309,34 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 			break;
 		}
 		bind_data->trie[node].field = int64_t(f);
+	}
+
+	// One-pass jsono trie (the binary counterpart of the text trie above): eligible whenever every
+	// shred is a scalar object-key path. A shared trie node carries a duplicate path's two fields as
+	// two scalar leaves, so — unlike the text writer — duplicates need no fallback: both leaves read
+	// the same located cursor, matching what two independent LocatePath calls would have written.
+	bind_data->one_pass_jsono = true;
+	bind_data->jsono_trie.Reset();
+	bind_data->jsono_trie.PrepareFieldMetadata(bind_data->fields.size());
+	for (idx_t f = 0; f < bind_data->fields.size(); f++) {
+		auto &field = bind_data->fields[f];
+		if (field.kind != ShredKind::Scalar) {
+			bind_data->one_pass_jsono = false;
+			continue;
+		}
+		auto leaf = bind_data->jsono_trie.WalkFieldToLeaf(f, field.path.steps);
+		bind_data->jsono_trie.nodes[leaf].scalar_leaves.push_back(f);
+	}
+	if (bind_data->one_pass_jsono) {
+		bind_data->jsono_trie.SortEdges();
+		for (auto &node : bind_data->jsono_trie.nodes) {
+			if (node.scalar_leaves.size() == 1 && node.key_edges.empty() && node.index_edges.empty() &&
+			    node.wildcard_child == DConstants::INVALID_INDEX) {
+				node.simple_scalar_leaf = node.scalar_leaves[0];
+			}
+		}
+	} else {
+		bind_data->jsono_trie.Reset();
 	}
 	return bind_data;
 }
@@ -531,8 +571,57 @@ bool WriteScalarArrayShred(const ShredField &field, const JsonoView &view, const
 	    });
 }
 
+// One-pass jsono trie walk state: the shred writer's per-row outputs, reached by field index. The
+// trie walk positions a cursor at each present scalar leaf (WriteScalarLeaf) and reaches every
+// absent one (NullScalarLeaf / NullNodeLeaves); both route through WriteShred so the lane/complete/
+// strip semantics are byte-identical to the per-field LocatePath loop, one document walk instead of
+// one descent per shred.
+struct ShredTrieWalkState {
+	const vector<ShredField> &fields;
+	vector<Vector *> &shred_children;
+	vector<Vector *> &complete_children;
+	std::string &scratch;
+	std::vector<const std::vector<PathStep> *> &strip_paths;
+	vector<idx_t> &stripped_fields;
+};
+
+struct ShredTrieWalkPolicy {
+	using State = ShredTrieWalkState;
+	static constexpr bool supports_wildcard = false;
+
+	static JSONO_ALWAYS_INLINE void WriteLeaf(State &state, idx_t field_index, const JsonoView &view,
+	                                          const JsonoPathLocation &location, idx_t row) {
+		auto &field = state.fields[field_index];
+		bool complete = true;
+		bool strippable =
+		    WriteShred(field, view, location, *state.shred_children[field_index], row, state.scratch, &complete);
+		FlatVector::GetData<int8_t>(*state.complete_children[field_index])[row] = complete ? 1 : 0;
+		if (strippable) {
+			state.strip_paths.push_back(&field.path.steps);
+			state.stripped_fields.push_back(field_index);
+		}
+	}
+
+	static JSONO_ALWAYS_INLINE void WriteScalarLeaf(State &state, idx_t field_index, const JsonoView &view,
+	                                                const JsonoCursor &cursor, idx_t row) {
+		WriteLeaf(state, field_index, view, JsonoPathLocation {cursor, true}, row);
+	}
+
+	static JSONO_ALWAYS_INLINE void NullScalarLeaf(State &state, idx_t field_index, const JsonoView &view, idx_t row) {
+		// Absent path: WriteShred writes a NULL lane, complete=1, strips nothing.
+		WriteLeaf(state, field_index, view, JsonoPathLocation {}, row);
+	}
+
+	static JSONO_ALWAYS_INLINE void NullNodeLeaves(State &state, const JsonoTrieNode &node, const JsonoView &view,
+	                                               idx_t row) {
+		for (auto field_index : node.scalar_leaves) {
+			NullScalarLeaf(state, field_index, view, row);
+		}
+	}
+};
+
 void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &fields, Vector &result,
-                      ShredLocalState &lstate) {
+                      ShredLocalState &lstate, const JsonoTrie *trie = nullptr) {
 	// The input is plain JSONO, which never carries a manifest of its own: the reader fails
 	// loud on a narrowed row, whose re-emit below would otherwise replace the old manifest
 	// with a fresh one and launder the loss into permanent undetectability.
@@ -608,6 +697,13 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 	std::string manifest;
 	vector<idx_t> stripped_fields;
 
+	// The one-pass trie walk (trie != nullptr) reaches every scalar shred in one sorted-merge pass of
+	// the document, replacing the per-shred LocatePath loop. Its rank cache is sized to the bind-time
+	// trie on first use and reused across chunks.
+	if (trie && lstate.jsono_rank_cache.entries.empty()) {
+		lstate.jsono_rank_cache.Init(trie->nodes);
+	}
+
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
@@ -620,26 +716,37 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		FlatVector::GetData<int64_t>(*set_out)[row] = layout_hash;
 		lstate.strip_paths.clear();
 		stripped_fields.clear();
-		for (idx_t f = 0; f < fields.size(); f++) {
-			auto &field = fields[f];
-			auto location = LocatePath(view, field.path.steps);
-			if (field.kind != ShredKind::Scalar) {
-				// Array shreds carry no completeness flag: a per-element diversion has no
-				// bare-struct_extract fast path to invalidate (the array is always reconstructed).
-				bool stripped = field.kind == ShredKind::ScalarArray
-				                    ? WriteScalarArrayShred(field, view, location, *shred_children[f], row, lstate.text)
-				                    : WriteArrayShred(field, view, location, *shred_children[f], row, lstate.text);
-				if (stripped) {
+		if (trie) {
+			ShredTrieWalkState walk_state {fields,      shred_children,     complete_children,
+			                               lstate.text, lstate.strip_paths, stripped_fields};
+			JsonoTrieWalkContext<ShredTrieWalkPolicy> ctx {trie->nodes, lstate.jsono_rank_cache, walk_state};
+			JsonoTrieApplyNode<ShredTrieWalkPolicy>(ctx, 0, view, JsonoCursor(), row);
+			// The walk visits leaves in document order; the manifest must stay canonical (sorted by
+			// field, = sorted by path), so restore that order before serializing it.
+			std::sort(stripped_fields.begin(), stripped_fields.end());
+		} else {
+			for (idx_t f = 0; f < fields.size(); f++) {
+				auto &field = fields[f];
+				auto location = LocatePath(view, field.path.steps);
+				if (field.kind != ShredKind::Scalar) {
+					// Array shreds carry no completeness flag: a per-element diversion has no
+					// bare-struct_extract fast path to invalidate (the array is always reconstructed).
+					bool stripped =
+					    field.kind == ShredKind::ScalarArray
+					        ? WriteScalarArrayShred(field, view, location, *shred_children[f], row, lstate.text)
+					        : WriteArrayShred(field, view, location, *shred_children[f], row, lstate.text);
+					if (stripped) {
+						stripped_fields.push_back(f);
+					}
+					continue;
+				}
+				bool complete = true;
+				bool strippable = WriteShred(field, view, location, *shred_children[f], row, lstate.text, &complete);
+				FlatVector::GetData<int8_t>(*complete_children[f])[row] = complete ? 1 : 0;
+				if (strippable) {
+					lstate.strip_paths.push_back(&field.path.steps);
 					stripped_fields.push_back(f);
 				}
-				continue;
-			}
-			bool complete = true;
-			bool strippable = WriteShred(field, view, location, *shred_children[f], row, lstate.text, &complete);
-			FlatVector::GetData<int8_t>(*complete_children[f])[row] = complete ? 1 : 0;
-			if (strippable) {
-				lstate.strip_paths.push_back(&field.path.steps);
-				stripped_fields.push_back(f);
 			}
 		}
 
@@ -846,7 +953,8 @@ void JsonoShredExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 	if (bind_data.reshred_active) {
 		ApplyReshredShredded(args.data[0], args.size(), bind_data, result, lstate);
 	} else {
-		ApplyShredFields(args.data[0], args.size(), bind_data.fields, result, lstate);
+		const JsonoTrie *trie = bind_data.one_pass_jsono ? &bind_data.jsono_trie : nullptr;
+		ApplyShredFields(args.data[0], args.size(), bind_data.fields, result, lstate, trie);
 	}
 	if (input_constant) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);

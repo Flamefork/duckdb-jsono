@@ -1,0 +1,84 @@
+# name: test/sql/jsono_shred_wide_onepass.test
+# description: one-pass jsono→shredded writer (wide shred set, sparse documents) — a single trie walk
+# group: [sql]
+
+#   of the binary body replaces the per-shred LocatePath loop. The observable contract (lane values,
+#   completeness, residual round-trip, manifest) must be byte-identical to the per-field path across
+#   absent, present, nested, diverted and duplicate paths.
+
+require jsono
+
+require json
+
+# A shred over a plain jsono input (not text) routes through ApplyShredFields — the trie path when
+# every shred is a scalar. The document carries only $.a and $.n.x; the other three lanes are absent.
+query I
+SELECT to_json(jsono(jsono('{"a":7,"n":{"x":"deep"},"keep":true}'),
+                     shredding := {'$.a':'BIGINT','$.b':'BIGINT','$.c':'VARCHAR','$.n.x':'VARCHAR','$.n.y':'BIGINT'}));
+----
+{"a":7,"keep":true,"n":{"x":"deep"}}
+
+# Present lanes read back their typed value; absent lanes read NULL. Both come from a single walk.
+query IIIII
+SELECT j->>'$.a', j->>'$.b', j->>'$.c', j->>'$.n.x', j->>'$.n.y'
+FROM (SELECT jsono(jsono('{"a":7,"n":{"x":"deep"},"keep":true}'),
+                   shredding := {'$.a':'BIGINT','$.b':'BIGINT','$.c':'VARCHAR','$.n.x':'VARCHAR','$.n.y':'BIGINT'}) AS j);
+----
+7	NULL	NULL	deep	NULL
+
+# A present scalar that does not fit its lane type diverts: the lane is NULL but the value stays in
+# the residual, so `->>` recovers it. `{"a":"text"}` into a BIGINT $.a lane.
+query II
+SELECT j->>'$.a', to_json(j)
+FROM (SELECT jsono(jsono('{"a":"text","b":5}'), shredding := {'$.a':'BIGINT','$.b':'BIGINT'}) AS j);
+----
+text	{"a":"text","b":5}
+
+# jsono_shred_stats reports completeness per lane: a fitting scalar is complete ($.present), a
+# divert is not ($.a: "text" does not fit BIGINT), an absent path is complete ($.absent: NULL lane
+# is the correct `->>` answer).
+query I
+SELECT to_json(jsono_shred_stats(j))
+FROM (SELECT jsono(jsono('{"a":"text","present":9}'),
+                   shredding := {'$.a':'BIGINT','$.absent':'BIGINT','$.present':'BIGINT'}) AS j);
+----
+[{"path":"$.a","type":"BIGINT","lane_rate":0.0,"divert_rate":1.0,"complete_rate":0.0},{"path":"$.absent","type":"BIGINT","lane_rate":0.0,"divert_rate":0.0,"complete_rate":1.0},{"path":"$.present","type":"BIGINT","lane_rate":1.0,"divert_rate":0.0,"complete_rate":1.0}]
+
+# Duplicate spec paths ('$.x' and 'x' address the same key): the trie shares one node with two
+# scalar leaves, both read the same located cursor — unlike the text writer, no two-pass fallback.
+query II
+SELECT j->>'$.x', to_json(j)
+FROM (SELECT jsono(jsono('{"x":42}'), shredding := {'$.x':'BIGINT','x':'BIGINT'}) AS j);
+----
+42	{"x":42}
+
+# Vectorized over many rows with a wide, mostly-absent shred set: round-trip and lane reads stay
+# correct at scale (the trie walk runs per row, the rank cache carries across rows).
+statement ok
+CREATE TABLE wide AS
+SELECT jsono(jsono('{"src":"' || (i % 3) || '","v":' || i || ',"n":{"x":' || (i * 2) || '}}'),
+             shredding := {'$.src':'VARCHAR','$.v':'BIGINT','$.n.x':'BIGINT',
+                           '$.cold1':'VARCHAR','$.cold2':'BIGINT','$.cold3':'VARCHAR','$.n.cold':'BIGINT'}) AS j
+FROM range(2000) t(i);
+
+query III
+SELECT count(*), sum(CAST(j->>'$.v' AS BIGINT)), sum(CAST(j->>'$.n.x' AS BIGINT)) FROM wide;
+----
+2000	1999000	3998000
+
+# Every cold lane is uniformly absent → complete (bare NULL is the right answer). The `->>` needs
+# parentheses inside the predicate: DuckDB's arrow-operator precedence binds `IS NOT NULL` tighter.
+query I
+SELECT count(*) FROM wide WHERE (j->>'$.cold1') IS NOT NULL OR (j->>'$.n.cold') IS NOT NULL;
+----
+0
+
+# Exact whole-value round-trip across the wide table (keys emit in sorted order n, src, v): the
+# reconstruction overlays the captured lanes back onto the residual losslessly for every row.
+query I
+SELECT to_json(j) FROM wide ORDER BY CAST(j->>'$.v' AS BIGINT) LIMIT 4;
+----
+{"n":{"x":0},"src":"0","v":0}
+{"n":{"x":2},"src":"1","v":1}
+{"n":{"x":4},"src":"2","v":2}
+{"n":{"x":6},"src":"0","v":3}
