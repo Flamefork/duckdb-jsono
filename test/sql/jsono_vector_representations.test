@@ -1,0 +1,175 @@
+# name: test/sql/jsono_vector_representations.test
+# description: jsono functions stay correct and memory-safe when inputs arrive as non-flat vectors
+# group: [sql]
+
+require jsono
+
+# to_json / reconstruct / diff ride core json's to_json(ANY).
+require json
+
+# Production inputs from Parquet/DuckLake scans reach jsono functions as dictionary-encoded (and, for
+# nested types, child-shuffled) vectors, not flat ones. Every hand-written vector path here must
+# flatten/ToUnifiedFormat before indexing and size any selection-based Copy to its selection length
+# (a merge fast-path Copy over-read its conflict selection into wild dictionary indices and crashed
+# only on dictionary sources — see jsono_merge_shredded.test). debug_verify_vector wraps every
+# expression input in the named representation, reproducing the scan shapes purely in-memory; the row
+# count exceeds STANDARD_VECTOR_SIZE so the checks span multiple chunks.
+
+statement ok
+CREATE TABLE docs AS
+SELECT i,
+  jsono('{"name":"n' || i || '","x":' || i || ',"nested":{"a":' || (i % 7) || '},"arr":[' || i || ',' || (i + 1) || ']}') AS plain,
+  jsono('{"name":"n' || i || '","x":' || i || '}', shredding := {'name':'VARCHAR','x':'BIGINT'}) AS shred,
+  jsono('{"event_name":"e' || (i % 3) || '","v":' || i || '}', shredding := {'event_name':'VARCHAR'}) AS shred2
+FROM range(3000) tbl(i);
+
+# --- Dictionary-encoded inputs (the representation that surfaced the merge crash) ---
+
+statement ok
+SET debug_verify_vector='dictionary_expression';
+
+# scalar extract
+query I
+SELECT count(*) FROM docs WHERE (plain ->> 'name') = 'n' || i;
+----
+3000
+
+# deep-path extract (navigates the nested object skeleton)
+query I
+SELECT count(*) FROM docs WHERE (plain ->> '$.nested.a')::BIGINT = i % 7;
+----
+3000
+
+# extract from a shred lane
+query I
+SELECT count(*) FROM docs WHERE (shred ->> 'x')::BIGINT = i;
+----
+3000
+
+# to_json of a plain value
+query I
+SELECT count(to_json(plain)) FROM docs;
+----
+3000
+
+# to_json of a shredded value (full reconstruct through the six blobs + lanes)
+query I
+SELECT count(*) FROM docs WHERE to_json(shred) = '{"name":"n' || i || '","x":' || i || '}';
+----
+3000
+
+# jsono_transform
+query I
+SELECT count(*) FROM docs WHERE jsono_transform(plain, {'name':'VARCHAR'}).name = 'n' || i;
+----
+3000
+
+# jsono_diff
+query I
+SELECT count(jsono_diff(plain, shred)) FROM docs;
+----
+3000
+
+# jsono_keys
+query I
+SELECT count(*) FROM docs WHERE len(jsono_keys(plain)) = 4;
+----
+3000
+
+# jsono_type
+query I
+SELECT count(*) FROM docs WHERE jsono_type(plain) = 'OBJECT';
+----
+3000
+
+# jsono_entries (one entry list per row)
+query I
+SELECT count(*) FROM (SELECT jsono_entries(plain) FROM docs);
+----
+3000
+
+# jsono_array_elements
+query I
+SELECT count(*) FROM (SELECT jsono_array_elements(plain -> 'arr') FROM docs);
+----
+3000
+
+# jsono_array_length
+query I
+SELECT count(*) FROM docs WHERE jsono_array_length(plain -> 'arr') = 2;
+----
+3000
+
+# jsono_merge_patch across two shredded inputs
+query I
+SELECT count(jsono_merge_patch(shred, shred2)) FROM docs;
+----
+3000
+
+# jsono_overlay across two shredded inputs
+query I
+SELECT count(jsono_overlay(shred, shred2)) FROM docs;
+----
+3000
+
+# keyed group_merge (folds shredded state without reconstruct)
+query I
+SELECT count(*) FROM (SELECT jsono_group_merge_max(shred2, i) FROM docs GROUP BY i % 5);
+----
+5
+
+# group_array (collects shredded elements)
+query I
+SELECT count(*) FROM (SELECT jsono_group_array(shred) FROM docs GROUP BY i % 5);
+----
+5
+
+# set-op union over different shred sets (reconciles to one shredded type)
+query I
+SELECT count(*) FROM (SELECT shred AS v FROM docs UNION ALL SELECT shred2 FROM docs);
+----
+6000
+
+# cast to varchar (reconstruct path)
+query I
+SELECT count(*) FROM docs WHERE length(shred::varchar) > 0;
+----
+3000
+
+# --- Child-shuffled nested vectors: focused on the nested-navigation paths ---
+
+statement ok
+SET debug_verify_vector='nested_shuffle';
+
+query I
+SELECT count(*) FROM docs WHERE (plain ->> '$.nested.a')::BIGINT = i % 7;
+----
+3000
+
+query I
+SELECT count(*) FROM docs WHERE to_json(shred) = '{"name":"n' || i || '","x":' || i || '}';
+----
+3000
+
+query I
+SELECT count(*) FROM docs WHERE jsono_transform(plain, {'name':'VARCHAR'}).name = 'n' || i;
+----
+3000
+
+query I
+SELECT count(jsono_diff(plain, shred)) FROM docs;
+----
+3000
+
+query I
+SELECT count(*) FROM (SELECT jsono_array_elements(plain -> 'arr') FROM docs);
+----
+3000
+
+query I
+SELECT count(jsono_merge_patch(shred, shred2)) FROM docs;
+----
+3000
+
+statement ok
+RESET debug_verify_vector;
