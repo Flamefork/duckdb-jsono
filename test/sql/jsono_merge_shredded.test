@@ -588,3 +588,49 @@ SELECT count(*) FROM (
 ) WHERE shredded IS DISTINCT FROM plain;
 ----
 0
+
+# --- Partial-conflict fast path over dictionary-encoded inputs ---
+
+# The all-shredded fast path splits a chunk into conflict / non-conflict rows and gathers the
+# conflict rows into a compact vector. That gather passed the full chunk size as the Copy
+# source_count while the conflict selection vector holds only the conflict-row count; for a
+# DICTIONARY source (Parquet/DuckLake scans, or debug_verify_vector) the extra source_count
+# entries over-read the selection vector into wild dictionary indices and crashed. This setting
+# wraps every expression input in a dictionary vector, reproducing it purely in-memory.
+statement ok
+SET debug_verify_vector='dictionary_expression';
+
+# Exact merge: plain base + auto-shredded patch, rows 2 and 3 conflict (base carries a key that
+# names a shred lane) while 1 and 4 do not — the partial split that hit the over-read.
+query II
+SELECT id, to_json(jsono_merge_patch(snap, jsono({'name':'p','details':'d'}))) AS m
+FROM (VALUES
+  (1, jsono('{"x":1}')),
+  (2, jsono('{"name":"old","x":2}')),
+  (3, jsono('{"details":"old2","y":3}')),
+  (4, jsono('{"z":4}'))
+) t(id, snap)
+ORDER BY id;
+----
+1	{"details":"d","name":"p","x":1}
+2	{"details":"d","name":"p","x":2}
+3	{"details":"d","name":"p","y":3}
+4	{"details":"d","name":"p","z":4}
+
+# Across a multi-chunk scan (> STANDARD_VECTOR_SIZE), every merged row must keep the patch keys and
+# its own untouched residual: name='p', details='d', and x carried through equal to i.
+query I
+SELECT count(*) FROM (
+  SELECT i, jsono_merge_patch(snap, jsono({'name':'p','details':'d'})) AS m
+  FROM (
+    SELECT i,
+      CASE WHEN i % 4 = 0 THEN jsono('{"name":"old","x":' || i || '}')
+                          ELSE jsono('{"x":' || i || '}') END AS snap
+    FROM range(3000) tbl(i)
+  )
+) WHERE (m ->> 'name') = 'p' AND (m ->> 'details') = 'd' AND (m ->> 'x')::BIGINT = i;
+----
+3000
+
+statement ok
+RESET debug_verify_vector;

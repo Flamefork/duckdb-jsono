@@ -1774,7 +1774,10 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 					compact->SetVectorType(VectorType::CONSTANT_VECTOR);
 					ConstantVector::SetNull(*compact, true);
 				} else {
-					VectorOperations::Copy(args.data[i], *compact, conflict_sel, count, 0, 0, conflict_count);
+					// source_count counts the selection entries read (it sizes dict_sel.Slice for a
+					// dictionary source); conflict_sel holds exactly conflict_count of them, so passing
+					// the full chunk count over-reads conflict_sel into wild dictionary indices.
+					VectorOperations::Copy(args.data[i], *compact, conflict_sel, conflict_count, 0, 0, conflict_count);
 				}
 				compact_args.push_back(compact.get());
 				compact_vectors.push_back(std::move(compact));
