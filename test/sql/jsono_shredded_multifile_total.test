@@ -136,6 +136,34 @@ EXPLAIN SELECT MIN(e->>'a') FROM mft_projected;
 ----
 physical_plan	<!REGEX>:.*COALESCE.*
 
+# Totality is keyed by the projection's OUTPUT column, not slot 0. A reorder that
+# lands the jsono column in a later slot (with a live scalar column keeping the
+# projection past column pruning) must still fold the lane COALESCE-free.
+statement ok
+COPY (SELECT i AS k, jsono('{"a":"A' || i || '"}', shredding := {'a':'VARCHAR'}) AS e FROM range(1000) t(i))
+TO '__TEST_DIR__/mft_kv.parquet' (FORMAT parquet);
+
+statement ok
+CREATE VIEW mft_reordered AS
+SELECT k + 1 AS k2, e FROM read_parquet('__TEST_DIR__/mft_kv.parquet');
+
+query II
+EXPLAIN SELECT MIN(e->>'a'), MIN(k2) FROM mft_reordered;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+# The propagation must not fabricate totality: a lane that is non-total at the scan
+# (absent from one union_by_name file) stays on the COALESCE fallback through the
+# same transparent projection.
+statement ok
+CREATE VIEW mft_b_projected AS
+SELECT e FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true);
+
+query II
+EXPLAIN SELECT MIN(e->>'b') FROM mft_b_projected;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
 statement ok
 PRAGMA explain_output='all';
 
