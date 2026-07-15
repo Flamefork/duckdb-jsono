@@ -123,6 +123,19 @@ EXPLAIN SELECT MIN(e->>'a') FROM read_parquet('__TEST_DIR__/mft_a.parquet');
 ----
 physical_plan	<!REGEX>:.*COALESCE.*
 
+# A transparent projection over the same single-file scan must preserve the
+# lane's totality. DuckDB relations and views introduce this projection shape;
+# losing the scan statistics here turns a one-lane read back into a full
+# residual-body read.
+statement ok
+CREATE VIEW mft_projected AS
+SELECT e FROM read_parquet('__TEST_DIR__/mft_a.parquet');
+
+query II
+EXPLAIN SELECT MIN(e->>'a') FROM mft_projected;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
 statement ok
 PRAGMA explain_output='all';
 

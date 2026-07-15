@@ -1611,9 +1611,10 @@ unique_ptr<BaseStatistics> TryRecoverMultiFileColumnStats(ClientContext &context
 // unknown / a spill / a schema mismatch all leave entry true so the safe COALESCE form stays.
 using ShredTotalityMap = column_binding_map_t<vector<bool>>;
 
-// Walk the plan's LogicalGet leaves and, for each shredded jsono column the scan exposes, decide each
-// shred's totality from statistics pulled through the table function's statistics_extended pointer
-// (the same one DuckDB's own StatisticsPropagator uses; native tables and Parquet both register it).
+// Walk the plan bottom-up. At LogicalGet leaves, decide each exposed shredded jsono column's
+// totality from statistics pulled through the table function's statistics_extended pointer (the
+// same one DuckDB's own StatisticsPropagator uses; native tables and Parquet both register it).
+// Propagate that proof through projection outputs that forward a bare column reference unchanged.
 // Descend the returned StructStats: top struct child 0 is the layout, layout child 1 is the `shreds`
 // struct (child 0 the shred-set marker, child 1 + child_index a scalar shred pair whose child 1 is
 // `complete`). A shred is total iff the marker proves schema identity (min==max==read-type hash) AND
@@ -1622,6 +1623,21 @@ using ShredTotalityMap = column_binding_map_t<vector<bool>>;
 void CollectShredTotality(ClientContext &context, const LogicalOperator &op, ShredTotalityMap &totality) {
 	for (auto &child : op.children) {
 		CollectShredTotality(context, *child, totality);
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &projection = op.Cast<LogicalProjection>();
+		for (idx_t i = 0; i < projection.expressions.size(); i++) {
+			auto &expression = projection.expressions[i];
+			if (expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				continue;
+			}
+			auto &column_ref = expression->Cast<BoundColumnRefExpression>();
+			auto source = totality.find(column_ref.binding);
+			if (source != totality.end()) {
+				totality.emplace(ColumnBinding(projection.table_index, i), source->second);
+			}
+		}
+		return;
 	}
 	if (op.type != LogicalOperatorType::LOGICAL_GET) {
 		return;
