@@ -1714,6 +1714,46 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 		}
 		return;
 	}
+	if (op.type == LogicalOperatorType::LOGICAL_UNION || op.type == LogicalOperatorType::LOGICAL_EXCEPT ||
+	    op.type == LogicalOperatorType::LOGICAL_INTERSECT) {
+		// A set operation only concatenates or drops branch rows, so per-row totality survives it:
+		// a column is total iff it is total in EVERY branch (positional AND — stored as OR of the
+		// non-total flags). Only same-shredded branches can all prove totality: a reconciling
+		// branch reaches here as a cast projection, which the projection forward above skips, so
+		// differently-shredded unions stay unknown and remain with the pushdown facade.
+		auto &setop = op.Cast<LogicalSetOperation>();
+		for (idx_t col = 0; col < setop.column_count; col++) {
+			vector<bool> merged;
+			bool known = true;
+			for (auto &child : op.children) {
+				auto bindings = child->GetColumnBindings();
+				if (col >= bindings.size()) {
+					known = false;
+					break;
+				}
+				auto entry = totality.find(bindings[col]);
+				if (entry == totality.end()) {
+					known = false;
+					break;
+				}
+				if (merged.empty()) {
+					merged = entry->second;
+					continue;
+				}
+				if (merged.size() != entry->second.size()) {
+					known = false;
+					break;
+				}
+				for (idx_t k = 0; k < merged.size(); k++) {
+					merged[k] = merged[k] || entry->second[k];
+				}
+			}
+			if (known && !merged.empty()) {
+				totality.emplace(ColumnBinding(setop.table_index, col), std::move(merged));
+			}
+		}
+		return;
+	}
 	if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &projection = op.Cast<LogicalProjection>();
 		for (idx_t i = 0; i < projection.expressions.size(); i++) {

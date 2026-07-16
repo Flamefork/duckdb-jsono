@@ -1,0 +1,78 @@
+# name: test/sql/jsono_setop_totality.test
+# description: Shred totality flows through set operations over same-shredded branches (positional AND), so extracts over the set-op output read their lane COALESCE-free. Differently-shredded unions stay with the pushdown facade; a non-total branch keeps the safe fallback.
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE st_a AS
+SELECT jsono('{"x": ' || i || ', "k":"a"}', shredding := {'$.x':'BIGINT'}) AS j FROM range(1000) tt(i);
+
+statement ok
+CREATE TABLE st_b AS
+SELECT jsono('{"x": ' || (i + 1000) || ', "k":"b"}', shredding := {'$.x':'BIGINT'}) AS j FROM range(1000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# Same-shredded UNION ALL: both branches prove the $.x shred total, so the union output is total
+# and the read is a bare lane extract — no COALESCE, no residual read.
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM (SELECT j FROM st_a UNION ALL SELECT j FROM st_b) u;
+----
+physical_plan	<!REGEX>:.*(COALESCE|jsono_extract).*
+
+# UNION DISTINCT only drops rows, so per-row totality survives the dedup.
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM (SELECT j FROM st_a UNION SELECT j FROM st_b) u;
+----
+physical_plan	<!REGEX>:.*(COALESCE|jsono_extract).*
+
+# The union wrapped in a CTE: the early inlining plus the set-op fold keep the lane read.
+query II
+EXPLAIN WITH u AS (SELECT j FROM st_a UNION ALL SELECT j FROM st_b) SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM u;
+----
+physical_plan	<!REGEX>:.*(COALESCE|jsono_extract).*
+
+statement ok
+PRAGMA explain_output='all';
+
+query III
+SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)), COUNT(*)
+FROM (SELECT j FROM st_a UNION ALL SELECT j FROM st_b) u;
+----
+0	1999	2000
+
+query III
+SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)), COUNT(*)
+FROM (SELECT j FROM st_a UNION SELECT j FROM st_b) u;
+----
+0	1999	2000
+
+# Negative control: one branch diverts $.x (strings spill to the residual), so the union column is
+# NOT total — the safe COALESCE fallback stays and recovers the residual values.
+statement ok
+CREATE TABLE st_div AS
+SELECT jsono(
+  CASE WHEN i % 2 = 0 THEN '{"x": ' || i || '}' ELSE '{"x": "str"}' END,
+  shredding := {'$.x':'BIGINT'}) AS j
+FROM range(1000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(TRY_CAST(j->>'$.x' AS BIGINT)) FROM (SELECT j FROM st_a UNION ALL SELECT j FROM st_div) u;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT MIN(TRY_CAST(j->>'$.x' AS BIGINT)), MAX(TRY_CAST(j->>'$.x' AS BIGINT))
+FROM (SELECT j FROM st_a UNION ALL SELECT j FROM st_div) u;
+----
+0	999

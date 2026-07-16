@@ -162,8 +162,10 @@ SELECT count(*) FROM (SELECT e FROM pu_shred UNION SELECT e FROM pu_plain) WHERE
 ----
 1
 
-# (g) a same-type UNION ALL (no branch reconciliation) is deliberately left unchanged: the extract
-# stays above the union and keeps the residual fallback (no per-branch totality over a union output).
+# (g) a same-type UNION ALL (no branch reconciliation) is left structurally unchanged — the extract
+# stays above the union — but shred totality folds across the set operation (positional AND of the
+# branches), so two total branches read the lane COALESCE-free. The non-total same-type union keeps
+# the fallback: jsono_setop_totality.test owns that negative control.
 statement ok
 CREATE TABLE pu_shred_same AS SELECT jsono('{"a":"S' || i || '"}', shredding := {'a':'VARCHAR'}) AS e FROM range(100) t(i);
 
@@ -173,7 +175,7 @@ PRAGMA explain_output='physical_only';
 query II
 EXPLAIN SELECT e->>'a' FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_shred_same);
 ----
-physical_plan	<REGEX>:.*COALESCE.*
+physical_plan	<!REGEX>:.*COALESCE.*
 
 statement ok
 PRAGMA explain_output='all';
