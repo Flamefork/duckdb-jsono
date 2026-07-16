@@ -1,0 +1,77 @@
+# name: test/sql/jsono_delim_totality.test
+# description: Shred totality flows into flattened correlated subqueries: the duplicate-eliminated outer column read by a DELIM_GET keeps its lane totality, so an extract of the outer shredded column inside the subquery reads its lane COALESCE-free.
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE dtot AS
+SELECT i AS id, jsono('{"x": ' || i::VARCHAR || ', "k":"a"}', shredding := {'$.x':'BIGINT'}) AS j
+FROM range(100) tt(i);
+
+statement ok
+CREATE TABLE dother AS SELECT i AS id FROM range(100) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# A scalar correlated subquery: the outer shredded column is duplicate-eliminated into the
+# subquery side (DELIM_GET), and the extract over it sits in a join condition. Totality must
+# follow the duplicate-eliminated column or the read decays to the COALESCE residual fallback.
+query II
+EXPLAIN SELECT (SELECT MIN(o.id) FROM dother o WHERE o.id >= CAST(d.j->>'$.x' AS BIGINT)) FROM dtot d;
+----
+physical_plan	<!REGEX>:.*(COALESCE|jsono_extract|reconstruct|overlay).*
+
+# EXISTS takes the same flattening path (mark join over a DELIM_GET).
+query II
+EXPLAIN SELECT count(*) FROM dtot d WHERE EXISTS (SELECT 1 FROM dother o WHERE o.id = CAST(d.j->>'$.x' AS BIGINT));
+----
+physical_plan	<!REGEX>:.*(COALESCE|jsono_extract|reconstruct|overlay).*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Values stay correct: $.x mirrors id, so MIN(o.id >= id) == id and every EXISTS probe hits.
+query I
+SELECT (SELECT MIN(o.id) FROM dother o WHERE o.id >= CAST(d.j->>'$.x' AS BIGINT)) FROM dtot d ORDER BY d.id LIMIT 3;
+----
+0
+1
+2
+
+query I
+SELECT count(*) FROM dtot d WHERE EXISTS (SELECT 1 FROM dother o WHERE o.id = CAST(d.j->>'$.x' AS BIGINT));
+----
+100
+
+# Negative control: a diverted shred (string at $.x on odd rows) is NOT total; the correlated
+# read must keep the COALESCE fallback and recover the residual values.
+statement ok
+CREATE TABLE dhet AS
+SELECT i AS id, jsono(
+  CASE WHEN i % 2 = 0 THEN '{"x": ' || i::VARCHAR || '}' ELSE '{"x": "str"}' END,
+  shredding := {'$.x':'BIGINT'}) AS j
+FROM range(100) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT (SELECT MIN(o.id) FROM dother o WHERE o.id >= TRY_CAST(d.j->>'$.x' AS BIGINT)) FROM dhet d;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Odd rows carry a string: TRY_CAST yields NULL, the probe matches nothing, MIN is NULL.
+query II
+SELECT dhet.id, (SELECT MIN(o.id) FROM dother o WHERE o.id >= TRY_CAST(dhet.j->>'$.x' AS BIGINT)) FROM dhet ORDER BY dhet.id LIMIT 4;
+----
+0	0
+1	NULL
+2	2
+3	NULL

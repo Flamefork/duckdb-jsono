@@ -41,8 +41,10 @@
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -1613,6 +1615,11 @@ unique_ptr<BaseStatistics> TryRecoverMultiFileColumnStats(ClientContext &context
 // unknown / a spill / a schema mismatch all leave entry true so the safe COALESCE form stays.
 using ShredTotalityMap = column_binding_map_t<vector<bool>>;
 
+// Positional per-output-column totality of an operator that re-bases bindings (a materialized
+// CTE's definition side, a delim join's duplicate-eliminated columns); an empty inner vector
+// means "unknown" for that column.
+using ShredTotalityColumns = vector<vector<bool>>;
+
 // Walk the plan bottom-up. At LogicalGet leaves, decide each exposed shredded jsono column's
 // totality from statistics pulled through the table function's statistics_extended pointer (the
 // same one DuckDB's own StatisticsPropagator uses; native tables and Parquet both register it).
@@ -1627,13 +1634,19 @@ using ShredTotalityMap = column_binding_map_t<vector<bool>>;
 // snapshotted under the cte index (cte_totality) and replayed onto each CTE_SCAN's bindings.
 // Materialization is row-for-row, so totality (a per-row property of every scanned row) survives it.
 // Recursive CTEs are never registered — their refs stay non-total (fail-safe).
+// Flattened correlated subqueries are bridged the same way: a delim join duplicate-eliminates outer
+// columns into its delim side, where DELIM_GET leaves re-expose them under fresh bindings. The
+// snapshot of the duplicate-eliminated columns' totality is stacked (delim_totality) so nested delim
+// joins scope to the nearest enclosing one — the same association the physical planner's delim-scan
+// gather uses. Duplicate elimination only drops rows, so per-row totality survives it.
 void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTotalityMap &totality,
-                          unordered_map<idx_t, vector<vector<bool>>> &cte_totality) {
+                          unordered_map<idx_t, ShredTotalityColumns> &cte_totality,
+                          vector<ShredTotalityColumns> &delim_totality) {
 	if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 		auto &cte = op.Cast<LogicalMaterializedCTE>();
-		CollectShredTotality(context, *op.children[0], totality, cte_totality);
+		CollectShredTotality(context, *op.children[0], totality, cte_totality, delim_totality);
 		auto cte_bindings = op.children[0]->GetColumnBindings();
-		vector<vector<bool>> per_column(cte_bindings.size());
+		ShredTotalityColumns per_column(cte_bindings.size());
 		for (idx_t i = 0; i < cte_bindings.size(); i++) {
 			auto entry = totality.find(cte_bindings[i]);
 			if (entry != totality.end()) {
@@ -1641,11 +1654,35 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 			}
 		}
 		cte_totality.emplace(cte.table_index, std::move(per_column));
-		CollectShredTotality(context, *op.children[1], totality, cte_totality);
+		CollectShredTotality(context, *op.children[1], totality, cte_totality, delim_totality);
+		return;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		CollectShredTotality(context, *op.children[0], totality, cte_totality, delim_totality);
+		ShredTotalityColumns per_column(join.duplicate_eliminated_columns.size());
+		// delim_flipped is only ever set by the later BuildProbeSideOptimizer, so the LHS resolved
+		// above is the duplicate-eliminated source here; the guard keeps the snapshot fail-safe
+		// (all-unknown) should a flipped join ever reach this pass.
+		if (!join.delim_flipped) {
+			for (idx_t i = 0; i < join.duplicate_eliminated_columns.size(); i++) {
+				auto &expr = *join.duplicate_eliminated_columns[i];
+				if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					continue;
+				}
+				auto entry = totality.find(expr.Cast<BoundColumnRefExpression>().binding);
+				if (entry != totality.end()) {
+					per_column[i] = entry->second;
+				}
+			}
+		}
+		delim_totality.push_back(std::move(per_column));
+		CollectShredTotality(context, *op.children[1], totality, cte_totality, delim_totality);
+		delim_totality.pop_back();
 		return;
 	}
 	for (auto &child : op.children) {
-		CollectShredTotality(context, *child, totality, cte_totality);
+		CollectShredTotality(context, *child, totality, cte_totality, delim_totality);
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte_ref = op.Cast<LogicalCTERef>();
@@ -1656,6 +1693,22 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 		for (idx_t i = 0; i < entry->second.size(); i++) {
 			if (!entry->second[i].empty()) {
 				totality.emplace(ColumnBinding(cte_ref.table_index, i), entry->second[i]);
+			}
+		}
+		return;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+		if (delim_totality.empty()) {
+			return;
+		}
+		auto &delim_get = op.Cast<LogicalDelimGet>();
+		auto &per_column = delim_totality.back();
+		if (per_column.size() != delim_get.chunk_types.size()) {
+			return;
+		}
+		for (idx_t i = 0; i < per_column.size(); i++) {
+			if (!per_column[i].empty()) {
+				totality.emplace(ColumnBinding(delim_get.table_index, i), per_column[i]);
 			}
 		}
 		return;
@@ -1779,8 +1832,9 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 }
 
 void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTotalityMap &totality) {
-	unordered_map<idx_t, vector<vector<bool>>> cte_totality;
-	CollectShredTotality(context, op, totality, cte_totality);
+	unordered_map<idx_t, ShredTotalityColumns> cte_totality;
+	vector<ShredTotalityColumns> delim_totality;
+	CollectShredTotality(context, op, totality, cte_totality, delim_totality);
 }
 
 bool IsExtractFunction(const string &name) {
