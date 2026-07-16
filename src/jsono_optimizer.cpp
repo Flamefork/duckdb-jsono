@@ -26,6 +26,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -2643,8 +2644,9 @@ public:
 	// union reads that union's output), so the caller loops this to a fixpoint.
 	bool Run(LogicalOperator &root) {
 		unions.clear();
+		projections.clear();
 		pushed.clear();
-		CollectUnions(root);
+		CollectOperators(root);
 		if (unions.empty()) {
 			return false;
 		}
@@ -2660,16 +2662,66 @@ protected:
 	}
 
 private:
-	void CollectUnions(LogicalOperator &op) {
+	void CollectOperators(LogicalOperator &op) {
 		for (auto &child : op.children) {
-			CollectUnions(*child);
+			CollectOperators(*child);
 		}
 		if (op.type == LogicalOperatorType::LOGICAL_UNION) {
 			auto &setop = op.Cast<LogicalSetOperation>();
 			if (setop.setop_all) {
 				unions.emplace(setop.table_index, setop);
 			}
+			return;
 		}
+		if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = op.Cast<LogicalProjection>();
+			projections.emplace(projection.table_index, projection);
+		}
+	}
+
+	// Resolve the union an extract's source column comes from, walking down the bare
+	// column-reference forwards of interposed projections (e.g. the pass-through projection CTE
+	// inlining leaves in place of the CTE_SCAN). Fills `chain` with the projections traversed
+	// (outermost first) and returns the union column index through `column_index`. The plan is a
+	// tree, so the walk terminates.
+	optional_ptr<LogicalSetOperation>
+	ResolveUnionSource(ColumnBinding binding, vector<reference<LogicalProjection>> &chain, idx_t &column_index) {
+		while (true) {
+			auto union_entry = unions.find(binding.table_index);
+			if (union_entry != unions.end()) {
+				column_index = binding.column_index;
+				return &union_entry->second.get();
+			}
+			auto forward = projections.find(binding.table_index);
+			if (forward == projections.end()) {
+				return nullptr;
+			}
+			auto &projection = forward->second.get();
+			if (binding.column_index >= projection.expressions.size()) {
+				return nullptr;
+			}
+			auto &forwarded = *projection.expressions[binding.column_index];
+			if (forwarded.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				return nullptr;
+			}
+			chain.push_back(projection);
+			binding = forwarded.Cast<BoundColumnRefExpression>().binding;
+		}
+	}
+
+	// Re-expose a union output column through an interposed projection: reuse an existing
+	// pass-through reference or append one (appending never disturbs the projection's existing
+	// bindings, and consumers of its other columns are unaffected).
+	idx_t ForwardThroughProjection(LogicalProjection &projection, ColumnBinding binding, const LogicalType &type) {
+		for (idx_t i = 0; i < projection.expressions.size(); i++) {
+			auto &existing = *projection.expressions[i];
+			if (existing.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+			    existing.Cast<BoundColumnRefExpression>().binding == binding) {
+				return i;
+			}
+		}
+		projection.expressions.push_back(make_uniq<BoundColumnRefExpression>(type, binding));
+		return projection.expressions.size() - 1;
 	}
 
 	// The union output column an extract reads: a bare column reference, possibly under the
@@ -2752,12 +2804,13 @@ private:
 		if (!colref) {
 			return nullptr;
 		}
-		auto entry = unions.find(colref->binding.table_index);
-		if (entry == unions.end()) {
+		vector<reference<LogicalProjection>> chain;
+		idx_t column_index;
+		auto setop_ptr = ResolveUnionSource(colref->binding, chain, column_index);
+		if (!setop_ptr) {
 			return nullptr;
 		}
-		auto &setop = entry->second.get();
-		auto column_index = colref->binding.column_index;
+		auto &setop = *setop_ptr;
 		if (column_index >= setop.column_count) {
 			return nullptr;
 		}
@@ -2776,8 +2829,18 @@ private:
 			    JsonoPushedSetOpRead {column_index, string_fn, expr.return_type, std::move(path), output_column});
 		}
 		changed = true;
-		return make_uniq<BoundColumnRefExpression>(expr.GetAlias(), expr.return_type,
-		                                           ColumnBinding(setop.table_index, output_column));
+		// Carry the pushed union column back up the interposed projections (innermost first) so
+		// the replacement reference is valid at the extract's level.
+		auto result_binding = ColumnBinding(setop.table_index, output_column);
+		for (auto projection = chain.rbegin(); projection != chain.rend(); ++projection) {
+			result_binding =
+			    ColumnBinding(projection->get().table_index,
+			                  ForwardThroughProjection(projection->get(), result_binding, expr.return_type));
+		}
+		if (!chain.empty()) {
+			chain.front().get().ResolveOperatorTypes();
+		}
+		return make_uniq<BoundColumnRefExpression>(expr.GetAlias(), expr.return_type, result_binding);
 	}
 
 	// Append the per-branch extract to every branch and extend the union's column list; returns the
@@ -2834,6 +2897,7 @@ private:
 
 	OptimizerExtensionInput &input;
 	unordered_map<idx_t, reference<LogicalSetOperation>> unions;
+	unordered_map<idx_t, reference<LogicalProjection>> projections;
 	unordered_map<idx_t, vector<JsonoPushedSetOpRead>> pushed;
 	bool changed = false;
 };
@@ -2875,6 +2939,16 @@ void RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &pl
 }
 
 void JsonoOptimizerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	// Run the built-in CTE inliner first: CTEs are planned materialized and the pipeline's own
+	// CTE_INLINING pass only runs after this hook, so without it every rewrite below sees CTE_SCAN
+	// boundaries instead of the real plan shapes (set-op branches, scans). Its decision inputs
+	// (ref counts, materialize flags, definition volatility/aggregates, consumer LIMIT) are
+	// untouched between here and the built-in run, so this only re-orders the same inlining ahead
+	// of our rewrites; the built-in runs remain as backstop for anything declined here.
+	if (plan && !Optimizer::OptimizerDisabled(input.context, OptimizerType::CTE_INLINING)) {
+		CTEInlining cte_inlining(input.optimizer);
+		plan = cte_inlining.Optimize(std::move(plan));
+	}
 	// Push extracts through UNION ALL branches before anything else, so a read over a reconciled
 	// set-op column becomes per-branch homogeneous reads the passes below serve natively (and cast
 	// normalization still sees the raw reconciling casts on the branches).

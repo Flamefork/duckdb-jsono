@@ -1,0 +1,73 @@
+# name: test/sql/jsono_setop_cte_pushdown.test
+# description: Set-op extract pushdown reaches through inlined CTEs: an extract over a CTE wrapping a UNION ALL of differently-shredded branches becomes per-branch reads (parity with the direct subquery form), instead of the reconciled COALESCE read.
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE TABLE su_a AS
+SELECT jsono('{"x":' || i || ',"a":"A"}', shredding := {'$.x':'BIGINT','$.a':'VARCHAR'}) AS j FROM range(1000) tt(i);
+
+statement ok
+CREATE TABLE su_b AS
+SELECT jsono('{"x":' || (i + 1000) || ',"b":"B"}', shredding := {'$.x':'BIGINT','$.b':'VARCHAR'}) AS j FROM range(1000) tt(i);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# Control: the direct subquery form is served per-branch — no reconciled COALESCE read.
+query II
+EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM (SELECT j FROM su_a UNION ALL SELECT j FROM su_b) u;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+# The CTE form must match: the CTE is inlined ahead of the jsono rewrites, and the extract is
+# traced through the inlining's forward projection into the union branches.
+query II
+EXPLAIN WITH u AS (SELECT j FROM su_a UNION ALL SELECT j FROM su_b) SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM u;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+# Two paths over the CTE column push as two per-branch reads sharing the projection chain.
+query II
+EXPLAIN WITH u AS (SELECT j FROM su_a UNION ALL SELECT j FROM su_b) SELECT j->>'$.x', j->>'$.a' FROM u;
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+# Value parity across the boundary forms.
+query III
+WITH u AS (SELECT j FROM su_a UNION ALL SELECT j FROM su_b)
+SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)), COUNT(*) FROM u;
+----
+0	1999	2000
+
+query II
+WITH u AS (SELECT j FROM su_a UNION ALL SELECT j FROM su_b)
+SELECT j->>'$.a', count(*) FROM u GROUP BY 1 ORDER BY 1 NULLS LAST;
+----
+A	1000
+NULL	1000
+
+# AS MATERIALIZED keeps the reconciled read by design: the CTE result is computed once for all
+# consumers, so pushing per-branch reads into the definition would change its output; the safe
+# COALESCE form stays and values are unchanged.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN WITH u AS MATERIALIZED (SELECT j FROM su_a UNION ALL SELECT j FROM su_b) SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM u;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query I
+WITH u AS MATERIALIZED (SELECT j FROM su_a UNION ALL SELECT j FROM su_b) SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM u;
+----
+0
