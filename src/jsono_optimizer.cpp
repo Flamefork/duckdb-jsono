@@ -42,8 +42,10 @@
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
@@ -1620,9 +1622,43 @@ using ShredTotalityMap = column_binding_map_t<vector<bool>>;
 // `complete`). A shred is total iff the marker proves schema identity (min==max==read-type hash) AND
 // the shred's own `complete` (TINYINT 1/0) carries no 0 (min == 1). Fail-safe: no statistics function,
 // nullptr stats, a missing min/max, or a hash/spill mismatch leaves the shred non-total (true).
-void CollectShredTotality(ClientContext &context, const LogicalOperator &op, ShredTotalityMap &totality) {
+// CTEs are planned materialized and only inlined by the built-in pipeline AFTER this pre-optimize
+// pass, so the proof is also bridged across them: the definition side's per-output-column totality is
+// snapshotted under the cte index (cte_totality) and replayed onto each CTE_SCAN's bindings.
+// Materialization is row-for-row, so totality (a per-row property of every scanned row) survives it.
+// Recursive CTEs are never registered — their refs stay non-total (fail-safe).
+void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTotalityMap &totality,
+                          unordered_map<idx_t, vector<vector<bool>>> &cte_totality) {
+	if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		auto &cte = op.Cast<LogicalMaterializedCTE>();
+		CollectShredTotality(context, *op.children[0], totality, cte_totality);
+		auto cte_bindings = op.children[0]->GetColumnBindings();
+		vector<vector<bool>> per_column(cte_bindings.size());
+		for (idx_t i = 0; i < cte_bindings.size(); i++) {
+			auto entry = totality.find(cte_bindings[i]);
+			if (entry != totality.end()) {
+				per_column[i] = entry->second;
+			}
+		}
+		cte_totality.emplace(cte.table_index, std::move(per_column));
+		CollectShredTotality(context, *op.children[1], totality, cte_totality);
+		return;
+	}
 	for (auto &child : op.children) {
-		CollectShredTotality(context, *child, totality);
+		CollectShredTotality(context, *child, totality, cte_totality);
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		auto &cte_ref = op.Cast<LogicalCTERef>();
+		auto entry = cte_totality.find(cte_ref.cte_index);
+		if (entry == cte_totality.end()) {
+			return;
+		}
+		for (idx_t i = 0; i < entry->second.size(); i++) {
+			if (!entry->second[i].empty()) {
+				totality.emplace(ColumnBinding(cte_ref.table_index, i), entry->second[i]);
+			}
+		}
+		return;
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &projection = op.Cast<LogicalProjection>();
@@ -1740,6 +1776,11 @@ void CollectShredTotality(ClientContext &context, const LogicalOperator &op, Shr
 			}
 		}
 	}
+}
+
+void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTotalityMap &totality) {
+	unordered_map<idx_t, vector<vector<bool>>> cte_totality;
+	CollectShredTotality(context, op, totality, cte_totality);
 }
 
 bool IsExtractFunction(const string &name) {
