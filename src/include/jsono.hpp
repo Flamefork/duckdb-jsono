@@ -191,6 +191,11 @@ unique_ptr<Expression> MakeJsonoReconstructExpression(unique_ptr<Expression> shr
 // type drops back into the residual with this, leaving the kept shreds untouched.
 void JsonoOverlayShredsToPlain(Vector &input, idx_t count, const vector<idx_t> &shreds, Vector &result);
 
+// Render a shredded JSONO carrying top-level LIST shreds directly to JSON text. Scalar shreds are
+// first overlaid into the residual; list lanes then merge into their residual arrays by index,
+// without materializing the reconstructed arrays as a plain JSONO blob.
+void JsonoRenderShreddedListsToJson(Vector &input, idx_t count, Vector &result);
+
 // Parse a VARCHAR/JSON `source` vector into a plain JSONO `result` vector, throwing on
 // invalid JSON (the jsono() text contract). Exposed so the shred constructor overload can
 // parse-then-shred in one pass without duplicating the parser.

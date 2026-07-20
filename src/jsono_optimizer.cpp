@@ -1050,6 +1050,24 @@ ScalarFunction MakeJsonoReconstructFunction(const LogicalType &input_type) {
 	return fun;
 }
 
+void JsonoShreddedListsToJsonExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)state;
+	JsonoRenderShreddedListsToJson(args.data[0], args.size(), result);
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
+ScalarFunction MakeJsonoShreddedListsToJsonFunction(const LogicalType &input_type) {
+	ScalarFunction fun("__jsono_shredded_lists_to_json", {input_type}, LogicalType::JSON(),
+	                   JsonoShreddedListsToJsonExecute);
+	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	return fun;
+}
+
 idx_t ConservativePredicateRank(const JsonoMatchPredicate &predicate) {
 	auto root_path = predicate.path.steps.size() <= 1;
 	// A range comparison keeps a value interval, so it ranks with multi-value sets: less selective
@@ -2417,19 +2435,38 @@ private:
 		auto alias = column->GetAlias();
 		auto shreds = CollectShreddedShreds(column->return_type);
 		bool needs_full_reconstruct = false;
+		bool has_list_shreds = false;
+		bool direct_list_render = true;
 		for (idx_t i = 0; i < shreds.size() && !needs_full_reconstruct; i++) {
 			if (IsShredListType(shreds[i].type)) {
-				needs_full_reconstruct = true;
-				break;
+				has_list_shreds = true;
+				if (shreds[i].steps.size() != 1) {
+					direct_list_render = false;
+				}
 			}
 			for (idx_t j = i + 1; j < shreds.size(); j++) {
-				if (shreds[i].steps.size() != shreds[j].steps.size() &&
-				    ShredPathsOverlap(shreds[i].steps, shreds[j].steps)) {
+				if (!ShredPathsOverlap(shreds[i].steps, shreds[j].steps)) {
+					continue;
+				}
+				if (IsShredListType(shreds[i].type) || IsShredListType(shreds[j].type)) {
+					direct_list_render = false;
+				}
+				if (shreds[i].steps.size() != shreds[j].steps.size()) {
 					needs_full_reconstruct = true;
 					break;
 				}
 			}
 		}
+		if (has_list_shreds && direct_list_render && !needs_full_reconstruct) {
+			auto function = MakeJsonoShreddedListsToJsonFunction(column->return_type);
+			vector<unique_ptr<Expression>> children;
+			children.push_back(std::move(column));
+			auto result = make_uniq<BoundFunctionExpression>(LogicalType::JSON(), std::move(function),
+			                                                 std::move(children), nullptr);
+			result->SetAlias(alias);
+			return std::move(result);
+		}
+		needs_full_reconstruct = needs_full_reconstruct || has_list_shreds;
 		if (needs_full_reconstruct) {
 			auto plain = BoundCastExpression::AddCastToType(context, std::move(column), JsonoType());
 			auto json = BoundCastExpression::AddCastToType(context, std::move(plain), LogicalType::JSON());

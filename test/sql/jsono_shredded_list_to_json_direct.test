@@ -1,0 +1,162 @@
+# name: test/sql/jsono_shredded_list_to_json_direct.test
+# description: Direct shredded LIST rendering is byte-identical to reconstruct-then-render
+# group: [sql]
+
+require jsono
+
+require json
+
+statement ok
+CREATE MACRO plain_jsono_list_render(v) AS CAST(v AS STRUCT(jsono STRUCT(body STRUCT(
+  slots BLOB,
+  key_heap BLOB,
+  string_heap BLOB,
+  skips BLOB,
+  lengths BLOB,
+  nums BLOB
+))));
+
+# The typed writer fully captures finite DOUBLE subfields. NULLs and tail fields remain in the
+# residual skeleton and must interleave with lane fields in canonical key order.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    kind := 'order',
+    products := [
+      struct_pack(name := 'a', price := 1.5::DOUBLE, quantity := 2::BIGINT, tail := 'x'),
+      NULL,
+      struct_pack(name := NULL, price := NULL, quantity := 3::BIGINT, tail := NULL)
+    ])
+)
+SELECT to_json(jsono(v)) = to_json(plain_jsono_list_render(v))
+FROM input;
+----
+true
+
+# Explicit text shredding can leave a type-mismatched or differently encoded value in the
+# residual. A valid lane fills only absent fields; the residual remains authoritative.
+query I
+WITH docs(doc) AS (VALUES
+  ('{"kind":"mixed","products":[{"name":"a","price":1.25,"quantity":2,"tail":"x"},null]}'),
+  ('{"kind":"mixed","products":[{"name":"b","price":"kept","quantity":3}]}'),
+  ('{"kind":"mixed","products":[{"name":null,"price":2.5,"quantity":null}]}')
+)
+SELECT count(*)
+FROM docs
+WHERE to_json(jsono(
+        doc,
+        shredding := {
+          'kind':'VARCHAR',
+          'products':'STRUCT(name VARCHAR, price DOUBLE, quantity BIGINT)[]'
+        }))
+      = to_json(jsono(doc));
+----
+3
+
+# Scalar-array lanes merge per index: non-conforming elements and explicit nulls stay in residual.
+query I
+WITH docs(doc) AS (VALUES
+  ('{"a":[1,"two",3,null,true,-5],"kind":"mixed"}'),
+  ('{"a":[],"kind":"empty"}'),
+  ('{"kind":"absent"}'),
+  ('{"a":"not-an-array","kind":"scalar"}')
+)
+SELECT count(*)
+FROM docs
+WHERE to_json(jsono(doc, shredding := {'a':'UBIGINT[]','kind':'VARCHAR'}))
+      = to_json(jsono(doc));
+----
+4
+
+# Multiple list lanes and scalar siblings share one root overlay.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    kind := 'multiple',
+    ids := [1::BIGINT, NULL, 3],
+    products := [
+      struct_pack(name := 'a', price := 1.5::DOUBLE),
+      struct_pack(name := NULL, price := 2.5::DOUBLE)
+    ])
+)
+SELECT to_json(jsono(v)) = to_json(plain_jsono_list_render(v))
+FROM input;
+----
+true
+
+# A reconciled branch can NULL-fill a list lane while keeping the complete array in its residual.
+query I
+WITH widened AS (
+  SELECT jsono(struct_pack(kind := 'typed', ids := [1::BIGINT, 2])) AS j
+  UNION ALL
+  SELECT jsono('{"ids":["residual",null],"kind":"plain"}') AS j
+)
+SELECT count(*)
+FROM widened
+WHERE to_json(j) IN (
+  '{"ids":[1,2],"kind":"typed"}'::JSON,
+  '{"ids":["residual",null],"kind":"plain"}'::JSON
+);
+----
+2
+
+# SQL NULL and constant list inputs preserve the render contract.
+query II
+SELECT
+  to_json(jsono(NULL::STRUCT(ids BIGINT[]))) IS NULL,
+  to_json(jsono(struct_pack(ids := [1::BIGINT, NULL, 3])));
+----
+true	{"ids":[1,null,3]}
+
+# Dictionary and nested-shuffle verification exercise list entries, element structs, subfields,
+# and the residual skeleton over more than one STANDARD_VECTOR_SIZE chunk.
+statement ok
+CREATE TABLE direct_list_render_input AS
+SELECT
+  struct_pack(
+    kind := 'k' || (i % 7)::VARCHAR,
+    ids := CASE
+      WHEN i % 11 = 0 THEN NULL
+      WHEN i % 13 = 0 THEN []::BIGINT[]
+      ELSE [i::BIGINT, NULL, (i + 1)::BIGINT]
+    END,
+    products := [
+      struct_pack(
+        name := CASE WHEN i % 5 = 0 THEN NULL ELSE 'p' || i::VARCHAR END,
+        price := CASE WHEN i % 17 = 0 THEN NULL ELSE (i % 100)::DOUBLE / 4 END),
+      NULL
+    ]) AS v
+FROM range(3000) rows(i);
+
+statement ok
+SET debug_verify_vector='dictionary_expression';
+
+query I
+SELECT count(*)
+FROM direct_list_render_input
+WHERE to_json(jsono(v)) = to_json(plain_jsono_list_render(v));
+----
+3000
+
+statement ok
+SET debug_verify_vector='nested_shuffle';
+
+query I
+SELECT count(*)
+FROM direct_list_render_input
+WHERE to_json(jsono(v)) = to_json(plain_jsono_list_render(v));
+----
+3000
+
+statement ok
+RESET debug_verify_vector;
+
+# The optimizer selects the one-node renderer for top-level list lanes.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT to_json(jsono(v))
+FROM direct_list_render_input;
+----
+physical_plan	<REGEX>:.*__jsono_shredded_lists_to_j.*

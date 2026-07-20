@@ -22,7 +22,43 @@ struct ShredLane {
 	UnifiedVectorFormat fmt;
 	vector<jsono::JsonoScalarPrimitive> sub_kind; // element value lanes; valid when kind == Array / ScalarArray
 	vector<UnifiedVectorFormat> sub_fmt;          // element value lanes; valid when kind == Array / ScalarArray
+	UnifiedVectorFormat struct_fmt;               // element STRUCT validity; valid when kind == Array
 };
+
+inline void InitShredLane(Vector &shred_vec, idx_t count, const LogicalType &shred_type, ShredLane &lane) {
+	shred_vec.ToUnifiedFormat(count, lane.fmt);
+	lane.kind = ClassifyShredKind(shred_type);
+	switch (lane.kind) {
+	case ShredKind::Scalar:
+		lane.scalar_kind = jsono::JsonoScalarPrimitiveFromType(shred_type, "jsono shred lane reader");
+		break;
+	case ShredKind::Array: {
+		auto &element_struct = ListVector::GetEntry(shred_vec);
+		auto element_count = ListVector::GetListSize(shred_vec);
+		element_struct.ToUnifiedFormat(element_count, lane.struct_fmt);
+		auto &subfield_vecs = StructVector::GetEntries(element_struct);
+		auto &element_fields = StructType::GetChildTypes(ListType::GetChildType(shred_type));
+		lane.sub_fmt.resize(subfield_vecs.size());
+		lane.sub_kind.resize(subfield_vecs.size());
+		for (idx_t j = 0; j < subfield_vecs.size(); j++) {
+			subfield_vecs[j]->ToUnifiedFormat(element_count, lane.sub_fmt[j]);
+			lane.sub_kind[j] = jsono::JsonoScalarPrimitiveFromType(element_fields[j].second, "jsono shred lane reader");
+		}
+		break;
+	}
+	case ShredKind::ScalarArray: {
+		// One element value lane (the list child vector) stored at index 0, so the per-element
+		// byte sum and the entries expansion treat it as a single-column array.
+		auto element_count = ListVector::GetListSize(shred_vec);
+		lane.sub_fmt.resize(1);
+		lane.sub_kind.resize(1);
+		ListVector::GetEntry(shred_vec).ToUnifiedFormat(element_count, lane.sub_fmt[0]);
+		lane.sub_kind[0] =
+		    jsono::JsonoScalarPrimitiveFromType(ListType::GetChildType(shred_type), "jsono shred lane reader");
+		break;
+	}
+	}
+}
 
 // Build the reading lanes for every shred of a shredded jsono `input` vector, in shred order (shred
 // f is JsonoShredVector(input, f)). `shreds` is the input type's shred child list from
@@ -32,40 +68,7 @@ inline void InitShredLanes(Vector &input, idx_t count, const child_list_t<Logica
                            vector<ShredLane> &lanes) {
 	lanes.resize(shreds.size());
 	for (idx_t f = 0; f < shreds.size(); f++) {
-		auto &lane = lanes[f];
-		auto &shred_vec = jsono::JsonoShredVector(input, f);
-		shred_vec.ToUnifiedFormat(count, lane.fmt);
-		lane.kind = ClassifyShredKind(shreds[f].second);
-		switch (lane.kind) {
-		case ShredKind::Scalar:
-			lane.scalar_kind = jsono::JsonoScalarPrimitiveFromType(shreds[f].second, "jsono shred lane reader");
-			break;
-		case ShredKind::Array: {
-			auto &element_struct = ListVector::GetEntry(shred_vec);
-			auto element_count = ListVector::GetListSize(shred_vec);
-			auto &subfield_vecs = StructVector::GetEntries(element_struct);
-			auto &element_fields = StructType::GetChildTypes(ListType::GetChildType(shreds[f].second));
-			lane.sub_fmt.resize(subfield_vecs.size());
-			lane.sub_kind.resize(subfield_vecs.size());
-			for (idx_t j = 0; j < subfield_vecs.size(); j++) {
-				subfield_vecs[j]->ToUnifiedFormat(element_count, lane.sub_fmt[j]);
-				lane.sub_kind[j] =
-				    jsono::JsonoScalarPrimitiveFromType(element_fields[j].second, "jsono shred lane reader");
-			}
-			break;
-		}
-		case ShredKind::ScalarArray: {
-			// One element value lane (the list child vector) stored at index 0, so the per-element
-			// byte sum and the entries expansion treat it as a single-column array.
-			auto element_count = ListVector::GetListSize(shred_vec);
-			lane.sub_fmt.resize(1);
-			lane.sub_kind.resize(1);
-			ListVector::GetEntry(shred_vec).ToUnifiedFormat(element_count, lane.sub_fmt[0]);
-			lane.sub_kind[0] = jsono::JsonoScalarPrimitiveFromType(ListType::GetChildType(shreds[f].second),
-			                                                       "jsono shred lane reader");
-			break;
-		}
-		}
+		InitShredLane(jsono::JsonoShredVector(input, f), count, shreds[f].second, lanes[f]);
 	}
 }
 

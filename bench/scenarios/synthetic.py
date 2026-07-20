@@ -757,6 +757,19 @@ SCENARIOS += [
     for shape in TYPED_STRUCT_OPTIMIZATION_SHAPES
 ]
 
+SCENARIOS += [
+    {
+        "operation": operation,
+        "scenario": shape,
+        "typed_shape": shape,
+        "size": "1M",
+        "row_count": 1_000_000,
+        "targets": ["jsono"],
+    }
+    for operation in ("render_struct_json", "render_struct_plain_json")
+    for shape in ("typed_scalar_array", "typed_object_array")
+]
+
 # Same flatten over a products-shredded input — the production event_properties shape. whole_json
 # here goes through reconstruct-to-plain (the shredded read path), so the shredded-vs-plain gap is
 # the reconstruct cost. Paired indexed control reads the LIST<STRUCT> lanes element-by-element.

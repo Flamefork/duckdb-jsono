@@ -70,6 +70,8 @@ def case_uses_data_path(scenario_config: dict) -> bool:
         "parse_struct_plain",
         "parse_struct_roundtrip",
         "parse_struct_json_roundtrip",
+        "render_struct_json",
+        "render_struct_plain_json",
     }:
         return "struct_spec" in scenario_config
     return True
@@ -564,6 +566,40 @@ def build_jsono_parse_struct_json_roundtrip_query(
             CREATE OR REPLACE TEMP TABLE _bench_out AS
             SELECT jsono(to_json(payload)) AS r
             FROM _bench_struct_in
+        """,
+    )
+
+
+def build_jsono_render_struct_query(
+    scenario_config: dict, data_path: Path, plain: bool
+) -> BenchmarkQuery:
+    value_sql = (
+        """
+        CAST(payload AS STRUCT(jsono STRUCT(body STRUCT(
+            slots BLOB,
+            key_heap BLOB,
+            string_heap BLOB,
+            skips BLOB,
+            lengths BLOB,
+            nums BLOB
+        ))))
+        """
+        if plain
+        else "jsono(payload)"
+    )
+    return BenchmarkQuery(
+        prepare_sql=(
+            jsono_prepare_typed_struct(scenario_config, data_path),
+            f"""
+            CREATE OR REPLACE TEMP TABLE _bench_jsono_in AS
+            SELECT {value_sql} AS v
+            FROM _bench_struct_in
+            """,
+        ),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT to_json(v) AS r
+            FROM _bench_jsono_in
         """,
     )
 
@@ -1304,6 +1340,14 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_parse_struct_json_roundtrip_query(
                 scenario_config, data_path
             )
+        case "render_struct_json":
+            return build_jsono_render_struct_query(
+                scenario_config, data_path, plain=False
+            )
+        case "render_struct_plain_json":
+            return build_jsono_render_struct_query(
+                scenario_config, data_path, plain=True
+            )
         case "object_jsono":
             return build_jsono_object_jsono_query(scenario_config, data_path)
         case "object_json":
@@ -1624,6 +1668,18 @@ def collect_struct_constructor_checksum(
     }
 
 
+def collect_json_render_checksum(conn: duckdb.DuckDBPyConnection) -> dict:
+    row = conn.execute("""
+        SELECT count(*), sum(hash(r))::VARCHAR, sum(length(r))
+        FROM _bench_out
+        """).fetchone()
+    return {
+        "rows": row[0],
+        "hash_sum": row[1],
+        "json_bytes": row[2],
+    }
+
+
 def target_metadata(target: Target) -> dict:
     build_type = "unknown"
     path_text = str(target.extension_path)
@@ -1713,6 +1769,8 @@ def run_benchmarks(
                 result_checksum = None
                 if operation in {"parse_struct", "parse_struct_plain"}:
                     result_checksum = collect_struct_constructor_checksum(conn)
+                elif operation in {"render_struct_json", "render_struct_plain_json"}:
+                    result_checksum = collect_json_render_checksum(conn)
                 rows_per_second = None
                 if row_count is not None and timing["min_ms"] > 0:
                     rows_per_second = round(row_count / (timing["min_ms"] / 1000))

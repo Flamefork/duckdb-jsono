@@ -5,8 +5,10 @@
 #include "jsono_memory.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
 #include "jsono_shred.hpp"
+#include "jsono_shred_read.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/types.hpp"
@@ -1108,6 +1110,254 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		out_builder.Reset();
 		MergeTwoObjects(residual_view, JsonoCursor(), patch_view, JsonoCursor(), out_builder, MergeMode::Overlay, 0);
 		finish_row(row, out_builder);
+	}
+}
+
+struct DirectListJsonShred {
+	string key;
+	vector<string> subfield_names;
+	vector<idx_t> sorted_subfields;
+	ShredLane lane;
+};
+
+void AppendDirectListLaneValue(const UnifiedVectorFormat &fmt, idx_t idx, JsonoScalarPrimitive kind, std::string &out) {
+	AppendScalarJsonText(JsonoScalarFromPrimitiveVector(kind, fmt, idx), out);
+}
+
+void AppendDirectObjectArrayElement(const JsonoView &view, JsonoCursor &cursor, const DirectListJsonShred &shred,
+                                    idx_t child, std::string &out, size_t depth) {
+	auto layout = ReadObjectLayout(view, cursor.pos);
+	JsonoCursor residual = cursor;
+	residual.pos = layout.value_start;
+	auto struct_idx = shred.lane.struct_fmt.sel->get_index(child);
+	bool struct_present = shred.lane.struct_fmt.validity.RowIsValid(struct_idx);
+	idx_t residual_field = 0;
+	idx_t lane_field = 0;
+	idx_t emitted = 0;
+	out.push_back('{');
+	while (residual_field < layout.key_count || lane_field < shred.sorted_subfields.size()) {
+		while (lane_field < shred.sorted_subfields.size()) {
+			auto field = shred.sorted_subfields[lane_field];
+			auto sub_idx = shred.lane.sub_fmt[field].sel->get_index(child);
+			if (struct_present && shred.lane.sub_fmt[field].validity.RowIsValid(sub_idx)) {
+				break;
+			}
+			lane_field++;
+		}
+		if (residual_field >= layout.key_count && lane_field >= shred.sorted_subfields.size()) {
+			break;
+		}
+
+		nonstd::string_view residual_key;
+		if (residual_field < layout.key_count) {
+			auto key_slot = view.SlotAt(layout.key_start + residual_field);
+			if (SlotTag(key_slot) != tag::KEY) {
+				throw InvalidInputException("malformed JSONO: object key slot expected");
+			}
+			residual_key = view.KeyAt(SlotPayload(key_slot));
+		}
+		int cmp = 1;
+		if (lane_field >= shred.sorted_subfields.size()) {
+			cmp = -1;
+		} else if (residual_field < layout.key_count) {
+			auto field = shred.sorted_subfields[lane_field];
+			auto &lane_key = shred.subfield_names[field];
+			cmp = CompareJsonoKeys(residual_key, nonstd::string_view(lane_key.data(), lane_key.size()));
+		}
+
+		if (emitted++) {
+			out.push_back(',');
+		}
+		if (cmp <= 0) {
+			AppendJsonString(residual_key, out);
+			out.push_back(':');
+			AppendJsonValueText(view, residual, out, depth + 1);
+			residual_field++;
+			if (cmp == 0) {
+				lane_field++;
+			}
+			continue;
+		}
+
+		auto field = shred.sorted_subfields[lane_field++];
+		auto &lane_key = shred.subfield_names[field];
+		AppendJsonString(nonstd::string_view(lane_key.data(), lane_key.size()), out);
+		out.push_back(':');
+		auto sub_idx = shred.lane.sub_fmt[field].sel->get_index(child);
+		AppendDirectListLaneValue(shred.lane.sub_fmt[field], sub_idx, shred.lane.sub_kind[field], out);
+	}
+	if (residual.pos >= view.Slots() || SlotTag(view.SlotAt(residual.pos)) != tag::OBJ_END) {
+		throw InvalidInputException("malformed JSONO: object value span mismatch");
+	}
+	residual.pos++;
+	cursor = residual;
+	out.push_back('}');
+}
+
+void AppendDirectArrayOverlay(const JsonoView &view, JsonoCursor &cursor, const DirectListJsonShred &shred, idx_t row,
+                              std::string &out, size_t depth) {
+	auto end_pos = ReadArrayEndPos(view, cursor.pos);
+	out.push_back('[');
+	cursor.pos++;
+	auto list_idx = shred.lane.fmt.sel->get_index(row);
+	if (!shred.lane.fmt.validity.RowIsValid(list_idx)) {
+		idx_t element = 0;
+		while (cursor.pos < end_pos) {
+			if (element++) {
+				out.push_back(',');
+			}
+			AppendJsonValueText(view, cursor, out, depth + 1);
+		}
+		out.push_back(']');
+		cursor.pos = end_pos + 1;
+		return;
+	}
+
+	auto entry = UnifiedVectorFormat::GetData<list_entry_t>(shred.lane.fmt)[list_idx];
+	idx_t element = 0;
+	while (cursor.pos < end_pos) {
+		if (element >= entry.length) {
+			throw InvalidInputException("malformed JSONO: array shred list is shorter than the residual array "
+			                            "(a struct cast truncated it)");
+		}
+		if (element) {
+			out.push_back(',');
+		}
+		auto child = entry.offset + element;
+		if (shred.lane.kind == ShredKind::ScalarArray) {
+			auto &element_fmt = shred.lane.sub_fmt[0];
+			auto element_idx = element_fmt.sel->get_index(child);
+			if (element_fmt.validity.RowIsValid(element_idx)) {
+				AppendDirectListLaneValue(element_fmt, element_idx, shred.lane.sub_kind[0], out);
+				SkipValueFast(view, cursor);
+			} else {
+				AppendJsonValueText(view, cursor, out, depth + 1);
+			}
+		} else if (SlotTag(view.SlotAt(cursor.pos)) == tag::OBJ_START) {
+			AppendDirectObjectArrayElement(view, cursor, shred, child, out, depth + 1);
+		} else {
+			AppendJsonValueText(view, cursor, out, depth + 1);
+		}
+		element++;
+	}
+	if (element != entry.length) {
+		throw InvalidInputException("malformed JSONO: array shred list is longer than the residual array "
+		                            "(a struct cast altered it)");
+	}
+	out.push_back(']');
+	cursor.pos = end_pos + 1;
+}
+
+void AppendDirectTopLevelListJson(const JsonoView &view, const vector<DirectListJsonShred> &shreds, idx_t row,
+                                  std::string &out) {
+	JsonoCursor cursor;
+	if (SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+		AppendJsonValueText(view, cursor, out, 0);
+		return;
+	}
+
+	auto layout = ReadObjectLayout(view, 0);
+	cursor.pos = layout.value_start;
+	idx_t shred = 0;
+	out.push_back('{');
+	for (idx_t field = 0; field < layout.key_count; field++) {
+		auto key_slot = view.SlotAt(layout.key_start + field);
+		if (SlotTag(key_slot) != tag::KEY) {
+			throw InvalidInputException("malformed JSONO: object key slot expected");
+		}
+		auto key = view.KeyAt(SlotPayload(key_slot));
+		while (shred < shreds.size() &&
+		       CompareJsonoKeys(nonstd::string_view(shreds[shred].key.data(), shreds[shred].key.size()), key) < 0) {
+			shred++;
+		}
+		if (field) {
+			out.push_back(',');
+		}
+		AppendJsonString(key, out);
+		out.push_back(':');
+		bool overlays =
+		    shred < shreds.size() &&
+		    CompareJsonoKeys(nonstd::string_view(shreds[shred].key.data(), shreds[shred].key.size()), key) == 0 &&
+		    SlotTag(view.SlotAt(cursor.pos)) == tag::ARR_START;
+		if (overlays) {
+			AppendDirectArrayOverlay(view, cursor, shreds[shred], row, out, 1);
+			shred++;
+		} else {
+			AppendJsonValueText(view, cursor, out, 1);
+		}
+	}
+	if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
+		throw InvalidInputException("malformed JSONO: object value span mismatch");
+	}
+	out.push_back('}');
+}
+
+void RenderShreddedListsToJsonImpl(Vector &input, idx_t count, Vector &result) {
+	JsonoLayoutType layout;
+	if (!TryParseJsonoLayoutType(input.GetType(), layout) || layout.shreds.empty()) {
+		throw InternalException("__jsono_shredded_lists_to_json requires a shredded JSONO input");
+	}
+
+	vector<idx_t> scalar_shreds;
+	vector<DirectListJsonShred> list_shreds;
+	for (idx_t f = 0; f < layout.shreds.size(); f++) {
+		auto &shred_type = layout.shreds[f].second;
+		if (!IsShredListType(shred_type)) {
+			scalar_shreds.push_back(f);
+			continue;
+		}
+		auto steps = ShredNamePath(layout.shreds[f].first, "__jsono_shredded_lists_to_json");
+		if (steps.size() != 1 || steps[0].kind != PathStepKind::Key) {
+			throw InternalException("__jsono_shredded_lists_to_json requires top-level list shred paths");
+		}
+		DirectListJsonShred shred;
+		shred.key = std::move(steps[0].key);
+		if (IsShredArrayType(shred_type)) {
+			for (auto &field : StructType::GetChildTypes(ListType::GetChildType(shred_type))) {
+				shred.subfield_names.push_back(field.first);
+			}
+			shred.sorted_subfields.resize(shred.subfield_names.size());
+			for (idx_t field = 0; field < shred.sorted_subfields.size(); field++) {
+				shred.sorted_subfields[field] = field;
+			}
+			std::sort(shred.sorted_subfields.begin(), shred.sorted_subfields.end(),
+			          [&](idx_t a, idx_t b) { return shred.subfield_names[a] < shred.subfield_names[b]; });
+		}
+		InitShredLane(JsonoShredVector(input, f), count, shred_type, shred.lane);
+		list_shreds.push_back(std::move(shred));
+	}
+	std::sort(list_shreds.begin(), list_shreds.end(),
+	          [](const DirectListJsonShred &a, const DirectListJsonShred &b) { return a.key < b.key; });
+	for (idx_t f = 1; f < list_shreds.size(); f++) {
+		if (list_shreds[f - 1].key == list_shreds[f].key) {
+			throw InternalException("__jsono_shredded_lists_to_json requires unique list shred paths");
+		}
+	}
+
+	Vector scalar_plain(JsonoType(), count);
+	Vector *source = &input;
+	if (!scalar_shreds.empty()) {
+		JsonoOverlayShredsToPlain(input, count, scalar_shreds, scalar_plain);
+		source = &scalar_plain;
+	}
+	JsonoRowReader reader;
+	reader.Init(*source, count);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data = FlatVector::GetData<string_t>(result);
+	std::string out;
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob;
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		out.clear();
+		AppendDirectTopLevelListJson(view, list_shreds, row, out);
+		result_data[row] = StringVector::AddString(result, out.data(), out.size());
+	}
+	if (input.GetVectorType() == VectorType::CONSTANT_VECTOR && count > 0) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
 }
 
@@ -4813,6 +5063,10 @@ void JsonoReconstructToPlain(Vector &input, idx_t count, Vector &result) {
 // the target type drops back into the residual without materializing the full document.
 void JsonoOverlayShredsToPlain(Vector &input, idx_t count, const vector<idx_t> &shreds, Vector &result) {
 	ReconstructShreddedToPlainImpl(input, count, result, &shreds);
+}
+
+void JsonoRenderShreddedListsToJson(Vector &input, idx_t count, Vector &result) {
+	RenderShreddedListsToJsonImpl(input, count, result);
 }
 
 // The residual-emit core (defined below, after the array-skeleton helpers it dispatches to):
