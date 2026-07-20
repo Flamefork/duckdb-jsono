@@ -928,7 +928,13 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			array_shreds.push_back(std::move(ars));
 			continue;
 		}
-		shreds.push_back(ReconShred {i, layout.shreds[i].second, std::move(steps)});
+		auto duplicate = std::find_if(shreds.begin(), shreds.end(),
+		                              [&](const ReconShred &shred) { return PathStepsEqual(shred.steps, steps); });
+		if (duplicate != shreds.end()) {
+			*duplicate = ReconShred {i, layout.shreds[i].second, std::move(steps)};
+		} else {
+			shreds.push_back(ReconShred {i, layout.shreds[i].second, std::move(steps)});
+		}
 	}
 	std::sort(shreds.begin(), shreds.end(), [](const ReconShred &a, const ReconShred &b) {
 		auto n = std::min(a.steps.size(), b.steps.size());

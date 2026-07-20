@@ -13,6 +13,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -115,9 +116,8 @@ struct JsonoStructBindData : public FunctionData {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		// shreds must travel with the copy: the optimizer's shredded reconstruction copies the
-		// constructor expression, and a copy that loses its shreds would take the plain path yet
-		// still allocate the shredded return type, leaving the shred children uninitialized.
+		// A copy that loses its shreds would take the plain path yet still allocate the shredded
+		// return type, leaving the shred children uninitialized.
 		auto copy = make_uniq<JsonoStructBindData>(plan);
 		copy->shreds = shreds;
 		copy->one_pass_shred = one_pass_shred;
@@ -144,6 +144,44 @@ struct JsonoStructCastData : public BoundCastData {
 	unique_ptr<BoundCastData> Copy() const override {
 		return make_uniq<JsonoStructCastData>(plan,
 		                                      source_cast ? make_uniq<BoundCastInfo>(source_cast->Copy()) : nullptr);
+	}
+};
+
+struct JsonoShredPatchNode {
+	idx_t shred = DConstants::INVALID_INDEX;
+	vector<pair<string, JsonoShredPatchNode>> children;
+
+	JsonoShredPatchNode &Child(const string &key) {
+		for (auto &child : children) {
+			if (child.first == key) {
+				return child.second;
+			}
+		}
+		children.emplace_back(key, JsonoShredPatchNode {});
+		return children.back().second;
+	}
+};
+
+struct JsonoShredPatchBindData : public FunctionData {
+	LogicalType input_type;
+	LogicalType patch_type;
+	JsonoShredPatchNode root;
+	JsonoStructPlan plan;
+	unique_ptr<BoundCastInfo> patch_cast;
+
+	JsonoShredPatchBindData(LogicalType input_type_p, LogicalType patch_type_p, JsonoShredPatchNode root_p,
+	                        JsonoStructPlan plan_p, unique_ptr<BoundCastInfo> patch_cast_p)
+	    : input_type(std::move(input_type_p)), patch_type(std::move(patch_type_p)), root(std::move(root_p)),
+	      plan(std::move(plan_p)), patch_cast(std::move(patch_cast_p)) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<JsonoShredPatchBindData>(input_type, patch_type, root, plan,
+		                                          patch_cast ? make_uniq<BoundCastInfo>(patch_cast->Copy()) : nullptr);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		return input_type == other_p.Cast<JsonoShredPatchBindData>().input_type;
 	}
 };
 
@@ -179,6 +217,18 @@ struct JsonoStructLocalState : public FunctionLocalState {
 			}
 		}
 		return std::move(state);
+	}
+
+	static unique_ptr<FunctionLocalState> InitShredPatch(ExpressionState &state, const BoundFunctionExpression &expr,
+	                                                     FunctionData *bind_data) {
+		(void)expr;
+		auto result = make_uniq<JsonoStructLocalState>();
+		auto &patch_data = bind_data->Cast<JsonoShredPatchBindData>();
+		if (patch_data.patch_cast && patch_data.patch_cast->init_local_state) {
+			CastLocalStateParameters parameters(state.GetContext(), patch_data.patch_cast->cast_data);
+			result->source_cast_state = patch_data.patch_cast->init_local_state(parameters);
+		}
+		return std::move(result);
 	}
 };
 
@@ -1222,6 +1272,97 @@ void ExecuteStructConstructor(Vector &input, idx_t count, Vector &result, const 
 	}
 }
 
+LogicalType ShredPatchType(const JsonoShredPatchNode &node, const JsonoLayoutType &layout) {
+	child_list_t<LogicalType> children;
+	children.reserve(node.children.size());
+	for (auto &child : node.children) {
+		if (child.second.children.empty()) {
+			children.emplace_back(child.first, layout.shreds[child.second.shred].second);
+		} else {
+			children.emplace_back(child.first, ShredPatchType(child.second, layout));
+		}
+	}
+	return LogicalType::STRUCT(std::move(children));
+}
+
+void ReferenceShredPatch(Vector &patch, Vector &input, const JsonoShredPatchNode &node) {
+	auto &patch_children = StructVector::GetEntries(patch);
+	for (idx_t i = 0; i < node.children.size(); i++) {
+		auto &child = node.children[i].second;
+		if (child.children.empty()) {
+			patch_children[i]->Reference(JsonoShredVector(input, child.shred));
+		} else {
+			ReferenceShredPatch(*patch_children[i], input, child);
+		}
+	}
+}
+
+unique_ptr<FunctionData> JsonoShredPatchBind(ClientContext &context, ScalarFunction &bound_function,
+                                             vector<unique_ptr<Expression>> &arguments) {
+	auto input_type = arguments[0]->return_type;
+	JsonoLayoutType layout;
+	if (!TryParseJsonoLayoutType(input_type, layout) || layout.shreds.empty()) {
+		throw InternalException("__jsono_shred_patch requires a shredded JSONO input");
+	}
+	JsonoShredPatchNode root;
+	for (idx_t i = 0; i < layout.shreds.size(); i++) {
+		if (IsShredListType(layout.shreds[i].second)) {
+			throw InternalException("__jsono_shred_patch does not accept list shreds");
+		}
+		auto steps = ShredNamePath(layout.shreds[i].first, "__jsono_shred_patch");
+		auto *node = &root;
+		for (auto &step : steps) {
+			if (step.kind != PathStepKind::Key) {
+				throw InternalException("__jsono_shred_patch requires object-key shred paths");
+			}
+			if (node->shred != DConstants::INVALID_INDEX) {
+				throw InternalException("__jsono_shred_patch does not accept prefix-overlapping shreds");
+			}
+			node = &node->Child(step.key);
+		}
+		if (!node->children.empty()) {
+			throw InternalException("__jsono_shred_patch does not accept prefix-overlapping shreds");
+		}
+		node->shred = i;
+	}
+	auto patch_type = ShredPatchType(root, layout);
+	auto plan = BuildStructConstructorPlan(patch_type, "__jsono_shred_patch");
+	idx_t next_key_cache_index = 0;
+	AssignStructConstructorKeyCacheIndexes(plan, next_key_cache_index);
+	unique_ptr<BoundCastInfo> patch_cast;
+	if (patch_type != plan.bound_type) {
+		GetCastFunctionInput cast_input(context);
+		patch_cast = make_uniq<BoundCastInfo>(
+		    CastFunctionSet::Get(context).GetCastFunction(patch_type, plan.bound_type, cast_input));
+	}
+	bound_function.arguments[0] = input_type;
+	return make_uniq<JsonoShredPatchBindData>(std::move(input_type), std::move(patch_type), std::move(root),
+	                                          std::move(plan), std::move(patch_cast));
+}
+
+void JsonoShredPatchExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoStructLocalState>();
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoShredPatchBindData>();
+	auto count = args.size();
+	Vector patch(bind_data.patch_type, count);
+	ReferenceShredPatch(patch, args.data[0], bind_data.root);
+	Vector *constructor_input = &patch;
+	unique_ptr<Vector> casted;
+	if (bind_data.patch_cast) {
+		casted = make_uniq<Vector>(bind_data.plan.bound_type, count);
+		CastParameters parameters(bind_data.patch_cast->cast_data.get(), false, nullptr,
+		                          lstate.source_cast_state.get());
+		if (!bind_data.patch_cast->function(patch, *casted, count, parameters)) {
+			throw InternalException("__jsono_shred_patch cast failed");
+		}
+		constructor_input = casted.get();
+	}
+	ExecuteStructConstructor(*constructor_input, count, result, bind_data.plan, lstate);
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
 // Append `key` to a JSON path under `$`, quoting it when it carries a character ParseJsonoPath
 // would otherwise treat as structural (a bare `.foo` step only spans up to the next . [ ] ").
 void AppendShredPathStep(string &path, const string &key) {
@@ -1373,8 +1514,9 @@ void DropCollidingAutoShreds(vector<pair<string, LogicalType>> &shreds) {
 	shreds = std::move(kept);
 }
 
-unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
-                                               vector<unique_ptr<Expression>> &arguments, bool allow_shred) {
+unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction &bound_function,
+                                         vector<unique_ptr<Expression>> &arguments) {
+	(void)context;
 	auto &input_type = arguments[0]->return_type;
 	auto plan = BuildStructConstructorPlan(input_type, "jsono()");
 	idx_t next_key_cache_index = 0;
@@ -1391,7 +1533,7 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 	// are per-row data, a LIST root is not an object, and a jsono root is a document the constructor
 	// copies through — all three construct plain jsono. The plan's strategy is the authority here,
 	// since a jsono value is physically a STRUCT too.
-	if (allow_shred && bind_data->plan.strategy == StructValueStrategy::Struct) {
+	if (bind_data->plan.strategy == StructValueStrategy::Struct) {
 		CollectAutoShreds(input_type, string(), 1, bind_data->shreds);
 		DropCollidingAutoShreds(bind_data->shreds);
 	}
@@ -1447,20 +1589,6 @@ unique_ptr<FunctionData> JsonoStructBindShared(ScalarFunction &bound_function,
 		}
 	}
 	return std::move(bind_data);
-}
-
-unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction &bound_function,
-                                         vector<unique_ptr<Expression>> &arguments) {
-	return JsonoStructBindShared(bound_function, arguments, true);
-}
-
-// The optimizer's shredded reconstruction builds a JSONO patch via JsonoStructConstructorFunction;
-// that patch must stay plain JSONO so the overlay merges plain residual + plain patch. This bind
-// forces shred off (the patch's top-level fields are shred-typed scalars, which the always-on
-// auto-shred would otherwise lift back into shreds and break the overlay).
-unique_ptr<FunctionData> JsonoStructBindPlain(ClientContext &context, ScalarFunction &bound_function,
-                                              vector<unique_ptr<Expression>> &arguments) {
-	return JsonoStructBindShared(bound_function, arguments, false);
 }
 
 // Typed reads for one shred column: the value copies straight from the input child vector
@@ -1818,12 +1946,9 @@ BoundCastInfo JsonoStructCastBind(BindCastInput &input, const LogicalType &sourc
 
 } // namespace
 
-// The bare jsono(STRUCT) constructor overload, exposed so the optimizer's shredded
-// reconstruction can build a JSONO patch from the shred columns without a catalog
-// lookup. Mirrors the single-argument overload registered below.
-ScalarFunction JsonoStructConstructorFunction() {
-	ScalarFunction fun("jsono", {LogicalTypeId::STRUCT}, JsonoType(), JsonoStructExecute, JsonoStructBindPlain, nullptr,
-	                   nullptr, JsonoStructLocalState::Init);
+ScalarFunction JsonoShreddedPatchFunction(const LogicalType &input_type) {
+	ScalarFunction fun("__jsono_shred_patch", {input_type}, JsonoType(), JsonoShredPatchExecute, JsonoShredPatchBind,
+	                   nullptr, nullptr, JsonoStructLocalState::InitShredPatch);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 	return fun;

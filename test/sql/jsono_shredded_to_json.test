@@ -1,0 +1,113 @@
+# name: test/sql/jsono_shredded_to_json.test
+# description: Shredded to_json reconstruction is byte-identical to the plain JSONO render
+# group: [sql]
+
+require jsono
+
+require json
+
+# Generated scalar-lane corpus, checked in both EXCEPT directions.
+statement ok
+CREATE TABLE corpus AS
+SELECT i, json_object(
+    'a', i,
+    'b', CASE WHEN i % 3 = 0 THEN NULL ELSE i + 1 END,
+    'nested', json_object('x', i + 2, 'residual', i + 3),
+    'tail', json_array(i, i + 1)
+)::VARCHAR AS doc
+FROM range(128) t(i);
+
+query I
+SELECT count(*) FROM (
+    (SELECT i, to_json(jsono(doc, shredding := {
+         'a': 'BIGINT', 'b': 'BIGINT', '$.nested.x': 'BIGINT'})) AS rendered
+     FROM corpus
+     EXCEPT
+     SELECT i, to_json(jsono(doc)) AS rendered FROM corpus)
+    UNION ALL
+    (SELECT i, to_json(jsono(doc)) AS rendered FROM corpus
+     EXCEPT
+     SELECT i, to_json(jsono(doc, shredding := {
+         'a': 'BIGINT', 'b': 'BIGINT', '$.nested.x': 'BIGINT'})) AS rendered
+     FROM corpus)
+);
+----
+0
+
+# The rewrite stays constant-size: all scalar lanes feed one typed patch constructor node.
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT to_json(jsono(doc, shredding := {
+    'a': 'BIGINT', 'b': 'BIGINT', '$.nested.x': 'BIGINT'}))
+FROM corpus;
+----
+physical_plan	<REGEX>:.*__jsono_shred_patch.*
+
+# The typed patch preserves every scalar shred kind, including UBIGINT's constructor-side
+# conversion to canonical number text.
+query I
+SELECT to_json(jsono(
+    '{"s":"x","i":-7,"u":18446744073709551615,"d":1.25,"b":true,"tail":0}',
+    shredding := {'s':'VARCHAR','i':'BIGINT','u':'UBIGINT','d':'DOUBLE','b':'BOOLEAN'}))
+    = to_json(jsono('{"s":"x","i":-7,"u":18446744073709551615,"d":1.25,"b":true,"tail":0}'));
+----
+true
+
+# SQL NULL stays SQL NULL.
+query I
+SELECT to_json(jsono(NULL::VARCHAR, shredding := {'a': 'BIGINT'})) IS NULL;
+----
+true
+
+# A value that cannot enter its typed lane stays authoritative in the residual.
+query I
+SELECT to_json(jsono('{"a":"not-an-integer","tail":1}', shredding := {'a': 'BIGINT'}))
+     = to_json(jsono('{"a":"not-an-integer","tail":1}'));
+----
+true
+
+# Set-operation widening NULL-fills the absent lane while that branch keeps the value in residual.
+query I
+WITH widened AS (
+    SELECT jsono('{"a":1,"b":2}', shredding := {'a': 'BIGINT'}) AS j
+    UNION ALL
+    SELECT jsono('{"a":3,"b":4}', shredding := {'b': 'BIGINT'}) AS j
+)
+SELECT count(*) FROM widened
+WHERE to_json(j) NOT IN ('{"a":1,"b":2}'::JSON, '{"a":3,"b":4}'::JSON);
+----
+0
+
+# Equivalent path spellings collapse to one logical reconstructed path.
+query I
+SELECT to_json(jsono('{"a":7,"tail":8}', shredding := {'a': 'BIGINT', '$.a': 'BIGINT'}))
+     = to_json(jsono('{"a":7,"tail":8}'));
+----
+true
+
+# Nested lanes refill only their stripped leaves; residual siblings remain authoritative.
+query I
+SELECT to_json(jsono('{"a":{"x":1,"y":2},"b":3}',
+                     shredding := {'$.a.x': 'BIGINT', '$.b': 'BIGINT'}))
+     = to_json(jsono('{"a":{"x":1,"y":2},"b":3}'));
+----
+true
+
+# The reserved physical marker name remains an ordinary JSON key in the logical value.
+query I
+SELECT to_json(jsono('{"$jsono$set":9,"a":1}', shredding := {'a': 'BIGINT'}))
+     = to_json(jsono('{"$jsono$set":9,"a":1}'));
+----
+true
+
+# List shreds and strictly-overlapping paths already use full reconstruction and retain parity.
+query II
+SELECT to_json(jsono('{"items":[1,2,3],"tail":4}', shredding := {'$.items': 'BIGINT[]'}))
+     = to_json(jsono('{"items":[1,2,3],"tail":4}')),
+       to_json(jsono('{"a":{"x":1},"tail":2}',
+                     shredding := {'a': 'VARCHAR', '$.a.x': 'BIGINT'}))
+     = to_json(jsono('{"a":{"x":1},"tail":2}'));
+----
+true	true

@@ -63,9 +63,9 @@
 
 namespace duckdb {
 
-// Exposed jsono function factories used to build the shredded reconstruction patch
+// Exposed jsono function factories used to build the constant-node reconstruction
 // and to read non-shred paths natively off the residual.
-ScalarFunction JsonoStructConstructorFunction();
+ScalarFunction JsonoShreddedPatchFunction(const LogicalType &input_type);
 ScalarFunction JsonoOverlayFunction();
 ScalarFunction JsonoCheckedResidualFunction();
 ScalarFunction JsonoStripManifestFunction();
@@ -1475,9 +1475,9 @@ bool RewriteProjectionProjector(OptimizerExtensionInput &input, LogicalProjectio
 //   - `->>`/json_extract_string on a shred path -> struct_extract of the shred column.
 //     The shred already holds the extracted text, so this skips the JSONO parse and
 //     lets projection/row-group pruning act on the shred column directly.
-//   - any CAST(shredded->JSON) and to_json(shredded) -> reinterpret(col->JSONO)::JSON,
-//     which reconstructs the authoritative value from the six-blob prefix. Because a
-//     non-shred extract's inner cast is rewritten too, correctness never depends on a
+//   - any CAST(shredded->JSON) and to_json(shredded) -> reconstruct(col->JSONO)::JSON,
+//     which reconstructs the authoritative value from the residual and shreds. Because
+//     a non-shred extract's inner cast is rewritten too, correctness never depends on a
 //     path being shredded; shreds are purely a fast path.
 //===--------------------------------------------------------------------===//
 
@@ -1524,24 +1524,6 @@ bool ReadNeedsReconstruct(const vector<PathStep> &read, const JsonoShred &shred,
 	}
 	return PathStepsObjectKeyPrefix(read, shred.steps) || ReadDescendsIntoArrayShred(shred.type, shred.steps, read);
 }
-
-// A node in the shred reconstruction patch. Shreds are inserted by their path so the patch
-// rebuilds the original nesting as a struct_pack tree; a leaf (no children) carries the
-// shred's struct child index, a group carries nested keys.
-struct ShredPatchNode {
-	idx_t child_index = 0;
-	vector<pair<string, ShredPatchNode>> children;
-
-	ShredPatchNode &Child(const string &key) {
-		for (auto &entry : children) {
-			if (entry.first == key) {
-				return entry.second;
-			}
-		}
-		children.emplace_back(key, ShredPatchNode {});
-		return children.back().second;
-	}
-};
 
 // Align a per-file statistics object to the (merged) read type by struct-child NAME, recursively:
 // a child the file lacks — or whose type diverges from the read type — contributes fully unknown
@@ -2428,43 +2410,12 @@ private:
 		    [](unique_ptr<Expression> fallback_text) { return fallback_text; }, alias);
 	}
 
-	// Build the shred patch as a nested struct_pack tree mirroring each shred's path: a leaf
-	// reads its shred column, a group packs its nested keys. jsono_struct_constructor turns
-	// it into a JSONO patch for the overlay.
-	unique_ptr<Expression> BuildPatchStruct(Expression &column, const vector<pair<string, ShredPatchNode>> &children) {
-		FunctionBinder function_binder(context);
-		vector<unique_ptr<Expression>> pack_children;
-		for (auto &entry : children) {
-			unique_ptr<Expression> value;
-			if (entry.second.children.empty()) {
-				value = ShredExtract(column, entry.second.child_index);
-			} else {
-				value = BuildPatchStruct(column, entry.second.children);
-			}
-			value->SetAlias(entry.first);
-			pack_children.push_back(std::move(value));
-		}
-		return function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(pack_children));
-	}
-
-	// Reconstruct the full JSONO value as JSON by overlaying the shreds onto the residual:
-	// the residual is authoritative and each shred only fills a path the residual dropped
-	// (jsono_overlay deep-merges, so nested shreds refill nested leaves). Correct whether or not
-	// a path was stripped — a path still present in the residual makes its shred a no-op; a
-	// stripped path is refilled from its shred. Index/array shreds are never stripped,
-	// so they stay in the residual and sit out the patch; with no object-key shreds the
-	// overlay is skipped.
+	// Reconstruct with a constant-size expression tree. The patch function receives the shredded
+	// column once and executes the bind-time typed constructor plan internally; list and
+	// prefix-overlapping shapes use the general reconstruct cast.
 	unique_ptr<Expression> ReconstructShreddedToJson(unique_ptr<Expression> column) {
+		auto alias = column->GetAlias();
 		auto shreds = CollectShreddedShreds(column->return_type);
-		// The struct_pack patch overlay below cannot represent two shred shapes, so fall back to the
-		// array-aware reconstruct cast (which applies each shred as an independent residual-authoritative
-		// overlay and so handles both): (1) an array shred (LIST<STRUCT>/LIST<scalar>) leaves a skeleton
-		// array in the residual the object-key patch would keep verbatim; (2) two object-key paths where
-		// one STRICTLY prefixes another (a scalar `a` and a nested `$.a.a`) — a patch node would be both a
-		// leaf and a group, so building the tree would silently drop the shorter shred. Equal-length
-		// overlapping paths (the duplicate-path spec `a` and `$.a`) are NOT a problem: they collapse to
-		// one patch node, which is the intended dedup. The cast propagates a NULL value through to a NULL
-		// JSON, so no struct_pack guard is needed.
 		bool needs_full_reconstruct = false;
 		for (idx_t i = 0; i < shreds.size() && !needs_full_reconstruct; i++) {
 			if (IsShredListType(shreds[i].type)) {
@@ -2480,52 +2431,31 @@ private:
 			}
 		}
 		if (needs_full_reconstruct) {
-			auto alias = column->GetAlias();
 			auto plain = BoundCastExpression::AddCastToType(context, std::move(column), JsonoType());
 			auto json = BoundCastExpression::AddCastToType(context, std::move(plain), LogicalType::JSON());
 			json->SetAlias(alias);
 			return json;
 		}
-		ShredPatchNode root;
-		for (auto &shred : shreds) {
-			bool object_key = !shred.steps.empty();
-			for (auto &step : shred.steps) {
-				if (step.kind != PathStepKind::Key) {
-					object_key = false;
-					break;
-				}
-			}
-			if (!object_key) {
-				continue;
-			}
-			auto *node = &root;
-			for (auto &step : shred.steps) {
-				node = &node->Child(step.key);
-			}
-			node->child_index = shred.child_index;
-		}
-		auto residual = ResidualReinterpret(*column);
-		if (root.children.empty()) {
-			// No object-key shreds to merge; the residual reinterpret already carries
-			// row validity, so a NULL value casts straight to a NULL JSON.
-			return BoundCastExpression::AddCastToType(context, std::move(residual), LogicalType::JSON());
-		}
+
 		FunctionBinder function_binder(context);
-		auto patch_struct = BuildPatchStruct(*column, root.children);
-		vector<unique_ptr<Expression>> ctor_children;
-		ctor_children.push_back(std::move(patch_struct));
-		auto patch = function_binder.BindScalarFunction(JsonoStructConstructorFunction(), std::move(ctor_children));
-		vector<unique_ptr<Expression>> merge_children;
-		merge_children.push_back(std::move(residual));
-		merge_children.push_back(std::move(patch));
-		auto merged = function_binder.BindScalarFunction(JsonoOverlayFunction(), std::move(merge_children));
-		auto merged_json = BoundCastExpression::AddCastToType(context, std::move(merged), LogicalType::JSON());
-		// struct_pack builds a non-null struct even when every field is NULL, so the
-		// merge would emit `{}` for a NULL value. Guard it: a NULL shredded value is NULL.
+		auto residual = ResidualReinterpret(*column);
 		auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
 		is_null->children.push_back(column->Copy());
+		auto patch_function = JsonoShreddedPatchFunction(column->return_type);
+		patch_function.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
+		patch_function.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+		vector<unique_ptr<Expression>> patch_children;
+		patch_children.push_back(std::move(column));
+		auto patch = function_binder.BindScalarFunction(std::move(patch_function), std::move(patch_children));
+		vector<unique_ptr<Expression>> overlay_children;
+		overlay_children.push_back(std::move(residual));
+		overlay_children.push_back(std::move(patch));
+		auto merged = function_binder.BindScalarFunction(JsonoOverlayFunction(), std::move(overlay_children));
+		auto json = BoundCastExpression::AddCastToType(context, std::move(merged), LogicalType::JSON());
 		auto null_json = make_uniq<BoundConstantExpression>(Value(LogicalType::JSON()));
-		return make_uniq<BoundCaseExpression>(std::move(is_null), std::move(null_json), std::move(merged_json));
+		auto result = make_uniq<BoundCaseExpression>(std::move(is_null), std::move(null_json), std::move(json));
+		result->SetAlias(alias);
+		return std::move(result);
 	}
 
 	ClientContext &context;

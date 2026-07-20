@@ -386,7 +386,7 @@ Whether a read hits a shred lane (fast, and row-group-prunable) or rebuilds the 
   - `__jsono_internal_project` — two or more residual extracts on the same column fused into one document walk.
 - **Reconstruct** — rebuilds the whole document (a 3–10× per-row cost):
   - `__jsono_reconstruct` — explicit (a `jsono_transform` field descending into an array shred).
-  - `jsono_overlay` — a whole-value read as JSON (`to_json`, `::JSON`).
+  - `jsono_overlay` / `__jsono_shred_patch` — a whole-value read as JSON (`to_json`, `::JSON`).
   - an anonymous `CAST(… AS STRUCT("jsono" …))` — `jsono_array_elements`, the collect aggregates, and `jsono_diff` when its lane-aware fast path declines.
 
 If a read you expect to be hot shows a residual/reconstruct token, shred the exact path (the plan says whether it *can* push down; [`jsono_shred_stats`](#jsono_shred_stats) says how well an existing lane actually serves it), then apply the [pruning rules](#jsonovalue-shredding) above (filter the typed shred in its own type; `ORDER BY` the hot leaf at write time). For reads across many Parquet files, pass `union_by_name := true` (see below) so the lane stays a bare, prunable `struct_extract_at` instead of a `COALESCE`.
