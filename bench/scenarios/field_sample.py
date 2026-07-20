@@ -66,6 +66,16 @@ FIELD_SAMPLE_SCENARIOS = [
         "targets": ["jsono"],
     },
     {
+        "operation": "parse_struct_plain",
+        "scenario": "field_sample_typed_core",
+        "size": "245760",
+        "row_count": FIELD_SAMPLE_ROW_COUNT,
+        "data_file": FIELD_SAMPLE_EVENTS_NESTED_PATH,
+        "json_column": "event_properties",
+        "struct_spec": FIELD_SAMPLE_STRUCT_CORE_SPEC,
+        "targets": ["jsono"],
+    },
+    {
         "operation": "parse_struct_roundtrip",
         "scenario": "field_sample_typed_core",
         "size": "245760",
@@ -107,6 +117,16 @@ FIELD_SAMPLE_SCENARIOS = [
     },
     {
         "operation": "parse_struct",
+        "scenario": "field_sample_typed_products",
+        "size": "245760",
+        "row_count": FIELD_SAMPLE_ROW_COUNT,
+        "data_file": FIELD_SAMPLE_EVENTS_NESTED_PATH,
+        "json_column": "event_properties",
+        "struct_spec": FIELD_SAMPLE_STRUCT_PRODUCTS_SPEC,
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "parse_struct_plain",
         "scenario": "field_sample_typed_products",
         "size": "245760",
         "row_count": FIELD_SAMPLE_ROW_COUNT,

@@ -62,7 +62,17 @@ def get_data_path(size: str, scenario_config: dict) -> Path:
 
 
 def case_uses_data_path(scenario_config: dict) -> bool:
-    return scenario_config["operation"] != "shape_plan_recovery_transform"
+    operation = scenario_config["operation"]
+    if operation == "shape_plan_recovery_transform":
+        return False
+    if operation in {
+        "parse_struct",
+        "parse_struct_plain",
+        "parse_struct_roundtrip",
+        "parse_struct_json_roundtrip",
+    }:
+        return "struct_spec" in scenario_config
+    return True
 
 
 def get_scenario_sizes(scenario_config: dict) -> list[str]:
@@ -306,20 +316,109 @@ def jsono_prepare_jsono_pair_with_group_and_key(
     """
 
 
-def typed_struct_payload_sql() -> str:
-    return """
-        struct_pack(
-            event_name := 'event_' || (i % 10)::VARCHAR,
-            event_ts := i,
-            score := i * 0.5,
-            ok := i % 2 = 0,
-            nested := struct_pack(
-                a := i,
-                b := 'x' || i::VARCHAR
-            ),
-            arr := [i, NULL, i + 1]
-        )
-    """
+def typed_struct_payload_sql(shape: str) -> str:
+    match shape:
+        case "nested_typed":
+            return """
+                struct_pack(
+                    event_name := 'event_' || (i % 10)::VARCHAR,
+                    event_ts := i,
+                    score := i * 0.5,
+                    ok := i % 2 = 0,
+                    nested := struct_pack(
+                        a := i,
+                        b := 'x' || i::VARCHAR
+                    ),
+                    arr := [i, NULL, i + 1]
+                )
+            """
+        case "typed_mixed_all":
+            return """
+                struct_pack(
+                    event_name := 'event_' || (i % 10)::VARCHAR,
+                    event_ts := i,
+                    score := i * 0.5,
+                    ok := i % 2 = 0,
+                    nested := struct_pack(
+                        a := i,
+                        b := 'x' || i::VARCHAR
+                    ),
+                    ids := [i, NULL, i + 1],
+                    products := [
+                        struct_pack(
+                            name := 'p' || (i % 100)::VARCHAR,
+                            quantity := (i % 5) + 1,
+                            price := (i % 100) * 0.5
+                        ),
+                        CASE
+                            WHEN i % 7 = 0 THEN NULL
+                            ELSE struct_pack(
+                                name := 'q' || (i % 50)::VARCHAR,
+                                quantity := (i % 3) + 1,
+                                price := (i % 70) * 0.25
+                            )
+                        END
+                    ]
+                )
+            """
+        case "typed_top_scalar":
+            return """
+                struct_pack(
+                    event_name := 'event_' || (i % 10)::VARCHAR,
+                    event_ts := i,
+                    score := i * 0.5,
+                    ok := i % 2 = 0
+                )
+            """
+        case "typed_scalar_array":
+            return """
+                struct_pack(
+                    event_name := 'event_' || (i % 10)::VARCHAR,
+                    event_ts := i,
+                    score := i * 0.5,
+                    ok := i % 2 = 0,
+                    ids := [i, NULL, i + 1]
+                )
+            """
+        case "typed_object_array":
+            return """
+                struct_pack(
+                    event_name := 'event_' || (i % 10)::VARCHAR,
+                    event_ts := i,
+                    score := i * 0.5,
+                    ok := i % 2 = 0,
+                    products := [
+                        struct_pack(
+                            name := 'p' || (i % 100)::VARCHAR,
+                            quantity := (i % 5) + 1,
+                            price := (i % 100) * 0.5
+                        ),
+                        CASE
+                            WHEN i % 7 = 0 THEN NULL
+                            ELSE struct_pack(
+                                name := 'q' || (i % 50)::VARCHAR,
+                                quantity := (i % 3) + 1,
+                                price := (i % 70) * 0.25
+                            )
+                        END
+                    ]
+                )
+            """
+        case "typed_nested_scalar":
+            return """
+                struct_pack(
+                    event_name := 'event_' || (i % 10)::VARCHAR,
+                    event_ts := i,
+                    score := i * 0.5,
+                    ok := i % 2 = 0,
+                    nested := struct_pack(
+                        a := i,
+                        b := 'x' || i::VARCHAR
+                    )
+                )
+            """
+        case _:
+            raise ValueError(f"unknown typed STRUCT benchmark shape: {shape}")
 
 
 def jsono_prepare_typed_struct(scenario_config: dict, data_path: Path) -> str:
@@ -342,7 +441,7 @@ def jsono_prepare_typed_struct(scenario_config: dict, data_path: Path) -> str:
     row_count = scenario_config["row_count"]
     return f"""
         CREATE OR REPLACE TEMP TABLE _bench_struct_in AS
-        SELECT {typed_struct_payload_sql()} AS payload
+        SELECT {typed_struct_payload_sql(scenario_config["typed_shape"])} AS payload
         FROM range({row_count}) t(i)
     """
 
@@ -402,6 +501,26 @@ def build_jsono_parse_struct_query(
         timed_sql="""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
             SELECT jsono(payload) AS r
+            FROM _bench_struct_in
+        """,
+    )
+
+
+def build_jsono_parse_struct_plain_query(
+    scenario_config: dict, data_path: Path
+) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT CAST(payload AS STRUCT(jsono STRUCT(body STRUCT(
+                slots BLOB,
+                key_heap BLOB,
+                string_heap BLOB,
+                skips BLOB,
+                lengths BLOB,
+                nums BLOB
+            )))) AS r
             FROM _bench_struct_in
         """,
     )
@@ -1161,6 +1280,8 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_parse_shred_query(scenario_config, data_path)
         case "parse_struct":
             return build_jsono_parse_struct_query(scenario_config, data_path)
+        case "parse_struct_plain":
+            return build_jsono_parse_struct_plain_query(scenario_config, data_path)
         case "parse_struct_roundtrip":
             return build_jsono_parse_struct_roundtrip_query(scenario_config, data_path)
         case "parse_struct_json_roundtrip":
@@ -1473,6 +1594,20 @@ def run_single_benchmark(
     }
 
 
+def collect_struct_constructor_checksum(
+    conn: duckdb.DuckDBPyConnection,
+) -> dict:
+    row = conn.execute("""
+        SELECT count(*), sum(hash(r))::VARCHAR, sum(length(to_json(r)))
+        FROM _bench_out
+        """).fetchone()
+    return {
+        "rows": row[0],
+        "hash_sum": row[1],
+        "json_bytes": row[2],
+    }
+
+
 def target_metadata(target: Target) -> dict:
     build_type = "unknown"
     path_text = str(target.extension_path)
@@ -1501,7 +1636,8 @@ def run_benchmarks(
 ) -> list[dict]:
     results = []
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    connections: dict[str, duckdb.DuckDBPyConnection] = {}
+    conn = None
+    active_target_label = None
 
     try:
         for target, size, scenario_config in cases_to_run:
@@ -1522,10 +1658,11 @@ def run_benchmarks(
 
             case_id = get_case_id(target, operation, size, scenario)
 
-            conn = connections.get(target.label)
-            if conn is None:
+            if target.label != active_target_label:
+                if conn is not None:
+                    conn.close()
                 conn = create_connection(target)
-                connections[target.label] = conn
+                active_target_label = target.label
 
             query = build_query(target, scenario_config, data_path)
             row_count = get_row_count(size, scenario_config)
@@ -1557,6 +1694,9 @@ def run_benchmarks(
                     )
 
                 timing = run_single_benchmark(conn, query, runs)
+                result_checksum = None
+                if operation in {"parse_struct", "parse_struct_plain"}:
+                    result_checksum = collect_struct_constructor_checksum(conn)
                 rows_per_second = None
                 if row_count is not None and timing["min_ms"] > 0:
                     rows_per_second = round(row_count / (timing["min_ms"] / 1000))
@@ -1600,10 +1740,11 @@ def run_benchmarks(
                         "rows_per_second": rows_per_second,
                         "output_bytes": output_bytes,
                         "row_groups": row_group_scans or None,
+                        "result_checksum": result_checksum,
                     }
                 )
     finally:
-        for conn in connections.values():
+        if conn is not None:
             conn.close()
 
     return results
@@ -1646,6 +1787,7 @@ def save_results_json(
                 "rows_per_second": r["rows_per_second"],
                 "output_bytes": r["output_bytes"],
                 "row_groups": r.get("row_groups"),
+                "result_checksum": r.get("result_checksum"),
             }
             for r in results
         ],

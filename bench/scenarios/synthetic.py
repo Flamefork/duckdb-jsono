@@ -66,6 +66,7 @@ SCENARIOS = [
     {
         "operation": "parse_struct",
         "scenario": "nested_typed",
+        "typed_shape": "nested_typed",
         "size": "100k",
         "row_count": 100_000,
         "targets": ["jsono"],
@@ -73,6 +74,7 @@ SCENARIOS = [
     {
         "operation": "parse_struct_roundtrip",
         "scenario": "nested_typed",
+        "typed_shape": "nested_typed",
         "size": "100k",
         "row_count": 100_000,
         "targets": ["jsono"],
@@ -80,6 +82,7 @@ SCENARIOS = [
     {
         "operation": "parse_struct_json_roundtrip",
         "scenario": "nested_typed",
+        "typed_shape": "nested_typed",
         "size": "100k",
         "row_count": 100_000,
         "targets": ["jsono"],
@@ -731,6 +734,26 @@ SCENARIOS += [
         ("indexed_elements", "ecom_indexed"),
         ("whole_json", "ecom_whole"),
     )
+]
+
+TYPED_STRUCT_OPTIMIZATION_SHAPES = (
+    "typed_top_scalar",
+    "typed_scalar_array",
+    "typed_object_array",
+    "typed_nested_scalar",
+    "typed_mixed_all",
+)
+SCENARIOS += [
+    {
+        "operation": operation,
+        "scenario": shape,
+        "typed_shape": shape,
+        "size": "1M",
+        "row_count": 1_000_000,
+        "targets": ["jsono"],
+    }
+    for operation in ("parse_struct", "parse_struct_plain")
+    for shape in TYPED_STRUCT_OPTIMIZATION_SHAPES
 ]
 
 # Same flatten over a products-shredded input — the production event_properties shape. whole_json

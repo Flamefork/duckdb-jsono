@@ -169,6 +169,33 @@ class ProfileDriverCaseResolutionTest(unittest.TestCase):
 
 
 class ExtractBenchmarkQueryTest(unittest.TestCase):
+    def test_jsono_parse_struct_plain_query_bypasses_auto_shredding(self) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "parse_struct_plain",
+                "scenario": "typed_scalar_array",
+                "typed_shape": "typed_scalar_array",
+                "row_count": 10,
+                "targets": ["jsono"],
+            },
+            Path("unused.parquet"),
+        )
+
+        self.assertIn(
+            "SELECT CAST(payload AS STRUCT(jsono STRUCT(body STRUCT(",
+            query.timed_sql,
+        )
+        self.assertNotIn("jsono(payload)", query.timed_sql)
+        self.assertIn(
+            "CREATE OR REPLACE TEMP TABLE _bench_struct_in", query.prepare_sql[0]
+        )
+
+    def test_existing_nested_typed_payload_keeps_its_shape(self) -> None:
+        payload_sql = run_benchmarks.typed_struct_payload_sql("nested_typed")
+
+        self.assertIn("arr := [i, NULL, i + 1]", payload_sql)
+        self.assertNotIn("products :=", payload_sql)
+
     def test_jsono_merge_patch_query_uses_constant_typed_patch(self) -> None:
         query = run_benchmarks.build_jsono_query(
             {
@@ -399,6 +426,92 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
 
 
 class RunBenchmarksDataPathTest(unittest.TestCase):
+    def test_closes_previous_target_connection_before_opening_next(self) -> None:
+        first = run_benchmarks.Target("first", "jsono", Path("first.duckdb_extension"))
+        second = run_benchmarks.Target(
+            "second", "jsono", Path("second.duckdb_extension")
+        )
+        scenario_config = {
+            "operation": "shape_plan_recovery_transform",
+            "scenario": "stable_only",
+            "size": "100k",
+            "row_count": 100_000,
+            "shape_stream": "stable_only",
+            "targets": ["jsono"],
+        }
+        events: list[str] = []
+
+        def create_connection(target: run_benchmarks.Target) -> Mock:
+            events.append(f"create:{target.label}")
+            conn = Mock()
+            conn.close.side_effect = lambda: events.append(f"close:{target.label}")
+            return conn
+
+        def run_single_benchmark(
+            conn: Mock, query: run_benchmarks.BenchmarkQuery, runs: int
+        ) -> dict:
+            del conn, query, runs
+            events.append("run")
+            return {"min_ms": 1.0, "median_ms": 1.0, "max_ms": 1.0}
+
+        with (
+            patch.object(
+                run_benchmarks, "create_connection", side_effect=create_connection
+            ),
+            patch.object(
+                run_benchmarks,
+                "run_single_benchmark",
+                side_effect=run_single_benchmark,
+            ),
+        ):
+            run_benchmarks.run_benchmarks(
+                [first, second],
+                [
+                    (first, "100k", scenario_config),
+                    (second, "100k", scenario_config),
+                ],
+                runs=1,
+                thread_modes=[1],
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "create:first",
+                "run",
+                "close:first",
+                "create:second",
+                "run",
+                "close:second",
+            ],
+        )
+
+    def test_synthetic_parse_struct_does_not_require_events_parquet(self) -> None:
+        self.assertFalse(
+            run_benchmarks.case_uses_data_path(
+                {
+                    "operation": "parse_struct",
+                    "scenario": "typed_scalar_array",
+                    "typed_shape": "typed_scalar_array",
+                    "size": "1M",
+                    "row_count": 1_000_000,
+                    "targets": ["jsono"],
+                }
+            )
+        )
+
+    def test_field_sample_parse_struct_requires_its_parquet(self) -> None:
+        self.assertTrue(
+            run_benchmarks.case_uses_data_path(
+                {
+                    "operation": "parse_struct",
+                    "scenario": "field_sample_typed_products",
+                    "struct_spec": {"products": [{"name": "VARCHAR"}]},
+                    "targets": ["jsono"],
+                }
+            )
+        )
+
     def test_shape_plan_recovery_transform_does_not_require_events_parquet(
         self,
     ) -> None:

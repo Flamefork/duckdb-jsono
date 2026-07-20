@@ -68,6 +68,8 @@ JSONO-only operations:
 - `parse_copy`: `parse` + writing the result to Parquet (end-to-end path with storage size);
 - `scan_text`: diagnostic lower bound on scan/output cost; compare against `parse` when optimizing JSONO creation;
 - `parse_struct`: `jsono(STRUCT)` on a pre-materialized typed STRUCT input;
+- `parse_struct_plain`: direct cast of the same typed STRUCT to plain JSONO storage, bypassing
+  automatic shredding; this is the constructor lower bound, not a user-facing path;
 - `parse_struct_roundtrip`: control path `jsono(to_json(STRUCT)::VARCHAR)` for the same typed input;
 - `parse_struct_json_roundtrip`: control path `jsono(to_json(STRUCT))` for the same typed input;
 - `object_jsono`: `jsono(STRUCT)` on a scalar object payload;
@@ -153,8 +155,9 @@ mismatch:
 
 For JSONO-native operations the input `JSONO` is materialized before the timed section.
 If you need the end-to-end path with parse cost, combine the matching `parse` scenario with the JSONO operation.
-For `parse_struct` field-sample scenarios the typed `STRUCT` is also materialized before the timed section:
-the timed part measures the JSONO constructor itself, not DuckDB `json_transform`.
+For `parse_struct` and `parse_struct_plain` field-sample scenarios the typed `STRUCT` is also
+materialized before the timed section: the timed part measures the JSONO constructor itself, not
+DuckDB `json_transform`.
 
 ## Field-sample scenarios
 

@@ -97,16 +97,17 @@ struct JsonoStructPlan {
 
 struct JsonoStructBindData : public FunctionData {
 	JsonoStructPlan plan;
-	// When non-empty, the constructor shreds these top-level scalar fields into shred
-	// columns (result is a shredded JSONO struct).
+	// When non-empty, the constructor shreds these typed fields into shred columns
+	// (result is a shredded JSONO struct).
 	vector<std::pair<string, LogicalType>> shreds;
 	// One-pass shredded write (ExecuteStructConstructorShredded): shred values copy straight
-	// from the typed input children and the residual emits only the non-shred fields, so the
-	// full plain value is never materialized. Eligible when every shred name is a literal
-	// top-level key; a '$...'-named field addresses a nested path (ParseShredPathSpec) and
-	// keeps the locate-and-strip path. `shred_fields` maps each shred to its input child,
-	// `residual_fields` lists the non-shred children in input order, and `residual_plan`
-	// is a constructor plan over just those fields (unset when every field is a shred).
+	// from the typed input children and the residual emits non-shred fields plus array
+	// skeletons, so the full plain value is never materialized. Eligible when every shred
+	// name is a literal top-level key; a '$...'-named field addresses a nested path
+	// (ParseShredPathSpec) and keeps the locate-and-strip path. `shred_fields` maps each
+	// shred to its input child, `residual_fields` lists the non-shred children in input
+	// order, and `residual_plan` is a constructor plan over just those fields (unset when
+	// every field is a shred).
 	bool one_pass_shred = false;
 	vector<idx_t> shred_fields;
 	vector<idx_t> residual_fields;
@@ -1552,10 +1553,8 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 
 		bind_data->one_pass_shred = true;
 		for (auto &shred : bind_data->shreds) {
-			// A nested-path scalar ($-prefixed) or an array shred (LIST<STRUCT> / LIST<scalar>) cannot
-			// use the scalar direct-copy one-pass writer; route through the materialize-then-shred
-			// fallback, which lifts the array elements and builds the skeleton via JsonoShredFromSpec.
-			if ((!shred.first.empty() && shred.first[0] == '$') || IsShredListType(shred.second)) {
+			// Nested paths still need the path-aware materialize-then-shred fallback.
+			if (!shred.first.empty() && shred.first[0] == '$') {
 				bind_data->one_pass_shred = false;
 				break;
 			}
@@ -1581,10 +1580,21 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 					bind_data->residual_fields.push_back(i);
 				}
 			}
-			if (!bind_data->residual_fields.empty()) {
+			for (idx_t f = 0; f < bind_data->shreds.size(); f++) {
+				if (IsShredListType(bind_data->shreds[f].second) &&
+				    bind_data->plan.children[bind_data->shred_fields[f]].bound_type != bind_data->shreds[f].second) {
+					bind_data->one_pass_shred = false;
+					break;
+				}
+			}
+			if (bind_data->one_pass_shred && !bind_data->residual_fields.empty()) {
 				bind_data->residual_plan =
 				    BuildStructConstructorPlan(LogicalType::STRUCT(std::move(residual_children)), "jsono()");
 				AssignStructConstructorKeyCacheIndexes(bind_data->residual_plan, next_key_cache_index);
+			}
+			if (!bind_data->one_pass_shred) {
+				bind_data->shred_fields.clear();
+				bind_data->residual_fields.clear();
 			}
 		}
 	}
@@ -1607,7 +1617,77 @@ struct ShredColumnSource {
 	const double *double_data = nullptr;
 	const bool *bool_data = nullptr;
 	const uint64_t *uint_data = nullptr;
+	unique_ptr<JsonoStructVectorData> list_data;
 };
+
+void ValidateCapturedListValue(const JsonoStructVectorData &data, idx_t row) {
+	if (data.plan->strategy != StructValueStrategy::Double) {
+		return;
+	}
+	auto idx = RowIndex(data.fmt, row);
+	if (!std::isfinite(data.double_data[idx])) {
+		throw InvalidInputException("jsono: cannot store non-finite double value (NaN/Infinity)");
+	}
+}
+
+bool EmitListShredResidual(const JsonoStructVectorData &data, idx_t row, DomJsonoBuilder &builder) {
+	auto idx = RowIndex(data.fmt, row);
+	if (!data.fmt.validity.RowIsValid(idx)) {
+		builder.EmitNull();
+		return false;
+	}
+
+	auto entry = data.list_entries[idx];
+	auto &element = data.children[0];
+	bool captured = false;
+	builder.EmitArrayStart();
+	if (element.plan->strategy != StructValueStrategy::Struct) {
+		for (idx_t child = entry.offset; child < entry.offset + entry.length; child++) {
+			if (!ConstructorValueRowIsNull(element, child)) {
+				ValidateCapturedListValue(element, child);
+				captured = true;
+			}
+			builder.EmitNull();
+		}
+		builder.EmitArrayEnd();
+		return captured;
+	}
+
+	for (idx_t child = entry.offset; child < entry.offset + entry.length; child++) {
+		if (ConstructorValueRowIsNull(element, child)) {
+			builder.EmitNull();
+			continue;
+		}
+		idx_t null_fields = 0;
+		for (auto field_idx : element.plan->field_perm) {
+			auto &field = element.children[field_idx];
+			if (ConstructorValueRowIsNull(field, child)) {
+				null_fields++;
+			} else {
+				ValidateCapturedListValue(field, child);
+				captured = true;
+			}
+		}
+		builder.EmitObjectStart(null_fields);
+		for (auto field_idx : element.plan->field_perm) {
+			if (!ConstructorValueRowIsNull(element.children[field_idx], child)) {
+				continue;
+			}
+			auto &name = element.plan->field_names[field_idx];
+			builder.EmitKeySlot(nonstd::string_view(name.data(), name.size()));
+		}
+		for (auto field_idx : element.plan->field_perm) {
+			if (!ConstructorValueRowIsNull(element.children[field_idx], child)) {
+				continue;
+			}
+			builder.EmitObjectChildStart();
+			builder.EmitNull();
+		}
+		builder.EmitObjectEnd();
+	}
+	builder.EmitArrayEnd();
+	return captured;
+}
 
 // One-pass shredded constructor: shred values copy from the typed input children, the residual
 // emits only the non-shred fields, and the manifest is written along the way — the two-pass path
@@ -1629,11 +1709,23 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 
 	vector<ShredColumnSource> sources(shred_count);
 	vector<Vector *> shred_out(shred_count);
+	bool has_list_shreds = false;
 	for (idx_t f = 0; f < shred_count; f++) {
 		auto field_idx = bind_data.shred_fields[f];
 		auto &src = sources[f];
 		shred_out[f] = &JsonoShredVector(result, f);
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
+		auto &child = *casted_children[field_idx];
+		if (IsShredListType(shreds[f].second)) {
+			if (child.GetType() != shreds[f].second) {
+				throw InternalException("jsono constructor: list shred source type does not match lane type");
+			}
+			has_list_shreds = true;
+			VectorOperations::Copy(child, *shred_out[f], count, 0, 0);
+			src.list_data = make_uniq<JsonoStructVectorData>();
+			InitStructConstructorVectorData(child, count, plan.children[field_idx], *src.list_data);
+			continue;
+		}
 		if (shreds[f].second.id() == LogicalTypeId::UBIGINT) {
 			auto &raw_child = *StructVector::GetEntries(raw_input)[field_idx];
 			raw_child.ToUnifiedFormat(count, src.fmt);
@@ -1641,7 +1733,6 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			src.raw_uint = true;
 			continue;
 		}
-		auto &child = *casted_children[field_idx];
 		src.strategy = plan.children[field_idx].strategy;
 		if (src.strategy == StructValueStrategy::StringDefaultCast) {
 			src.rendered = make_uniq<Vector>(LogicalType::VARCHAR, count);
@@ -1734,6 +1825,10 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		stripped_fields.clear();
 		for (idx_t f = 0; f < shred_count; f++) {
 			auto &src = sources[f];
+			if (src.list_data) {
+				stripped[f] = 0;
+				continue;
+			}
 			auto idx = src.fmt.sel->get_index(row);
 			if (!src.fmt.validity.RowIsValid(idx)) {
 				FlatVector::SetNull(*shred_out[f], row, true);
@@ -1773,6 +1868,45 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			}
 		}
 		FlatVector::Validity(result).SetValid(row);
+
+		if (has_list_shreds) {
+			builder.Reset();
+			builder.EmitObjectStart(plan.field_perm.size() - stripped_count);
+			for (auto field_idx : plan.field_perm) {
+				auto f = shred_pos[field_idx];
+				if (f != DConstants::INVALID_INDEX && stripped[f]) {
+					continue;
+				}
+				auto &name = plan.field_names[field_idx];
+				builder.EmitKeySlot(nonstd::string_view(name.data(), name.size()));
+			}
+			for (auto field_idx : plan.field_perm) {
+				auto f = shred_pos[field_idx];
+				if (f != DConstants::INVALID_INDEX && stripped[f]) {
+					continue;
+				}
+				builder.EmitObjectChildStart();
+				if (f == DConstants::INVALID_INDEX) {
+					EmitConstructorValue(residual_data.children[residual_pos[field_idx]], row, lstate, builder);
+				} else if (sources[f].list_data) {
+					if (EmitListShredResidual(*sources[f].list_data, row, builder)) {
+						stripped_fields.push_back(f);
+					}
+				} else {
+					builder.EmitNull();
+				}
+			}
+			builder.EmitObjectEnd();
+			std::sort(stripped_fields.begin(), stripped_fields.end());
+			const std::string *manifest_ptr = nullptr;
+			if (!stripped_fields.empty()) {
+				manifest.clear();
+				JsonoAppendShredManifest(manifest, manifest_entries, stripped_fields);
+				manifest_ptr = &manifest;
+			}
+			writer.WriteRow(row, builder, manifest_ptr);
+			continue;
+		}
 
 		if (stripped_count == shred_count) {
 			if (residual_empty) {

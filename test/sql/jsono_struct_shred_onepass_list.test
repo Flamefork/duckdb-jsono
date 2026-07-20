@@ -1,0 +1,221 @@
+# name: test/sql/jsono_struct_shred_onepass_list.test
+# description: Typed STRUCT array auto-shreds stay physically identical to the generic shred writer
+# group: [sql]
+
+require jsono
+
+statement ok
+CREATE MACRO plain_jsono(v) AS CAST(v AS STRUCT(jsono STRUCT(body STRUCT(
+  slots BLOB,
+  key_heap BLOB,
+  string_heap BLOB,
+  skips BLOB,
+  lengths BLOB,
+  nums BLOB
+))));
+
+# The current plain-constructor + generic-spec writer is the physical contract for the typed fast
+# path: complete nested output equality covers the residual skeleton, manifest, lanes, and NULL
+# masks. The plain input must stay binary JSONO: a to_json text round-trip changes numeric kinds.
+statement ok
+CREATE TABLE scalar_array_input(v STRUCT(kind VARCHAR, ids INTEGER[]));
+
+statement ok
+INSERT INTO scalar_array_input VALUES
+  (struct_pack(kind := 'mixed', ids := [1, NULL, 3])),
+  (struct_pack(kind := 'null-list', ids := NULL)),
+  (struct_pack(kind := 'empty', ids := [])),
+  (struct_pack(kind := 'all-null', ids := [NULL, NULL]));
+
+query I
+SELECT count(*)
+FROM scalar_array_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(plain_jsono(v), shredding := {'ids':'BIGINT[]','kind':'VARCHAR'});
+----
+4
+
+# ARRAY binds to the same promoted LIST lane as LIST.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    kind := 'fixed',
+    ids := [i::SMALLINT, (i + 1)::SMALLINT]::SMALLINT[2])
+  FROM range(2) rows(i)
+)
+SELECT count(*)
+FROM input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(plain_jsono(v), shredding := {'ids':'BIGINT[]','kind':'VARCHAR'});
+----
+2
+
+statement ok
+CREATE TABLE object_array_input(
+  v STRUCT(kind VARCHAR, products STRUCT(name VARCHAR, quantity SMALLINT, price FLOAT)[])
+);
+
+statement ok
+INSERT INTO object_array_input VALUES
+  (struct_pack(
+    kind := 'mixed',
+    products := [
+      struct_pack(name := 'a', quantity := 2, price := 1.5),
+      NULL,
+      struct_pack(name := NULL, quantity := 3, price := NULL)
+    ])),
+  (struct_pack(kind := 'null-list', products := NULL)),
+  (struct_pack(kind := 'empty', products := [])),
+  (struct_pack(kind := 'null-element', products := [NULL])),
+  (struct_pack(
+    kind := 'all-null-fields',
+    products := [struct_pack(name := NULL, quantity := NULL, price := NULL)]));
+
+query I
+SELECT count(*)
+FROM object_array_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono(v),
+        shredding := {
+          'kind':'VARCHAR',
+          'products':'STRUCT(name VARCHAR, quantity BIGINT, price DOUBLE)[]'
+        });
+----
+5
+
+# Scalar and object arrays can coexist in one top-level shred set.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    kind := 'both',
+    ids := [1::INTEGER, NULL, 3],
+    products := [
+      struct_pack(name := 'a', quantity := 2::SMALLINT, price := 1.5::FLOAT),
+      struct_pack(name := NULL, quantity := NULL, price := NULL)
+    ])
+)
+SELECT jsono(v) IS NOT DISTINCT FROM
+       jsono(
+         plain_jsono(v),
+         shredding := {
+           'ids':'BIGINT[]',
+           'kind':'VARCHAR',
+           'products':'STRUCT(name VARCHAR, quantity BIGINT, price DOUBLE)[]'
+         })
+FROM input;
+----
+true
+
+# SQL NULL roots and constant inputs preserve the same complete physical value.
+query II
+SELECT
+  jsono(NULL::STRUCT(kind VARCHAR, ids INTEGER[])) IS NOT DISTINCT FROM
+    jsono(
+      plain_jsono(NULL::STRUCT(kind VARCHAR, ids INTEGER[])),
+      shredding := {'ids':'BIGINT[]','kind':'VARCHAR'}),
+  jsono(struct_pack(kind := 'constant', ids := [1::INTEGER, 2])) IS NOT DISTINCT FROM
+    jsono(
+      plain_jsono(struct_pack(kind := 'constant', ids := [1::INTEGER, 2])),
+      shredding := {'ids':'BIGINT[]','kind':'VARCHAR'});
+----
+true	true
+
+# LIST<UBIGINT> keeps the generic path because its constructor plan uses exact number text while
+# the shred lane stays UBIGINT; the candidate must not reinterpret that casted child as a lane.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(ids := [1::UBIGINT, 18446744073709551615::UBIGINT])
+)
+SELECT jsono(v) IS NOT DISTINCT FROM
+       jsono(plain_jsono(v), shredding := {'ids':'UBIGINT[]'})
+FROM input;
+----
+true
+
+# Direct list-lane copying preserves the constructor's non-finite rejection.
+statement error
+SELECT jsono(struct_pack(vals := [1.0::DOUBLE, 'nan'::DOUBLE]));
+----
+non-finite
+
+statement error
+SELECT jsono(struct_pack(items := [struct_pack(price := 'inf'::DOUBLE)]));
+----
+non-finite
+
+# Nested paths remain on the generic path, including a nested list, and retain the same contract.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    kind := 'nested',
+    nested := struct_pack(score := 7::INTEGER, ids := [1::INTEGER, NULL, 3]))
+)
+SELECT jsono(v) IS NOT DISTINCT FROM
+       jsono(
+         plain_jsono(v),
+         shredding := {
+           '$.nested.ids':'BIGINT[]',
+           '$.nested.score':'BIGINT',
+           'kind':'VARCHAR'
+         })
+FROM input;
+----
+true
+
+# The constructor receives dictionary and child-shuffled nested vectors from scans and optimizer
+# verification. The physical comparison spans more than one STANDARD_VECTOR_SIZE chunk.
+statement ok
+CREATE TABLE list_vector_input AS
+SELECT struct_pack(
+  kind := 'k' || (i % 7)::VARCHAR,
+  ids := CASE
+    WHEN i % 11 = 0 THEN NULL
+    WHEN i % 13 = 0 THEN []::INTEGER[]
+    ELSE [i::INTEGER, NULL, (i + 1)::INTEGER]
+  END,
+  products := [
+    struct_pack(
+      name := CASE WHEN i % 5 = 0 THEN NULL ELSE 'p' || i::VARCHAR END,
+      quantity := (i % 9)::SMALLINT,
+      price := CASE WHEN i % 17 = 0 THEN NULL ELSE (i % 100)::FLOAT / 4 END),
+    NULL
+  ]) AS v
+FROM range(3000) rows(i);
+
+statement ok
+SET debug_verify_vector='dictionary_expression';
+
+query I
+SELECT count(*)
+FROM list_vector_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono(v),
+        shredding := {
+          'ids':'BIGINT[]',
+          'kind':'VARCHAR',
+          'products':'STRUCT(name VARCHAR, quantity BIGINT, price DOUBLE)[]'
+        });
+----
+3000
+
+statement ok
+SET debug_verify_vector='nested_shuffle';
+
+query I
+SELECT count(*)
+FROM list_vector_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono(v),
+        shredding := {
+          'ids':'BIGINT[]',
+          'kind':'VARCHAR',
+          'products':'STRUCT(name VARCHAR, quantity BIGINT, price DOUBLE)[]'
+        });
+----
+3000
+
+statement ok
+RESET debug_verify_vector;
