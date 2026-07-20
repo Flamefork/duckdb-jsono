@@ -121,14 +121,52 @@ SELECT
 ----
 true	true
 
-# LIST<UBIGINT> keeps the generic path because its constructor plan uses exact number text while
-# the shred lane stays UBIGINT; the candidate must not reinterpret that casted child as a lane.
+# LIST<UBIGINT> has a VARCHAR[] constructor source but an UBIGINT[] lane; the one-pass lane source
+# cast must stay physically identical to the generic writer.
 query I
 WITH input(v) AS (
   SELECT struct_pack(ids := [1::UBIGINT, 18446744073709551615::UBIGINT])
 )
 SELECT jsono(v) IS NOT DISTINCT FROM
        jsono(plain_jsono(v), shredding := {'ids':'UBIGINT[]'})
+FROM input;
+----
+true
+
+# A top-level LIST<UBIGINT> can share the nested one-pass executor with sibling nested scalar
+# shreds. Its constructor source is VARCHAR[] after the number-text plan cast, while its lane stays
+# UBIGINT[]; lane capture must retain the generic writer's complete physical value.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    ids := [1::UBIGINT, NULL, 18446744073709551615::UBIGINT],
+    nested := struct_pack(kind := 'x'))
+)
+SELECT jsono(v) IS NOT DISTINCT FROM
+       jsono(
+         plain_jsono(v),
+         shredding := {'ids':'UBIGINT[]','$.nested.kind':'VARCHAR'})
+FROM input;
+----
+true
+
+# The same source/lane mismatch can occur recursively inside a top-level LIST<STRUCT> lane.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    items := [
+      struct_pack(id := 18446744073709551615::UBIGINT, quantity := 2::INTEGER),
+      NULL
+    ],
+    nested := struct_pack(kind := 'x'))
+)
+SELECT jsono(v) IS NOT DISTINCT FROM
+       jsono(
+         plain_jsono(v),
+         shredding := {
+           'items':'STRUCT(id UBIGINT, quantity BIGINT)[]',
+           '$.nested.kind':'VARCHAR'
+         })
 FROM input;
 ----
 true
@@ -184,6 +222,37 @@ SELECT struct_pack(
 FROM range(3000) rows(i);
 
 statement ok
+CREATE TABLE mismatched_list_vector_input AS
+SELECT struct_pack(
+  ids := CASE
+    WHEN i % 11 = 0 THEN NULL::UBIGINT[]
+    WHEN i % 13 = 0 THEN []::UBIGINT[]
+    ELSE [
+      i::UBIGINT,
+      NULL,
+      CASE
+        WHEN i % 23 = 0 THEN 18446744073709551615::UBIGINT
+        ELSE (i + 1)::UBIGINT
+      END
+    ]
+  END,
+  items := CASE
+    WHEN i % 17 = 0 THEN NULL::STRUCT(id UBIGINT, quantity INTEGER)[]
+    WHEN i % 19 = 0 THEN []::STRUCT(id UBIGINT, quantity INTEGER)[]
+    ELSE [
+      struct_pack(
+        id := CASE
+          WHEN i % 29 = 0 THEN 18446744073709551615::UBIGINT
+          ELSE i::UBIGINT
+        END,
+        quantity := (i % 9)::INTEGER),
+      NULL
+    ]
+  END,
+  nested := struct_pack(kind := 'k' || (i % 7)::VARCHAR)) AS v
+FROM range(3000) rows(i);
+
+statement ok
 SET debug_verify_vector='dictionary_expression';
 
 query I
@@ -196,6 +265,20 @@ WHERE jsono(v) IS NOT DISTINCT FROM
           'ids':'BIGINT[]',
           'kind':'VARCHAR',
           'products':'STRUCT(name VARCHAR, quantity BIGINT, price DOUBLE)[]'
+        });
+----
+3000
+
+query I
+SELECT count(*)
+FROM mismatched_list_vector_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono(v),
+        shredding := {
+          'ids':'UBIGINT[]',
+          'items':'STRUCT(id UBIGINT, quantity BIGINT)[]',
+          '$.nested.kind':'VARCHAR'
         });
 ----
 3000
@@ -213,6 +296,20 @@ WHERE jsono(v) IS NOT DISTINCT FROM
           'ids':'BIGINT[]',
           'kind':'VARCHAR',
           'products':'STRUCT(name VARCHAR, quantity BIGINT, price DOUBLE)[]'
+        });
+----
+3000
+
+query I
+SELECT count(*)
+FROM mismatched_list_vector_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono(v),
+        shredding := {
+          'ids':'UBIGINT[]',
+          'items':'STRUCT(id UBIGINT, quantity BIGINT)[]',
+          '$.nested.kind':'VARCHAR'
         });
 ----
 3000

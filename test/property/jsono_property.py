@@ -646,6 +646,9 @@ def shred_spec_sql(spec: dict[str, str]) -> str:
     return "{" + ", ".join(f"'{path}': '{stype}'" for path, stype in spec.items()) + "}"
 
 
+PLAIN_JSONO_TYPE_SQL = "STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))"
+
+
 @settings(PROPERTY_SETTINGS)
 @given(doc=shred_documents, data=st.data())
 def test_shred_lossless(doc: dict[str, Any], data: Any) -> None:
@@ -1099,6 +1102,130 @@ def test_struct_auto_shred_lossless(doc: dict[str, Any]) -> None:
     assert auto == plain, f"auto-shred changed the value: {struct_sql} : {auto!r} != plain {plain!r}"
 
 
+# One row per constructor source-type class. `lane_type` is the auto-shred lane after promotion;
+# None means the value must stay in the residual. The matrix below crosses every row with scalar,
+# scalar-list/array, nested, and object-list/array shapes, both alone and beside an independent nested shred.
+CONSTRUCTOR_AUTO_SHRED_TYPE_CASES: list[tuple[str, str, str | None]] = [
+    ("boolean", "true", "BOOLEAN"),
+    ("tinyint", "-7::TINYINT", "BIGINT"),
+    ("smallint", "-300::SMALLINT", "BIGINT"),
+    ("integer", "-70000::INTEGER", "BIGINT"),
+    ("bigint", "-5000000000::BIGINT", "BIGINT"),
+    ("utinyint", "200::UTINYINT", "BIGINT"),
+    ("usmallint", "60000::USMALLINT", "BIGINT"),
+    ("uinteger", "4000000000::UINTEGER", "BIGINT"),
+    ("ubigint", "18446744073709551615::UBIGINT", "UBIGINT"),
+    ("float", "1.25::FLOAT", "DOUBLE"),
+    ("double", "2.5::DOUBLE", "DOUBLE"),
+    ("varchar", "'text'::VARCHAR", "VARCHAR"),
+    ("date", "DATE '2024-01-02'", "VARCHAR"),
+    ("time", "TIME '12:34:56'", "VARCHAR"),
+    ("time_ns", "TIME_NS '12:34:56.123456789'", "VARCHAR"),
+    ("timetz", "TIMETZ '12:34:56+02'", "VARCHAR"),
+    ("timestamp_s", "TIMESTAMP_S '2024-01-02 12:34:56'", "VARCHAR"),
+    ("timestamp_ms", "TIMESTAMP_MS '2024-01-02 12:34:56.789'", "VARCHAR"),
+    ("timestamp", "TIMESTAMP '2024-01-02 12:34:56.123456'", "VARCHAR"),
+    ("timestamp_ns", "TIMESTAMP_NS '2024-01-02 12:34:56.123456789'", "VARCHAR"),
+    ("timestamptz", "TIMESTAMPTZ '2024-01-02 12:34:56+02'", "VARCHAR"),
+    ("uuid", "UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd'", "VARCHAR"),
+    ("enum", "CAST('alpha' AS ENUM('alpha','beta'))", "VARCHAR"),
+    ("interval", "INTERVAL '3 days 2 hours'", "VARCHAR"),
+    ("blob", "'\\xAA\\xBB'::BLOB", "VARCHAR"),
+    ("bit", "'101'::BIT", "VARCHAR"),
+    ("hugeint", "170141183460469231731687303715884105727::HUGEINT", None),
+    ("uhugeint", "340282366920938463463374607431768211455::UHUGEINT", None),
+    ("bignum", "1234567890123456789012345678901234567890::BIGNUM", None),
+    ("decimal", "123456789012345678901234567890123456.12::DECIMAL(38,2)", None),
+    ("json", "'{\"x\":1}'::JSON", None),
+]
+
+
+def constructor_auto_shred_shapes(value_sql: str, lane_type: str | None) -> list[tuple[str, str, dict[str, str], str]]:
+    lane = {} if lane_type is None else {"value": lane_type}
+    list_lane = {} if lane_type is None else {"values": f"{lane_type}[]"}
+    nested_lane = {} if lane_type is None else {"$.parent.value": lane_type}
+    nested_list_lane = {} if lane_type is None else {"$.parent.values": f"{lane_type}[]"}
+    object_list_lane = {} if lane_type is None else {"items": f"STRUCT(value {lane_type})[]"}
+    sibling_lane = {"$.sibling.kind": "VARCHAR"}
+    value_list = f"[{value_sql}, NULL]"
+    value_array = f"array_value({value_sql}, NULL)"
+    object_list = f"[struct_pack(value := {value_sql}), NULL]"
+    object_array = f"array_value(struct_pack(value := {value_sql}), NULL)"
+    return [
+        ("scalar", f"{{'value': {value_sql}}}", lane, "value"),
+        (
+            "scalar+nested",
+            f"{{'value': {value_sql}, 'sibling': {{'kind': 'x'}}}}",
+            lane | sibling_lane,
+            "value",
+        ),
+        ("list", f"{{'values': {value_list}}}", list_lane, "values"),
+        (
+            "list+nested",
+            f"{{'values': {value_list}, 'sibling': {{'kind': 'x'}}}}",
+            list_lane | sibling_lane,
+            "values",
+        ),
+        ("array", f"{{'values': {value_array}}}", list_lane, "values"),
+        (
+            "array+nested",
+            f"{{'values': {value_array}, 'sibling': {{'kind': 'x'}}}}",
+            list_lane | sibling_lane,
+            "values",
+        ),
+        ("nested-scalar", f"{{'parent': {{'value': {value_sql}}}}}", nested_lane, "$.parent.value"),
+        (
+            "nested-list",
+            f"{{'parent': {{'values': {value_list}}}}}",
+            nested_list_lane,
+            "$.parent.values",
+        ),
+        ("object-list", f"{{'items': {object_list}}}", object_list_lane, "$.items[0].value"),
+        (
+            "object-list+nested",
+            f"{{'items': {object_list}, 'sibling': {{'kind': 'x'}}}}",
+            object_list_lane | sibling_lane,
+            "$.items[0].value",
+        ),
+        ("object-array", f"{{'items': {object_array}}}", object_list_lane, "$.items[0].value"),
+        (
+            "object-array+nested",
+            f"{{'items': {object_array}, 'sibling': {{'kind': 'x'}}}}",
+            object_list_lane | sibling_lane,
+            "$.items[0].value",
+        ),
+    ]
+
+
+def test_struct_constructor_auto_shred_matrix() -> None:
+    for type_name, value_sql, lane_type in CONSTRUCTOR_AUTO_SHRED_TYPE_CASES:
+        for shape_name, struct_sql, spec, read_path in constructor_auto_shred_shapes(value_sql, lane_type):
+            auto = f"jsono({struct_sql})"
+            plain = f"CAST(({struct_sql}) AS {PLAIN_JSONO_TYPE_SQL})"
+            generic = plain if not spec else f"jsono({plain}, shredding := {shred_spec_sql(spec)})"
+            parity = SESSION.value(
+                f"(typeof({auto}) = typeof({generic})) AND "
+                + f"(({auto}) IS NOT DISTINCT FROM ({generic})) AND "
+                + f"(to_json({auto}) IS NOT DISTINCT FROM to_json({generic})) AND "
+                + f"((({auto}) ->> '{read_path}') IS NOT DISTINCT FROM (({generic}) ->> '{read_path}'))"
+            )
+            assert parity == "true", f"{type_name}/{shape_name}: auto-shred differs from generic writer"
+
+
+def test_struct_constructor_auto_shred_parquet() -> None:
+    struct_sql = "{'values': [1::UBIGINT, NULL, 18446744073709551615::UBIGINT], " + "'sibling': {'kind': 'x'}}"
+    auto = f"jsono({struct_sql})"
+    path = f"{PARQUET_ROUNDTRIP_DIR}/struct_constructor.parquet"
+    SESSION.statement(f"COPY (SELECT {auto} AS j) TO '{path}' (FORMAT parquet);")
+    parity = SESSION.value(
+        f"(SELECT (j IS NOT DISTINCT FROM {auto}) AND "
+        + f"(to_json(j) IS NOT DISTINCT FROM to_json({auto})) AND "
+        + f"((j ->> 'values') IS NOT DISTINCT FROM (({auto}) ->> 'values')) "
+        + f"FROM read_parquet('{path}'))"
+    )
+    assert parity == "true", "UBIGINT list + nested shred changed across Parquet round-trip"
+
+
 # Constructor (native STRUCT) auto-shred of a top-level LIST<STRUCT> field: the lifted array must
 # reconstruct to the same JSON as parsing the equivalent document. The element subfield types are
 # fixed (a DuckDB list is homogeneous); values and null elements are fuzzed.
@@ -1129,12 +1256,13 @@ def array_struct_sql(elements: list[Any]) -> str:
 @given(elements=array_struct_elements)
 def test_struct_array_auto_shred_lossless(elements: list[Any]) -> None:
     list_sql = array_struct_sql(elements)
-    from_struct = SESSION.value(f"to_json(jsono({{'items': {list_sql}}}))")
-    json_doc = {
-        "items": [(None if el is None else {"id": el["id"], "name": el["name"], "flag": el["flag"]}) for el in elements]
-    }
-    plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps(json_doc))}))")
-    assert from_struct == plain, f"struct array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
+    items = [(None if el is None else {"id": el["id"], "name": el["name"], "flag": el["flag"]}) for el in elements]
+    for nested_sql, nested_json in (("", {}), (", 'nested': {'kind': 'x'}", {"nested": {"kind": "x"}})):
+        from_struct = SESSION.value(f"to_json(jsono({{'items': {list_sql}{nested_sql}}}))")
+        plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps({'items': items, **nested_json}))}))")
+        assert from_struct == plain, (
+            f"struct array auto-shred changed the value: {list_sql}{nested_sql} : " + f"{from_struct!r} != {plain!r}"
+        )
 
 
 # Constructor (native STRUCT) auto-shred of a top-level LIST<scalar> field: the lifted array must
@@ -1183,9 +1311,12 @@ def test_scalar_array_auto_shred_lossless(spec: tuple[str, list[Any]]) -> None:
     # must equal the plain parse of the same document.
     stype, values = spec
     list_sql = "[" + ", ".join(scalar_list_element_sql(v, stype) for v in values) + f"]::{stype}[]"
-    from_struct = SESSION.value(f"to_json(jsono({{'item_ids': {list_sql}}}))")
-    plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps({'item_ids': values}))}))")
-    assert from_struct == plain, f"scalar array auto-shred changed the value: {list_sql} : {from_struct!r} != {plain!r}"
+    for nested_sql, nested_json in (("", {}), (", 'nested': {'kind': 'x'}", {"nested": {"kind": "x"}})):
+        from_struct = SESSION.value(f"to_json(jsono({{'item_ids': {list_sql}{nested_sql}}}))")
+        plain = SESSION.value(f"to_json(jsono({sql_literal(json_dumps({'item_ids': values, **nested_json}))}))")
+        assert from_struct == plain, (
+            f"scalar array auto-shred changed the value: {list_sql}{nested_sql} : " + f"{from_struct!r} != {plain!r}"
+        )
 
 
 @settings(VALIDISH_PROPERTY_SETTINGS)
@@ -1666,6 +1797,8 @@ PROPERTIES = [
     test_array_reader_parity,
     test_scalar_array_reader_parity,
     test_struct_auto_shred_lossless,
+    test_struct_constructor_auto_shred_matrix,
+    test_struct_constructor_auto_shred_parquet,
     test_struct_array_auto_shred_lossless,
     test_scalar_array_auto_shred_lossless,
     test_narrowing_fails_loud,

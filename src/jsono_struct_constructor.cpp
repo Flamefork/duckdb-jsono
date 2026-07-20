@@ -1398,57 +1398,67 @@ void AppendShredPathStep(string &path, const string &key) {
 	path.push_back('"');
 }
 
-// Shred-lane type for an auto-shred candidate field: narrow numerics are lifted through the same
-// widening the residual emit already applies (BuildStructConstructorPlan maps narrow ints to
-// BIGINT and FLOAT to DOUBLE), so the lane stores exactly the value the residual would have
-// carried and to_json output is unchanged. Unsigned narrow types promote to BIGINT, never
-// UBIGINT: every value fits int64, and the UBIGINT shred source reads the RAW input child as
-// uint64, which would misread a narrower unsigned vector. LIST element and LIST<STRUCT> subfield
-// types promote recursively so narrow-typed arrays gain lanes too; everything else (UBIGINT,
-// HUGEINT, DECIMAL, aliased JSON, ...) keeps its type and the existing eligibility gates decide.
-LogicalType PromoteAutoShredType(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-		return LogicalType::BIGINT;
-	case LogicalTypeId::FLOAT:
-		return LogicalType::DOUBLE;
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::TIME:
-	case LogicalTypeId::TIME_TZ:
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_TZ:
-	case LogicalTypeId::UUID:
-	case LogicalTypeId::ENUM:
-	case LogicalTypeId::INTERVAL:
-	case LogicalTypeId::BLOB:
-	case LogicalTypeId::BIT:
-		// The residual carries these as their rendered text (BuildStructConstructorPlan casts them
-		// to VARCHAR), so a VARCHAR lane stores exactly the value the residual would have carried.
-		return LogicalType::VARCHAR;
-	case LogicalTypeId::LIST:
-		return LogicalType::LIST(PromoteAutoShredType(ListType::GetChildType(type)));
-	case LogicalTypeId::ARRAY:
-		// The residual carries a fixed-size array as a plain JSON array (BuildStructConstructorPlan
-		// binds ARRAY to LIST), so its lane is the same list lane a LIST field would get.
-		return LogicalType::LIST(PromoteAutoShredType(ArrayType::GetChildType(type)));
-	case LogicalTypeId::STRUCT: {
-		child_list_t<LogicalType> children;
-		for (auto &child : StructType::GetChildTypes(type)) {
-			children.emplace_back(child.first, PromoteAutoShredType(child.second));
+// Auto-shred lanes derive from the constructor plan that defines the residual representation, so
+// adding a source type cannot update one representation without the other. The raw type only
+// distinguishes UBIGINT from the wider NumberText types and supplies LIST/ARRAY/STRUCT child types.
+bool TryBuildAutoShredLaneType(const JsonoStructPlan &plan, const LogicalType &source_type, LogicalType &lane_type) {
+	switch (plan.strategy) {
+	case StructValueStrategy::Int:
+		lane_type = LogicalType::BIGINT;
+		return true;
+	case StructValueStrategy::Double:
+		lane_type = LogicalType::DOUBLE;
+		return true;
+	case StructValueStrategy::String:
+	case StructValueStrategy::StringDefaultCast:
+		lane_type = LogicalType::VARCHAR;
+		return true;
+	case StructValueStrategy::Bool:
+		lane_type = LogicalType::BOOLEAN;
+		return true;
+	case StructValueStrategy::NumberText:
+		if (source_type.id() != LogicalTypeId::UBIGINT) {
+			return false;
 		}
-		return LogicalType::STRUCT(std::move(children));
+		lane_type = LogicalType::UBIGINT;
+		return true;
+	case StructValueStrategy::List: {
+		LogicalType child_source;
+		if (source_type.id() == LogicalTypeId::LIST) {
+			child_source = ListType::GetChildType(source_type);
+		} else if (source_type.id() == LogicalTypeId::ARRAY) {
+			child_source = ArrayType::GetChildType(source_type);
+		} else {
+			throw InternalException("jsono constructor: list plan source type is not LIST or ARRAY");
+		}
+		LogicalType child_lane;
+		if (!TryBuildAutoShredLaneType(plan.children[0], child_source, child_lane)) {
+			return false;
+		}
+		lane_type = LogicalType::LIST(std::move(child_lane));
+		return true;
 	}
-	default:
-		return type;
+	case StructValueStrategy::Struct: {
+		auto &source_children = StructType::GetChildTypes(source_type);
+		child_list_t<LogicalType> lane_children;
+		for (idx_t i = 0; i < source_children.size(); i++) {
+			LogicalType child_lane;
+			if (!TryBuildAutoShredLaneType(plan.children[i], source_children[i].second, child_lane)) {
+				return false;
+			}
+			lane_children.emplace_back(source_children[i].first, std::move(child_lane));
+		}
+		lane_type = LogicalType::STRUCT(std::move(lane_children));
+		return true;
 	}
+	case StructValueStrategy::Null:
+	case StructValueStrategy::RawJson:
+	case StructValueStrategy::Jsono:
+	case StructValueStrategy::Map:
+	case StructValueStrategy::Decimal:
+		return false;
+	}
+	throw InternalException("jsono constructor: unhandled value strategy in auto-shred lane plan");
 }
 
 struct AutoShredCandidate {
@@ -1464,11 +1474,12 @@ struct AutoShredCandidate {
 // leaves at depth 1..N are lifted and a leaf strictly deeper stays in the residual. The schema is
 // the only signal available at bind (the return type is a pure function of the input type, no
 // per-row inference), so depth is a fixed cap — see JSONO_AUTO_SHRED_MAX_DEPTH.
-void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix, idx_t depth, vector<idx_t> &fields,
-                       vector<AutoShredCandidate> &shreds) {
+void CollectAutoShreds(const LogicalType &struct_type, const JsonoStructPlan &struct_plan, const string &path_prefix,
+                       idx_t depth, vector<idx_t> &fields, vector<AutoShredCandidate> &shreds) {
 	auto &children = StructType::GetChildTypes(struct_type);
 	for (idx_t field = 0; field < children.size(); field++) {
 		auto &child = children[field];
+		auto &child_plan = struct_plan.children[field];
 		// A top-level field named 'body' or the reserved shred-set marker would collide with a layout
 		// field name, so it stays in the residual instead of becoming a shred (auto-shred must not
 		// error on field names). Only depth-1 names collide: a nested `$.URL.body` lane is safe.
@@ -1483,12 +1494,13 @@ void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix
 			continue;
 		}
 		fields.push_back(field);
-		auto shred_type = PromoteAutoShredType(child.second);
+		LogicalType shred_type;
 		// A scalar leaf, or a regular array shred — fixed-shape objects (LIST<STRUCT<scalars>>) lifting
 		// their element subfields, or scalars (LIST<UBIGINT>, LIST<VARCHAR>, …) lifting each whole
 		// element — into a parallel typed list shred, leaving a skeleton array in the residual. Lifted
 		// at depth 1 by bare name, deeper under its `$.parent.child` path.
-		if (IsShredValueType(shred_type) || IsShredListType(shred_type)) {
+		if (TryBuildAutoShredLaneType(child_plan, child.second, shred_type) &&
+		    (IsShredValueType(shred_type) || IsShredListType(shred_type))) {
 			if (depth == 1) {
 				shreds.push_back({child.first, shred_type, fields});
 			} else {
@@ -1502,7 +1514,7 @@ void CollectAutoShreds(const LogicalType &struct_type, const string &path_prefix
 		if (depth < JSONO_AUTO_SHRED_MAX_DEPTH && child.second.id() == LogicalTypeId::STRUCT) {
 			string path = depth == 1 ? "$" : path_prefix;
 			AppendShredPathStep(path, child.first);
-			CollectAutoShreds(child.second, path, depth + 1, fields, shreds);
+			CollectAutoShreds(child.second, child_plan, path, depth + 1, fields, shreds);
 		}
 		fields.pop_back();
 	}
@@ -1575,7 +1587,7 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 	// since a jsono value is physically a STRUCT too.
 	if (bind_data->plan.strategy == StructValueStrategy::Struct) {
 		vector<idx_t> fields;
-		CollectAutoShreds(input_type, string(), 1, fields, auto_shreds);
+		CollectAutoShreds(input_type, bind_data->plan, string(), 1, fields, auto_shreds);
 		DropCollidingAutoShreds(auto_shreds);
 	}
 	if (!auto_shreds.empty()) {
@@ -1670,6 +1682,16 @@ struct ShredColumnSource {
 	unique_ptr<JsonoStructVectorData> list_data;
 };
 
+Vector &PrepareListShredLaneSource(Vector &source, const LogicalType &lane_type, idx_t count,
+                                   unique_ptr<Vector> &casted_source) {
+	if (source.GetType() == lane_type) {
+		return source;
+	}
+	casted_source = make_uniq<Vector>(lane_type, count);
+	VectorOperations::DefaultCast(source, *casted_source, count);
+	return *casted_source;
+}
+
 void ValidateCapturedListValue(const JsonoStructVectorData &data, idx_t row) {
 	if (data.plan->strategy != StructValueStrategy::Double) {
 		return;
@@ -1754,6 +1776,7 @@ struct NestedShredColumnSource {
 	const uint64_t *uint_data = nullptr;
 	bool raw_uint = false;
 	bool list = false;
+	unique_ptr<Vector> rendered;
 };
 
 NestedShredColumnSource ResolveNestedShredSource(const JsonoStructVectorData &root, const vector<idx_t> &fields) {
@@ -1849,10 +1872,8 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
 		auto &child = StructVectorAtPath(casted_input, bind_data.shred_fields[f]);
 		if (IsShredListType(shreds[f].second)) {
-			if (child.GetType() != shreds[f].second) {
-				throw InternalException("jsono constructor: list shred source type does not match lane type");
-			}
-			VectorOperations::Copy(child, *shred_out[f], count, 0, 0);
+			auto &lane_source = PrepareListShredLaneSource(child, shreds[f].second, count, source.rendered);
+			VectorOperations::Copy(lane_source, *shred_out[f], count, 0, 0);
 			source.list = true;
 			continue;
 		}
@@ -1988,14 +2009,9 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
 		auto &child = *casted_children[field_idx];
 		if (IsShredListType(shreds[f].second)) {
-			auto lane_source = &child;
-			if (child.GetType() != shreds[f].second) {
-				src.rendered = make_uniq<Vector>(shreds[f].second, count);
-				VectorOperations::DefaultCast(child, *src.rendered, count);
-				lane_source = src.rendered.get();
-			}
+			auto &lane_source = PrepareListShredLaneSource(child, shreds[f].second, count, src.rendered);
 			has_list_shreds = true;
-			VectorOperations::Copy(*lane_source, *shred_out[f], count, 0, 0);
+			VectorOperations::Copy(lane_source, *shred_out[f], count, 0, 0);
 			src.list_data = make_uniq<JsonoStructVectorData>();
 			InitStructConstructorVectorData(child, count, plan.children[field_idx], *src.list_data);
 			continue;

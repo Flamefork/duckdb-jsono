@@ -731,7 +731,7 @@ The operation set, version/core-json comparisons, field-sample scenarios, and re
 
 ## Development
 
-Run the full local pre-PR gate (release build + tests, assert-enabled build + tests, format check) in one command:
+Run the full local pre-PR gate (release build + tests, assert-enabled build + tests and constructor matrix, format check) in one command:
 
 ```bash
 uv run make verify
@@ -797,7 +797,7 @@ Contributions and feedback are welcome. Please:
 
 1. Open an issue first to discuss proposed changes.
 2. Add or update SQLLogic tests in `test/sql/` for new behavior.
-3. Run `uv run make verify` (release build + tests, assert-enabled build + tests, format check) before submitting a pull request. CI additionally runs `uv run make tidy-check`, which needs a local clang-tidy + compile-database setup.
+3. Run `uv run make verify` (release build + tests, assert-enabled build + tests and constructor matrix, format check) before submitting a pull request. CI additionally runs `uv run make tidy-check`, which needs a local clang-tidy + compile-database setup.
 
 See [GitHub Issues](https://github.com/Flamefork/duckdb-jsono/issues) for current tasks and feature requests.
 
