@@ -1,0 +1,228 @@
+# name: test/sql/jsono_struct_shred_onepass_nested.test
+# description: Nested typed STRUCT auto-shreds stay physically identical to the generic shred writer
+# group: [sql]
+
+require jsono
+
+statement ok
+CREATE MACRO plain_jsono(v) AS CAST(v AS STRUCT(jsono STRUCT(body STRUCT(
+  slots BLOB,
+  key_heap BLOB,
+  string_heap BLOB,
+  skips BLOB,
+  lengths BLOB,
+  nums BLOB
+))));
+
+statement ok
+CREATE TABLE nested_scalar_input(
+  v STRUCT(
+    kind VARCHAR,
+    nested STRUCT(a INTEGER, b VARCHAR, score FLOAT, ok BOOLEAN)
+  )
+);
+
+statement ok
+INSERT INTO nested_scalar_input VALUES
+  (struct_pack(
+    kind := 'full',
+    nested := struct_pack(a := 1, b := 'x', score := 1.5, ok := true))),
+  (struct_pack(kind := 'null-parent', nested := NULL)),
+  (struct_pack(
+    kind := 'partial-null',
+    nested := struct_pack(a := NULL, b := 'y', score := NULL, ok := false))),
+  (NULL);
+
+query I
+SELECT count(*)
+FROM nested_scalar_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono(v),
+        shredding := {
+          '$.nested.a':'BIGINT',
+          '$.nested.b':'VARCHAR',
+          '$.nested.ok':'BOOLEAN',
+          '$.nested.score':'DOUBLE',
+          'kind':'VARCHAR'
+        });
+----
+4
+
+# Scalar promotion and raw UBIGINT reads follow the same typed route through a nested parent.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    nested := struct_pack(
+      small := 7::SMALLINT,
+      u := 18446744073709551615::UBIGINT,
+      ts := '2025-03-04 05:06:07+00'::TIMESTAMPTZ))
+)
+SELECT jsono(v) IS NOT DISTINCT FROM
+       jsono(
+         plain_jsono(v),
+         shredding := {
+           '$.nested.small':'BIGINT',
+           '$.nested.ts':'VARCHAR',
+           '$.nested.u':'UBIGINT'
+         })
+FROM input;
+----
+true
+
+# The source route is structural; JSONPath quoting is only the public lane name.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    "a.b" := struct_pack("q.x" := 42::INTEGER, plain := 'ok'),
+    kind := 'quoted')
+)
+SELECT jsono(v) IS NOT DISTINCT FROM
+       jsono(
+         plain_jsono(v),
+         shredding := {
+           '$."a.b"."q.x"':'BIGINT',
+           '$."a.b".plain':'VARCHAR',
+           'kind':'VARCHAR'
+         })
+FROM input;
+----
+true
+
+# Nested scalar and existing top-level scalar/object-array lanes share one recursive residual.
+query I
+WITH input(v) AS (
+  SELECT struct_pack(
+    kind := 'mixed',
+    nested := struct_pack(a := 7::INTEGER, b := 'x'),
+    ids := [1::INTEGER, NULL, 3],
+    products := [
+      struct_pack(name := 'a', quantity := 2::SMALLINT, price := 1.5::FLOAT),
+      NULL,
+      struct_pack(name := NULL, quantity := NULL, price := NULL)
+    ])
+)
+SELECT jsono(v) IS NOT DISTINCT FROM
+       jsono(
+         plain_jsono(v),
+         shredding := {
+           '$.nested.a':'BIGINT',
+           '$.nested.b':'VARCHAR',
+           'ids':'BIGINT[]',
+           'kind':'VARCHAR',
+           'products':'STRUCT(name VARCHAR, quantity BIGINT, price DOUBLE)[]'
+         })
+FROM input;
+----
+true
+
+# Residual composites that are not shred-eligible retain the generic writer's exact key offsets.
+query II
+WITH input(v) AS (
+  SELECT struct_pack(
+    event_name := 'event_' || (i % 10)::VARCHAR,
+    event_ts := i,
+    score := i * 0.5,
+    ok := i % 2 = 0,
+    nested := struct_pack(a := i, b := 'x' || i::VARCHAR),
+    ids := [i, NULL, i + 1],
+    products := [
+      struct_pack(
+        name := 'p' || (i % 100)::VARCHAR,
+        quantity := (i % 5) + 1,
+        price := (i % 100) * 0.5),
+      struct_pack(
+        name := 'q' || (i % 50)::VARCHAR,
+        quantity := (i % 3) + 1,
+        price := (i % 70) * 0.25)
+    ])
+  FROM range(1, 2) rows(i)
+), compared AS (
+  SELECT
+    jsono(v) AS fast,
+    jsono(
+      plain_jsono(v),
+      shredding := {
+        '$.nested.a':'BIGINT',
+        '$.nested.b':'VARCHAR',
+        'event_name':'VARCHAR',
+        'event_ts':'BIGINT',
+        'ids':'BIGINT[]',
+        'ok':'BOOLEAN'
+      }) AS generic
+  FROM input
+)
+SELECT hash(fast) = hash(generic), fast.jsono.body IS NOT DISTINCT FROM generic.jsono.body
+FROM compared;
+----
+true	true
+
+# Constant roots preserve constant-vector semantics.
+query I
+SELECT jsono(struct_pack(nested := struct_pack(a := 1::INTEGER, b := 'x'))) IS NOT DISTINCT FROM
+       jsono(
+         plain_jsono(struct_pack(nested := struct_pack(a := 1::INTEGER, b := 'x'))),
+         shredding := {'$.nested.a':'BIGINT','$.nested.b':'VARCHAR'});
+----
+true
+
+statement error
+SELECT jsono(struct_pack(nested := struct_pack(score := 'nan'::DOUBLE)));
+----
+non-finite
+
+# Scan vectors exercise dictionary and child-shuffled nested representations across chunk bounds.
+statement ok
+CREATE TABLE nested_vector_input AS
+SELECT struct_pack(
+  kind := 'k' || (i % 7)::VARCHAR,
+  nested := CASE
+    WHEN i % 11 = 0 THEN NULL
+    ELSE struct_pack(
+      a := CASE WHEN i % 13 = 0 THEN NULL ELSE i::INTEGER END,
+      b := CASE WHEN i % 17 = 0 THEN NULL ELSE 'x' || i::VARCHAR END)
+  END,
+  ids := CASE
+    WHEN i % 19 = 0 THEN NULL
+    ELSE [i::INTEGER, NULL, (i + 1)::INTEGER]
+  END) AS v
+FROM range(3000) rows(i);
+
+statement ok
+SET debug_verify_vector='dictionary_expression';
+
+query I
+SELECT count(*)
+FROM nested_vector_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono(v),
+        shredding := {
+          '$.nested.a':'BIGINT',
+          '$.nested.b':'VARCHAR',
+          'ids':'BIGINT[]',
+          'kind':'VARCHAR'
+        });
+----
+3000
+
+statement ok
+SET debug_verify_vector='nested_shuffle';
+
+query I
+SELECT count(*)
+FROM nested_vector_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono(v),
+        shredding := {
+          '$.nested.a':'BIGINT',
+          '$.nested.b':'VARCHAR',
+          'ids':'BIGINT[]',
+          'kind':'VARCHAR'
+        });
+----
+3000
+
+statement ok
+RESET debug_verify_vector;
