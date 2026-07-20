@@ -1532,14 +1532,6 @@ void DropCollidingAutoShreds(vector<AutoShredCandidate> &shreds) {
 	shreds = std::move(kept);
 }
 
-const JsonoStructPlan &StructPlanAtPath(const JsonoStructPlan &root, const vector<idx_t> &fields) {
-	auto plan = &root;
-	for (auto field : fields) {
-		plan = &plan->children[field];
-	}
-	return *plan;
-}
-
 void AddStructShredPlanPath(JsonoStructShredPlan &root, const JsonoStructPlan &plan, const vector<idx_t> &fields,
                             idx_t shred) {
 	auto node = &root;
@@ -1619,10 +1611,6 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 					break;
 				}
 			}
-			if (IsShredListType(shred.second) && StructPlanAtPath(bind_data->plan, fields).bound_type != shred.second) {
-				bind_data->one_pass_shred = false;
-				break;
-			}
 		}
 		if (bind_data->one_pass_shred) {
 			auto &children = StructType::GetChildTypes(input_type);
@@ -1671,8 +1659,8 @@ struct ShredColumnSource {
 	StructValueStrategy strategy = StructValueStrategy::Null;
 	bool raw_uint = false;
 	UnifiedVectorFormat fmt;
-	// The DefaultCast render of a StringDefaultCast field: the lane must carry the same text the
-	// residual would have carried, and the cast set's own render is session-dependent.
+	// DefaultCast storage for a StringDefaultCast scalar or a promoted LIST lane: each must carry
+	// the deterministic text the residual would have carried, not the session-dependent cast.
 	unique_ptr<Vector> rendered;
 	const string_t *string_data = nullptr;
 	const int64_t *int_data = nullptr;
@@ -2000,11 +1988,14 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
 		auto &child = *casted_children[field_idx];
 		if (IsShredListType(shreds[f].second)) {
+			auto lane_source = &child;
 			if (child.GetType() != shreds[f].second) {
-				throw InternalException("jsono constructor: list shred source type does not match lane type");
+				src.rendered = make_uniq<Vector>(shreds[f].second, count);
+				VectorOperations::DefaultCast(child, *src.rendered, count);
+				lane_source = src.rendered.get();
 			}
 			has_list_shreds = true;
-			VectorOperations::Copy(child, *shred_out[f], count, 0, 0);
+			VectorOperations::Copy(*lane_source, *shred_out[f], count, 0, 0);
 			src.list_data = make_uniq<JsonoStructVectorData>();
 			InitStructConstructorVectorData(child, count, plan.children[field_idx], *src.list_data);
 			continue;

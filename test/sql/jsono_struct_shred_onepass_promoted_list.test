@@ -1,0 +1,160 @@
+# name: test/sql/jsono_struct_shred_onepass_promoted_list.test
+# description: Promoted typed STRUCT arrays auto-shred with the generic writer's exact semantics
+# group: [sql]
+
+require jsono
+
+require json
+
+require icu
+
+statement ok
+CREATE MACRO plain_jsono_promoted_list(v) AS CAST(v AS STRUCT(jsono STRUCT(body STRUCT(
+  slots BLOB,
+  key_heap BLOB,
+  string_heap BLOB,
+  skips BLOB,
+  lengths BLOB,
+  nums BLOB
+))));
+
+# TIMESTAMPTZ has a native constructor input but a deterministic VARCHAR shred lane. The direct
+# path must preserve the generic writer's complete physical value across element/list NULLs.
+statement ok
+CREATE TABLE promoted_scalar_list_input(v STRUCT(kind VARCHAR, moments TIMESTAMPTZ[]));
+
+statement ok
+INSERT INTO promoted_scalar_list_input VALUES
+  (struct_pack(
+    kind := 'mixed',
+    moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02', NULL, TIMESTAMPTZ '2024-01-02 00:00:00-05'])),
+  (struct_pack(kind := 'null-list', moments := NULL)),
+  (struct_pack(kind := 'empty', moments := [])),
+  (struct_pack(kind := 'all-null', moments := [NULL, NULL]));
+
+query I
+SELECT count(*)
+FROM promoted_scalar_list_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(plain_jsono_promoted_list(v), shredding := {'kind':'VARCHAR','moments':'VARCHAR[]'});
+----
+4
+
+query I
+SELECT typeof(jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02'])));
+----
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, moments VARCHAR[])))
+
+# DefaultCast is deliberately independent of the session TimeZone: the lane and reconstructed
+# document both store the UTC representation.
+statement ok
+SET TimeZone='Europe/Madrid';
+
+query II
+SELECT j.jsono.shreds."moments"[1], to_json(j)::VARCHAR
+FROM (SELECT jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02'])) AS j);
+----
+2024-01-01 10:34:56+00	{"moments":["2024-01-01 10:34:56+00"]}
+
+statement ok
+SET TimeZone='Asia/Tokyo';
+
+query II
+SELECT j.jsono.shreds."moments"[1], to_json(j)::VARCHAR
+FROM (SELECT jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02'])) AS j);
+----
+2024-01-01 10:34:56+00	{"moments":["2024-01-01 10:34:56+00"]}
+
+# Promotion is recursive through LIST<STRUCT>: TIMESTAMPTZ -> VARCHAR and SMALLINT -> BIGINT.
+statement ok
+CREATE TABLE promoted_object_list_input(
+  v STRUCT(kind VARCHAR, items STRUCT(event_ts TIMESTAMPTZ, n SMALLINT)[])
+);
+
+statement ok
+INSERT INTO promoted_object_list_input VALUES
+  (struct_pack(
+    kind := 'mixed',
+    items := [
+      struct_pack(event_ts := TIMESTAMPTZ '2024-01-01 12:34:56+02', n := 3::SMALLINT),
+      NULL,
+      struct_pack(event_ts := NULL, n := NULL)
+    ])),
+  (struct_pack(kind := 'null-list', items := NULL)),
+  (struct_pack(kind := 'empty', items := []));
+
+query I
+SELECT count(*)
+FROM promoted_object_list_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono_promoted_list(v),
+        shredding := {
+          'items':'STRUCT(event_ts VARCHAR, n BIGINT)[]',
+          'kind':'VARCHAR'
+        });
+----
+3
+
+# Constant inputs preserve both the complete physical value and constant-vector contract.
+query II
+SELECT
+  jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02', NULL])) IS NOT DISTINCT FROM
+    jsono(
+      plain_jsono_promoted_list(
+        struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02', NULL])),
+      shredding := {'moments':'VARCHAR[]'}),
+  to_json(jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02', NULL])))::VARCHAR;
+----
+true	{"moments":["2024-01-01 10:34:56+00",null]}
+
+# Scans and optimizer verification supply dictionary and child-shuffled nested vectors. The
+# physical oracle spans more than one STANDARD_VECTOR_SIZE chunk.
+statement ok
+CREATE TABLE promoted_list_vector_input AS
+SELECT struct_pack(
+  kind := 'k' || (i % 7)::VARCHAR,
+  moments := CASE
+    WHEN i % 11 = 0 THEN NULL
+    WHEN i % 13 = 0 THEN []::TIMESTAMPTZ[]
+    ELSE [
+      TIMESTAMPTZ '2024-01-01 00:00:00+00' + (i % 86400) * INTERVAL '1 second',
+      CASE
+        WHEN i % 5 = 0 THEN NULL
+        ELSE TIMESTAMPTZ '2024-01-02 00:00:00+00' + (i % 86400) * INTERVAL '1 second'
+      END
+    ]
+  END) AS v
+FROM range(3000) rows(i);
+
+statement ok
+SET debug_verify_vector='dictionary_expression';
+
+query I
+SELECT count(*)
+FROM promoted_list_vector_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono_promoted_list(v),
+        shredding := {'kind':'VARCHAR','moments':'VARCHAR[]'});
+----
+3000
+
+statement ok
+SET debug_verify_vector='nested_shuffle';
+
+query I
+SELECT count(*)
+FROM promoted_list_vector_input
+WHERE jsono(v) IS NOT DISTINCT FROM
+      jsono(
+        plain_jsono_promoted_list(v),
+        shredding := {'kind':'VARCHAR','moments':'VARCHAR[]'});
+----
+3000
+
+statement ok
+RESET debug_verify_vector;
+
+statement ok
+RESET TimeZone;

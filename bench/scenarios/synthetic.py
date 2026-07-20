@@ -739,6 +739,7 @@ SCENARIOS += [
 TYPED_STRUCT_OPTIMIZATION_SHAPES = (
     "typed_top_scalar",
     "typed_scalar_array",
+    "typed_promoted_scalar_array",
     "typed_object_array",
     "typed_nested_scalar",
     "typed_mixed_all",

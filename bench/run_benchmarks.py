@@ -380,6 +380,22 @@ def typed_struct_payload_sql(shape: str) -> str:
                     ids := [i, NULL, i + 1]
                 )
             """
+        case "typed_promoted_scalar_array":
+            return """
+                struct_pack(
+                    event_name := 'event_' || (i % 10)::VARCHAR,
+                    event_ts := i,
+                    moments := [
+                        TIMESTAMPTZ '2024-01-01 00:00:00+00'
+                            + (i % 86400) * INTERVAL '1 second',
+                        CASE
+                            WHEN i % 7 = 0 THEN NULL
+                            ELSE TIMESTAMPTZ '2024-01-02 00:00:00+00'
+                                + (i % 86400) * INTERVAL '1 second'
+                        END
+                    ]
+                )
+            """
         case "typed_object_array":
             return """
                 struct_pack(
