@@ -1,0 +1,142 @@
+# name: test/sql/jsono_reshred_widening_direct.test
+# description: Flat-object widening reshred is physically identical to reconstruct plus generic shred
+# group: [sql]
+
+require jsono
+
+statement ok
+CREATE MACRO plain_jsono(v) AS CAST(v AS STRUCT(jsono STRUCT(body STRUCT(
+  slots BLOB,
+  key_heap BLOB,
+  string_heap BLOB,
+  skips BLOB,
+  lengths BLOB,
+  nums BLOB
+))));
+
+# Seventeen surviving fields exercise the root span and cursor-checkpoint framing.
+query II
+WITH source AS (
+  SELECT jsono(
+    '{
+      "a":"A","b":"B","c":"C","d":4,
+      "e":5,"f":6,"g":7,"h":8,"i":9,"j":10,"k":11,"l":12,
+      "m":13,"n":14,"o":15,"p":16,"q":17,"r":18,"s":19,"t":20,"u":21
+    }',
+    shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS v
+), compared AS (
+  SELECT
+    jsono(v, shredding := {
+      'a':'VARCHAR','b':'VARCHAR','c':'VARCHAR','d':'BIGINT'
+    }) AS fast,
+    jsono(plain_jsono(v), shredding := {
+      'a':'VARCHAR','b':'VARCHAR','c':'VARCHAR','d':'BIGINT'
+    }) AS generic
+  FROM source
+)
+SELECT hash(fast) = hash(generic), fast.jsono.body IS NOT DISTINCT FROM generic.jsono.body
+FROM compared;
+----
+true	true
+
+# Removed values split the key, string, length, and number streams into copy runs.
+query II
+WITH source AS (
+  SELECT jsono(
+    '{"a":"lifted","b":"left","c":11,"d":12,"e":"","m":"cut","n":"right","z":13}',
+    shredding := {'a':'VARCHAR'}) AS v
+), compared AS (
+  SELECT
+    jsono(v, shredding := {'a':'VARCHAR','d':'BIGINT','m':'VARCHAR'}) AS fast,
+    jsono(plain_jsono(v), shredding := {'a':'VARCHAR','d':'BIGINT','m':'VARCHAR'}) AS generic
+  FROM source
+)
+SELECT hash(fast) = hash(generic), fast.jsono.body IS NOT DISTINCT FROM generic.jsono.body
+FROM compared;
+----
+true	true
+
+# Missing and diverted new lanes leave the source residual blobs unchanged.
+query I
+WITH input(text) AS (VALUES
+  ('{"a":"x","n":7,"tail":"ok"}'),
+  ('{"a":"x","n":"7","tail":"ok"}'),
+  ('{"a":"x","tail":"ok"}')
+), source AS (
+  SELECT jsono(text, shredding := {'a':'VARCHAR'}) AS v
+  FROM input
+)
+SELECT count(*)
+FROM source
+WHERE jsono(v, shredding := {'a':'VARCHAR','n':'BIGINT'})
+      IS NOT DISTINCT FROM
+      jsono(plain_jsono(v), shredding := {'a':'VARCHAR','n':'BIGINT'});
+----
+3
+
+# A surviving container keeps the recursive fallback and exact output.
+query II
+WITH source AS (
+  SELECT jsono(
+    '{"a":"x","n":7,"nested":{"x":1,"y":"z"}}',
+    shredding := {'a':'VARCHAR'}) AS v
+), compared AS (
+  SELECT
+    jsono(v, shredding := {'a':'VARCHAR','n':'BIGINT'}) AS fast,
+    jsono(plain_jsono(v), shredding := {'a':'VARCHAR','n':'BIGINT'}) AS generic
+  FROM source
+)
+SELECT hash(fast) = hash(generic), fast.jsono.body IS NOT DISTINCT FROM generic.jsono.body
+FROM compared;
+----
+true	true
+
+# SQL NULL and constant inputs retain the regular vector contracts.
+query II
+WITH input(v) AS (
+  SELECT jsono(NULL, shredding := {'a':'VARCHAR'})
+  UNION ALL
+  SELECT jsono('{"a":"x","n":7}', shredding := {'a':'VARCHAR'})
+)
+SELECT
+  count(*) FILTER (
+    WHERE jsono(v, shredding := {'a':'VARCHAR','n':'BIGINT'}) IS NULL),
+  count(*) FILTER (
+    WHERE jsono(v, shredding := {'a':'VARCHAR','n':'BIGINT'}) IS NOT NULL)
+FROM input;
+----
+1	1
+
+statement ok
+CREATE TABLE widening_vector_input AS
+SELECT jsono(
+  '{"a":"x","n":' || i || ',"tail":"t' || i || '"}',
+  shredding := {'a':'VARCHAR'}) AS v
+FROM range(3000) rows(i);
+
+statement ok
+SET debug_verify_vector='dictionary_expression';
+
+query I
+SELECT count(*)
+FROM widening_vector_input
+WHERE jsono(v, shredding := {'a':'VARCHAR','n':'BIGINT'})
+      IS NOT DISTINCT FROM
+      jsono(plain_jsono(v), shredding := {'a':'VARCHAR','n':'BIGINT'});
+----
+3000
+
+statement ok
+SET debug_verify_vector='nested_shuffle';
+
+query I
+SELECT count(*)
+FROM widening_vector_input
+WHERE jsono(v, shredding := {'a':'VARCHAR','n':'BIGINT'})
+      IS NOT DISTINCT FROM
+      jsono(plain_jsono(v), shredding := {'a':'VARCHAR','n':'BIGINT'});
+----
+3000
+
+statement ok
+RESET debug_verify_vector;

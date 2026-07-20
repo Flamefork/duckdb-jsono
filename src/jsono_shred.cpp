@@ -1,5 +1,6 @@
 #include "jsono_shred.hpp"
 #include "jsono.hpp"
+#include "jsono_copy.hpp"
 #include "jsono_dom.hpp"
 #include "jsono_locate.hpp"
 #include "jsono_number.hpp"
@@ -111,6 +112,8 @@ struct ShredLocalState : public FunctionLocalState {
 	JsonoBuilder builder;
 	std::string text;
 	std::vector<const std::vector<PathStep> *> strip_paths;
+	vector<idx_t> flat_strip_positions;
+	vector<uint8_t> flat_residual_keep;
 	// Per-node rank cache for the one-pass jsono trie walk; sized to the bind-time trie on first use
 	// and reused across chunks (it survives in the local state, the whole point of the cache).
 	JsonoTrieRankCache jsono_rank_cache;
@@ -766,6 +769,290 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 	}
 }
 
+// A widening reshred already located every removed top-level scalar. Reuse those slot positions and
+// bulk-copy the surviving stream runs; nested residuals keep the recursive emitter below.
+bool TryWriteFlatObjectStrippingPaths(const JsonoView &view, const std::vector<const std::vector<PathStep> *> &paths,
+                                      const vector<idx_t> &positions, vector<uint8_t> &keep,
+                                      const std::string *manifest, JsonoBodyWriter &writer, idx_t row) {
+	if (view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+		return false;
+	}
+	for (auto path : paths) {
+		if (path->size() != 1) {
+			return false;
+		}
+	}
+
+	auto layout = ReadObjectLayout(view, 0);
+	keep.assign(layout.key_count, 1);
+	for (auto position : positions) {
+		if (position < layout.value_start || position >= layout.value_start + layout.key_count) {
+			return false;
+		}
+		keep[position - layout.value_start] = 0;
+	}
+	auto key_at = [&](idx_t i) {
+		auto key_slot = view.SlotAt(layout.key_start + i);
+		if (SlotTag(key_slot) != tag::KEY) {
+			throw InvalidInputException("malformed JSONO: expected KEY slot");
+		}
+		return view.KeyAt(SlotPayload(key_slot));
+	};
+	idx_t surviving = 0;
+	size_t key_bytes = 0;
+	size_t string_bytes = 0;
+	size_t length_count = 0;
+	size_t num_count = 0;
+	JsonoCursor cursor;
+	cursor.pos = layout.value_start;
+	for (idx_t i = 0; i < layout.key_count; i++) {
+		auto slot = view.SlotAt(cursor.pos);
+		auto slot_tag = SlotTag(slot);
+		if (slot_tag == tag::OBJ_START || slot_tag == tag::ARR_START) {
+			return false;
+		}
+		bool survives = keep[i] != 0;
+		if (survives) {
+			surviving++;
+			key_bytes += key_at(i).size();
+		}
+		switch (ClassifyRawScalarSlot(slot)) {
+		case RawScalarValueKind::LengthHeap: {
+			auto len = view.LengthAt(cursor.length_cursor);
+			if (survives) {
+				string_bytes += len;
+				length_count++;
+			}
+			cursor.string_cursor += len;
+			cursor.length_cursor++;
+			break;
+		}
+		case RawScalarValueKind::Number:
+			if (survives) {
+				num_count++;
+			}
+			cursor.num_cursor++;
+			break;
+		case RawScalarValueKind::Literal:
+			break;
+		}
+		cursor.pos++;
+	}
+	if (cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::OBJ_END) {
+		throw InvalidInputException("malformed JSONO: object value span mismatch");
+	}
+	if (surviving > CONTAINER_CHILD_COUNT_MASK || key_bytes > std::numeric_limits<uint32_t>::max() ||
+	    string_bytes > std::numeric_limits<uint32_t>::max() || length_count > std::numeric_limits<uint32_t>::max() ||
+	    num_count > std::numeric_limits<uint32_t>::max()) {
+		throw InvalidInputException("jsono: flat residual exceeds storage limits");
+	}
+
+	auto slot_count = size_t(2 + surviving * 2);
+	auto slots = StringVector::EmptyString(writer.Slots(), JSONO_HEADER_SIZE + slot_count * sizeof(uint64_t));
+	auto slots_data = slots.GetDataWriteable();
+	WriteJsonoHeaderInto(reinterpret_cast<uint8_t *>(slots_data), flags::SORTED_KEYS);
+	auto write_slot = [&](idx_t index, uint64_t slot) {
+		std::memcpy(slots_data + JSONO_HEADER_SIZE + index * sizeof(uint64_t), &slot, sizeof(slot));
+	};
+	write_slot(0, MakeSlot(tag::OBJ_START, MakeContainerPayload(0, surviving)));
+
+	auto key_heap = StringVector::EmptyString(writer.KeyHeap(), key_bytes);
+	auto key_data = key_heap.GetDataWriteable();
+	size_t key_offset = 0;
+	idx_t output_field = 0;
+	uint64_t shape_hash = HASH_SEED;
+	size_t key_run_source = 0;
+	size_t key_run_output = 0;
+	size_t key_run_size = 0;
+	auto flush_key_run = [&]() {
+		if (key_run_size > 0) {
+			auto source = view.KeyHeapSlice(key_run_source, key_run_size);
+			std::memcpy(key_data + key_run_output, source.data(), key_run_size);
+			key_run_size = 0;
+		}
+	};
+	for (idx_t i = 0; i < layout.key_count; i++) {
+		if (!keep[i]) {
+			continue;
+		}
+		auto key_slot = view.SlotAt(layout.key_start + i);
+		auto key = view.KeyAt(SlotPayload(key_slot));
+		auto source_offset = KeyOffset(SlotPayload(key_slot));
+		if (!key.empty() && key_run_size == 0) {
+			key_run_source = source_offset;
+			key_run_output = key_offset;
+		} else if (!key.empty() && source_offset != key_run_source + key_run_size) {
+			flush_key_run();
+			key_run_source = source_offset;
+			key_run_output = key_offset;
+		}
+		key_run_size += key.size();
+		write_slot(1 + output_field, MakeSlot(tag::KEY, MakeKeyPayload(key_offset, key.size())));
+		shape_hash = HashKey(shape_hash, key);
+		key_offset += key.size();
+		output_field++;
+	}
+	flush_key_run();
+
+	auto string_heap = StringVector::EmptyString(writer.StringHeap(), string_bytes);
+	auto string_data = string_heap.GetDataWriteable();
+	auto lengths = StringVector::EmptyString(writer.Lengths(), length_count * sizeof(uint32_t));
+	auto lengths_data = lengths.GetDataWriteable();
+	auto nums = StringVector::EmptyString(writer.Nums(), num_count * sizeof(uint64_t));
+	auto nums_data = nums.GetDataWriteable();
+
+	bool has_checkpoints = surviving > OBJECT_CHECKPOINT_STRIDE;
+	auto checkpoint_count = has_checkpoints ? (surviving - 1) / OBJECT_CHECKPOINT_STRIDE : 0;
+	auto manifest_size = manifest ? manifest->size() : 0;
+	auto skips_size = sizeof(ContainerMetadataHeader) +
+	                  (has_checkpoints ? sizeof(uint32_t) + sizeof(ContainerSpan) + sizeof(ObjectCheckpointIndex) +
+	                                         checkpoint_count * sizeof(ObjectCursorCheckpoint)
+	                                   : 0) +
+	                  manifest_size;
+	auto skips = StringVector::EmptyString(writer.Skips(), skips_size);
+	auto skips_data = skips.GetDataWriteable();
+	ContainerMetadataHeader metadata {has_checkpoints ? 1U : 0U, has_checkpoints ? 1U : 0U, uint32_t(checkpoint_count)};
+	std::memcpy(skips_data, &metadata, sizeof(metadata));
+	size_t skips_offset = sizeof(metadata);
+	char *checkpoint_data = nullptr;
+	if (has_checkpoints) {
+		uint32_t root_id = 0;
+		std::memcpy(skips_data + skips_offset, &root_id, sizeof(root_id));
+		skips_offset += sizeof(root_id);
+		ContainerSpan span {uint32_t(slot_count), uint32_t(string_bytes), shape_hash, uint32_t(length_count),
+		                    uint32_t(num_count)};
+		std::memcpy(skips_data + skips_offset, &span, sizeof(span));
+		skips_offset += sizeof(span);
+		ObjectCheckpointIndex index {0, 0, OBJECT_CHECKPOINT_STRIDE, 0};
+		std::memcpy(skips_data + skips_offset, &index, sizeof(index));
+		skips_offset += sizeof(index);
+		checkpoint_data = skips_data + skips_offset;
+		skips_offset += checkpoint_count * sizeof(ObjectCursorCheckpoint);
+	}
+	if (manifest_size > 0) {
+		std::memcpy(skips_data + skips_offset, manifest->data(), manifest_size);
+	}
+
+	cursor = JsonoCursor();
+	cursor.pos = layout.value_start;
+	output_field = 0;
+	size_t output_string = 0;
+	size_t output_length = 0;
+	size_t output_num = 0;
+	size_t string_run_source = 0;
+	size_t string_run_output = 0;
+	size_t string_run_size = 0;
+	size_t length_run_source = 0;
+	size_t length_run_output = 0;
+	size_t length_run_count = 0;
+	size_t num_run_source = 0;
+	size_t num_run_output = 0;
+	size_t num_run_count = 0;
+	auto flush_string_run = [&]() {
+		if (string_run_size > 0) {
+			auto source = view.StringAt(string_run_source, string_run_size);
+			std::memcpy(string_data + string_run_output, source.data(), string_run_size);
+			string_run_size = 0;
+		}
+	};
+	auto flush_length_run = [&]() {
+		if (length_run_count > 0) {
+			std::memcpy(lengths_data + length_run_output * sizeof(uint32_t),
+			            view.LengthsBytes(length_run_source, length_run_count), length_run_count * sizeof(uint32_t));
+			length_run_count = 0;
+		}
+	};
+	auto flush_num_run = [&]() {
+		if (num_run_count > 0) {
+			std::memcpy(nums_data + num_run_output * sizeof(uint64_t), view.NumsBytes(num_run_source, num_run_count),
+			            num_run_count * sizeof(uint64_t));
+			num_run_count = 0;
+		}
+	};
+	for (idx_t i = 0; i < layout.key_count; i++) {
+		auto slot = view.SlotAt(cursor.pos);
+		bool survives = keep[i] != 0;
+		if (survives && output_field > 0 && output_field % OBJECT_CHECKPOINT_STRIDE == 0) {
+			ObjectCursorCheckpoint checkpoint {uint32_t(output_field), uint32_t(output_string), uint32_t(output_length),
+			                                   uint32_t(output_num)};
+			auto checkpoint_index = output_field / OBJECT_CHECKPOINT_STRIDE - 1;
+			std::memcpy(checkpoint_data + checkpoint_index * sizeof(checkpoint), &checkpoint, sizeof(checkpoint));
+		}
+		if (survives) {
+			write_slot(1 + surviving + output_field, slot);
+		}
+		switch (ClassifyRawScalarSlot(slot)) {
+		case RawScalarValueKind::LengthHeap: {
+			auto len = view.LengthAt(cursor.length_cursor);
+			if (survives) {
+				if (len > 0 && string_run_size == 0) {
+					string_run_source = cursor.string_cursor;
+					string_run_output = output_string;
+				} else if (len > 0 && cursor.string_cursor != string_run_source + string_run_size) {
+					flush_string_run();
+					string_run_source = cursor.string_cursor;
+					string_run_output = output_string;
+				}
+				string_run_size += len;
+				if (length_run_count == 0) {
+					length_run_source = cursor.length_cursor;
+					length_run_output = output_length;
+				} else if (cursor.length_cursor != length_run_source + length_run_count) {
+					flush_length_run();
+					length_run_source = cursor.length_cursor;
+					length_run_output = output_length;
+				}
+				length_run_count++;
+				output_string += len;
+				output_length++;
+			}
+			cursor.string_cursor += len;
+			cursor.length_cursor++;
+			break;
+		}
+		case RawScalarValueKind::Number:
+			if (survives) {
+				if (num_run_count == 0) {
+					num_run_source = cursor.num_cursor;
+					num_run_output = output_num;
+				} else if (cursor.num_cursor != num_run_source + num_run_count) {
+					flush_num_run();
+					num_run_source = cursor.num_cursor;
+					num_run_output = output_num;
+				}
+				num_run_count++;
+				output_num++;
+			}
+			cursor.num_cursor++;
+			break;
+		case RawScalarValueKind::Literal:
+			break;
+		}
+		if (survives) {
+			output_field++;
+		}
+		cursor.pos++;
+	}
+	flush_string_run();
+	flush_length_run();
+	flush_num_run();
+	write_slot(slot_count - 1, MakeSlot(tag::OBJ_END, 0));
+
+	slots.Finalize();
+	key_heap.Finalize();
+	string_heap.Finalize();
+	skips.Finalize();
+	lengths.Finalize();
+	nums.Finalize();
+	writer.data[BODY_SLOTS][row] = slots;
+	writer.data[BODY_KEY_HEAP][row] = key_heap;
+	writer.data[BODY_STRING_HEAP][row] = string_heap;
+	writer.data[BODY_SKIPS][row] = skips;
+	writer.data[BODY_LENGTHS][row] = lengths;
+	writer.data[BODY_NUMS][row] = nums;
+	return true;
+}
+
 // Single-pass reshred of a shredded input whose shreds all survive into the target (see
 // ShredBindData::reshred_active): kept shreds are copied vector-at-a-time, only the target's new
 // paths are located in and stripped from the residual, and the manifest carries over the kept
@@ -885,6 +1172,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		FlatVector::Validity(result).SetValid(row);
 		FlatVector::GetData<int64_t>(*set_out)[row] = layout_hash;
 		lstate.strip_paths.clear();
+		lstate.flat_strip_positions.clear();
 		stripped_fields.clear();
 		for (idx_t f = 0; f < fields.size(); f++) {
 			if (bind_data.keep_src[f] != DConstants::INVALID_INDEX) {
@@ -904,6 +1192,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			}
 			if (strippable) {
 				lstate.strip_paths.push_back(&field.path.steps);
+				lstate.flat_strip_positions.push_back(location.cursor.pos);
 				stripped_fields.push_back(f);
 			}
 		}
@@ -933,14 +1222,18 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			continue;
 		}
 
-		lstate.builder.Reset();
-		JsonoEmitObjectStrippingPaths(view, lstate.strip_paths, lstate.builder);
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_fields.empty()) {
 			manifest.clear();
 			JsonoAppendShredManifest(manifest, manifest_entries, stripped_fields);
 			manifest_ptr = &manifest;
 		}
+		if (TryWriteFlatObjectStrippingPaths(view, lstate.strip_paths, lstate.flat_strip_positions,
+		                                     lstate.flat_residual_keep, manifest_ptr, writer, row)) {
+			continue;
+		}
+		lstate.builder.Reset();
+		JsonoEmitObjectStrippingPaths(view, lstate.strip_paths, lstate.builder);
 		writer.WriteRow(row, lstate.builder, manifest_ptr);
 	}
 }
