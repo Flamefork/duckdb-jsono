@@ -11,16 +11,20 @@ require icu
 # A document is storage, not a render: the same instant must produce the same bytes - and the same
 # shred lane text, whose Parquet min/max drives row-group pruning - whatever TimeZone the writing
 # session runs in. ICU overrides TIMESTAMPTZ -> VARCHAR in the cast set with a session render, so the
-# constructor renders through DefaultCast instead, which is the cast set core to_json renders through.
+# constructor renders through DefaultCast (UTC-fixed) instead. Core to_json renders TIMESTAMPTZ through
+# that session render since v1.5.5, so jsono matches core only under a UTC session and stays UTC-fixed
+# under every other TimeZone - the storage invariant wins over the session.
 
 statement ok
 SET TimeZone='America/New_York';
 
+# Columns 1-2: UTC-fixed literal under a non-UTC session. Column 3: the same instant written with a
+# -05 offset renders to identical bytes, so a shred lane and its Parquet min/max stay deterministic.
 query III
 SELECT to_json(jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'}))::VARCHAR,
        jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'})->>'ts',
        to_json(jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'}))::VARCHAR
-       = to_json({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'})::VARCHAR;
+       = to_json(jsono({'ts': TIMESTAMPTZ '2024-01-01 07:00:00-05'}))::VARCHAR;
 ----
 {"ts":"2024-01-01 12:00:00+00"}	2024-01-01 12:00:00+00	true
 
@@ -39,6 +43,14 @@ query I
 SELECT count(*) FROM tz_docs WHERE (j->>'ts') = '2024-01-01 12:00:00+00';
 ----
 2
+
+# Under a UTC session core to_json and jsono agree: jsono renders through core's cast set, not a
+# private format - the divergence above is only ICU's session offset, which storage deliberately drops.
+query I
+SELECT to_json(jsono({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'}))::VARCHAR
+       = to_json({'ts': TIMESTAMPTZ '2024-01-01 12:00:00+00'})::VARCHAR;
+----
+true
 
 # The MAP key path renders through the same cast: a TIMESTAMPTZ key is UTC text too.
 statement ok
