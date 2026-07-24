@@ -1616,6 +1616,90 @@ unique_ptr<BaseStatistics> TryRecoverMultiFileColumnStats(ClientContext &context
 	return merged.ToUnique();
 }
 
+// Decode one shredded-jsono statistics object against `type`'s own layout into the set of scalar
+// shred PATHS proven spill-clean by the two-valued marker + the spill-column statistics: all paths
+// under marker min==max==clean-hash, per-bit decodes under identity-with-dirt (uniform mask word /
+// high bound — see CollectShredTotality). Shared by the scan-wide proof and the per-file proof (a
+// multi-file scan whose merged marker stats fail identity may still prove a lane by ANDing each
+// file's own decode under the file's own hash and rank numbering). Fail-safe: missing stats,
+// foreign hashes and out-of-domain masks prove nothing.
+void CollectSpillProvenPaths(const BaseStatistics &stats, const LogicalType &type, unordered_set<string> &proven) {
+	JsonoLayoutType layout;
+	if (!TryParseJsonoLayoutType(type, layout) || layout.kind != JsonoLayoutKind::Shredded) {
+		return;
+	}
+	if (stats.GetType().id() != LogicalTypeId::STRUCT || StructType::GetChildCount(stats.GetType()) < 1) {
+		return;
+	}
+	auto &layout_stats = StructStats::GetChildStats(stats, 0);
+	if (layout_stats.GetType().id() != LogicalTypeId::STRUCT || StructType::GetChildCount(layout_stats.GetType()) < 2) {
+		return;
+	}
+	auto &shreds_stats = StructStats::GetChildStats(layout_stats, 1);
+	if (shreds_stats.GetType().id() != LogicalTypeId::STRUCT || StructType::GetChildCount(shreds_stats.GetType()) < 2) {
+		return;
+	}
+	auto clean_hash = int64_t(JsonoLayoutHashOf(type));
+	auto dirty_hash = int64_t(uint64_t(clean_hash) ^ JSONO_DIRTY_HASH_FLIP);
+	auto &set_stats = StructStats::GetChildStats(shreds_stats, 0);
+	bool all_clean = false;
+	bool identity = false;
+	if (NumericStats::HasMinMax(set_stats)) {
+		auto marker_min = NumericStats::Min(set_stats).GetValue<int64_t>();
+		auto marker_max = NumericStats::Max(set_stats).GetValue<int64_t>();
+		all_clean = marker_min == clean_hash && marker_max == clean_hash;
+		identity = (marker_min == clean_hash || marker_min == dirty_hash) &&
+		           (marker_max == clean_hash || marker_max == dirty_hash);
+	}
+	auto spill_words = layout.spill_columns;
+	vector<bool> exact_mask(spill_words, false);
+	vector<uint64_t> mask(spill_words, 0);
+	vector<bool> high_bound(spill_words, false);
+	vector<uint64_t> mask_max(spill_words, 0);
+	if (identity && !all_clean) {
+		for (idx_t word = 0; word < spill_words; word++) {
+			auto &spill_stats = StructStats::GetChildStats(shreds_stats, 1 + word);
+			if (!NumericStats::HasMinMax(spill_stats)) {
+				continue;
+			}
+			auto spill_min = NumericStats::Min(spill_stats).GetValue<int64_t>();
+			auto spill_max = NumericStats::Max(spill_stats).GetValue<int64_t>();
+			if (spill_min < 0 || spill_max < 0) {
+				continue;
+			}
+			idx_t word_bits = MinValue<idx_t>(JSONO_SPILL_BITS, layout.shreds.size() - word * JSONO_SPILL_BITS);
+			if (spill_min == spill_max && (uint64_t(spill_min) >> word_bits) == 0) {
+				exact_mask[word] = true;
+				mask[word] = uint64_t(spill_min);
+			} else {
+				high_bound[word] = true;
+				mask_max[word] = uint64_t(spill_max);
+			}
+		}
+	}
+	// Canonical spill-bit rank of each shred: its position in the byte-wise sorted name list
+	// (== field index for canonically-ordered types; a reorder-only cast permutes fields while the
+	// order-independent set hash still matches).
+	vector<string> shred_names;
+	shred_names.reserve(layout.shreds.size());
+	for (auto &shred : layout.shreds) {
+		shred_names.push_back(shred.first);
+	}
+	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
+	for (idx_t k = 0; k < layout.shreds.size(); k++) {
+		if (IsShredListType(layout.shreds[k].second)) {
+			continue; // array shreds are always reconstructed, never bare-read
+		}
+		auto rank = spill_ranks[k];
+		auto word = rank / JSONO_SPILL_BITS;
+		auto bit = rank % JSONO_SPILL_BITS;
+		if (all_clean || (word < spill_words && ((exact_mask[word] && ((mask[word] >> bit) & 1) == 0) ||
+		                                         (high_bound[word] && (mask_max[word] >> bit) == 0)))) {
+			proven.insert(layout.shreds[k].first);
+		}
+	}
+}
+
 // Per shredded jsono column (keyed by its base table ColumnBinding), the totality of each shred:
 // entry[child_index] == false means a bare lane read serves the shred's full `->>` answer on every
 // row (no value spilled to the residual AND the file was written under exactly the read shred set).
@@ -1806,115 +1890,120 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 			stats = TryRecoverMultiFileColumnStats(context, get, table_index, returned_types[table_index]);
 		}
 		vector<bool> per_shred(shreds.size(), true);
-		if (stats && stats->GetType().id() == LogicalTypeId::STRUCT &&
-		    StructType::GetChildCount(stats->GetType()) >= 1) {
-			auto &layout_stats = StructStats::GetChildStats(*stats, 0);
-			if (layout_stats.GetType().id() == LogicalTypeId::STRUCT &&
-			    StructType::GetChildCount(layout_stats.GetType()) >= 2) {
-				// layout child 1 is the `shreds` struct: child 0 is the shred-set marker, child 1 the
-				// spill bitmap, child 2 + shred.child_index the shred's bare lane.
-				auto &shreds_stats = StructStats::GetChildStats(layout_stats, 1);
-				if (shreds_stats.GetType().id() == LogicalTypeId::STRUCT &&
-				    StructType::GetChildCount(shreds_stats.GetType()) >= 2) {
-					auto shred_children = StructType::GetChildCount(shreds_stats.GetType());
-					// Schema identity via the two-valued marker: every scanned row was written under
-					// EXACTLY the read shred set when the marker min/max stay within the {clean hash,
-					// dirty hash} pair. min==max==clean is the dominant all-clean proof — every scalar
-					// shred is total at once, with no spill statistics consulted (a plain NumericStats
-					// question that survives Parquet zone-maps, native storage and DuckLake's global
-					// min/max strings alike). Any dirty rows flip their markers, so identity-with-dirt
-					// falls through to the spill-bitmap statistics below. Only under identity is the
-					// bitmap readable — its bit numbering is the writing set's sorted-name ranks, and a
-					// NULL marker can only be a SQL-NULL row (min/max ignore NULLs; those rows are
-					// invisible here and contribute nothing to any read either).
-					auto &set_stats = StructStats::GetChildStats(shreds_stats, 0);
-					auto clean_hash = int64_t(JsonoLayoutHashOf(returned_types[table_index]));
-					auto dirty_hash = int64_t(uint64_t(clean_hash) ^ JSONO_DIRTY_HASH_FLIP);
-					bool all_clean = false;
-					bool identity = false;
-					if (NumericStats::HasMinMax(set_stats)) {
-						auto marker_min = NumericStats::Min(set_stats).GetValue<int64_t>();
-						auto marker_max = NumericStats::Max(set_stats).GetValue<int64_t>();
-						all_clean = marker_min == clean_hash && marker_max == clean_hash;
-						identity = (marker_min == clean_hash || marker_min == dirty_hash) &&
-						           (marker_max == clean_hash || marker_max == dirty_hash);
-					}
-					// Spill-column proofs under identity-with-dirt. Clean rows store NULL (never an
-					// all-zero mask), so per-column min/max describe the DIRTY rows alone: min==max==M
-					// is the exact decode — every dirty row carries the same mask word, so a shred
-					// whose bit is clear in M is total. That makes a systematic divert (one source
-					// consistently missing a lane type) quarantine to its own shreds instead of
-					// demoting the whole row-group. A word is trusted only when in-domain
-					// (non-negative, no bits at or above the shred count) — an out-of-domain mask can
-					// only come from a hand-built row, and its in-range bits must not be believed
-					// either (see jsono_shredded_total.test). Mixed dirty masks (min != max) keep a
-					// one-sided bound: masks are non-negative, so a bit set in any row forces
-					// max >= 2^bit — every bit with 2^bit > max is provably clean in that word.
-					JsonoLayoutType read_layout;
-					TryParseJsonoLayoutType(returned_types[table_index], read_layout);
-					auto spill_words = read_layout.spill_columns;
-					vector<bool> exact_mask(spill_words, false);
-					vector<uint64_t> mask(spill_words, 0);
-					vector<bool> high_bound(spill_words, false);
-					vector<uint64_t> mask_max(spill_words, 0);
-					if (identity && !all_clean) {
-						for (idx_t word = 0; word < spill_words; word++) {
-							auto &spill_stats = StructStats::GetChildStats(shreds_stats, 1 + word);
-							if (!NumericStats::HasMinMax(spill_stats)) {
+		JsonoLayoutType read_layout;
+		TryParseJsonoLayoutType(returned_types[table_index], read_layout);
+		if (stats) {
+			// Scan-wide spill proof: the two-valued marker (min==max==clean-hash = the dominant
+			// all-clean case; values within the {clean, dirty} pair = identity with some dirty rows)
+			// plus the per-column dirty-mask decode, all plain min/max questions — see
+			// CollectSpillProvenPaths.
+			unordered_set<string> proven;
+			CollectSpillProvenPaths(*stats, returned_types[table_index], proven);
+			for (auto &shred : shreds) {
+				if (proven.count(read_layout.shreds[shred.child_index].first)) {
+					per_shred[shred.child_index] = false;
+				}
+			}
+			// Per-lane no-NULL proof, independent of identity: the lane has no NULL at all, so
+			// nothing can be hiding behind it — no divert, no absent path, and no reconciliation
+			// NULL-fill (which is how a row written under a set LACKING this lane would look).
+			// Survives shred-set evolution for dense non-null lanes where the merged marker stats
+			// break identity (union_by_name / DuckLake evolution).
+			if (stats->GetType().id() == LogicalTypeId::STRUCT && StructType::GetChildCount(stats->GetType()) >= 1) {
+				auto &layout_stats = StructStats::GetChildStats(*stats, 0);
+				if (layout_stats.GetType().id() == LogicalTypeId::STRUCT &&
+				    StructType::GetChildCount(layout_stats.GetType()) >= 2) {
+					auto &shreds_stats = StructStats::GetChildStats(layout_stats, 1);
+					if (shreds_stats.GetType().id() == LogicalTypeId::STRUCT &&
+					    StructType::GetChildCount(shreds_stats.GetType()) >= 2) {
+						auto shred_children = StructType::GetChildCount(shreds_stats.GetType());
+						for (auto &shred : shreds) {
+							if (!per_shred[shred.child_index] || IsShredListType(shred.type)) {
 								continue;
 							}
-							auto spill_min = NumericStats::Min(spill_stats).GetValue<int64_t>();
-							auto spill_max = NumericStats::Max(spill_stats).GetValue<int64_t>();
-							if (spill_min < 0 || spill_max < 0) {
+							idx_t lane_child = 1 + read_layout.spill_columns + shred.child_index;
+							if (lane_child >= shred_children) {
 								continue;
 							}
-							idx_t word_bits =
-							    MinValue<idx_t>(JSONO_SPILL_BITS, shreds.size() - word * JSONO_SPILL_BITS);
-							if (spill_min == spill_max && (uint64_t(spill_min) >> word_bits) == 0) {
-								exact_mask[word] = true;
-								mask[word] = uint64_t(spill_min);
-							} else {
-								high_bound[word] = true;
-								mask_max[word] = uint64_t(spill_max);
+							auto &lane_stats = StructStats::GetChildStats(shreds_stats, lane_child);
+							if (!lane_stats.CanHaveNull()) {
+								per_shred[shred.child_index] = false;
 							}
 						}
 					}
-					// Canonical spill-bit rank of each shred: its position in the byte-wise sorted name
-					// list (== child_index for canonically-ordered types; a reorder-only cast permutes
-					// fields while the order-independent set hash still matches).
-					vector<string> shred_names;
-					shred_names.reserve(read_layout.shreds.size());
-					for (auto &shred : read_layout.shreds) {
-						shred_names.push_back(shred.first);
+				}
+			}
+		}
+		// Per-file identity proof for the shreds still not proven: a union_by_name multi-file scan
+		// whose per-file shred sets diverge fails the merged-marker identity (each file carries an
+		// unrelated hash) and, for a sparse lane, the no-NULL proof too — yet every file may be
+		// provably clean under ITS OWN hash and rank numbering. AND the per-file decodes: a lane is
+		// total iff every file carries it at the read type AND proves it spill-clean by its own
+		// statistics. Files translate their local ranks to paths inside CollectSpillProvenPaths, so
+		// no cross-file numbering is needed. Fail-safe: a missing union reader, a file lacking the
+		// column/lane, a retyped lane (union widening — left to the no-NULL proof, whose rendering
+		// equivalence is established) or an unproven file keeps the fallback.
+		bool any_unproven_scalar = false;
+		for (auto &shred : shreds) {
+			any_unproven_scalar |= per_shred[shred.child_index] && !IsShredListType(shred.type);
+		}
+		if (any_unproven_scalar && get.bind_data) {
+			auto multi_file = dynamic_cast<MultiFileBindData *>(get.bind_data.get());
+			if (multi_file && !multi_file->union_readers.empty() && table_index < multi_file->names.size()) {
+				auto &column_name = multi_file->names[table_index];
+				vector<unordered_set<string>> file_proven;
+				vector<const child_list_t<LogicalType> *> file_shreds;
+				vector<JsonoLayoutType> file_layouts(multi_file->union_readers.size());
+				bool per_file_usable = true;
+				for (idx_t file_idx = 0; file_idx < multi_file->union_readers.size() && per_file_usable; file_idx++) {
+					auto &union_data = multi_file->union_readers[file_idx];
+					if (!union_data) {
+						per_file_usable = false;
+						break;
 					}
-					auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
+					// The file's own column type: per-file hash + rank numbering come from here.
+					optional_idx column_pos;
+					for (idx_t c = 0; c < union_data->names.size(); c++) {
+						if (union_data->names[c] == column_name) {
+							column_pos = c;
+							break;
+						}
+					}
+					if (!column_pos.IsValid() ||
+					    !TryParseJsonoLayoutType(union_data->types[column_pos.GetIndex()], file_layouts[file_idx]) ||
+					    file_layouts[file_idx].kind != JsonoLayoutKind::Shredded) {
+						per_file_usable = false;
+						break;
+					}
+					auto file_stats = file_idx == 0 && multi_file->initial_reader
+					                      ? multi_file->initial_reader->GetStatistics(context, column_name)
+					                      : union_data->GetStatistics(context, column_name);
+					unordered_set<string> proven;
+					if (file_stats) {
+						CollectSpillProvenPaths(*file_stats, union_data->types[column_pos.GetIndex()], proven);
+					}
+					file_proven.push_back(std::move(proven));
+					file_shreds.push_back(&file_layouts[file_idx].shreds);
+				}
+				if (per_file_usable) {
 					for (auto &shred : shreds) {
-						// Array shreds stay non-total (always reconstructed). !HasMinMax / foreign hash /
-						// missing stats all fail safe: the residual COALESCE stays.
-						if (IsShredListType(shred.type)) {
+						if (!per_shred[shred.child_index] || IsShredListType(shred.type)) {
 							continue;
 						}
-						auto rank = spill_ranks[shred.child_index];
-						auto word = rank / JSONO_SPILL_BITS;
-						auto bit = rank % JSONO_SPILL_BITS;
-						bool spill_clear =
-						    all_clean || (word < spill_words && ((exact_mask[word] && ((mask[word] >> bit) & 1) == 0) ||
-						                                         (high_bound[word] && (mask_max[word] >> bit) == 0)));
-						if (spill_clear) {
-							per_shred[shred.child_index] = false;
-							continue;
+						auto &path = read_layout.shreds[shred.child_index].first;
+						auto &read_type = read_layout.shreds[shred.child_index].second;
+						bool every_file = true;
+						for (idx_t file_idx = 0; file_idx < file_proven.size() && every_file; file_idx++) {
+							bool carried_same_type = false;
+							for (auto &file_shred : *file_shreds[file_idx]) {
+								if (file_shred.first == path) {
+									carried_same_type = file_shred.second == read_type;
+									break;
+								}
+							}
+							every_file = carried_same_type && file_proven[file_idx].count(path);
 						}
-						// Per-lane no-NULL proof, independent of identity: the lane has no NULL at all, so
-						// nothing can be hiding behind it — no divert, no absent path, and no
-						// reconciliation NULL-fill (which is how a row written under a set LACKING this
-						// lane would look). Survives shred-set evolution for dense non-null lanes where
-						// the merged marker stats break identity (union_by_name / DuckLake evolution).
-						idx_t lane_child = 1 + spill_words + shred.child_index;
-						if (lane_child >= shred_children) {
-							continue;
-						}
-						auto &lane_stats = StructStats::GetChildStats(shreds_stats, lane_child);
-						if (!lane_stats.CanHaveNull()) {
+						if (every_file) {
 							per_shred[shred.child_index] = false;
 						}
 					}

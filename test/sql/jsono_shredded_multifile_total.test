@@ -63,8 +63,9 @@ FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_b.parquet'], 
 ----
 B	1000
 
-# (c) a SQL NULL row in one file nulls its `complete` lane; without schema identity that blocks the
-# fold (conservative), and values stay correct.
+# (c) a SQL NULL row in one file makes the `a` lane nullable, so the per-lane no-NULL proof fails —
+# but each file is all-clean under its own marker (a SQL-NULL row is invisible to min/max and a bare
+# read of it is correctly NULL), so the per-file identity AND still folds the read COALESCE-free.
 statement ok
 COPY (SELECT CASE WHEN i % 10 = 0 THEN jsono(NULL) ELSE jsono('{"a":"N' || i || '"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) END AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_null.parquet' (FORMAT parquet);
@@ -75,7 +76,7 @@ PRAGMA explain_output='physical_only';
 query II
 EXPLAIN SELECT MIN(e->>'a') FROM read_parquet(['__TEST_DIR__/mft_null.parquet', '__TEST_DIR__/mft_b.parquet'], union_by_name=true);
 ----
-physical_plan	<REGEX>:.*COALESCE.*
+physical_plan	<!REGEX>:.*COALESCE.*
 
 statement ok
 PRAGMA explain_output='all';
@@ -86,8 +87,8 @@ FROM read_parquet(['__TEST_DIR__/mft_null.parquet', '__TEST_DIR__/mft_b.parquet'
 ----
 1090	1100
 
-# (d) a spilled value (a string in a BIGINT lane) zeroes `complete` in its file; min==max==1 fails
-# and the fallback recovers the residual value.
+# (d) a spilled value (a string in a BIGINT lane) dirties its file's marker and sets the lane's
+# spill bit; the per-file decode excludes the lane and the fallback recovers the residual value.
 statement ok
 COPY (SELECT jsono('{"n":' || i || '}', shredding := {'$.n':'BIGINT'}) AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_num.parquet' (FORMAT parquet);
@@ -196,11 +197,12 @@ SELECT count(DISTINCT e->>'a') FROM (
 2100
 
 # (g) the SAME lane carried at a DIVERGENT value type across files (union_by_name widens the BIGINT
-# lane to VARCHAR). The name-aligned stats recovery reads the lane's `complete` (which does not
-# diverge) and folds the STRING extract COALESCE-free: its answer is text either way, and the widened
-# lane renders identically to the residual. But a json-valued read cannot — the number-vs-string
-# distinction is lost in the widened lane, so the raw-cast manifest guard fails it loudly rather than
-# fabricate a value. This pins the correctness-critical `AlignStatsToReadType` divergent-type branch.
+# lane to VARCHAR). The name-aligned stats recovery carries the lane's null-validity across the type
+# divergence, so the no-NULL proof folds the STRING extract COALESCE-free: its answer is text either
+# way, and the widened lane renders identically to the residual. But a json-valued read cannot — the
+# number-vs-string distinction is lost in the widened lane, so the raw-cast manifest guard fails it
+# loudly rather than fabricate a value. This pins the correctness-critical `AlignStatsToReadType`
+# divergent-type branch.
 statement ok
 COPY (SELECT jsono('{"a":"A' || i || '"}', shredding := {'a':'VARCHAR'}) AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_dv_a.parquet' (FORMAT parquet);
@@ -303,3 +305,67 @@ query II
 SELECT MIN(e->>'a'), count(*) FROM read_parquet(['__TEST_DIR__/mft_a.parquet', '__TEST_DIR__/mft_a.parquet']);
 ----
 A0	2000
+
+# (j) per-file identity: two files carry DIVERGENT shred sets ({a} vs {a, b}), so the merged marker
+# stats never prove identity, and the common lane `a` is SPARSE (absent on some rows -> NULL lane),
+# so the per-lane no-NULL proof fails too. Each file is still provably all-clean under its OWN
+# hash — the per-file AND proves lane `a` total, and the read is COALESCE-free.
+statement ok
+COPY (SELECT jsono(CASE WHEN i % 3 = 0 THEN '{"z":1}' ELSE '{"a":"A' || i || '"}' END,
+                   shredding := {'a':'VARCHAR'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft_pf_a.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono(CASE WHEN i % 3 = 0 THEN '{"z":1}' ELSE '{"a":"B' || i || '","b":' || i || '}' END,
+                   shredding := {'a':'VARCHAR','b':'BIGINT'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft_pf_b.parquet' (FORMAT parquet);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(e->>'a') FROM read_parquet(['__TEST_DIR__/mft_pf_a.parquet', '__TEST_DIR__/mft_pf_b.parquet'], union_by_name=true);
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+# The file-B-only lane `b` is NULL-filled on file A's rows while file A has no values for it in
+# the residual either (no `b` key there): reads stay correct, and `b` keeps the COALESCE fallback
+# (file A does not carry the lane).
+query II
+EXPLAIN SELECT MIN(TRY_CAST(e->>'b' AS BIGINT)) FROM read_parquet(['__TEST_DIR__/mft_pf_a.parquet', '__TEST_DIR__/mft_pf_b.parquet'], union_by_name=true);
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query III
+SELECT count(*), MIN(e->>'a'), MAX(e->>'a')
+FROM read_parquet(['__TEST_DIR__/mft_pf_a.parquet', '__TEST_DIR__/mft_pf_b.parquet'], union_by_name=true);
+----
+200	A1	B98
+
+# (k) per-file identity respects per-file dirt: file B's `a` lane diverts on a few rows (a number
+# at the VARCHAR lane). File B's own dirty-mask decode excludes `a`, so the AND keeps the fallback
+# and the diverted values read from the residual.
+statement ok
+COPY (SELECT jsono(CASE WHEN i % 10 = 0 THEN '{"a":' || i || '}' ELSE '{"a":"B' || i || '"}' END,
+                   shredding := {'a':'VARCHAR','b':'BIGINT'}) AS e FROM range(100) t(i))
+TO '__TEST_DIR__/mft_pf_dirty.parquet' (FORMAT parquet);
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT MIN(e->>'a') FROM read_parquet(['__TEST_DIR__/mft_pf_a.parquet', '__TEST_DIR__/mft_pf_dirty.parquet'], union_by_name=true);
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+PRAGMA explain_output='all';
+
+query II
+SELECT count(*) FILTER ((e->>'a') = '0'), count(*)
+FROM read_parquet(['__TEST_DIR__/mft_pf_a.parquet', '__TEST_DIR__/mft_pf_dirty.parquet'], union_by_name=true);
+----
+1	200

@@ -43,7 +43,7 @@ Shredded storage:
 
 - [`jsono(value, shredding := spec)`](#jsonovalue-shredding) — build a *shredded* `STRUCT` from JSON text or an existing JSONO, lifting hot paths into typed shred columns; `->>` and `to_json` stay transparent and read the shreds.
 - [`jsono_suggest_shredding(value[, min_presence, min_fit])`](#jsono_suggest_shredding) — aggregate a *plain* JSONO column into a ready-to-paste `shredding :=` spec string.
-- [`jsono_shred_stats(value)`](#jsono_shred_stats) — aggregate an existing *shredded* column into per-shred lane / divert / complete rates.
+- [`jsono_shred_stats(value)`](#jsono_shred_stats) — aggregate an existing *shredded* column into per-shred lane / divert rates.
 
 Inspect:
 
@@ -418,16 +418,15 @@ Number lanes follow the `BIGINT` > `DOUBLE` > `BOOLEAN` > `VARCHAR` preference, 
 
 ### `jsono_shred_stats`
 
-Aggregates an existing **shredded** column and reports, per shred, how well the shred set is working — as a `LIST<STRUCT(path VARCHAR, type VARCHAR, lane_rate DOUBLE, divert_rate DOUBLE, complete_rate DOUBLE)>` sorted by path:
+Aggregates an existing **shredded** column and reports, per shred, how well the shred set is working — as a `LIST<STRUCT(path VARCHAR, type VARCHAR, lane_rate DOUBLE, divert_rate DOUBLE)>` sorted by path:
 
 - `lane_rate` — fraction of non-`NULL` rows whose typed lane is populated (by a lifted value).
 - `divert_rate` — fraction of non-`NULL` rows where the lane is `NULL` because the value did not fit its shred type and stayed behind in the residual. A high divert rate means the shred type is too narrow. An explicit JSON `null` (a complete NULL lane) is lossless and does **not** count as a divert.
-- `complete_rate` — fraction of rows where a bare typed lane read is the full `->>` answer (a fit, an absent path, or an explicit `null`). Array shreds report `1.0`.
 
 ```sql
 SELECT to_json(jsono_shred_stats(payload)) FROM shredded;
--- [{"path":"kind","type":"VARCHAR","lane_rate":1.0,"divert_rate":0.0,"complete_rate":1.0},
---  {"path":"time_us","type":"BIGINT","lane_rate":0.98,"divert_rate":0.02,"complete_rate":0.98}]
+-- [{"path":"kind","type":"VARCHAR","lane_rate":1.0,"divert_rate":0.0},
+--  {"path":"time_us","type":"BIGINT","lane_rate":0.98,"divert_rate":0.02}]
 ```
 
 Plain (non-shredded) input is rejected — use `jsono_suggest_shredding` to propose shreds for a plain column.

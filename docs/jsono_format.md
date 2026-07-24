@@ -45,10 +45,11 @@ STRUCT(
     body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB,
                 lengths BLOB, nums BLOB),
     shreds STRUCT(
-      "$jsono$set" BIGINT,                          -- shred-set marker (see below)
-      "<path1>" STRUCT("value" <type1>, complete TINYINT), -- scalar shred: value + spill flag
-      "<path2>" STRUCT("value" <type2>, complete TINYINT),
-      "<arrpath>" <list_type>,                      -- array shred: a bare LIST, no pair
+      "$jsono$set" BIGINT,      -- shred-set marker (see below)
+      "$jsono$spill" BIGINT,    -- spill bitmap column(s): "$jsono$spill1", … for sets past 63 shreds
+      "<path1>" <type1>,        -- scalar shred: the bare typed lane
+      "<path2>" <type2>,
+      "<arrpath>" <list_type>,  -- array shred: a bare LIST
       …
     )
   )
@@ -61,11 +62,11 @@ applies to them unchanged, including `version`. A plain (unshredded) value has
 **no** `shreds` field (`STRUCT(jsono STRUCT(body …))`); shredded-ness is exactly
 the presence of `shreds`. Each scalar *shred* is the value at its canonical path
 (`$.kind`, `$.commit.operation`, …) materialized as a plain typed DuckDB column
-(`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`) inside a pair
-`STRUCT(value, complete)`, with the path as the field name. Nested shred paths
-are allowed. No JSON key is reserved: a JSON key named `body` can still be
-shredded through its `$.`-prefixed path form (`$.body`), which lands inside
-`shreds` and cannot collide with the layout's `body`.
+(`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`) with the path as the field
+name. Nested shred paths are allowed. No JSON key is reserved: a JSON key named
+`body` can still be shredded through its `$.`-prefixed path form (`$.body`),
+which lands inside `shreds` and cannot collide with the layout's `body` (the
+`$jsono$` name prefix is reserved for the layout's own fields).
 
 The single layout name (`jsono` for both plain and shredded) and the nested
 `shreds` struct are both deliberate. DuckDB reconciles struct types by field
@@ -91,52 +92,80 @@ the left branch's shreds first — same shred set, branch-dependent field order.
 Shred `value` lanes stay scalar columns, so Parquet/DuckLake projection and
 filter pushdown act on them directly.
 
-### Shred-set marker and per-shred completeness
+### Shred-set marker and spill bitmap
 
-Two orthogonal signals let the optimizer decide, per shred, whether a bare
-`struct_extract` of the `value` lane is the full `->>` answer (a zone-map-pushed
-columnar read) or whether it must fall back to / reconstruct from the residual:
+Two reserved fields let the optimizer decide, per shred, whether a bare
+`struct_extract` of the lane is the full `->>` answer (a zone-map-pushed
+columnar read) or whether it must fall back to / reconstruct from the residual.
+All proofs are plain min/max questions, so they survive every statistics
+backend alike — Parquet zone-maps, native storage, and DuckLake's global
+min/max strings (which carry no value counts, the reason nothing here depends
+on a null-count or has-valid-values signal):
 
 - **`shreds.$jsono$set`** (`BIGINT`, one per value): the canonical layout hash of
   the shred *set* (paths + types) the row was written under — its `uint64` hash
-  bits reinterpreted as a signed `BIGINT`. It is the *schema identity* across
-  files: a scan whose marker zone-map proves a single `min == max == ` the read
-  type's layout hash was written under exactly the read shred set. A multi-file
-  read that unions narrower/retyped shred sets (`union_by_name`, DuckLake schema
-  evolution) carries a different hash per file (`min != max`), which keeps the
-  residual fallback — unless the per-shred `complete` proof below applies — so a
-  reader-NULL-filled lane is read from the residual, not as a silent `NULL`. The
-  hash is **order-independent** (the marker identifies the set, not the field
-  order, so a set-op/reorder cast that permutes the shreds still matches). It is
-  `NULL` only on a SQL-NULL row; a divert never nulls it. It is a signed `BIGINT`,
-  not `UBIGINT`, because DuckDB's Parquet writer omits min/max stats for unsigned
-  integers — a `UBIGINT` marker would carry no zone-map on a Parquet scan.
-- **`shreds.<path>.complete`** (`TINYINT`, per scalar shred, per row): `1` when the
-  `value` lane holds the complete `->>` answer for this row, `0` when the value
-  spilled to the residual. Per-shred, so a divert on one shred never demotes
-  another. A shred is read bare (the residual COALESCE arm is dropped) when its
-  `complete` zone-map proves `min == max == 1` (no spill anywhere) **and either**
-  the marker proves schema identity **or** the `complete` stats prove no `NULL` at
-  all. The second path is what survives shred-set evolution: a lane every file
-  wrote and filled (`complete` all `1`, no `NULL`) stays total even when the
-  marker cannot prove identity (`min != max` across set-op / `union_by_name` /
-  DuckLake-evolved files), while a reconciliation that `NULL`-fills a lane on the
-  rows whose writing shred set lacked it puts `NULL`s into `complete` — invisible
-  to `min`/`max` — so the no-`NULL` proof fails and the residual fallback is
-  correctly kept. It is a `TINYINT` 1/0 flag, not a `BOOLEAN`, because DuckDB's
-  Parquet statistics reader does not transform `BOOLEAN` page min/max into
-  zone-map statistics — a `BOOLEAN` flag would never prove totality on a Parquet
-  scan. Array shreds carry no `complete` (they are always reconstructed, never
-  bare-read).
+  bits reinterpreted as a signed `BIGINT` — stamped **clean** (the hash itself)
+  on a row whose spill bitmap is empty and **dirty** (the hash with its lowest
+  bit flipped) on a row where at least one shred diverted. It is the *schema
+  identity* across files, two-valued so the zone-map alone separates the cases:
+  `min == max ==` the clean hash proves the scan all-clean under exactly the
+  read shred set — every scalar shred reads bare at once; marker values within
+  the `{clean, dirty}` pair prove the identity with some dirty rows, whose spill
+  statistics then decide per shred (below). A multi-file read that unions
+  narrower/retyped shred sets (`union_by_name`, DuckLake schema evolution)
+  carries an unrelated hash per file, which fails both patterns and keeps the
+  residual fallback — unless the per-lane no-`NULL` proof below applies — so a
+  reader-`NULL`-filled lane is read from the residual, not as a silent `NULL`.
+  The hash is **order-independent** (the marker identifies the set, not the
+  field order, so a set-op/reorder cast that permutes the shreds still matches).
+  It is `NULL` only on a SQL-NULL row. It is a signed `BIGINT`, not `UBIGINT`,
+  because DuckDB's Parquet writer omits min/max stats for unsigned integers — a
+  `UBIGINT` marker would carry no zone-map on a Parquet scan.
+- **`shreds.$jsono$spill`** (`BIGINT` bitmap column(s), per row): bit
+  `rank % 63` of column `rank / 63` is set when the scalar shred at canonical
+  *rank* diverted on this row (the value stayed in the residual). Canonical rank
+  is the shred's position in the byte-wise **sorted name list** of the shred
+  set — not the physical field position, which a reorder cast may permute while
+  the order-independent marker still matches. A set of N shreds carries
+  `⌈N/63⌉` columns, named `$jsono$spill`, `$jsono$spill1`, `$jsono$spill2`, …
+  (63 bits per column — the sign bit stays clear so masks order as non-negative
+  numbers in every zone-map). **All columns are `NULL` on a clean row** (an
+  all-zero mask is never stored) **and all non-`NULL` on a dirty one** (zeroes
+  allowed per column), so min/max statistics describe the *dirty rows alone*:
+  under set identity, a column whose `min == max == M` decodes exactly — every
+  dirty row carries the same mask word, so a shred whose bit is clear in `M` is
+  total. A systematic divert (one source consistently missing a lane type)
+  thereby quarantines to its own shreds instead of demoting the whole
+  row-group. Mixed dirty masks (`min != max`) keep a one-sided bound: masks are
+  non-negative, so a bit set anywhere forces `max >= 2^bit` — every bit with
+  `2^bit > max` is still provably clean. An out-of-domain word (negative, or
+  bits at/above the shred count) marks a hand-built row and is not trusted at
+  all. Array shreds get ranks but never set bits (they are always
+  reconstructed, never bare-read).
+- **Per-lane no-`NULL` proof**, independent of identity: a lane whose statistics
+  prove no `NULL` at all has nothing hiding behind it — no divert, no absent
+  path, and no reconciliation `NULL`-fill — so it reads bare even when the
+  marker cannot prove identity (`union_by_name` / DuckLake-evolved files). A
+  reconciliation that `NULL`-fills a lane on rows whose writing shred set lacked
+  it breaks the proof on exactly those scans, keeping the fallback correct.
 
-`complete` by case, for a scalar shred at path `P`:
+Interpretation of the spill bitmap is **identity-gated**: a raw by-name cast
+copies the bitmap across shred sets, where the foreign marker hash fails the
+identity patterns and the foreign bit numbering is conservatively ignored. A
+set-op merged type carries the union of both branches' shreds but only the
+by-name union of their spill columns, which can under-provision a crossing
+union's set (`⌈N/63⌉` columns needed, fewer present): such a type stays fully
+readable — bits for ranks beyond its columns simply do not exist, so those
+shreds are never proven total and every read keeps the residual `COALESCE`.
 
-- absent path / explicit JSON `null`: `value` = `NULL`, `->>` = `NULL` →
-  `complete = 1` (a bare `NULL` read is correct).
-- a scalar that round-trips through the shred type: `value` set → `complete = 1`.
+The spill bit by case, for a scalar shred at path `P`:
+
+- absent path / explicit JSON `null`: lane `NULL`, `->>` = `NULL` → no bit (a
+  bare `NULL` read is correct).
+- a scalar that round-trips through the shred type: lane set → no bit.
 - a divert (a string at a `BIGINT` lane, a number at a `VARCHAR` lane, …) or a
-  container at `P`: `value` = `NULL`, the value stays in the residual →
-  `complete = 0`, so the read falls back to the residual / reconstructs.
+  container at `P`: lane `NULL`, the value stays in the residual → bit set, so
+  the read falls back to the residual / reconstructs.
 
 **Single-storage invariant: every value is stored exactly once, and a set lane
 means the path is stripped from the residual.** Every shred path is a non-empty
