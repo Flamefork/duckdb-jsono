@@ -244,9 +244,7 @@ def grp_core(rng: random.Random, seed: int, row_idx: int) -> dict:
         "event_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:event:{row_idx}")),
         "event_ts": 1_716_000_000 + rng.randint(0, 2_592_000),
         "user_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:user:{row_idx // 5}")),
-        "session_id": str(
-            uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:session:{row_idx // 5}")
-        ),
+        "session_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:session:{row_idx // 5}")),
     }
 
 
@@ -419,9 +417,7 @@ ARCHETYPES = {
         lambda rng: {
             "custom_event_search_query": rng.choice(SEARCH_QUERIES),
             "custom_event_filter_applied": f"val_{rng.randint(0, 20)}",
-            "custom_event_sort_order": rng.choice(
-                ["relevance", "price_asc", "price_desc", "newest"]
-            ),
+            "custom_event_sort_order": rng.choice(["relevance", "price_asc", "price_desc", "newest"]),
         },
     ),
     "share": (
@@ -550,10 +546,7 @@ def generate_data(size_name: str, num_rows: int, seed: int) -> None:
             """)
         conn.executemany(
             "INSERT INTO batch VALUES (?, ?, ?, ?, ?)",
-            [
-                (r["json_nested"], r["json_flat"], r["g1e1"], r["g1e3"], r["g1e4"])
-                for r in batch
-            ],
+            [(r["json_nested"], r["json_flat"], r["g1e1"], r["g1e3"], r["g1e4"]) for r in batch],
         )
 
         if not temp_table_created:
@@ -636,9 +629,7 @@ def generate_numbers_data(size_name: str, num_rows: int, seed: int) -> None:
 
     while rows_generated < num_rows:
         batch_rows = min(batch_size, num_rows - rows_generated)
-        batch = [
-            generate_numbers_row(rows_generated + i, seed) for i in range(batch_rows)
-        ]
+        batch = [generate_numbers_row(rows_generated + i, seed) for i in range(batch_rows)]
 
         conn.execute("""
             CREATE OR REPLACE TEMP TABLE batch (
@@ -747,9 +738,7 @@ def generate_wide_flat_data(size_name: str, num_rows: int, seed: int) -> None:
 
     while rows_generated < num_rows:
         batch_rows = min(batch_size, num_rows - rows_generated)
-        batch = [
-            generate_wide_flat_row(rows_generated + i, seed) for i in range(batch_rows)
-        ]
+        batch = [generate_wide_flat_row(rows_generated + i, seed) for i in range(batch_rows)]
 
         conn.execute("""
             CREATE OR REPLACE TEMP TABLE batch (
@@ -801,12 +790,8 @@ def generate_ecom_row(row_idx: int, seed: int) -> dict:
         {
             "item_id": f"sku_{rng.randint(1000, 9999)}",
             "item_name": rng.choice(ITEM_NAMES),
-            "item_brand": rng.choice(
-                ("Acme", "Globex", "Initech", "Umbrella", "Soylent")
-            ),
-            "item_category": rng.choice(
-                ("apparel", "electronics", "home", "outdoor", "books")
-            ),
+            "item_brand": rng.choice(("Acme", "Globex", "Initech", "Umbrella", "Soylent")),
+            "item_category": rng.choice(("apparel", "electronics", "home", "outdoor", "books")),
             "item_variant": rng.choice(("S", "M", "L", "XL", "default")),
             "affiliation": rng.choice(("web", "ios", "android")),
             "price": round(rng.uniform(5, 500), 2),
@@ -1140,9 +1125,7 @@ def generate_diff_pairs_rows(num_rows: int, seed: int) -> list[tuple[int, int, s
     txn_id = 0
     seg_index = 0
     while len(rows) < num_rows:
-        remaining_in_segment = DIFF_PAIRS_SNAPSHOT_SEGMENTS[
-            seg_index % len(DIFF_PAIRS_SNAPSHOT_SEGMENTS)
-        ]
+        remaining_in_segment = DIFF_PAIRS_SNAPSHOT_SEGMENTS[seg_index % len(DIFF_PAIRS_SNAPSHOT_SEGMENTS)]
         seg_index += 1
         for _ in range(remaining_in_segment[0]):
             if len(rows) >= num_rows:
@@ -1228,9 +1211,7 @@ def make_marketing_url(rng: random.Random, row_idx: int) -> str:
         ),
         ("flag", ""),
     ]
-    query = "&".join(
-        key if key == "flag" else f"{key}={value}" for key, value in params
-    )
+    query = "&".join(key if key == "flag" else f"{key}={value}" for key, value in params)
     return f"https://{rng.choice(DOMAINS)}{clean_path(rng.choice(PAGE_PATHS))}?{query}"
 
 
@@ -1341,9 +1322,7 @@ def generate_url_data(size_name: str, num_rows: int, seed: int) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate marketing-telemetry benchmark data (v2)"
-    )
+    parser = argparse.ArgumentParser(description="Generate marketing-telemetry benchmark data (v2)")
     parser.add_argument(
         "--size",
         choices=sorted(set(SIZES) | set(URL_SIZES)),
@@ -1364,9 +1343,7 @@ def main() -> None:
         default="all",
         help="Dataset kind to generate (default: all)",
     )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="Random seed (default: 42)"
-    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     args = parser.parse_args()
 
     if args.size:

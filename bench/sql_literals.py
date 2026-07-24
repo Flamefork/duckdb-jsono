@@ -28,9 +28,7 @@ def sql_typed_literal(value: object) -> str:
         fields = []
         for key, item in value.items():
             if not isinstance(key, str):
-                raise ValueError(
-                    f"typed struct literal key must be a string, got: {key!r}"
-                )
+                raise ValueError(f"typed struct literal key must be a string, got: {key!r}")
             fields.append(f"{sql_string(key)}: {sql_typed_literal(item)}")
         return "{" + ", ".join(fields) + "}"
     raise ValueError(f"unsupported typed literal value: {value!r}")

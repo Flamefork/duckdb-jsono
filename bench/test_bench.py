@@ -13,23 +13,17 @@ bench = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(bench)
 
-run_spec = importlib.util.spec_from_file_location(
-    "run_benchmarks_script", BENCH_DIR / "run_benchmarks.py"
-)
+run_spec = importlib.util.spec_from_file_location("run_benchmarks_script", BENCH_DIR / "run_benchmarks.py")
 run_benchmarks = importlib.util.module_from_spec(run_spec)
 assert run_spec.loader is not None
 run_spec.loader.exec_module(run_benchmarks)
 
-compare_spec = importlib.util.spec_from_file_location(
-    "compare_results_script", BENCH_DIR / "compare_results.py"
-)
+compare_spec = importlib.util.spec_from_file_location("compare_results_script", BENCH_DIR / "compare_results.py")
 compare_results = importlib.util.module_from_spec(compare_spec)
 assert compare_spec.loader is not None
 compare_spec.loader.exec_module(compare_results)
 
-profile_spec = importlib.util.spec_from_file_location(
-    "profile_driver_script", BENCH_DIR / "profile_driver.py"
-)
+profile_spec = importlib.util.spec_from_file_location("profile_driver_script", BENCH_DIR / "profile_driver.py")
 profile_driver = importlib.util.module_from_spec(profile_spec)
 assert profile_spec.loader is not None
 profile_spec.loader.exec_module(profile_driver)
@@ -58,21 +52,15 @@ class FieldSampleJSONOMetadataTest(unittest.TestCase):
                 self.assertTrue(bench.field_sample_jsono_metadata_matches(source_path))
 
                 with patch.object(bench, "FIELD_SAMPLE_JSONO_COMPRESSION_LEVEL", 1):
-                    self.assertFalse(
-                        bench.field_sample_jsono_metadata_matches(source_path)
-                    )
+                    self.assertFalse(bench.field_sample_jsono_metadata_matches(source_path))
 
                 with patch.object(bench, "FIELD_SAMPLE_JSONO_ROW_GROUP_SIZE", 8_192):
-                    self.assertFalse(
-                        bench.field_sample_jsono_metadata_matches(source_path)
-                    )
+                    self.assertFalse(bench.field_sample_jsono_metadata_matches(source_path))
 
 
 class ProfileDriverCaseResolutionTest(unittest.TestCase):
     def test_resolves_exact_core_case(self) -> None:
-        target = profile_driver.Target(
-            "current", "jsono", Path("jsono.duckdb_extension")
-        )
+        target = profile_driver.Target("current", "jsono", Path("jsono.duckdb_extension"))
 
         _, size, scenario_config = profile_driver.resolve_profile_case(
             target, "merge_patch/10k/nested_small_patch", False
@@ -83,9 +71,7 @@ class ProfileDriverCaseResolutionTest(unittest.TestCase):
         self.assertEqual(scenario_config["scenario"], "nested_small_patch")
 
     def test_resolves_extract_jsono_case(self) -> None:
-        target = profile_driver.Target(
-            "current", "jsono", Path("jsono.duckdb_extension")
-        )
+        target = profile_driver.Target("current", "jsono", Path("jsono.duckdb_extension"))
 
         _, size, scenario_config = profile_driver.resolve_profile_case(
             target, "extract_jsono/10k/nested_top_key", False
@@ -96,32 +82,22 @@ class ProfileDriverCaseResolutionTest(unittest.TestCase):
         self.assertEqual(scenario_config["scenario"], "nested_top_key")
 
     def test_rejects_core_json_target_filter(self) -> None:
-        target = profile_driver.Target(
-            "current", "jsono", Path("jsono.duckdb_extension")
-        )
+        target = profile_driver.Target("current", "jsono", Path("jsono.duckdb_extension"))
 
         with self.assertRaisesRegex(ValueError, "only current JSONO target"):
-            profile_driver.resolve_profile_case(
-                target, "json/extract_jsono/10k/nested_top_key", False
-            )
+            profile_driver.resolve_profile_case(target, "json/extract_jsono/10k/nested_top_key", False)
 
     def test_rejects_ambiguous_filter(self) -> None:
-        target = profile_driver.Target(
-            "current", "jsono", Path("jsono.duckdb_extension")
-        )
+        target = profile_driver.Target("current", "jsono", Path("jsono.duckdb_extension"))
 
         with self.assertRaisesRegex(ValueError, "must match exactly one"):
             profile_driver.resolve_profile_case(target, "group_merge", False)
 
     def test_field_sample_requires_flag(self) -> None:
-        target = profile_driver.Target(
-            "current", "jsono", Path("jsono.duckdb_extension")
-        )
+        target = profile_driver.Target("current", "jsono", Path("jsono.duckdb_extension"))
 
         with self.assertRaisesRegex(ValueError, "no jsono benchmark case matches"):
-            profile_driver.resolve_profile_case(
-                target, "merge_patch/245760/retail_sample_nested", False
-            )
+            profile_driver.resolve_profile_case(target, "merge_patch/245760/retail_sample_nested", False)
 
         _, size, scenario_config = profile_driver.resolve_profile_case(
             target, "merge_patch/245760/retail_sample_nested", True
@@ -133,9 +109,7 @@ class ProfileDriverCaseResolutionTest(unittest.TestCase):
     def test_profile_loop_shape_plan_recovery_does_not_require_events_parquet(
         self,
     ) -> None:
-        target = profile_driver.Target(
-            "current", "jsono", Path("jsono.duckdb_extension")
-        )
+        target = profile_driver.Target("current", "jsono", Path("jsono.duckdb_extension"))
         scenario_config = {
             "operation": "shape_plan_recovery_transform",
             "scenario": "stable_only",
@@ -186,9 +160,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
             query.timed_sql,
         )
         self.assertNotIn("jsono(payload)", query.timed_sql)
-        self.assertIn(
-            "CREATE OR REPLACE TEMP TABLE _bench_struct_in", query.prepare_sql[0]
-        )
+        self.assertIn("CREATE OR REPLACE TEMP TABLE _bench_struct_in", query.prepare_sql[0])
 
     def test_existing_nested_typed_payload_keeps_its_shape(self) -> None:
         payload_sql = run_benchmarks.typed_struct_payload_sql("nested_typed")
@@ -281,9 +253,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
             "jsono(event_properties::VARCHAR, shredding := {'clientID': 'VARCHAR'})",
             query.prepare_sql[0],
         )
-        self.assertIn(
-            "SELECT jsono_extract_string(t, '$.clientID') AS r", query.timed_sql
-        )
+        self.assertIn("SELECT jsono_extract_string(t, '$.clientID') AS r", query.timed_sql)
         self.assertNotIn("shredding", query.timed_sql)
 
     def test_jsono_group_merge_keyed_query_materializes_input_and_keys(self) -> None:
@@ -305,9 +275,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
         )
         self.assertIn("g1e4 AS g", query.prepare_sql[0])
         self.assertIn("row_num AS k_ts", query.prepare_sql[0])
-        self.assertIn(
-            "(row_num % 1000000)::UBIGINT AS k_secondary", query.prepare_sql[0]
-        )
+        self.assertIn("(row_num % 1000000)::UBIGINT AS k_secondary", query.prepare_sql[0])
         self.assertIn(
             "SELECT jsono_group_merge_max(t, row(k_ts, k_secondary)) AS r",
             query.timed_sql,
@@ -341,9 +309,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
         )
         self.assertIn("g_medium_group_rows AS g", query.prepare_sql[0])
         self.assertIn("row_num AS k_ts", query.prepare_sql[0])
-        self.assertIn(
-            "(row_num % 1000000)::UBIGINT AS k_secondary", query.prepare_sql[0]
-        )
+        self.assertIn("(row_num % 1000000)::UBIGINT AS k_secondary", query.prepare_sql[0])
         self.assertIn(
             "jsono_group_merge_min(wide_payload, row(k_ts, k_secondary)) AS wide_payload",
             query.timed_sql,
@@ -428,9 +394,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
 class RunBenchmarksDataPathTest(unittest.TestCase):
     def test_closes_previous_target_connection_before_opening_next(self) -> None:
         first = run_benchmarks.Target("first", "jsono", Path("first.duckdb_extension"))
-        second = run_benchmarks.Target(
-            "second", "jsono", Path("second.duckdb_extension")
-        )
+        second = run_benchmarks.Target("second", "jsono", Path("second.duckdb_extension"))
         scenario_config = {
             "operation": "shape_plan_recovery_transform",
             "scenario": "stable_only",
@@ -447,17 +411,13 @@ class RunBenchmarksDataPathTest(unittest.TestCase):
             conn.close.side_effect = lambda: events.append(f"close:{target.label}")
             return conn
 
-        def run_single_benchmark(
-            conn: Mock, query: run_benchmarks.BenchmarkQuery, runs: int
-        ) -> dict:
+        def run_single_benchmark(conn: Mock, query: run_benchmarks.BenchmarkQuery, runs: int) -> dict:
             del conn, query, runs
             events.append("run")
             return {"min_ms": 1.0, "median_ms": 1.0, "max_ms": 1.0}
 
         with (
-            patch.object(
-                run_benchmarks, "create_connection", side_effect=create_connection
-            ),
+            patch.object(run_benchmarks, "create_connection", side_effect=create_connection),
             patch.object(
                 run_benchmarks,
                 "run_single_benchmark",
@@ -515,9 +475,7 @@ class RunBenchmarksDataPathTest(unittest.TestCase):
     def test_shape_plan_recovery_transform_does_not_require_events_parquet(
         self,
     ) -> None:
-        target = run_benchmarks.Target(
-            "current", "jsono", Path("jsono.duckdb_extension")
-        )
+        target = run_benchmarks.Target("current", "jsono", Path("jsono.duckdb_extension"))
         scenario_config = {
             "operation": "shape_plan_recovery_transform",
             "scenario": "stable_only",

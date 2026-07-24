@@ -14,4 +14,12 @@ dependencies = [
 ]
 
 [tool.black]
+# Match duckdb/scripts/format.py (the formatter `make format-check` drives over src/test): black at
+# width 120 with no quote normalization. Pinning it here means a standalone `black` / `black --check`
+# agrees with the make gate instead of silently formatting to black's 88-column default.
 target-version = ["py313"]
+line-length = 120
+skip-string-normalization = true
+# bench/optimization-log is an append-only research archive (some probes are not valid py313); it is
+# not code we keep formatted, so black skips it even when handed the bench/ tree.
+force-exclude = "bench/optimization-log/"

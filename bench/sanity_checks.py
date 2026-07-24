@@ -59,58 +59,34 @@ def gate_columns(scenario_config: dict) -> tuple[str, str]:
 
     if operation == "entries":
         jsono_expr = f"list_sort(jsono_entries(jsono({json_column}::VARCHAR), key_style := 'dotted'))"
-        core_expr = (
-            f"list_sort(map_entries("
-            f"json_transform({json_column}, '\"map(string, string)\"')))"
-        )
+        core_expr = f"list_sort(map_entries(" f"json_transform({json_column}, '\"map(string, string)\"')))"
         return jsono_expr, core_expr
 
     if operation == "extract":
         # jsono_transform takes a STRUCT-literal spec; core json_transform takes the JSON-string spec.
-        jsono_expr = (
-            f"jsono_transform(jsono({json_column}::VARCHAR), "
-            f"{sql_typed_literal(scenario_config['spec'])})"
-        )
-        core_expr = (
-            f"json_transform({json_column}, {sql_json(scenario_config['spec'])})"
-        )
+        jsono_expr = f"jsono_transform(jsono({json_column}::VARCHAR), " f"{sql_typed_literal(scenario_config['spec'])})"
+        core_expr = f"json_transform({json_column}, {sql_json(scenario_config['spec'])})"
         return jsono_expr, core_expr
 
     if operation == "extract_jsono":
         jsono_value = f"jsono({json_column}::VARCHAR)"
         core_value = json_column
         if "base_path" in scenario_config:
-            jsono_value = extract_call_sql(
-                "jsono_extract", jsono_value, scenario_config["base_path"]
-            )
-            core_value = extract_call_sql(
-                "json_extract", core_value, scenario_config["base_path"]
-            )
-        jsono_extract_expr = extract_call_sql(
-            "jsono_extract", jsono_value, scenario_config["path"]
-        )
+            jsono_value = extract_call_sql("jsono_extract", jsono_value, scenario_config["base_path"])
+            core_value = extract_call_sql("json_extract", core_value, scenario_config["base_path"])
+        jsono_extract_expr = extract_call_sql("jsono_extract", jsono_value, scenario_config["path"])
         jsono_expr = f"to_json({jsono_extract_expr})"
-        core_expr = extract_call_sql(
-            "json_extract", core_value, scenario_config["path"]
-        )
+        core_expr = extract_call_sql("json_extract", core_value, scenario_config["path"])
         return jsono_expr, core_expr
 
     if operation == "extract_string":
         jsono_value = f"jsono({json_column}::VARCHAR)"
         core_value = json_column
         if "base_path" in scenario_config:
-            jsono_value = extract_call_sql(
-                "jsono_extract", jsono_value, scenario_config["base_path"]
-            )
-            core_value = extract_call_sql(
-                "json_extract", core_value, scenario_config["base_path"]
-            )
-        jsono_expr = extract_call_sql(
-            "jsono_extract_string", jsono_value, scenario_config["path"]
-        )
-        core_expr = extract_call_sql(
-            "json_extract_string", core_value, scenario_config["path"]
-        )
+            jsono_value = extract_call_sql("jsono_extract", jsono_value, scenario_config["base_path"])
+            core_value = extract_call_sql("json_extract", core_value, scenario_config["base_path"])
+        jsono_expr = extract_call_sql("jsono_extract_string", jsono_value, scenario_config["path"])
+        core_expr = extract_call_sql("json_extract_string", core_value, scenario_config["path"])
         return jsono_expr, core_expr
 
     raise ValueError(f"no correctness gate defined for operation: {operation}")
@@ -166,16 +142,12 @@ def run_correctness_gate(args: list[str]) -> list[str]:
                 SELECT {jsono_expr} AS j, {core_expr} AS c
                 FROM {source}
             """
-            mismatches = conn.execute(
-                f"SELECT count(*) FROM ({paired}) WHERE j IS DISTINCT FROM c"
-            ).fetchone()[0]
+            mismatches = conn.execute(f"SELECT count(*) FROM ({paired}) WHERE j IS DISTINCT FROM c").fetchone()[0]
 
             if mismatches == 0:
                 continue
 
-            sample = conn.execute(
-                f"SELECT j, c FROM ({paired}) WHERE j IS DISTINCT FROM c LIMIT 1"
-            ).fetchone()
+            sample = conn.execute(f"SELECT j, c FROM ({paired}) WHERE j IS DISTINCT FROM c LIMIT 1").fetchone()
             errors.append(
                 f"correctness gate failed for {case_id}: "
                 f"{mismatches:,} row(s) differ between jsono and core json\n"
@@ -191,9 +163,7 @@ def run_correctness_gate(args: list[str]) -> list[str]:
     return errors
 
 
-def check_row_count(
-    conn: duckdb.DuckDBPyConnection, path: Path, expected: int
-) -> str | None:
+def check_row_count(conn: duckdb.DuckDBPyConnection, path: Path, expected: int) -> str | None:
     """Check row count matches expected. Returns error message or None."""
     result = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{path}')").fetchone()
     actual = result[0]
@@ -202,9 +172,7 @@ def check_row_count(
     return None
 
 
-def check_schema(
-    conn: duckdb.DuckDBPyConnection, path: Path, required_columns: list[str]
-) -> str | None:
+def check_schema(conn: duckdb.DuckDBPyConnection, path: Path, required_columns: list[str]) -> str | None:
     """Check required columns exist. Returns error message or None."""
     result = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()
     columns = {row[0] for row in result}
@@ -251,9 +219,7 @@ def run_sanity_checks(args: list[str]) -> int:
         print("Sanity check failed:", file=sys.stderr)
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
-        print(
-            "\nRegenerate data: uv run python bench/generate_data.py", file=sys.stderr
-        )
+        print("\nRegenerate data: uv run python bench/generate_data.py", file=sys.stderr)
         return 2
 
     gate_errors = run_correctness_gate(args)

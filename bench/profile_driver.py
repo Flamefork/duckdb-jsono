@@ -23,9 +23,7 @@ def positive_int(value: str) -> int:
     return parsed
 
 
-def resolve_profile_case(
-    target: Target, filter_text: str, include_field_sample: bool
-) -> tuple[Target, str, dict]:
+def resolve_profile_case(target: Target, filter_text: str, include_field_sample: bool) -> tuple[Target, str, dict]:
     if filter_text.startswith("json/"):
         raise ValueError(
             "external profile driver supports only current JSONO target; "
@@ -42,9 +40,7 @@ def resolve_profile_case(
         f"  {get_case_id(case_target, scenario_config['operation'], size, scenario_config['scenario'])}"
         for case_target, size, scenario_config in cases
     )
-    raise ValueError(
-        "profile filter must match exactly one jsono case; matched:\n" + matches
-    )
+    raise ValueError("profile filter must match exactly one jsono case; matched:\n" + matches)
 
 
 def run_profile_loop(
@@ -55,9 +51,7 @@ def run_profile_loop(
     include_field_sample: bool,
 ) -> None:
     target = Target("current", "jsono", extension_path.expanduser())
-    case_target, size, scenario_config = resolve_profile_case(
-        target, filter_text, include_field_sample
-    )
+    case_target, size, scenario_config = resolve_profile_case(target, filter_text, include_field_sample)
     data_path = get_data_path(size, scenario_config)
     if case_uses_data_path(scenario_config) and not data_path.exists():
         raise FileNotFoundError(f"benchmark data file not found: {data_path}")
@@ -76,13 +70,9 @@ def run_profile_loop(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run one benchmark case in a tight loop for external profilers"
-    )
+    parser = argparse.ArgumentParser(description="Run one benchmark case in a tight loop for external profilers")
     parser.add_argument("extension_path", type=Path)
-    parser.add_argument(
-        "filter", help="Benchmark filter that must match one jsono case"
-    )
+    parser.add_argument("filter", help="Benchmark filter that must match one jsono case")
     parser.add_argument("iterations", nargs="?", type=positive_int, default=150)
     parser.add_argument("threads", nargs="?", type=positive_int)
     parser.add_argument(

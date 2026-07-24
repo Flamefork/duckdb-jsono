@@ -27,9 +27,7 @@ from pathlib import Path
 import duckdb
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-EXTENSION = (
-    REPO_ROOT / "build" / "release" / "extension" / "jsono" / "jsono.duckdb_extension"
-)
+EXTENSION = REPO_ROOT / "build" / "release" / "extension" / "jsono" / "jsono.duckdb_extension"
 PARQUET = REPO_ROOT / "bench" / "data" / "micro_nested_lane.parquet"
 ROWS = 1_000_000
 HOT_RUNS = 7
@@ -102,9 +100,7 @@ def build(conn: duckdb.DuckDBPyConnection) -> None:
 def is_bare_lane(conn: duckdb.DuckDBPyConnection, predicate: str) -> bool:
     plan = "\n".join(
         row[1]
-        for row in conn.execute(
-            f"EXPLAIN SELECT count(*) FROM read_parquet('{PARQUET}') WHERE {predicate}"
-        ).fetchall()
+        for row in conn.execute(f"EXPLAIN SELECT count(*) FROM read_parquet('{PARQUET}') WHERE {predicate}").fetchall()
     )
     return not any(marker in plan for marker in RESIDUAL_MARKERS)
 
@@ -129,9 +125,7 @@ def main() -> int:
         return 1
     conn = connect()
     build(conn)
-    print(
-        f"rows={ROWS:,}  parquet={PARQUET.stat().st_size / 1e6:.1f} MB  (min of {HOT_RUNS} hot runs)\n"
-    )
+    print(f"rows={ROWS:,}  parquet={PARQUET.stat().st_size / 1e6:.1f} MB  (min of {HOT_RUNS} hot runs)\n")
     scalar_ms = None
     not_lowered = False
     for label, predicate, expect_lane in CASES:
@@ -178,8 +172,7 @@ PLAN029_NESTED_SHRED = {
 PLAN029_SCALAR_ARR = ", 'goals', json_array(i, i + 1, i + 2)"
 PLAN029_SCALAR_ARR_SHRED = {"$.goals": "BIGINT[]"}
 PLAN029_OBJ_ARR = (
-    ", 'items', json_array(json_object('name', 'a' || i, 'cat', 'c'),"
-    " json_object('name', 'b', 'cat', 'd'))"
+    ", 'items', json_array(json_object('name', 'a' || i, 'cat', 'c')," " json_object('name', 'b', 'cat', 'd'))"
 )
 PLAN029_OBJ_ARR_SHRED = {"$.items": "STRUCT(name VARCHAR, cat VARCHAR)[]"}
 
@@ -246,33 +239,23 @@ def plan029_bench(conn: duckdb.DuckDBPyConnection, path: Path, predicate: str) -
     return min(times)
 
 
-def plan029_is_bare_lane(
-    conn: duckdb.DuckDBPyConnection, path: Path, predicate: str
-) -> bool:
+def plan029_is_bare_lane(conn: duckdb.DuckDBPyConnection, path: Path, predicate: str) -> bool:
     plan = "\n".join(
         row[1]
-        for row in conn.execute(
-            f"EXPLAIN SELECT count(*) FROM read_parquet('{path}') WHERE {predicate}"
-        ).fetchall()
+        for row in conn.execute(f"EXPLAIN SELECT count(*) FROM read_parquet('{path}') WHERE {predicate}").fetchall()
     )
     return not any(marker in plan for marker in RESIDUAL_MARKERS)
 
 
 def plan029(conn: duckdb.DuckDBPyConnection) -> bool:
     """Returns True if a B-isolation (->>) probe failed to stay a lane. Prints ms + ratio-to-flat."""
-    print(
-        f"\n=== plan 029: wide shredded reconstruction ({PLAN029_ROWS:,} rows, {PLAN029_FLAT_N} flat shreds) ===\n"
-    )
+    print(f"\n=== plan 029: wide shredded reconstruction ({PLAN029_ROWS:,} rows, {PLAN029_FLAT_N} flat shreds) ===\n")
     results: dict[str, dict[str, float]] = {}
     for shape in PLAN029_SHAPES:
         plan029_build(conn, shape)
         path = plan029_parquet(shape)
-        results[shape] = {
-            kind: plan029_bench(conn, path, pred) for _, pred, kind in PLAN029_PROBES
-        }
-    header = f"{'shape':16s}" + "".join(
-        f"{label:>26s}" for label, _, _ in PLAN029_PROBES
-    )
+        results[shape] = {kind: plan029_bench(conn, path, pred) for _, pred, kind in PLAN029_PROBES}
+    header = f"{'shape':16s}" + "".join(f"{label:>26s}" for label, _, _ in PLAN029_PROBES)
     print(header)
     print("-" * len(header))
     flat = results["flat"]

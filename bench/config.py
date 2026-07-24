@@ -6,19 +6,10 @@ RESULTS_DIR = BENCH_DIR / "results"
 PROFILES_DIR = RESULTS_DIR / "profiles"
 PROJECT_ROOT = BENCH_DIR.parent
 
-JSONO_EXTENSION_PATH = (
-    PROJECT_ROOT
-    / "build"
-    / "release"
-    / "extension"
-    / "jsono"
-    / "jsono.duckdb_extension"
-)
+JSONO_EXTENSION_PATH = PROJECT_ROOT / "build" / "release" / "extension" / "jsono" / "jsono.duckdb_extension"
 FIELD_SAMPLE_DATA_DIR = DATA_DIR / "field_sample"
 FIELD_SAMPLE_EVENTS_NESTED_PATH = FIELD_SAMPLE_DATA_DIR / "events_nested.parquet"
-FIELD_SAMPLE_JSONO_EVENTS_PATH = (
-    DATA_DIR / "field_sample" / "events_nested_jsono.parquet"
-)
+FIELD_SAMPLE_JSONO_EVENTS_PATH = DATA_DIR / "field_sample" / "events_nested_jsono.parquet"
 FIELD_SAMPLE_RULES_PATH = FIELD_SAMPLE_DATA_DIR / "rules.json"
 FIELD_SAMPLE_ROW_COUNT = 245_760
 
@@ -39,13 +30,9 @@ EXTRACT_RETAIL_SAMPLE_SPEC = {
 # Deep-nested retail-shaped ecommerce events (root + nested params + nested
 # `ecommerce` arrays of products, avg ~2.7KB). Covers the array/deep-nesting
 # dimension the page_view sample lacks. Gitignored, local-only.
-RETAIL_SAMPLE_ECOMMERCE_PATH = (
-    DATA_DIR / "field_sample" / "retail_sample_ecommerce.parquet"
-)
+RETAIL_SAMPLE_ECOMMERCE_PATH = DATA_DIR / "field_sample" / "retail_sample_ecommerce.parquet"
 RETAIL_SAMPLE_ECOMMERCE_ROW_COUNT = 65_987
-RETAIL_SAMPLE_ECOMMERCE_PARSE_COPY_PATH = (
-    RESULTS_DIR / "retail_sample_ecommerce_parse_copy.parquet"
-)
+RETAIL_SAMPLE_ECOMMERCE_PARSE_COPY_PATH = RESULTS_DIR / "retail_sample_ecommerce_parse_copy.parquet"
 # Scalar paths into the ecommerce shape (one reaches into the nested array head).
 EXTRACT_RETAIL_SAMPLE_ECOMMERCE_SPEC = {
     "URL": "VARCHAR",
@@ -260,13 +247,8 @@ WIDE_FLAT_GROUPS = {
 }
 
 WIDE_FLAT_FIELDS = [
-    (f"{group}_{suffix}", kind)
-    for group, suffixes in WIDE_FLAT_GROUPS.items()
-    for suffix, kind in suffixes
-] + [
-    (f"custom_param_{i:02d}", "token" if i % 2 == 0 else "sparse_token")
-    for i in range(1, 21)
-]
+    (f"{group}_{suffix}", kind) for group, suffixes in WIDE_FLAT_GROUPS.items() for suffix, kind in suffixes
+] + [(f"custom_param_{i:02d}", "token" if i % 2 == 0 else "sparse_token") for i in range(1, 21)]
 
 # Shred spec covering every always-present scalar top-level key (~107 lanes). int
 # values shred as BIGINT, every other kind (digits/token/sparse_token/flag/url) is
@@ -274,10 +256,7 @@ WIDE_FLAT_FIELDS = [
 # value is a wide shredded group-merge base with many typed lanes.
 WIDE_FLAT_SHREDDING_SPEC = {
     "event_name": "VARCHAR",
-    **{
-        name: ("BIGINT" if kind == "int" else "VARCHAR")
-        for name, kind in WIDE_FLAT_FIELDS
-    },
+    **{name: ("BIGINT" if kind == "int" else "VARCHAR") for name, kind in WIDE_FLAT_FIELDS},
 }
 KEYED_PAIR_WIDE_SHREDDING_SPEC = {
     **WIDE_FLAT_SHREDDING_SPEC,
@@ -297,15 +276,9 @@ KEYED_PAIR_WIDE_SHREDDING_SPEC = {
 #                          auto-shred into '$.path' lanes. A nested shred disqualifies the fast
 #                          path (it is not a whole top-level lane), so this stays on the reshred
 #                          fallback even after H1 — it isolates that separate bottleneck.
-WIDE_FLAT_NESTED_PATCH = {
-    "plain": {"payload": {"detail_goal_a": "1042", "detail_goal_b": "5530"}}
-}
-WIDE_FLAT_SMALL_PATCH = {
-    "shredded": {"event_name": "page_view_merged", "goals": "g1,g2,g3"}
-}
-WIDE_FLAT_NESTED_SHRED_PATCH = {
-    "auto_shred": {"payload": {"detail_goal_a": "1042", "detail_goal_b": "5530"}}
-}
+WIDE_FLAT_NESTED_PATCH = {"plain": {"payload": {"detail_goal_a": "1042", "detail_goal_b": "5530"}}}
+WIDE_FLAT_SMALL_PATCH = {"shredded": {"event_name": "page_view_merged", "goals": "g1,g2,g3"}}
+WIDE_FLAT_NESTED_SHRED_PATCH = {"auto_shred": {"payload": {"detail_goal_a": "1042", "detail_goal_b": "5530"}}}
 
 # Shred set for shredded scenarios over the field_sample page_view shape:
 # always-present scalar keys, used by projection and filter-pushdown scenarios.

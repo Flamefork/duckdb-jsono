@@ -29,9 +29,7 @@ from pathlib import Path
 
 import duckdb
 
-FIELD_SAMPLE_EVENTS = (
-    Path(__file__).parent / "data" / "field_sample" / "events_nested.parquet"
-)
+FIELD_SAMPLE_EVENTS = Path(__file__).parent / "data" / "field_sample" / "events_nested.parquet"
 
 # JSON number token: optional '-', int part, optional fraction, optional exponent.
 # Anchored to value positions: preceded by [:,\[ \t\n] or start, to avoid matching
@@ -119,9 +117,7 @@ def main() -> int:
         return 2
 
     conn = duckdb.connect()
-    rows = conn.execute(
-        f"SELECT event_properties::VARCHAR FROM read_parquet('{FIELD_SAMPLE_EVENTS}')"
-    ).fetchall()
+    rows = conn.execute(f"SELECT event_properties::VARCHAR FROM read_parquet('{FIELD_SAMPLE_EVENTS}')").fetchall()
     conn.close()
 
     counts: Counter[str] = Counter()

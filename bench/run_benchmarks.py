@@ -236,9 +236,7 @@ def create_targets(args: argparse.Namespace) -> list[Target]:
         if target.kind == "json":
             continue
         if not target.extension_path.exists():
-            raise FileNotFoundError(
-                f"extension for target {target.label} not found: {target.extension_path}"
-            )
+            raise FileNotFoundError(f"extension for target {target.label} not found: {target.extension_path}")
 
     return targets
 
@@ -278,9 +276,7 @@ def jsono_prepare_jsono_with_group(scenario_config: dict, data_path: Path) -> st
     """
 
 
-def jsono_prepare_jsono_with_group_and_key(
-    scenario_config: dict, data_path: Path
-) -> str:
+def jsono_prepare_jsono_with_group_and_key(scenario_config: dict, data_path: Path) -> str:
     group_col = scenario_config["group_col"]
     return f"""
         CREATE OR REPLACE TEMP TABLE _bench_in AS
@@ -297,9 +293,7 @@ def jsono_prepare_jsono_with_group_and_key(
     """
 
 
-def jsono_prepare_jsono_pair_with_group_and_key(
-    scenario_config: dict, data_path: Path
-) -> str:
+def jsono_prepare_jsono_pair_with_group_and_key(scenario_config: dict, data_path: Path) -> str:
     wide_shredding = sql_typed_literal(scenario_config["wide_shredding"])
     group_col = scenario_config["group_col"]
     return f"""
@@ -444,8 +438,7 @@ def jsono_prepare_typed_struct(scenario_config: dict, data_path: Path) -> str:
         json_column = scenario_config["json_column"]
         struct_spec = scenario_config["struct_spec"]
         field_columns = ",\n                ".join(
-            f"struct_extract(payload, {sql_string(name)}) AS {sql_identifier(name)}"
-            for name in struct_spec.keys()
+            f"struct_extract(payload, {sql_string(name)}) AS {sql_identifier(name)}" for name in struct_spec.keys()
         )
         return f"""
             CREATE OR REPLACE TEMP TABLE _bench_struct_in AS
@@ -496,9 +489,7 @@ def build_jsono_parse_query(scenario_config: dict, data_path: Path) -> Benchmark
     )
 
 
-def build_jsono_parse_shred_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_parse_shred_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     # End-to-end shred-from-text ingest: parse + shred in one timed call, the
     # production write path of a shredded column (W-1/W-3 frame).
     return BenchmarkQuery(
@@ -511,9 +502,7 @@ def build_jsono_parse_shred_query(
     )
 
 
-def build_jsono_parse_struct_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_parse_struct_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
         timed_sql="""
@@ -524,9 +513,7 @@ def build_jsono_parse_struct_query(
     )
 
 
-def build_jsono_parse_struct_plain_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_parse_struct_plain_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
         timed_sql="""
@@ -544,9 +531,7 @@ def build_jsono_parse_struct_plain_query(
     )
 
 
-def build_jsono_parse_struct_roundtrip_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_parse_struct_roundtrip_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
         timed_sql="""
@@ -557,9 +542,7 @@ def build_jsono_parse_struct_roundtrip_query(
     )
 
 
-def build_jsono_parse_struct_json_roundtrip_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_parse_struct_json_roundtrip_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
         timed_sql="""
@@ -570,9 +553,7 @@ def build_jsono_parse_struct_json_roundtrip_query(
     )
 
 
-def build_jsono_render_struct_query(
-    scenario_config: dict, data_path: Path, plain: bool
-) -> BenchmarkQuery:
+def build_jsono_render_struct_query(scenario_config: dict, data_path: Path, plain: bool) -> BenchmarkQuery:
     value_sql = (
         """
         CAST(payload AS STRUCT(jsono STRUCT(body STRUCT(
@@ -604,9 +585,7 @@ def build_jsono_render_struct_query(
     )
 
 
-def build_jsono_object_jsono_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_object_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
         timed_sql="""
@@ -617,9 +596,7 @@ def build_jsono_object_jsono_query(
     )
 
 
-def build_jsono_object_json_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_object_json_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     field_names = list(scenario_config["struct_spec"].keys())
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
@@ -633,9 +610,7 @@ def build_jsono_object_json_query(
     )
 
 
-def build_jsono_parse_copy_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_parse_copy_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     json_column = scenario_config["json_column"]
     copy_path = scenario_config["copy_path"]
     return BenchmarkQuery(
@@ -657,9 +632,7 @@ def build_jsono_parse_copy_query(
     )
 
 
-def build_jsono_scan_text_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_scan_text_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     json_column = scenario_config["json_column"]
     return BenchmarkQuery(
         prepare_sql=(),
@@ -671,9 +644,7 @@ def build_jsono_scan_text_query(
     )
 
 
-def build_jsono_validate_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_validate_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     if "jsono_column" in scenario_config:
         return BenchmarkQuery(
             prepare_sql=(),
@@ -693,9 +664,7 @@ def build_jsono_validate_query(
     )
 
 
-def build_jsono_storage_size_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_storage_size_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     if "jsono_column" in scenario_config:
         return BenchmarkQuery(
             prepare_sql=(),
@@ -715,9 +684,7 @@ def build_jsono_storage_size_query(
     )
 
 
-def build_jsono_transform_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_transform_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     spec = get_transform_spec(scenario_config)
     if "jsono_column" in scenario_config:
         return BenchmarkQuery(
@@ -738,9 +705,7 @@ def build_jsono_transform_query(
     )
 
 
-def build_jsono_shape_plan_recovery_transform_query(
-    scenario_config: dict, _data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_shape_plan_recovery_transform_query(scenario_config: dict, _data_path: Path) -> BenchmarkQuery:
     row_count = scenario_config["row_count"]
     shape_stream = scenario_config["shape_stream"]
 
@@ -784,9 +749,7 @@ def build_jsono_shape_plan_recovery_transform_query(
     )
 
 
-def build_jsono_group_merge_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_group_merge_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_jsono_with_group(scenario_config, data_path),),
         timed_sql=f"""
@@ -798,9 +761,7 @@ def build_jsono_group_merge_query(
     )
 
 
-def build_jsono_group_merge_jsono_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_group_merge_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_jsono_with_group(scenario_config, data_path),),
         timed_sql=f"""
@@ -812,13 +773,9 @@ def build_jsono_group_merge_jsono_query(
     )
 
 
-def build_jsono_group_merge_keyed_query(
-    scenario_config: dict, data_path: Path, function_name: str
-) -> BenchmarkQuery:
+def build_jsono_group_merge_keyed_query(scenario_config: dict, data_path: Path, function_name: str) -> BenchmarkQuery:
     return BenchmarkQuery(
-        prepare_sql=(
-            jsono_prepare_jsono_with_group_and_key(scenario_config, data_path),
-        ),
+        prepare_sql=(jsono_prepare_jsono_with_group_and_key(scenario_config, data_path),),
         timed_sql=f"""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
             SELECT {function_name}(t, row(k_ts, k_secondary)) AS r
@@ -828,13 +785,9 @@ def build_jsono_group_merge_keyed_query(
     )
 
 
-def build_jsono_group_merge_keyed_pair_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_group_merge_keyed_pair_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
-        prepare_sql=(
-            jsono_prepare_jsono_pair_with_group_and_key(scenario_config, data_path),
-        ),
+        prepare_sql=(jsono_prepare_jsono_pair_with_group_and_key(scenario_config, data_path),),
         timed_sql="""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
             SELECT
@@ -846,9 +799,7 @@ def build_jsono_group_merge_keyed_pair_query(
     )
 
 
-def build_jsono_optimizer_project_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_optimizer_project_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
         timed_sql="""
@@ -869,14 +820,11 @@ def build_jsono_optimizer_project_query(
 
 def project_paths_columns_sql(value_sql: str, paths: list[str]) -> str:
     return ",\n                ".join(
-        f"{value_sql}->>{sql_string(path)} AS p{index}"
-        for index, path in enumerate(paths)
+        f"{value_sql}->>{sql_string(path)} AS p{index}" for index, path in enumerate(paths)
     )
 
 
-def build_jsono_project_paths_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_project_paths_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     # Filterless multi-extract projection: no WHERE, so the matcher-gated
     # projector fuse does not fire today (O-1); over shredded input each path is
     # rewritten independently (O-2).
@@ -904,9 +852,7 @@ def filter_paths_predicates_sql(value_sql: str, predicates: list[dict]) -> str:
     return "\n              AND ".join(clauses)
 
 
-def build_jsono_filter_paths_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_filter_paths_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     # Filtered multi-extract read: a WHERE with >=2 constant `->>` equality/IN predicates over
     # one column. The matcher fuses them into a single __jsono_internal_match (one residual read
     # + one manifest check over a shredded column; O-2). The aggregate count keeps the result
@@ -933,9 +879,7 @@ def prune_filter_predicate_sql(scenario_config: dict) -> str:
     return f"{column} BETWEEN {low} AND {high}"
 
 
-def build_jsono_prune_filter_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_prune_filter_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     # Row-group pruning measurement (see --row-groups). The prepare COPY is untimed:
     # it shreds the typed leaf, carries the same value in a native control column,
     # and clusters rows by the leaf so every Parquet row group holds a disjoint
@@ -985,11 +929,7 @@ def merge_patch_one_patch_sql(patch: object) -> str:
     # -> '$.path' lanes). A bare value is treated as the struct form for backward compatibility.
     if isinstance(patch, dict) and set(patch) == {"plain"}:
         return f"jsono({sql_json(patch['plain'])})"
-    if (
-        isinstance(patch, dict)
-        and set(patch) <= {"shredded", "auto_shred"}
-        and len(patch) == 1
-    ):
+    if isinstance(patch, dict) and set(patch) <= {"shredded", "auto_shred"} and len(patch) == 1:
         return f"jsono({sql_typed_literal(next(iter(patch.values())))})"
     return f"jsono({sql_typed_literal(patch)})"
 
@@ -1001,19 +941,13 @@ def merge_patch_patches_sql(scenario_config: dict) -> list[str]:
     return [merge_patch_one_patch_sql(patch) for patch in patches]
 
 
-def build_jsono_merge_patch_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_merge_patch_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     # The base is materialized outside timing. With a 'shredding' key it becomes a
     # wide shredded value (jsono_value_sql), so the timed merge exercises the
     # shredded executor (fast path or reshred fallback). Patches are tagged plain vs
     # shredded so the scenario controls which executor path the merge takes.
     patch_args = ", ".join(merge_patch_patches_sql(scenario_config))
-    row_number_sql = (
-        ", row_number() OVER () AS bench_row_number"
-        if scenario_config.get("bench_row_number")
-        else ""
-    )
+    row_number_sql = ", row_number() OVER () AS bench_row_number" if scenario_config.get("bench_row_number") else ""
     return BenchmarkQuery(
         prepare_sql=(
             f"""
@@ -1224,14 +1158,10 @@ def build_jsono_extract_query(scenario_config: dict, data_path: Path) -> Benchma
     )
 
 
-def build_jsono_extract_jsono_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_extract_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     value_sql = "t"
     if "base_path" in scenario_config:
-        value_sql = extract_call_sql(
-            "jsono_extract", value_sql, scenario_config["base_path"]
-        )
+        value_sql = extract_call_sql("jsono_extract", value_sql, scenario_config["base_path"])
     result_sql = extract_call_sql("jsono_extract", value_sql, scenario_config["path"])
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
@@ -1243,17 +1173,11 @@ def build_jsono_extract_jsono_query(
     )
 
 
-def build_jsono_extract_string_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_extract_string_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     value_sql = "t"
     if "base_path" in scenario_config:
-        value_sql = extract_call_sql(
-            "jsono_extract", value_sql, scenario_config["base_path"]
-        )
-    result_sql = extract_call_sql(
-        "jsono_extract_string", value_sql, scenario_config["path"]
-    )
+        value_sql = extract_call_sql("jsono_extract", value_sql, scenario_config["base_path"])
+    result_sql = extract_call_sql("jsono_extract_string", value_sql, scenario_config["path"])
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
         timed_sql=f"""
@@ -1264,9 +1188,7 @@ def build_jsono_extract_string_query(
     )
 
 
-def build_jsono_setop_extract_string_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_setop_extract_string_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     # Facade read: one shredded branch, one plain branch over the same dataset. The optimizer
     # pushes the extract below the UNION ALL into per-branch native reads, so the timed query
     # pays no supertype reconciliation copy (plan 033 part A).
@@ -1287,17 +1209,13 @@ def build_jsono_setop_extract_string_query(
     )
 
 
-def build_jsono_multifile_extract_string_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_jsono_multifile_extract_string_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     # union_by_name heterogeneous multi-file read: two files shredded on diverging specs with the
     # measured lane present in both. Statistics recovery + null-aware totality (plan 033 parts
     # B+C) fold the read to a bare lane scan; without them every row pays the residual fallback.
     json_column = scenario_config["json_column"]
     result_sql = extract_call_sql("jsono_extract_string", "t", scenario_config["path"])
-    copy_paths = [
-        sql_string(str(scenario_config[key])) for key in ("copy_path_a", "copy_path_b")
-    ]
+    copy_paths = [sql_string(str(scenario_config[key])) for key in ("copy_path_a", "copy_path_b")]
     prepare_sql = tuple(
         f"""
         COPY (
@@ -1337,17 +1255,11 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
         case "parse_struct_roundtrip":
             return build_jsono_parse_struct_roundtrip_query(scenario_config, data_path)
         case "parse_struct_json_roundtrip":
-            return build_jsono_parse_struct_json_roundtrip_query(
-                scenario_config, data_path
-            )
+            return build_jsono_parse_struct_json_roundtrip_query(scenario_config, data_path)
         case "render_struct_json":
-            return build_jsono_render_struct_query(
-                scenario_config, data_path, plain=False
-            )
+            return build_jsono_render_struct_query(scenario_config, data_path, plain=False)
         case "render_struct_plain_json":
-            return build_jsono_render_struct_query(
-                scenario_config, data_path, plain=True
-            )
+            return build_jsono_render_struct_query(scenario_config, data_path, plain=True)
         case "object_jsono":
             return build_jsono_object_jsono_query(scenario_config, data_path)
         case "object_json":
@@ -1363,21 +1275,15 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
         case "transform":
             return build_jsono_transform_query(scenario_config, data_path)
         case "shape_plan_recovery_transform":
-            return build_jsono_shape_plan_recovery_transform_query(
-                scenario_config, data_path
-            )
+            return build_jsono_shape_plan_recovery_transform_query(scenario_config, data_path)
         case "group_merge":
             return build_jsono_group_merge_query(scenario_config, data_path)
         case "group_merge_jsono":
             return build_jsono_group_merge_jsono_query(scenario_config, data_path)
         case "group_merge_keyed_max_jsono":
-            return build_jsono_group_merge_keyed_query(
-                scenario_config, data_path, "jsono_group_merge_max"
-            )
+            return build_jsono_group_merge_keyed_query(scenario_config, data_path, "jsono_group_merge_max")
         case "group_merge_keyed_min_jsono":
-            return build_jsono_group_merge_keyed_query(
-                scenario_config, data_path, "jsono_group_merge_min"
-            )
+            return build_jsono_group_merge_keyed_query(scenario_config, data_path, "jsono_group_merge_min")
         case "group_merge_keyed_pair_jsono":
             return build_jsono_group_merge_keyed_pair_query(scenario_config, data_path)
         case "optimizer_project":
@@ -1405,16 +1311,12 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
         case "setop_extract_string":
             return build_jsono_setop_extract_string_query(scenario_config, data_path)
         case "multifile_extract_string":
-            return build_jsono_multifile_extract_string_query(
-                scenario_config, data_path
-            )
+            return build_jsono_multifile_extract_string_query(scenario_config, data_path)
         case _:
             raise ValueError(f"jsono target does not support operation: {operation}")
 
 
-def build_core_merge_patch_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_core_merge_patch_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     json_column = scenario_config["json_column"]
     patch_object = scenario_config["patch_object"]
     return BenchmarkQuery(
@@ -1455,14 +1357,10 @@ def build_core_extract_query(scenario_config: dict, data_path: Path) -> Benchmar
     )
 
 
-def build_core_extract_jsono_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_core_extract_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     value_sql = scenario_config["json_column"]
     if "base_path" in scenario_config:
-        value_sql = extract_call_sql(
-            "json_extract", value_sql, scenario_config["base_path"]
-        )
+        value_sql = extract_call_sql("json_extract", value_sql, scenario_config["base_path"])
     result_sql = extract_call_sql("json_extract", value_sql, scenario_config["path"])
     return BenchmarkQuery(
         prepare_sql=(),
@@ -1474,17 +1372,11 @@ def build_core_extract_jsono_query(
     )
 
 
-def build_core_extract_string_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_core_extract_string_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     value_sql = scenario_config["json_column"]
     if "base_path" in scenario_config:
-        value_sql = extract_call_sql(
-            "json_extract", value_sql, scenario_config["base_path"]
-        )
-    result_sql = extract_call_sql(
-        "json_extract_string", value_sql, scenario_config["path"]
-    )
+        value_sql = extract_call_sql("json_extract", value_sql, scenario_config["base_path"])
+    result_sql = extract_call_sql("json_extract_string", value_sql, scenario_config["path"])
     return BenchmarkQuery(
         prepare_sql=(),
         timed_sql=f"""
@@ -1495,12 +1387,8 @@ def build_core_extract_string_query(
     )
 
 
-def build_core_project_paths_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
-    columns = project_paths_columns_sql(
-        scenario_config["json_column"], scenario_config["paths"]
-    )
+def build_core_project_paths_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    columns = project_paths_columns_sql(scenario_config["json_column"], scenario_config["paths"])
     return BenchmarkQuery(
         prepare_sql=(),
         timed_sql=f"""
@@ -1511,12 +1399,8 @@ def build_core_project_paths_query(
     )
 
 
-def build_core_filter_paths_query(
-    scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
-    predicates_sql = filter_paths_predicates_sql(
-        scenario_config["json_column"], scenario_config["predicates"]
-    )
+def build_core_filter_paths_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    predicates_sql = filter_paths_predicates_sql(scenario_config["json_column"], scenario_config["predicates"])
     return BenchmarkQuery(
         prepare_sql=(),
         timed_sql=f"""
@@ -1550,9 +1434,7 @@ def build_json_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             raise ValueError(f"json target does not support operation: {operation}")
 
 
-def build_query(
-    target: Target, scenario_config: dict, data_path: Path
-) -> BenchmarkQuery:
+def build_query(target: Target, scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     if target.kind == "jsono":
         return build_jsono_query(scenario_config, data_path)
     if target.kind == "json":
@@ -1565,9 +1447,7 @@ def prepare_case(conn: duckdb.DuckDBPyConnection, query: BenchmarkQuery) -> None
         conn.execute(statement).fetchall()
 
 
-def collect_duckdb_profile(
-    conn: duckdb.DuckDBPyConnection, query: BenchmarkQuery, profile_path: Path
-) -> None:
+def collect_duckdb_profile(conn: duckdb.DuckDBPyConnection, query: BenchmarkQuery, profile_path: Path) -> None:
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     prepare_case(conn, query)
 
@@ -1606,9 +1486,7 @@ def parse_row_group_scans(profile_path: Path) -> list[dict]:
     return scans
 
 
-def collect_row_group_metrics(
-    conn: duckdb.DuckDBPyConnection, query: BenchmarkQuery, profile_path: Path
-) -> list[dict]:
+def collect_row_group_metrics(conn: duckdb.DuckDBPyConnection, query: BenchmarkQuery, profile_path: Path) -> list[dict]:
     # OPERATOR_ROW_GROUPS_SCANNED / OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN are populated
     # by the parquet reader (and the native table scan) since DuckDB 1.5.4, but
     # they are not in the default/detailed profiling set — they must be requested
@@ -1629,14 +1507,10 @@ def collect_row_group_metrics(
 def format_row_groups(scans: list[dict]) -> str:
     if not scans:
         return "row_groups —"
-    return "row_groups " + ", ".join(
-        f"{scan['scanned']}/{scan['total']}" for scan in scans
-    )
+    return "row_groups " + ", ".join(f"{scan['scanned']}/{scan['total']}" for scan in scans)
 
 
-def run_single_benchmark(
-    conn: duckdb.DuckDBPyConnection, query: BenchmarkQuery, runs: int
-) -> dict:
+def run_single_benchmark(conn: duckdb.DuckDBPyConnection, query: BenchmarkQuery, runs: int) -> dict:
     prepare_case(conn, query)
     conn.execute(query.timed_sql).fetchall()
 
@@ -1719,13 +1593,9 @@ def run_benchmarks(
             if case_uses_data_path(scenario_config) and not data_path.exists():
                 print(f"FAILED: benchmark data file not found: {data_path}")
                 if "data_file" in scenario_config:
-                    print(
-                        "This benchmark uses an explicit data_file; it is not generated by bench/generate_data.py"
-                    )
+                    print("This benchmark uses an explicit data_file; it is not generated by bench/generate_data.py")
                 else:
-                    print(
-                        f"Generate it with: uv run python bench/generate_data.py --kind events --size {size}"
-                    )
+                    print(f"Generate it with: uv run python bench/generate_data.py --kind events --size {size}")
                 raise SystemExit(2)
 
             case_id = get_case_id(target, operation, size, scenario)
@@ -1746,9 +1616,7 @@ def run_benchmarks(
                 print(f"Running {case_id} [t{threads}]...", end=" ", flush=True)
 
                 if profile:
-                    profile_dir = (
-                        PROFILES_DIR / f"{case_id.replace('/', '_')}_t{threads}"
-                    )
+                    profile_dir = PROFILES_DIR / f"{case_id.replace('/', '_')}_t{threads}"
                     duckdb_profile_path = profile_dir / "query_profile.json"
                     print("profile...", end=" ", flush=True)
                     collect_duckdb_profile(conn, query, duckdb_profile_path)
@@ -1756,14 +1624,8 @@ def run_benchmarks(
 
                 row_group_scans: list[dict] = []
                 if collect_row_groups:
-                    row_group_path = (
-                        PROFILES_DIR
-                        / f"{case_id.replace('/', '_')}_t{threads}"
-                        / "row_groups.json"
-                    )
-                    row_group_scans = collect_row_group_metrics(
-                        conn, query, row_group_path
-                    )
+                    row_group_path = PROFILES_DIR / f"{case_id.replace('/', '_')}_t{threads}" / "row_groups.json"
+                    row_group_scans = collect_row_group_metrics(conn, query, row_group_path)
 
                 timing = run_single_benchmark(conn, query, runs)
                 result_checksum = None
@@ -1774,28 +1636,14 @@ def run_benchmarks(
                 rows_per_second = None
                 if row_count is not None and timing["min_ms"] > 0:
                     rows_per_second = round(row_count / (timing["min_ms"] / 1000))
-                throughput_text = (
-                    f", {rows_per_second:,} rows/s"
-                    if rows_per_second is not None
-                    else ""
-                )
+                throughput_text = f", {rows_per_second:,} rows/s" if rows_per_second is not None else ""
                 output_bytes = None
                 copy_path = scenario_config.get("copy_path")
                 if copy_path is not None and Path(copy_path).exists():
                     output_bytes = Path(copy_path).stat().st_size
-                size_text = (
-                    f", {output_bytes / 1_000_000:.2f}MB out"
-                    if output_bytes is not None
-                    else ""
-                )
-                row_group_text = (
-                    f", {format_row_groups(row_group_scans)}"
-                    if collect_row_groups
-                    else ""
-                )
-                print(
-                    f"{timing['median_ms']:.1f}ms{throughput_text}{size_text}{row_group_text}"
-                )
+                size_text = f", {output_bytes / 1_000_000:.2f}MB out" if output_bytes is not None else ""
+                row_group_text = f", {format_row_groups(row_group_scans)}" if collect_row_groups else ""
+                print(f"{timing['median_ms']:.1f}ms{throughput_text}{size_text}{row_group_text}")
 
                 results.append(
                     {
@@ -1835,9 +1683,7 @@ def save_results_json(
     output = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": (
-            results[0]["timestamp"]
-            if results
-            else datetime.now(timezone.utc).isoformat(timespec="seconds")
+            results[0]["timestamp"] if results else datetime.now(timezone.utc).isoformat(timespec="seconds")
         ),
         "environment": environment,
         "config": {
@@ -1928,8 +1774,7 @@ def show_results(results_path: Path) -> None:
         # usually fixed parallel output overhead, not an operation-level regression.
         lo, hi = thread_modes[0], thread_modes[-1]
         per_mode = ",\n                   ".join(
-            f"round(max(min_ms) FILTER (threads = {n}), 1) AS t{n}_ms"
-            for n in thread_modes
+            f"round(max(min_ms) FILTER (threads = {n}), 1) AS t{n}_ms" for n in thread_modes
         )
         conn.sql(f"""
             SELECT target, operation, scenario, size,
@@ -1988,17 +1833,11 @@ def build_cases(
 
 def print_case_list(cases: list[tuple[Target, str, dict]]) -> None:
     for target, size, scenario_config in cases:
-        print(
-            get_case_id(
-                target, scenario_config["operation"], size, scenario_config["scenario"]
-            )
-        )
+        print(get_case_id(target, scenario_config["operation"], size, scenario_config["scenario"]))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run jsono benchmarks against core DuckDB json baselines"
-    )
+    parser = argparse.ArgumentParser(description="Run jsono benchmarks against core DuckDB json baselines")
     parser.add_argument(
         "--filter",
         help="Filter cases by substring, for example transform/1k/flat_core",
@@ -2015,9 +1854,7 @@ def main() -> None:
         help="Comma-separated DuckDB thread counts; every case runs once per count "
         "so single-thread vs parallel scaling is visible (default: 1,8)",
     )
-    parser.add_argument(
-        "--profile", action="store_true", help="Collect DuckDB query profiles"
-    )
+    parser.add_argument("--profile", action="store_true", help="Collect DuckDB query profiles")
     parser.add_argument(
         "--row-groups",
         action="store_true",
@@ -2057,9 +1894,7 @@ def main() -> None:
     try:
         thread_modes = [int(part) for part in args.threads.split(",") if part.strip()]
     except ValueError:
-        print(
-            f"Error: --threads must be comma-separated integers, got {args.threads!r}"
-        )
+        print(f"Error: --threads must be comma-separated integers, got {args.threads!r}")
         raise SystemExit(2)
     if not thread_modes or any(count < 1 for count in thread_modes):
         print(f"Error: --threads must list positive integers, got {args.threads!r}")
@@ -2081,10 +1916,7 @@ def main() -> None:
         return
 
     modes_text = ", ".join(f"t{count}" for count in thread_modes)
-    print(
-        f"Running {len(cases_to_run)} benchmark case(s) across {len(targets)} target(s) "
-        f"at {modes_text}"
-    )
+    print(f"Running {len(cases_to_run)} benchmark case(s) across {len(targets)} target(s) " f"at {modes_text}")
 
     runs = args.runs
     if args.profile and args.runs == DEFAULT_RUNS:
@@ -2101,9 +1933,7 @@ def main() -> None:
     )
     if results:
         sizes_used = sorted(set(size for _, size, _ in cases_to_run))
-        environment = collect_environment(
-            DEFAULT_SEED, sizes_used, [target_metadata(target) for target in targets]
-        )
+        environment = collect_environment(DEFAULT_SEED, sizes_used, [target_metadata(target) for target in targets])
         save_results_json(results, args.output, runs, environment=environment)
         print(f"\nResults saved to {args.output}")
 

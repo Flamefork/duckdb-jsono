@@ -125,13 +125,7 @@ def result_thread(result: dict) -> int:
     if "threads" in result:
         return int(result["threads"])
     prefix, separator, suffix = result["id"].rpartition("/")
-    if (
-        separator
-        and prefix
-        and len(suffix) > 1
-        and suffix[0] == "t"
-        and suffix[1:].isdigit()
-    ):
+    if separator and prefix and len(suffix) > 1 and suffix[0] == "t" and suffix[1:].isdigit():
         return int(suffix[1:])
     return 0
 
@@ -279,9 +273,7 @@ def print_diff(diff: dict, baseline: dict, latest: dict) -> None:
         print()
 
     s = diff["summary"]
-    print(
-        f"Summary: {s['regressions']} regression(s), {s['improvements']} improvement(s), {s['unchanged']} unchanged"
-    )
+    print(f"Summary: {s['regressions']} regression(s), {s['improvements']} improvement(s), {s['unchanged']} unchanged")
 
 
 def save_diff(diff: dict, path: Path) -> None:
@@ -308,17 +300,13 @@ def compare_results(
     baseline = load_results(baseline_path)
     if baseline is None:
         print(f"Error: Baseline not found at {baseline_path}")
-        print(
-            "Save current results as baseline: uv run python bench/compare_results.py --save-baseline"
-        )
+        print("Save current results as baseline: uv run python bench/compare_results.py --save-baseline")
         return 2
 
     # Check schema version
     baseline_version = baseline.get("schema_version", 0)
     if baseline_version > SCHEMA_VERSION:
-        print(
-            f"Error: Incompatible schema version {baseline_version}, expected {SCHEMA_VERSION}"
-        )
+        print(f"Error: Incompatible schema version {baseline_version}, expected {SCHEMA_VERSION}")
         return 2
 
     diff = generate_diff(baseline, latest, tolerance_pct, min_effect_ms)
@@ -354,9 +342,7 @@ def save_baseline(latest_path: Path, baseline_path: Path) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Compare benchmark results with baseline"
-    )
+    parser = argparse.ArgumentParser(description="Compare benchmark results with baseline")
     parser.add_argument(
         "--baseline",
         type=Path,

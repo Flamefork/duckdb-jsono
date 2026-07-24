@@ -40,9 +40,7 @@ def build_symbol_lookup(syms: dict) -> dict:
             rva = s["rva"]
             size = s.get("size", 0)
             sym_idx = s["symbol"]
-            sym_name = (
-                string_table[sym_idx] if sym_idx < len(string_table) else f"<{sym_idx}>"
-            )
+            sym_name = string_table[sym_idx] if sym_idx < len(string_table) else f"<{sym_idx}>"
             symbols.append((rva, rva + size, sym_name))
         symbols.sort(key=lambda x: x[0])
         lib_symbols[debug_name] = symbols
@@ -56,9 +54,7 @@ def lookup_symbol(symbols: list, addr: int) -> str | None:
     return None
 
 
-def analyze_thread(
-    thread: dict, lib_symbols: dict, lib_debug_names: dict
-) -> tuple[dict, dict]:
+def analyze_thread(thread: dict, lib_symbols: dict, lib_debug_names: dict) -> tuple[dict, dict]:
     """Analyze a thread and return (self_samples, inclusive_samples) dicts."""
     samples = thread.get("samples", {})
     stack_table = thread.get("stackTable", {})
@@ -128,15 +124,10 @@ def main() -> None:
         "--min-thread-samples",
         type=int,
         default=50,
-        help="Threads with fewer samples are treated as idle/infra and excluded from "
-        "the aggregate (default: 50)",
+        help="Threads with fewer samples are treated as idle/infra and excluded from " "the aggregate (default: 50)",
     )
-    parser.add_argument(
-        "--top", type=int, default=30, help="Number of top functions to show"
-    )
-    parser.add_argument(
-        "--filter", default=None, help="Filter functions containing this string"
-    )
+    parser.add_argument("--top", type=int, default=30, help="Number of top functions to show")
+    parser.add_argument("--filter", default=None, help="Filter functions containing this string")
     args = parser.parse_args()
 
     syms_path = args.profile.with_suffix("").with_suffix(".json.syms.json")
@@ -150,17 +141,11 @@ def main() -> None:
     lib_symbols = build_symbol_lookup(syms)
 
     libs = profile.get("libs", [])
-    lib_debug_names = {
-        i: lib.get("debugName", lib.get("name", f"lib{i}"))
-        for i, lib in enumerate(libs)
-    }
+    lib_debug_names = {i: lib.get("debugName", lib.get("name", f"lib{i}")) for i, lib in enumerate(libs)}
 
     threads = profile.get("threads", [])
     by_count = sorted(
-        (
-            (t.get("name", "<unnamed>"), len(t.get("samples", {}).get("stack", [])), t)
-            for t in threads
-        ),
+        ((t.get("name", "<unnamed>"), len(t.get("samples", {}).get("stack", [])), t) for t in threads),
         key=lambda entry: -entry[1],
     )
 
@@ -179,10 +164,7 @@ def main() -> None:
         analyzed = [t for _, count, t in by_count if count >= args.min_thread_samples]
         if not analyzed and by_count:
             analyzed = [by_count[0][2]]
-        scope = (
-            f"aggregate of {len(analyzed)} thread(s) "
-            f"with >= {args.min_thread_samples} samples"
-        )
+        scope = f"aggregate of {len(analyzed)} thread(s) " f"with >= {args.min_thread_samples} samples"
 
     analyzed_ids = {id(t) for t in analyzed}
     print("Threads (samples; * = in aggregate):")
@@ -220,9 +202,7 @@ def main() -> None:
         print(f"{pct:5.1f}%  {count:5d}  {shorten(name)}")
 
     print(f"\n=== Inclusive time (top {args.top}) ===")
-    for name, count in sorted(inclusive_samples.items(), key=lambda x: -x[1])[
-        : args.top
-    ]:
+    for name, count in sorted(inclusive_samples.items(), key=lambda x: -x[1])[: args.top]:
         if not matches_filter(name):
             continue
         pct = 100 * count / total if total else 0

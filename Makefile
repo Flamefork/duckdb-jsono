@@ -22,6 +22,27 @@ ifeq ($(SKIP_TESTS),1)
 	TEST_CONSTRUCTOR_MATRIX_RELASSERT_TARGET=tests_skipped
 endif
 
+# The bundled ci-tools `format`/`format-check` (format.py over `src test`) cover C++/SQL and the
+# Python under those trees, but not bench/ and scripts/ — a gap that let a file drift under a
+# different black config unnoticed. The `-all` targets add those Python trees at the SAME standard
+# format.py enforces on src/test (`black --skip-string-normalization --line-length 120`, pinned in
+# pyproject's [tool.black] so a standalone `black` agrees). bench/optimization-log is an append-only
+# research archive — some probes are not even valid py313 — and is excluded via [tool.black]. We add
+# new targets instead of overriding the ci-tools ones so no "overriding recipe" warning prints on
+# every make invocation; `verify` uses the comprehensive `format-check-all`.
+JSONO_PYTHON_DIRS = bench scripts
+
+.PHONY: format-all format-check-all format-python format-check-python
+format-check-all: format-check format-check-python
+
+format-all: format format-python
+
+format-check-python:
+	uv run --frozen black --check $(JSONO_PYTHON_DIRS)
+
+format-python:
+	uv run --frozen black $(JSONO_PYTHON_DIRS)
+
 .PHONY: test_relassert test_relassert_internal test_constructor_matrix_relassert test_constructor_matrix_relassert_internal
 test_relassert: $(TEST_RELASSERT_TARGET)
 
@@ -49,4 +70,4 @@ verify:
 	$(MAKE) relassert
 	$(MAKE) test_relassert
 	$(MAKE) test_constructor_matrix_relassert
-	$(MAKE) format-check
+	$(MAKE) format-check-all

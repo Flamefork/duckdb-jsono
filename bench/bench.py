@@ -68,15 +68,8 @@ def needs_field_sample_jsono(args: list[str]) -> bool:
         return True
 
     for scenario_config in FIELD_SAMPLE_SCENARIOS:
-        if (
-            "data_file" in scenario_config
-            and scenario_config["data_file"] == FIELD_SAMPLE_JSONO_EVENTS_PATH
-        ):
-            case_id = (
-                f"{scenario_config['operation']}/"
-                f"{scenario_config['size']}/"
-                f"{scenario_config['scenario']}"
-            )
+        if "data_file" in scenario_config and scenario_config["data_file"] == FIELD_SAMPLE_JSONO_EVENTS_PATH:
+            case_id = f"{scenario_config['operation']}/" f"{scenario_config['size']}/" f"{scenario_config['scenario']}"
             for label in get_jsono_target_labels(args):
                 if filter_arg in f"{label}/{case_id}":
                     return True
@@ -85,9 +78,7 @@ def needs_field_sample_jsono(args: list[str]) -> bool:
 
 
 def field_sample_jsono_metadata_path() -> Path:
-    return FIELD_SAMPLE_JSONO_EVENTS_PATH.with_suffix(
-        f"{FIELD_SAMPLE_JSONO_EVENTS_PATH.suffix}.metadata.json"
-    )
+    return FIELD_SAMPLE_JSONO_EVENTS_PATH.with_suffix(f"{FIELD_SAMPLE_JSONO_EVENTS_PATH.suffix}.metadata.json")
 
 
 def expected_field_sample_jsono_metadata(source_path: Path) -> dict[str, object]:
@@ -124,11 +115,7 @@ def write_field_sample_jsono_metadata(source_path: Path) -> None:
 
 def ensure_data_exists(args: list[str]) -> None:
     required_sizes = get_required_sizes(args)
-    missing = [
-        size
-        for size in required_sizes
-        if not (DATA_DIR / f"events_{size}.parquet").exists()
-    ]
+    missing = [size for size in required_sizes if not (DATA_DIR / f"events_{size}.parquet").exists()]
     if not missing:
         return
 
@@ -179,8 +166,7 @@ def field_sample_jsono_is_current() -> bool:
     return (
         row_count == FIELD_SAMPLE_ROW_COUNT
         and rows > 1
-        and max_row_group_size
-        == min(FIELD_SAMPLE_ROW_COUNT, FIELD_SAMPLE_JSONO_ROW_GROUP_SIZE)
+        and max_row_group_size == min(FIELD_SAMPLE_ROW_COUNT, FIELD_SAMPLE_JSONO_ROW_GROUP_SIZE)
         and compression == FIELD_SAMPLE_JSONO_COMPRESSION.upper()
     )
 
