@@ -326,9 +326,9 @@ CREATE TABLE shredded AS SELECT jsono(d, shredding := {'a':'BIGINT'}) AS j FROM 
 query I
 SELECT to_json(jsono_shred_stats(j)) FROM shredded;
 ----
-[{"path":"a","type":"BIGINT","lane_rate":0.5,"divert_rate":0.25,"complete_rate":0.75}]
+[{"path":"a","type":"BIGINT","lane_rate":0.5,"divert_rate":0.25}]
 
-# An array shred reports complete_rate 1.0 (array shreds carry no completeness flag); tags is
+# An array shred has no spill bits; tags is
 # present as a lane in 1/2 rows and never diverted (its only absence is a missing key).
 query I
 SELECT to_json(jsono_shred_stats(j)) FROM (
@@ -338,7 +338,7 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
   ) AS t(d)
 );
 ----
-[{"path":"tags","type":"BIGINT[]","lane_rate":0.5,"divert_rate":0.0,"complete_rate":1.0}]
+[{"path":"tags","type":"BIGINT[]","lane_rate":0.5,"divert_rate":0.0}]
 
 # An array shred DIVERTS when the value at its path does not fit the element lane (a scalar there
 # stays whole in the residual): lane NULL plus a residual hit counts as a divert, unlike the
@@ -351,12 +351,12 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
   ) AS t(d)
 );
 ----
-[{"path":"tags","type":"BIGINT[]","lane_rate":0.5,"divert_rate":0.5,"complete_rate":1.0}]
+[{"path":"tags","type":"BIGINT[]","lane_rate":0.5,"divert_rate":0.5}]
 
 # An object-array shred (LIST<STRUCT> lane) reports lane / divert / complete the same way the scalar
 # array does: lane present when the value is a regular array (2/4 here), diverted when a scalar sits
 # at the path and stays whole in the residual (1/4), a missing key is neither (1/4), and array shreds
-# carry no completeness flag so complete_rate is always 1.0.
+# carry no spill bits.
 query I
 SELECT to_json(jsono_shred_stats(j)) FROM (
   SELECT jsono(d, shredding := {'items':'STRUCT(n BIGINT)[]'}) AS j FROM (VALUES
@@ -367,7 +367,7 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
   ) AS t(d)
 );
 ----
-[{"path":"items","type":"STRUCT(n BIGINT)[]","lane_rate":0.5,"divert_rate":0.25,"complete_rate":1.0}]
+[{"path":"items","type":"STRUCT(n BIGINT)[]","lane_rate":0.5,"divert_rate":0.25}]
 
 # Multiple shreds report in sorted path order.
 query I
@@ -378,10 +378,10 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
   ) AS t(d)
 );
 ----
-[{"path":"a","type":"BIGINT","lane_rate":1.0,"divert_rate":0.0,"complete_rate":1.0},{"path":"name","type":"VARCHAR","lane_rate":1.0,"divert_rate":0.0,"complete_rate":1.0}]
+[{"path":"a","type":"BIGINT","lane_rate":1.0,"divert_rate":0.0},{"path":"name","type":"VARCHAR","lane_rate":1.0,"divert_rate":0.0}]
 
 # An explicit JSON null keeps a complete NULL lane (it reads back as `->>` NULL) and lives in the
-# residual as null — it is NOT a divert. Here row `null` counts toward complete_rate but not
+# residual as null — it is NOT a divert. Here row `null` does not count toward
 # divert_rate, while the string "x" (a real type-too-narrow divert) counts divert but not complete.
 query I
 SELECT to_json(jsono_shred_stats(j)) FROM (
@@ -393,7 +393,7 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
   ) AS t(d)
 );
 ----
-[{"path":"k","type":"BIGINT","lane_rate":0.5,"divert_rate":0.25,"complete_rate":0.75}]
+[{"path":"k","type":"BIGINT","lane_rate":0.5,"divert_rate":0.25}]
 
 # All-NULL (no non-NULL rows) yields SQL NULL.
 query I
@@ -420,7 +420,7 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
   ) AS t(d)
 );
 ----
-[{"path":"$.m.deep","type":"BIGINT","lane_rate":0.25,"divert_rate":0.25,"complete_rate":0.75}]
+[{"path":"$.m.deep","type":"BIGINT","lane_rate":0.25,"divert_rate":0.25}]
 
 # A spec key that begins with `$` but is not a `$.`-rooted JSONPath is rejected loudly by the
 # constructor (the spec DSL reserves the `$` prefix for JSONPath), so no literal `$`-prefixed

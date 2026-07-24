@@ -35,7 +35,7 @@ COPY list_docs TO '__TEST_DIR__/jsono_input_types_list.parquet' (FORMAT parquet)
 query I
 SELECT typeof(j) FROM '__TEST_DIR__/jsono_input_types.parquet' LIMIT 1;
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, n STRUCT("value" BIGINT, complete TINYINT), ts STRUCT("value" VARCHAR, complete TINYINT), u STRUCT("value" VARCHAR, complete TINYINT))))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, n BIGINT, ts VARCHAR, u VARCHAR)))
 
 # The documents read back byte-identically, and the lanes still answer ->> after the round-trip
 # (a NULL lane value falls back to the residual's explicit null).

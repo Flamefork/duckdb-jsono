@@ -66,7 +66,7 @@ true
 query I
 SELECT typeof(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789', 'u': UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd'}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, ts STRUCT("value" VARCHAR, complete TINYINT), u STRUCT("value" VARCHAR, complete TINYINT))))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, ts VARCHAR, u VARCHAR)))
 
 query III
 SELECT jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789', 'u': UUID '4ac7a9e9-607c-4c8a-84f3-843f0191e3fd'})->>'ts',
@@ -81,7 +81,7 @@ query II
 SELECT typeof(jsono({'v': ('1' || repeat('0', 45))::VARINT, 'ts': TIMESTAMP '2024-01-01 12:34:56.789'})),
        to_json(jsono({'v': ('1' || repeat('0', 45))::VARINT, 'ts': TIMESTAMP '2024-01-01 12:34:56.789'}))::VARCHAR;
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, ts STRUCT("value" VARCHAR, complete TINYINT))))	{"ts":"2024-01-01 12:34:56.789","v":1000000000000000000000000000000000000000000000}
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, ts VARCHAR)))	{"ts":"2024-01-01 12:34:56.789","v":1000000000000000000000000000000000000000000000}
 
 # An explicit shredding spec over a constructed value re-shreds the string-rendered lane
 # losslessly (the `shredding :=` overload takes JSON text or a jsono value, not a SQL STRUCT).
@@ -89,7 +89,7 @@ query II
 SELECT typeof(jsono(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789'}), shredding := {'$.ts': 'VARCHAR'})),
        to_json(jsono(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789'}), shredding := {'$.ts': 'VARCHAR'}))::VARCHAR;
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.ts" STRUCT("value" VARCHAR, complete TINYINT))))	{"ts":"2024-01-01 12:34:56.789"}
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.ts" VARCHAR)))	{"ts":"2024-01-01 12:34:56.789"}
 
 # UNION stays a loud bind error: core renders it as a tagged object, which the VARCHAR cast
 # does not reproduce, so there is no parity to be had from a text rendering.
@@ -199,7 +199,7 @@ SELECT typeof(jsono({'m': MAP {'k': 'v'}, 'n': 5})),
        jsono({'m': MAP {'k': 'v'}, 'n': 5})->>'$.m.k',
        jsono({'m': MAP {'k': 'v'}, 'n': 5})->>'n';
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, n STRUCT("value" BIGINT, complete TINYINT))))	v	5
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, n BIGINT)))	v	5
 
 # A MAP casts to jsono storage, so INSERT of a MAP into a jsono column works.
 statement ok

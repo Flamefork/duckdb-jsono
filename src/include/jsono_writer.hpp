@@ -487,24 +487,12 @@ inline Vector &JsonoShredsStructVector(Vector &result) {
 }
 
 // Shred `shred_index` (0-based over the shred set) of a shredded jsono vector: canonically the
-// `shreds` struct is the marker then the shreds, so shred k is shreds child 1 + k. A scalar shred is
-// a pair STRUCT(value, complete) — return its `value` child (child 0) so existing callers keep
-// reading/writing the value; an array shred is a LIST — return the LIST itself.
+// `shreds` struct is the marker, the spill bitmap, then the shreds, so shred k is shreds child
+// 2 + k. A scalar shred is its bare typed lane, an array shred its LIST — the field itself either
+// way.
 inline Vector &JsonoShredVector(Vector &result, idx_t shred_index) {
 	auto &shreds = JsonoShredsStructVector(result);
-	auto &field = *StructVector::GetEntries(shreds)[1 + shred_index];
-	if (field.GetType().id() == LogicalTypeId::LIST) {
-		return field;
-	}
-	return *StructVector::GetEntries(field)[0];
-}
-
-// The `complete` child (child 1) of scalar shred `shred_index`'s pair. Valid only for scalar shreds
-// (an array shred carries no completeness flag); writers set it per row.
-inline Vector &JsonoShredCompleteVector(Vector &result, idx_t shred_index) {
-	auto &shreds = JsonoShredsStructVector(result);
-	auto &field = *StructVector::GetEntries(shreds)[1 + shred_index];
-	return *StructVector::GetEntries(field)[1];
+	return *StructVector::GetEntries(shreds)[2 + shred_index];
 }
 
 // The shred-set marker vector (BIGINT) of a shredded jsono result: `shreds` child 0.
@@ -513,14 +501,20 @@ inline Vector &JsonoShredSetVector(Vector &result) {
 	return *StructVector::GetEntries(shreds)[0];
 }
 
-// Fill the shred-set marker (= the layout hash) AND every scalar shred's `complete` flag = true on
-// every row: for a producer that by construction never diverts a present scalar into the residual —
-// e.g. type-driven auto-shred, where each shred's type IS its source field's type, so a present value
-// always fits and a NULL is only an absent field, never a residual diversion. The marker is part of
-// the struct, so this also keeps such a value structurally equal (under `=`) to one the text/struct
-// path built with the same data and the same shred set. Callers null the marker/complete per row on
-// SQL-NULL rows via JsonoSetRowMarkerNull.
-inline void JsonoFillShredsComplete(Vector &result, idx_t count) {
+// The spill bitmap vector (BIGINT) of a shredded jsono result: `shreds` child 1.
+inline Vector &JsonoShredSpillVector(Vector &result) {
+	auto &shreds = JsonoShredsStructVector(result);
+	return *StructVector::GetEntries(shreds)[1];
+}
+
+// Fill the clean shred-set marker (= the layout hash) AND a NULL spill bitmap on every row: for a
+// producer that by construction never diverts a present scalar into the residual — e.g. type-driven
+// auto-shred, where each shred's type IS its source field's type, so a present value always fits
+// and a NULL is only an absent field, never a residual diversion. The marker is part of the struct,
+// so this also keeps such a value structurally equal (under `=`) to one the text/struct path built
+// with the same data and the same shred set. Callers null the marker per row on SQL-NULL rows via
+// JsonoSetRowMarkerNull.
+inline void JsonoFillShredMarker(Vector &result, idx_t count) {
 	auto &layout_type = StructType::GetChildTypes(result.GetType())[0].second;
 	auto &fields = StructType::GetChildTypes(layout_type);
 	if (fields.size() < 2 || fields[1].first != JsonoShredsName()) {
@@ -530,39 +524,40 @@ inline void JsonoFillShredsComplete(Vector &result, idx_t count) {
 	auto &set_vec = JsonoShredSetVector(result);
 	set_vec.SetVectorType(VectorType::FLAT_VECTOR);
 	auto set_data = FlatVector::GetData<int64_t>(set_vec);
+	auto &spill_vec = JsonoShredSpillVector(result);
+	spill_vec.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &spill_validity = FlatVector::Validity(spill_vec);
 	for (idx_t row = 0; row < count; row++) {
 		set_data[row] = layout_hash;
+		spill_validity.SetInvalid(row);
 	}
-	auto &shred_fields = StructVector::GetEntries(JsonoShredsStructVector(result));
-	for (idx_t k = 1; k < shred_fields.size(); k++) {
-		auto &field = *shred_fields[k];
-		if (field.GetType().id() == LogicalTypeId::LIST) {
-			continue; // array shred: no completeness flag
-		}
-		auto &complete = *StructVector::GetEntries(field)[1];
-		complete.SetVectorType(VectorType::FLAT_VECTOR);
-		auto complete_data = FlatVector::GetData<int8_t>(complete);
-		for (idx_t row = 0; row < count; row++) {
-			complete_data[row] = 1;
-		}
+}
+
+// Stamp one value row's marker + spill pair from its computed spill mask: a clean row (mask 0)
+// stamps the clean hash and a NULL spill, a dirty row the flipped hash and the mask. The single
+// owner of the two-valued stamp discipline every shred writer follows.
+inline void JsonoStampShredRow(int64_t *set_data, Vector &spill_vec, idx_t row, uint64_t layout_hash,
+                               uint64_t spill_mask) {
+	if (spill_mask == 0) {
+		set_data[row] = int64_t(layout_hash);
+		FlatVector::SetNull(spill_vec, row, true);
+	} else {
+		set_data[row] = int64_t(layout_hash ^ JSONO_DIRTY_HASH_FLIP);
+		FlatVector::Validity(spill_vec).SetValid(row);
+		FlatVector::GetData<int64_t>(spill_vec)[row] = int64_t(spill_mask);
 	}
 }
 
 // Null the whole `shreds` subtree for a SQL-NULL result row: the `shreds` struct itself, the
-// shred-set marker, and every shred field plus (for a scalar pair) its value/complete children.
-// DuckDB's struct Verify requires every child of a NULL struct to be NULL too — JsonoBodyWriter's
-// SetRowNull nulls result/layout/body, so the layout's other child (`shreds`) must be nulled here.
+// shred-set marker, the spill bitmap, and every shred field. DuckDB's struct Verify requires every
+// child of a NULL struct to be NULL too — JsonoBodyWriter's SetRowNull nulls result/layout/body, so
+// the layout's other child (`shreds`) must be nulled here.
 inline void JsonoSetRowMarkerNull(Vector &result, idx_t row) {
 	auto &shreds = JsonoShredsStructVector(result);
 	FlatVector::SetNull(shreds, row, true);
 	auto &shred_fields = StructVector::GetEntries(shreds);
 	for (auto &field : shred_fields) {
 		FlatVector::SetNull(*field, row, true);
-		if (field->GetType().id() == LogicalTypeId::STRUCT) {
-			for (auto &child : StructVector::GetEntries(*field)) {
-				FlatVector::SetNull(*child, row, true);
-			}
-		}
 	}
 }
 

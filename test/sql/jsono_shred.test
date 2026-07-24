@@ -237,7 +237,7 @@ invalid path
 # so jsono functions refuse it at bind instead of reading a read-copy lane. The same layout with an
 # object-key lane is recognized and binds.
 statement ok
-CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.arr[0]" STRUCT("value" BIGINT, complete TINYINT)))));
+CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.arr[0]" BIGINT))));
 
 statement error
 SELECT jsono_array_length(x) FROM bad_lane_layout;
@@ -245,7 +245,7 @@ SELECT jsono_array_length(x) FROM bad_lane_layout;
 must be JSONO
 
 statement ok
-CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.arr" STRUCT("value" BIGINT, complete TINYINT)))));
+CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.arr" BIGINT))));
 
 query I
 SELECT count(*) FROM (SELECT jsono_array_length(x) FROM good_lane_layout);
@@ -391,7 +391,7 @@ SELECT to_json(jsono(jsono('{"a":"1","b":"2","c":"3","d":4}', shredding := {'a':
 
 query II
 SELECT to_json(jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})),
-       jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})."jsono"."shreds"."a"."value";
+       jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})."jsono"."shreds"."a";
 ----
 {"a":7,"b":"x"}	7
 
@@ -414,14 +414,14 @@ SELECT to_json(jsono(jsono('{"p":{"q":"deep"},"r":"top"}', shredding := {'$.p.q'
 # Two spec entries naming the same key path ('a' and '$.a'): both shreds fill and the key
 # strips once (the duplicate-path fallback keeps the per-row locate-and-strip semantics).
 query III
-SELECT to_json(j), j."jsono"."shreds"."a"."value", j."jsono"."shreds"."$.a"."value"
+SELECT to_json(j), j."jsono"."shreds"."a", j."jsono"."shreds"."$.a"
 FROM (SELECT jsono('{"a":"v","z":1}', shredding := {'a':'VARCHAR', '$.a':'VARCHAR'}) AS j);
 ----
 {"a":"v","z":1}	v	v
 
 # A UBIGINT shred strips values past int64 range and plain non-negative integers alike.
 query III
-SELECT to_json(j), j."jsono"."shreds"."big"."value", j."jsono"."shreds"."small"."value"
+SELECT to_json(j), j."jsono"."shreds"."big", j."jsono"."shreds"."small"
 FROM (SELECT jsono('{"big":18446744073709551615,"small":7}', shredding := {'big':'UBIGINT','small':'UBIGINT'}) AS j);
 ----
 {"big":18446744073709551615,"small":7}	18446744073709551615	7

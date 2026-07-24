@@ -83,7 +83,7 @@ SELECT MIN(TRY_CAST(j->>'$.x' AS BIGINT)), MAX(TRY_CAST(j->>'$.x' AS BIGINT)) FR
 
 # (b2) a NULL-carrying shred that is still total: a third of the rows OMIT $.x (an absent path -> NULL
 # lane, not a residual spill), the rest are integers. No present scalar was diverted, so every row's
-# `complete` flag is 1. The lane itself still has NULLs (from the absent rows), yet the optimizer reads
+# spill mask stays 0. The lane itself still has NULLs (from the absent rows), yet the optimizer reads
 # it COALESCE-free anyway: a bare struct_extract returns NULL for an absent path, which is the correct
 # read, and MIN/MAX/count (which ignore those NULLs) stay correct. This is the per-shred totality fast
 # path that lets a typed shred beat ClickHouse without dropping the absent rows.
@@ -240,21 +240,23 @@ SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)) FROM merge
 ----
 0	999
 
-# A malformed `complete` value must NOT be trusted as total. `complete` is a 1/0 flag; the optimizer
-# requires min == max == 1 (no spill), not merely min != 0. A hand-built row with complete=2, a NULL
-# value lane, and the real value in the residual must keep the COALESCE fallback and read the residual
-# value — trusting min != 0 dropped COALESCE and returned a wrong NULL.
+# A malformed spill mask must NOT be trusted as total. Honest writers only set bits below the shred
+# count; a hand-built row carrying the TRUE set hash plus an out-of-range bit (bit 5 with a single
+# shred), a NULL lane, and the real value in the residual must keep the COALESCE fallback and read
+# the residual value — trusting the in-range bits of an out-of-domain mask would drop COALESCE and
+# return a wrong NULL.
 statement ok
-CREATE TABLE bad_complete AS
+CREATE TABLE bad_spill AS
 SELECT struct_pack(jsono := struct_pack(
   body := jsono('{"a":"oops"}')."jsono".body,
   shreds := struct_pack(
     "$jsono$set" := jsono('{"a":"oops"}', shredding := {'a':'BIGINT'}).jsono.shreds."$jsono$set",
-    a := struct_pack(value := NULL::BIGINT, complete := 2::TINYINT)
+    "$jsono$spill" := 32::BIGINT,
+    a := NULL::BIGINT
   )
-))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, a STRUCT(value BIGINT, complete TINYINT)))) AS j;
+))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, a BIGINT))) AS j;
 
 query I
-SELECT j ->> '$.a' FROM bad_complete;
+SELECT j ->> '$.a' FROM bad_spill;
 ----
 oops

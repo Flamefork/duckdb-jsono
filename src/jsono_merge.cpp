@@ -1943,11 +1943,10 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// speculatively here and overwritten by the reshred fallback below, so their possibly
 			// diverted lanes never reach the output). In a kept row scalar shred keys do not appear in
 			// the folded residual. Scalar-array keys may appear as their normal skeleton arrays, but they
-			// do not participate in the per-shred completeness typed-scalar shortcut. A diverted scalar
-			// (case B) would sit in that residual at the scalar shred's key and trip the gate to the
-			// fallback, so every NULL scalar shred in a kept row is an absent path (case A), never a
-			// diversion.
-			JsonoFillShredsComplete(result, count);
+			// never set spill bits. A diverted scalar (case B) would sit in that residual at the scalar
+			// shred's key and trip the gate to the fallback, so every NULL scalar shred in a kept row is
+			// an absent path (case A), never a diversion — the zero spill bitmap is exact.
+			JsonoFillShredMarker(result, count);
 			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
 			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
 			for (idx_t b = 0; b < BODY_BLOB_COUNT; b++) {
@@ -2696,29 +2695,32 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 	// reshred. Per scalar shred the residual decides, matching what compose(residual-authoritative)
 	// + reshred used to emit:
 	//   - path present in the residual (a later diverted write outranks the older lane) -> NULL
-	//     lane, complete = 0 (the value lives in the residual);
-	//   - a non-object prefix (the parent was replaced by a scalar) -> NULL lane, complete = 1
+	//     lane, spill bit set (the value lives in the residual);
+	//   - a non-object prefix (the parent was replaced by a scalar) -> NULL lane, no bit
 	//     (the lane value is dropped, replace semantics);
-	//   - path absent and the lane active -> the lane value, complete = 1, manifested as stripped;
-	//   - path absent and no lane -> NULL lane, complete = 1 (absent field).
+	//   - path absent and the lane active -> the lane value, no bit, manifested as stripped;
+	//   - path absent and no lane -> NULL lane, no bit (absent field).
 	// The fully-shredded hot case (empty residual) skips every locate.
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	JsonoBodyWriter writer;
 	writer.Init(result);
-	auto layout_hash = int64_t(JsonoLayoutHashOf(result.GetType()));
+	auto layout_hash = JsonoLayoutHashOf(result.GetType());
 	auto &set_vec = jsono::JsonoShredSetVector(result);
 	set_vec.SetVectorType(VectorType::FLAT_VECTOR);
 	auto set_data = FlatVector::GetData<int64_t>(set_vec);
+	auto &spill_vec = jsono::JsonoShredSpillVector(result);
+	spill_vec.SetVectorType(VectorType::FLAT_VECTOR);
+	vector<string> shred_names;
+	shred_names.reserve(bind_data.shreds.size());
+	for (auto &shred : bind_data.shreds) {
+		shred_names.push_back(shred.first);
+	}
+	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
 	vector<Vector *> lane_out(bind_data.shreds.size());
-	vector<Vector *> complete_out(bind_data.shreds.size(), nullptr);
 	vector<JsonoShredManifestEntryBytes> manifest_entries(bind_data.shreds.size());
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 		lane_out[f] = &jsono::JsonoShredVector(result, f);
 		lane_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
-		if (bind_data.shred_plan[f].kind == ShredKind::Scalar) {
-			complete_out[f] = &jsono::JsonoShredCompleteVector(result, f);
-			complete_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
-		}
 		manifest_entries[f] = JsonoShredManifestEntry(bind_data.shreds[f].first, bind_data.shreds[f].second);
 	}
 	JsonoBuilder empty_builder;
@@ -2736,18 +2738,15 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 			continue;
 		}
 		bool live = direct && direct->kind != DirectShreddedAcc::Kind::Empty;
-		set_data[rid] = layout_hash;
 		if (!live) {
-			// The group had input but folded to an empty object -> {} with NULL shreds (complete = 1: absent).
+			// The group had input but folded to an empty object -> {} with NULL shreds (absent, no spill).
+			jsono::JsonoStampShredRow(set_data, spill_vec, rid, layout_hash, 0);
 			empty_builder.Reset();
 			empty_builder.EmitObjectStart(0);
 			empty_builder.EmitObjectEnd();
 			writer.WriteRow(rid, empty_builder);
 			for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 				FlatVector::SetNull(*lane_out[f], rid, true);
-				if (complete_out[f]) {
-					FlatVector::GetData<int8_t>(*complete_out[f])[rid] = 1;
-				}
 			}
 			continue;
 		}
@@ -2760,6 +2759,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		                            SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START &&
 		                            ContainerChildCount(SlotPayload(acc_view.SlotAt(0))) > 0;
 		stripped_fields.clear();
+		uint64_t spill_mask = 0;
 		D_ASSERT(direct->lanes.size() == bind_data.shreds.size());
 		for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 			auto &plan = bind_data.shred_plan[f];
@@ -2769,13 +2769,13 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 				continue;
 			}
 			bool lane_active = direct->lanes[f].active;
-			int8_t complete = 1;
 			bool write_lane = false;
 			if (residual_has_members) {
 				idx_t depth_reached;
 				switch (ClassifyResidualPath(acc_view, plan.steps, depth_reached)) {
 				case ResidualPathOutcome::Present:
-					complete = 0; // a later diverted write outranks the older lane; the value lives in the residual
+					// a later diverted write outranks the older lane; the value lives in the residual
+					spill_mask |= uint64_t(1) << spill_ranks[f];
 					break;
 				case ResidualPathOutcome::Absent:
 					if (lane_active) {
@@ -2783,7 +2783,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 					}
 					break;
 				case ResidualPathOutcome::NonObjectPrefix:
-					break; // a parent was replaced by a scalar: drop the lane, complete stays 1 (replace semantics)
+					break; // a parent was replaced by a scalar: drop the lane, no spill (replace semantics)
 				}
 			} else if (lane_active) {
 				write_lane = true;
@@ -2812,10 +2812,8 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 			} else {
 				FlatVector::SetNull(*lane_out[f], rid, true);
 			}
-			if (complete_out[f]) {
-				FlatVector::GetData<int8_t>(*complete_out[f])[rid] = complete;
-			}
 		}
+		jsono::JsonoStampShredRow(set_data, spill_vec, rid, layout_hash, spill_mask);
 		auto &blob = direct->residual;
 		writer.data[BODY_SLOTS][rid] = WriteBlobInto(writer.Slots(), blob.slots.data(), blob.slots.size());
 		writer.data[BODY_KEY_HEAP][rid] = WriteBlobInto(writer.KeyHeap(), blob.key_heap.data(), blob.key_heap.size());
@@ -4635,17 +4633,20 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	JsonoBodyWriter writer;
 	writer.Init(result);
 	vector<Vector *> shred_out(bind_data.shreds.size());
-	vector<Vector *> complete_out(bind_data.shreds.size(), nullptr); // scalar shreds only
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 		shred_out[f] = &JsonoShredVector(result, f);
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
-		if (!IsShredListType(bind_data.shreds[f].second)) {
-			complete_out[f] = &JsonoShredCompleteVector(result, f);
-			complete_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
-		}
 	}
 	Vector *set_out = &JsonoShredSetVector(result);
 	set_out->SetVectorType(VectorType::FLAT_VECTOR);
+	Vector *spill_out = &JsonoShredSpillVector(result);
+	spill_out->SetVectorType(VectorType::FLAT_VECTOR);
+	vector<string> shred_names;
+	shred_names.reserve(bind_data.shreds.size());
+	for (auto &shred : bind_data.shreds) {
+		shred_names.push_back(shred.first);
+	}
+	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
 
 	// The shred-set marker value, order-independent over the shred set (see JsonoLayoutHashOf): the
 	// optimizer recomputes it from the read type, which a set-op/reorder cast may present in a
@@ -4667,15 +4668,9 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		for (auto *shred : shred_out) {
 			FlatVector::SetNull(*shred, rid, true);
 		}
-		// Shred-set marker on every value row (a no-input group emits SQL NULL below, which re-nulls
-		// this marker); each scalar shred's completeness starts true and a divert clears it below.
-		FlatVector::Validity(*set_out).SetValid(rid);
-		FlatVector::GetData<int64_t>(*set_out)[rid] = int64_t(manifest_layout_hash);
-		for (auto *complete : complete_out) {
-			if (complete) {
-				FlatVector::GetData<int8_t>(*complete)[rid] = 1;
-			}
-		}
+		// The clean/dirty marker + spill stamp lands after the scalar loop below has collected this
+		// row's divert bits (a no-input group emits SQL NULL instead).
+		uint64_t spill_mask = 0;
 
 		auto &state = *state_data[RowIndex(state_fmt, i)];
 		builder.Reset();
@@ -4729,8 +4724,8 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 					scalar_strip_paths.push_back(&shred.steps);
 					stripped_shred_indices.push_back(shred.child);
 				}
-				if (diverted && complete_out[shred.child]) {
-					FlatVector::GetData<int8_t>(*complete_out[shred.child])[rid] = 0;
+				if (diverted) {
+					spill_mask |= uint64_t(1) << spill_ranks[shred.child];
 				}
 			}
 			for (idx_t s = 0; s < list_shreds.size(); s++) {
@@ -4759,6 +4754,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		std::sort(stripped_child_indices.begin(), stripped_child_indices.end());
 		EmitLWWTreeNodeWithListOverrides(*state.root, builder, scalar_strip_paths, stripped_child_indices,
 		                                 list_override_indices, list_shreds, state.list_lanes, 0);
+		JsonoStampShredRow(FlatVector::GetData<int64_t>(*set_out), *spill_out, rid, manifest_layout_hash, spill_mask);
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_shred_indices.empty()) {
 			std::sort(stripped_shred_indices.begin(), stripped_shred_indices.end());

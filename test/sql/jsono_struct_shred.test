@@ -10,7 +10,7 @@ require json
 # (NULL shred = "value lives in the residual"), non-NULL shred fields are stripped and
 # manifest-covered. Mixed NULL masks per row exercise the partial-strip emit.
 query III
-SELECT j.jsono.shreds."a".value, j.jsono.shreds."k".value, to_json(j)::VARCHAR
+SELECT j.jsono.shreds."a", j.jsono.shreds."k", to_json(j)::VARCHAR
 FROM (
     SELECT jsono(struct_pack(a := a, k := k)) AS j
     FROM (VALUES ('x', 1::BIGINT), (NULL, 2::BIGINT), ('z', NULL::BIGINT)) v(a, k)
@@ -24,7 +24,7 @@ NULL	2	{"a":null,"k":2}
 # name parses as the path $.x, which does not exist, so the shred is NULL and the value
 # stays in the residual under its literal key.
 query II
-SELECT j.jsono.shreds."$.x".value IS NULL, to_json(j)::VARCHAR FROM (SELECT jsono({'$.x': 'v', 'y': 1}) AS j);
+SELECT j.jsono.shreds."$.x" IS NULL, to_json(j)::VARCHAR FROM (SELECT jsono({'$.x': 'v', 'y': 1}) AS j);
 ----
 true	{"$.x":"v","y":1}
 
@@ -34,7 +34,7 @@ true	{"$.x":"v","y":1}
 query I
 SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.commit.collection" STRUCT("value" VARCHAR, complete TINYINT), "$.commit.operation" STRUCT("value" VARCHAR, complete TINYINT), did STRUCT("value" VARCHAR, complete TINYINT), kind STRUCT("value" VARCHAR, complete TINYINT))))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR)))
 
 # The walk descends nested structs up to a deliberately high cap (JSONO_AUTO_SHRED_MAX_DEPTH), well
 # above realistic nesting, so every scalar leaf here lifts: $.b.c, $.b.d.e, and $.b.d.f.g. The cap
@@ -43,7 +43,7 @@ STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, ski
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep', 'f': {'g': 'deeper'}}}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.b.c" STRUCT("value" VARCHAR, complete TINYINT), "$.b.d.e" STRUCT("value" VARCHAR, complete TINYINT), "$.b.d.f.g" STRUCT("value" VARCHAR, complete TINYINT), a STRUCT("value" BIGINT, complete TINYINT))))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.b.c" VARCHAR, "$.b.d.e" VARCHAR, "$.b.d.f.g" VARCHAR, a BIGINT)))
 
 # The nested shreds round-trip losslessly.
 query I
@@ -60,7 +60,7 @@ SELECT to_json(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll',
 # A nested NULL scalar stays an explicit null in the residual (NULL shred = value-in-residual);
 # the typed nested shred captures the present value.
 query III
-SELECT j.jsono.shreds."$.commit.collection".value, j.jsono.shreds."$.commit.n".value, to_json(j)::VARCHAR
+SELECT j.jsono.shreds."$.commit.collection", j.jsono.shreds."$.commit.n", to_json(j)::VARCHAR
 FROM (
     SELECT jsono({'commit': {'collection': c, 'n': n}}) AS j
     FROM (VALUES ('post', 1::BIGINT), (NULL, NULL::BIGINT)) v(c, n)
@@ -117,7 +117,7 @@ nested	flat
 query I
 SELECT typeof(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$.commit.operation" STRUCT("value" VARCHAR, complete TINYINT))))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.commit.operation" VARCHAR)))
 
 # Type-driven auto-shred is always complete: a shred's type IS its field's type, so a present
 # value always fits and a NULL is only an absent field, never a residual diversion. A typed shred

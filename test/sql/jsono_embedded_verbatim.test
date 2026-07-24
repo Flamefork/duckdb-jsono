@@ -36,7 +36,7 @@ SELECT to_json(jsono({'eo': jsono('{}'), 'ea': jsono('[]')}));
 query I
 SELECT typeof(jsono({'z': 1, 'nested': jsono('{"a":1}')}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, z STRUCT("value" BIGINT, complete TINYINT))))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, z BIGINT)))
 
 # A shredded value embeds as its document at every position the constructor takes it: struct field,
 # MAP value, LIST element, and the document root. Only the plain layout is recognized structurally,

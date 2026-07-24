@@ -42,7 +42,7 @@ SELECT to_json(jsono_shred_stats(j))
 FROM (SELECT jsono(jsono('{"a":"text","present":9}'),
                    shredding := {'$.a':'BIGINT','$.absent':'BIGINT','$.present':'BIGINT'}) AS j);
 ----
-[{"path":"$.a","type":"BIGINT","lane_rate":0.0,"divert_rate":1.0,"complete_rate":0.0},{"path":"$.absent","type":"BIGINT","lane_rate":0.0,"divert_rate":0.0,"complete_rate":1.0},{"path":"$.present","type":"BIGINT","lane_rate":1.0,"divert_rate":0.0,"complete_rate":1.0}]
+[{"path":"$.a","type":"BIGINT","lane_rate":0.0,"divert_rate":1.0},{"path":"$.absent","type":"BIGINT","lane_rate":0.0,"divert_rate":0.0},{"path":"$.present","type":"BIGINT","lane_rate":1.0,"divert_rate":0.0}]
 
 # Duplicate spec paths ('$.x' and 'x' address the same key): the trie shares one node with two
 # scalar leaves, both read the same located cursor — unlike the text writer, no two-pass fallback.

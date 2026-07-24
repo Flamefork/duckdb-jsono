@@ -16,14 +16,17 @@ CREATE TABLE lockstep AS
 SELECT struct_pack("jsono" := struct_pack(
            body := j."jsono".body,
            shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$jsono$spill" := j."jsono".shreds."$jsono$spill",
                                  "$.a" := [1, 2]::BIGINT[]))) AS truncated,
        struct_pack("jsono" := struct_pack(
            body := j."jsono".body,
            shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$jsono$spill" := j."jsono".shreds."$jsono$spill",
                                  "$.a" := [1, 2, 3, 4]::BIGINT[]))) AS extended,
        struct_pack("jsono" := struct_pack(
            body := j."jsono".body,
            shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$jsono$spill" := j."jsono".shreds."$jsono$spill",
                                  "$.a" := j."jsono".shreds."$.a"))) AS intact
 FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := {'$.a':'BIGINT[]'}) AS j);
 
@@ -56,10 +59,12 @@ CREATE TABLE lockstep_obj AS
 SELECT struct_pack("jsono" := struct_pack(
            body := j."jsono".body,
            shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$jsono$spill" := j."jsono".shreds."$jsono$spill",
                                  "$.m.items" := [{'n': 1::BIGINT}]::STRUCT(n BIGINT)[]))) AS truncated,
        struct_pack("jsono" := struct_pack(
            body := j."jsono".body,
            shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$jsono$spill" := j."jsono".shreds."$jsono$spill",
                                  "$.m.items" := j."jsono".shreds."$.m.items"))) AS intact
 FROM (SELECT jsono('{"m":{"items":[{"n":1},{"n":2}]},"z":1}', shredding := {'$.m.items':'STRUCT(n BIGINT)[]'}) AS j);
 
@@ -74,6 +79,7 @@ query I
 SELECT jsono_validate(struct_pack("jsono" := struct_pack(
            body := j."jsono".body,
            shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
+                                 "$jsono$spill" := j."jsono".shreds."$jsono$spill",
                                  "$.a" := NULL::BIGINT[]))))
 FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := {'$.a':'BIGINT[]'}) AS j);
 ----

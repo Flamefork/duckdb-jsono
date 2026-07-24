@@ -1596,6 +1596,13 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 		// (bind_data->shreds) and the type's shred order must agree.
 		std::sort(auto_shreds.begin(), auto_shreds.end(),
 		          [](const AutoShredCandidate &a, const AutoShredCandidate &b) { return a.name < b.name; });
+		// Auto-shred is best-effort: a struct wider than the spill bitmap keeps its first
+		// JSONO_MAX_SHREDS lanes in canonical name order (deterministic — a pure function of the
+		// field-name set) and leaves the rest in the residual, where reads still fall back correctly.
+		// Only the explicit shredding spec fails loud on the cap (JsonoShreddedStructType).
+		if (auto_shreds.size() > JSONO_MAX_SHREDS) {
+			auto_shreds.resize(JSONO_MAX_SHREDS);
+		}
 		child_list_t<LogicalType> shred_types;
 		for (auto &shred : auto_shreds) {
 			bind_data->shreds.emplace_back(shred.name, shred.type);
@@ -1907,7 +1914,7 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
-	JsonoFillShredsComplete(result, count);
+	JsonoFillShredMarker(result, count);
 	auto &builder = lstate.builder;
 	vector<uint8_t> stripped(shred_count);
 	vector<idx_t> stripped_fields;
@@ -2089,10 +2096,10 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	writer.Init(result);
 	// Type-driven auto-shred never diverts: each shred's type is its source field's promoted plan
 	// type (narrow numerics widen to the BIGINT/DOUBLE the casted input already carries), so a
-	// present value always fits the shred and a NULL shred is only an absent field. The value is
-	// therefore always complete — which gives jsono(struct, shredding) the COALESCE-free typed
-	// read on read-back for struct-ingest workloads.
-	JsonoFillShredsComplete(result, count);
+	// present value always fits the shred and a NULL shred is only an absent field. The spill
+	// bitmap is therefore all-zero — which gives jsono(struct) the COALESCE-free typed read on
+	// read-back for struct-ingest workloads.
+	JsonoFillShredMarker(result, count);
 	auto &builder = lstate.builder;
 
 	// All-stripped rows with an empty residual share constant blobs (header + {} + manifest).

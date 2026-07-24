@@ -241,7 +241,7 @@ statement ok
 CREATE TABLE case_out AS SELECT CASE WHEN true THEN sa.e ELSE sb.e END AS e FROM shred_a AS sa, shred_b AS sb;
 
 query I
-SELECT t LIKE '%a STRUCT("value" VARCHAR, complete TINYINT)%' AND t LIKE '%b STRUCT("value" VARCHAR, complete TINYINT)%'
+SELECT t LIKE '%a VARCHAR%' AND t LIKE '%b VARCHAR%'
 FROM (SELECT (SELECT column_type FROM (DESCRIBE case_out)) AS t);
 ----
 true
@@ -256,7 +256,7 @@ statement ok
 CREATE TABLE coalesce_out AS SELECT COALESCE(sa.e, sb.e) AS e FROM shred_a AS sa, shred_b AS sb;
 
 query I
-SELECT t LIKE '%a STRUCT("value" VARCHAR, complete TINYINT)%' AND t LIKE '%b STRUCT("value" VARCHAR, complete TINYINT)%'
+SELECT t LIKE '%a VARCHAR%' AND t LIKE '%b VARCHAR%'
 FROM (SELECT (SELECT column_type FROM (DESCRIBE coalesce_out)) AS t);
 ----
 true

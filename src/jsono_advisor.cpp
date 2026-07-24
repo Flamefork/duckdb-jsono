@@ -722,8 +722,14 @@ void JsonoSuggestFinalize(Vector &states, AggregateInputData &aggr_input_data, V
 		}
 		string spec = "{";
 		bool first = true;
-		// std::map iterates in sorted (canonical) path order.
+		idx_t emitted = 0;
+		// std::map iterates in sorted (canonical) path order. The suggestion must stay
+		// constructor-valid, so it stops at the spill-bitmap cap the constructor enforces —
+		// the same first-JSONO_MAX_SHREDS-in-canonical-order rule auto-shred uses.
 		for (auto &entry : *state.paths) {
+			if (emitted == JSONO_MAX_SHREDS) {
+				break;
+			}
 			auto type = ChooseShredType(entry.second, state.non_null_rows, bind_data.min_presence, bind_data.min_fit);
 			if (type.empty()) {
 				continue;
@@ -732,6 +738,7 @@ void JsonoSuggestFinalize(Vector &states, AggregateInputData &aggr_input_data, V
 				spec.append(", ");
 			}
 			first = false;
+			emitted++;
 			AppendSpecKey(spec, entry.first);
 			spec.append(": ");
 			spec.append(type);
@@ -745,12 +752,11 @@ void JsonoSuggestFinalize(Vector &states, AggregateInputData &aggr_input_data, V
 	}
 }
 
-// ===== jsono_shred_stats: per-shred lane / divert / complete rates over a shredded column =====
+// ===== jsono_shred_stats: per-shred lane / divert rates over a shredded column =====
 
 struct ShredStatCounters {
 	idx_t lane_present = 0;
 	idx_t divert = 0;
-	idx_t complete = 0;
 };
 
 struct ShredStatsState {
@@ -821,11 +827,13 @@ struct ShredStatsAggregate {
 };
 
 LogicalType ShredStatsResultType() {
+	// No complete_rate column: with the spill-bitmap encoding it is identically 1 - divert_rate
+	// (a bit is set exactly when the value stayed in the residual), so reporting both would just
+	// restate one number.
 	return LogicalType::LIST(LogicalType::STRUCT({{"path", LogicalType::VARCHAR},
 	                                              {"type", LogicalType::VARCHAR},
 	                                              {"lane_rate", LogicalType::DOUBLE},
-	                                              {"divert_rate", LogicalType::DOUBLE},
-	                                              {"complete_rate", LogicalType::DOUBLE}}));
+	                                              {"divert_rate", LogicalType::DOUBLE}}));
 }
 
 unique_ptr<FunctionData> JsonoShredStatsBind(ClientContext &context, AggregateFunction &function,
@@ -857,12 +865,16 @@ unique_ptr<FunctionData> JsonoShredStatsBind(ClientContext &context, AggregateFu
 	return std::move(bind_data);
 }
 
-// Per-chunk read handles: the residual reader plus each shred's value lane (and, for a scalar shred,
-// its `complete` flag lane).
+// Per-chunk read handles: the residual reader plus each shred's value lane and the shared spill
+// bitmap (with the input type's canonical bit ranks and set hash for the per-row identity gate).
 struct ShredStatsLanes {
 	JsonoRowReader reader;
 	vector<UnifiedVectorFormat> value_fmt;
-	vector<UnifiedVectorFormat> complete_fmt; // valid only for scalar shreds
+	UnifiedVectorFormat set_fmt;
+	UnifiedVectorFormat spill_fmt;
+	bool mask_readable = false;
+	int64_t type_hash = 0;
+	vector<idx_t> spill_ranks;
 };
 
 void InitShredStatsLanes(Vector &input, idx_t count, const ShredStatsBindData &bind_data, ShredStatsLanes &lanes) {
@@ -874,19 +886,48 @@ void InitShredStatsLanes(Vector &input, idx_t count, const ShredStatsBindData &b
 	lanes.reader.Init(input, count);
 	auto nshreds = bind_data.shreds.size();
 	lanes.value_fmt.resize(nshreds);
-	lanes.complete_fmt.resize(nshreds);
 	for (idx_t f = 0; f < nshreds; f++) {
 		JsonoShredVector(input, f).ToUnifiedFormat(count, lanes.value_fmt[f]);
-		if (bind_data.shreds[f].kind == ShredKind::Scalar) {
-			JsonoShredCompleteVector(input, f).ToUnifiedFormat(count, lanes.complete_fmt[f]);
-		}
 	}
+	auto &set_vec = JsonoShredSetVector(input);
+	auto &spill_vec = JsonoShredSpillVector(input);
+	lanes.mask_readable =
+	    set_vec.GetType().id() == LogicalTypeId::BIGINT && spill_vec.GetType().id() == LogicalTypeId::BIGINT;
+	if (lanes.mask_readable) {
+		set_vec.ToUnifiedFormat(count, lanes.set_fmt);
+		spill_vec.ToUnifiedFormat(count, lanes.spill_fmt);
+	}
+	lanes.type_hash = int64_t(JsonoLayoutHashOf(input.GetType()));
+	vector<string> names;
+	names.reserve(nshreds);
+	for (auto &shred : bind_data.shreds) {
+		names.push_back(shred.path);
+	}
+	lanes.spill_ranks = JsonoSpillRanksOfNames(names);
 }
 
 void AccumulateShredStatsRow(ShredStatsState &state, const ShredStatsBindData &bind_data, ShredStatsLanes &lanes,
                              idx_t row, JsonoRowState row_state, const JsonoView &view) {
 	state.non_null_rows++;
 	bool have_residual = row_state == JsonoRowState::Value;
+	// The row's spill mask is meaningful only under per-row set identity — the marker carries the
+	// clean or dirty variant of the input type's hash (a raw by-name cast copies masks across shred
+	// sets in foreign numbering); without it every NULL lane falls back to the residual probe below.
+	bool row_identity = false;
+	uint64_t spill_mask = 0;
+	if (lanes.mask_readable) {
+		auto set_idx = lanes.set_fmt.sel->get_index(row);
+		auto spill_idx = lanes.spill_fmt.sel->get_index(row);
+		if (lanes.set_fmt.validity.RowIsValid(set_idx)) {
+			auto marker = UnifiedVectorFormat::GetData<int64_t>(lanes.set_fmt)[set_idx];
+			if (marker == lanes.type_hash || marker == int64_t(uint64_t(lanes.type_hash) ^ JSONO_DIRTY_HASH_FLIP)) {
+				row_identity = true;
+				if (lanes.spill_fmt.validity.RowIsValid(spill_idx)) {
+					spill_mask = uint64_t(UnifiedVectorFormat::GetData<int64_t>(lanes.spill_fmt)[spill_idx]);
+				}
+			}
+		}
+	}
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 		auto &counters = (*state.counters)[f];
 		bool is_scalar = bind_data.shreds[f].kind == ShredKind::Scalar;
@@ -895,24 +936,24 @@ void AccumulateShredStatsRow(ShredStatsState &state, const ShredStatsBindData &b
 		if (lane_present) {
 			counters.lane_present++;
 		}
-		// Array shreds carry no completeness flag; report complete_rate 1.0. A scalar shred's flag is 1
-		// on a fit, an absent path, and an explicit null (a bare NULL-lane read is the full `->>` answer).
-		bool complete = true;
-		if (is_scalar) {
-			auto complete_idx = lanes.complete_fmt[f].sel->get_index(row);
-			complete = lanes.complete_fmt[f].validity.RowIsValid(complete_idx) &&
-			           UnifiedVectorFormat::GetData<int8_t>(lanes.complete_fmt[f])[complete_idx] == 1;
-		}
-		if (complete) {
-			counters.complete++;
+		if (lane_present) {
+			continue;
 		}
 		// A divert is a value that did not fit its shred type and stayed in the residual — the signal
-		// "the type is too narrow". For a scalar shred a complete NULL lane is an absent path or an
-		// explicit null (lossless, not a diversion), so gate scalar diverts on an incomplete lane; only a
-		// value that actually spilled counts. Array shreds have no completeness flag: their lane-NULL rows
-		// where the path is present carry a whole non-array value in the residual — a genuine divert.
-		bool diverted_lane = is_scalar ? (!lane_present && !complete) : !lane_present;
-		if (diverted_lane && have_residual && LocatePath(view, bind_data.shreds[f].steps).found) {
+		// "the type is too narrow". For a scalar shred the spill bit is exact (an absent path and an
+		// explicit null carry no bit — lossless, not a diversion); on a non-identity row the residual
+		// probe decides instead (a non-null residual value at the path is a divert). Array shreds have
+		// no spill bits: their lane-NULL rows where the path is present carry a whole non-array value
+		// in the residual — a genuine divert.
+		bool diverted = false;
+		if (is_scalar && row_identity && lanes.spill_ranks[f] < JSONO_MAX_SHREDS) {
+			diverted = (spill_mask >> lanes.spill_ranks[f]) & 1;
+		} else if (have_residual) {
+			auto location = LocatePath(view, bind_data.shreds[f].steps);
+			diverted =
+			    location.found && (!is_scalar || SlotTag(view.SlotAt(location.cursor.pos)) != jsono::tag::VAL_NULL);
+		}
+		if (diverted) {
 			counters.divert++;
 		}
 	}
@@ -984,7 +1025,6 @@ void JsonoShredStatsCombine(Vector &source, Vector &target, AggregateInputData &
 		for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 			(*target_state.counters)[f].lane_present += (*source_state.counters)[f].lane_present;
 			(*target_state.counters)[f].divert += (*source_state.counters)[f].divert;
-			(*target_state.counters)[f].complete += (*source_state.counters)[f].complete;
 		}
 	}
 	// A target's counters are allocated on first touch (fixed size); account each distinct target once.
@@ -1015,7 +1055,6 @@ void JsonoShredStatsFinalize(Vector &states, AggregateInputData &aggr_input_data
 		auto type_data = FlatVector::GetData<string_t>(*child[1]);
 		auto lane_data = FlatVector::GetData<double>(*child[2]);
 		auto divert_data = FlatVector::GetData<double>(*child[3]);
-		auto complete_data = FlatVector::GetData<double>(*child[4]);
 		double denom = double(state.non_null_rows);
 		for (idx_t f = 0; f < nshreds; f++) {
 			auto idx = start + f;
@@ -1024,7 +1063,6 @@ void JsonoShredStatsFinalize(Vector &states, AggregateInputData &aggr_input_data
 			type_data[idx] = StringVector::AddString(*child[1], bind_data.shreds[f].type_name);
 			lane_data[idx] = double(counters.lane_present) / denom;
 			divert_data[idx] = double(counters.divert) / denom;
-			complete_data[idx] = double(counters.complete) / denom;
 		}
 		FinishListRow(result, rid, start, nshreds);
 	}

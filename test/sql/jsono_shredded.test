@@ -20,8 +20,9 @@ SELECT struct_pack(
         body := jsono('{"kind":"commit","did":"d1","extra":"e1"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$.did"  := struct_pack(value := 'd1', complete := 1::TINYINT),
-            "$.kind" := struct_pack(value := 'commit', complete := 1::TINYINT)))
+            "$jsono$spill" := 0::BIGINT,
+            "$.did"  := 'd1',
+            "$.kind" := 'commit'))
 ) AS j;
 
 # bare ->> on a shred path resolves transparently
@@ -74,7 +75,8 @@ SELECT struct_pack(
         body := jsono('{"kind":"commit","did":"d1"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$.kind" := struct_pack(value := 'SENTINEL', complete := 1::TINYINT)))
+            "$jsono$spill" := 0::BIGINT,
+            "$.kind" := 'SENTINEL'))
 ) AS j;
 
 query I
@@ -180,8 +182,9 @@ SELECT struct_pack(
         body := jsono('{"n":5,"s":"blob_s"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$.n" := struct_pack(value := 999::BIGINT, complete := 1::TINYINT),
-            "$.s" := struct_pack(value := 'shred_s', complete := 1::TINYINT)))
+            "$jsono$spill" := 0::BIGINT,
+            "$.n" := 999::BIGINT,
+            "$.s" := 'shred_s'))
 ) AS j;
 
 # typed BIGINT shred read through the ->> text contract returns the shred value
@@ -212,7 +215,8 @@ SELECT struct_pack(
         body := jsono('{"n":"hello"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$.n" := struct_pack(value := NULL::BIGINT, complete := 0::TINYINT)))
+            "$jsono$spill" := 1::BIGINT,
+            "$.n" := NULL::BIGINT))
 ) AS j;
 
 query I

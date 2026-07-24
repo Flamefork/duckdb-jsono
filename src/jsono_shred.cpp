@@ -418,27 +418,27 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 	return std::move(bind_data);
 }
 
-// Write a scalar shred's VALUE lane for a field and return whether the original value is losslessly
+// Write a scalar shred's lane for a field and return whether the original value is losslessly
 // captured by the shred type. Every shred path is an object-key chain (the bind rejects the rest),
 // so this return value alone decides stripping: true means the path is stripped from the residual. A
 // shred stores the value only when it round-trips through the shred type exactly (a real JSON string
 // in a VARCHAR shred, a matching-kind scalar in a typed shred); a divert leaves the lane NULL and the
 // value in the residual, and an absent path / explicit null leaves the lane NULL with nothing
 // stripped — so a set lane always means the path is stripped, the value is stored exactly once.
-// `complete` (optional out) is the per-shred, per-row flag a bare lane read may be trusted by: true
-// when the lane holds the full `->>` answer (absent path, explicit null, a fitting scalar), false
-// when the value stayed in the residual (divert, container) and the read must fall back / reconstruct.
+// `spill` (optional out) is the per-shred, per-row bit for the `$jsono$spill` bitmap: true when the
+// value stayed in the residual (divert, container) so a bare lane read would miss it, false when the
+// NULL/typed lane holds the full `->>` answer (absent path, explicit null, a fitting scalar).
 bool WriteShred(const ShredField &field, const JsonoView &view, const JsonoPathLocation &location, Vector &shred,
-                idx_t row, std::string &scratch, bool *complete = nullptr) {
-	auto set_complete = [&](bool value) {
-		if (complete) {
-			*complete = value;
+                idx_t row, std::string &scratch, bool *spill = nullptr) {
+	auto set_spill = [&](bool value) {
+		if (spill) {
+			*spill = value;
 		}
 	};
 	if (!location.found) {
 		// Absent path: `->>` is NULL, a bare read of the NULL lane is correct.
 		FlatVector::SetNull(shred, row, true);
-		set_complete(true);
+		set_spill(false);
 		return false;
 	}
 	auto value_tag = SlotTag(view.SlotAt(location.cursor.pos));
@@ -446,7 +446,7 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const JsonoPathL
 		// A container never fits a scalar lane: it stays in the residual and the read
 		// reconstructs / falls back.
 		FlatVector::SetNull(shred, row, true);
-		set_complete(false);
+		set_spill(true);
 		return false;
 	}
 	auto cursor = location.cursor;
@@ -454,18 +454,18 @@ bool WriteShred(const ShredField &field, const JsonoView &view, const JsonoPathL
 	if (scalar.kind == JsonoScalarKind::Null) {
 		// Explicit JSON null: `->>` is NULL, a bare read of the NULL lane is correct.
 		FlatVector::SetNull(shred, row, true);
-		set_complete(true);
+		set_spill(false);
 		return false;
 	}
 	if (JsonoScalarFitsPrimitive(scalar, field.primitive)) {
 		WriteJsonoFittingScalarLane(shred, row, scalar, field.primitive, scratch);
-		set_complete(true);
+		set_spill(false);
 		return true;
 	}
 	// A present scalar that did not match its shred's kind gate: the value stays in the
-	// residual, so a bare lane read would miss it — not complete.
+	// residual, so a bare lane read would miss it — a spill.
 	FlatVector::SetNull(shred, row, true);
-	set_complete(false);
+	set_spill(true);
 	return false;
 }
 
@@ -576,13 +576,14 @@ bool WriteScalarArrayShred(const ShredField &field, const JsonoView &view, const
 
 // One-pass jsono trie walk state: the shred writer's per-row outputs, reached by field index. The
 // trie walk positions a cursor at each present scalar leaf (WriteScalarLeaf) and reaches every
-// absent one (NullScalarLeaf / NullNodeLeaves); both route through WriteShred so the lane/complete/
+// absent one (NullScalarLeaf / NullNodeLeaves); both route through WriteShred so the lane/spill/
 // strip semantics are byte-identical to the per-field LocatePath loop, one document walk instead of
 // one descent per shred.
 struct ShredTrieWalkState {
 	const vector<ShredField> &fields;
 	vector<Vector *> &shred_children;
-	vector<Vector *> &complete_children;
+	const vector<idx_t> &spill_ranks;
+	uint64_t &row_spill_mask;
 	std::string &scratch;
 	std::vector<const std::vector<PathStep> *> &strip_paths;
 	vector<idx_t> &stripped_fields;
@@ -595,10 +596,12 @@ struct ShredTrieWalkPolicy {
 	static JSONO_ALWAYS_INLINE void WriteLeaf(State &state, idx_t field_index, const JsonoView &view,
 	                                          const JsonoPathLocation &location, idx_t row) {
 		auto &field = state.fields[field_index];
-		bool complete = true;
+		bool spill = false;
 		bool strippable =
-		    WriteShred(field, view, location, *state.shred_children[field_index], row, state.scratch, &complete);
-		FlatVector::GetData<int8_t>(*state.complete_children[field_index])[row] = complete ? 1 : 0;
+		    WriteShred(field, view, location, *state.shred_children[field_index], row, state.scratch, &spill);
+		if (spill) {
+			state.row_spill_mask |= uint64_t(1) << state.spill_ranks[field_index];
+		}
 		if (strippable) {
 			state.strip_paths.push_back(&field.path.steps);
 			state.stripped_fields.push_back(field_index);
@@ -623,6 +626,18 @@ struct ShredTrieWalkPolicy {
 	}
 };
 
+// The canonical spill-bit rank of each shred field (see JsonoSpillRanksOfNames): rank == index for
+// the sorted field lists the binds produce, recomputed here so an unsorted caller list stays
+// correct.
+vector<idx_t> ShredFieldSpillRanks(const vector<ShredField> &fields) {
+	vector<string> names;
+	names.reserve(fields.size());
+	for (auto &field : fields) {
+		names.push_back(field.path.text);
+	}
+	return JsonoSpillRanksOfNames(names);
+}
+
 void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &fields, Vector &result,
                       ShredLocalState &lstate, const JsonoTrie *trie = nullptr) {
 	// The input is plain JSONO, which never carries a manifest of its own: the reader fails
@@ -633,24 +648,20 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
-	// Shred-set marker: the layout hash on every value row (NULL only on a SQL-NULL row — divert is
-	// per-shred, in each scalar shred's `complete` flag, written below).
+	// Shred-set marker + spill bitmap: the two-valued clean/dirty stamp on every value row
+	// (JsonoStampShredRow; both NULL only on a SQL-NULL row).
 	Vector *set_out = &JsonoShredSetVector(result);
 	set_out->SetVectorType(VectorType::FLAT_VECTOR);
-	auto layout_hash = int64_t(JsonoLayoutHashOf(result.GetType()));
+	auto set_data = FlatVector::GetData<int64_t>(*set_out);
+	auto layout_hash = JsonoLayoutHashOf(result.GetType());
+	Vector *spill_out = &JsonoShredSpillVector(result);
+	spill_out->SetVectorType(VectorType::FLAT_VECTOR);
+	auto spill_ranks = ShredFieldSpillRanks(fields);
 	vector<Vector *> shred_children;
-	vector<Vector *> complete_children; // parallel to fields; nullptr for array shreds
 	shred_children.reserve(fields.size());
-	complete_children.reserve(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		shred_children.push_back(&JsonoShredVector(result, f));
 		shred_children.back()->SetVectorType(VectorType::FLAT_VECTOR);
-		if (fields[f].kind == ShredKind::Scalar) {
-			complete_children.push_back(&JsonoShredCompleteVector(result, f));
-			complete_children.back()->SetVectorType(VectorType::FLAT_VECTOR);
-		} else {
-			complete_children.push_back(nullptr);
-		}
 	}
 
 	auto null_shred_row = [&](idx_t row) {
@@ -716,11 +727,11 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		}
 
 		FlatVector::Validity(result).SetValid(row);
-		FlatVector::GetData<int64_t>(*set_out)[row] = layout_hash;
+		uint64_t spill_mask = 0;
 		lstate.strip_paths.clear();
 		stripped_fields.clear();
 		if (trie) {
-			ShredTrieWalkState walk_state {fields,      shred_children,     complete_children,
+			ShredTrieWalkState walk_state {fields,      shred_children,     spill_ranks,    spill_mask,
 			                               lstate.text, lstate.strip_paths, stripped_fields};
 			JsonoTrieWalkContext<ShredTrieWalkPolicy> ctx {trie->nodes, lstate.jsono_rank_cache, walk_state};
 			JsonoTrieApplyNode<ShredTrieWalkPolicy>(ctx, 0, view, JsonoCursor(), row);
@@ -732,7 +743,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 				auto &field = fields[f];
 				auto location = LocatePath(view, field.path.steps);
 				if (field.kind != ShredKind::Scalar) {
-					// Array shreds carry no completeness flag: a per-element diversion has no
+					// Array shreds never set spill bits: a per-element diversion has no
 					// bare-struct_extract fast path to invalidate (the array is always reconstructed).
 					bool stripped =
 					    field.kind == ShredKind::ScalarArray
@@ -743,15 +754,18 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 					}
 					continue;
 				}
-				bool complete = true;
-				bool strippable = WriteShred(field, view, location, *shred_children[f], row, lstate.text, &complete);
-				FlatVector::GetData<int8_t>(*complete_children[f])[row] = complete ? 1 : 0;
+				bool spill = false;
+				bool strippable = WriteShred(field, view, location, *shred_children[f], row, lstate.text, &spill);
+				if (spill) {
+					spill_mask |= uint64_t(1) << spill_ranks[f];
+				}
 				if (strippable) {
 					lstate.strip_paths.push_back(&field.path.steps);
 					stripped_fields.push_back(f);
 				}
 			}
 		}
+		JsonoStampShredRow(set_data, *spill_out, row, layout_hash, spill_mask);
 
 		lstate.builder.Reset();
 		if (has_array) {
@@ -1082,40 +1096,52 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
-	// Shred-set marker: the layout hash on every value row (NULL only on a SQL-NULL row). Per-shred
-	// completeness lives in each scalar shred's `complete` flag — copied through for a kept shred,
-	// recomputed by WriteShred for a newly-extracted one.
+	// Shred-set marker + spill bitmap: the two-valued clean/dirty stamp on every value row. A kept
+	// shred's bit is translated from the input row's mask (bit numbering follows each set's own
+	// sorted-name ranks), a newly-extracted shred's bit is recomputed by WriteShred.
 	Vector *set_out = &JsonoShredSetVector(result);
 	set_out->SetVectorType(VectorType::FLAT_VECTOR);
-	auto layout_hash = int64_t(JsonoLayoutHashOf(result.GetType()));
+	auto set_out_data = FlatVector::GetData<int64_t>(*set_out);
+	auto layout_hash = JsonoLayoutHashOf(result.GetType());
+	Vector *spill_out = &JsonoShredSpillVector(result);
+	spill_out->SetVectorType(VectorType::FLAT_VECTOR);
+	auto out_ranks = ShredFieldSpillRanks(fields);
 	vector<Vector *> shred_out(fields.size());
-	vector<Vector *> complete_out(fields.size(), nullptr); // scalar shreds only
 	for (idx_t f = 0; f < fields.size(); f++) {
 		shred_out[f] = &JsonoShredVector(result, f);
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
-		if (fields[f].kind == ShredKind::Scalar) {
-			complete_out[f] = &JsonoShredCompleteVector(result, f);
-			complete_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
-		}
 	}
 
 	for (idx_t f = 0; f < fields.size(); f++) {
 		if (bind_data.keep_src[f] != DConstants::INVALID_INDEX) {
 			VectorOperations::Copy(JsonoShredVector(input_vec, bind_data.keep_src[f]), *shred_out[f], count, 0, 0);
-			// Carry the kept shred's per-row completeness through verbatim (a source divert stays a
-			// divert).
-			if (complete_out[f]) {
-				auto &src_complete = JsonoShredCompleteVector(input_vec, bind_data.keep_src[f]);
-				if (src_complete.GetType().id() == complete_out[f]->GetType().id()) {
-					VectorOperations::Copy(src_complete, *complete_out[f], count, 0, 0);
-				} else {
-					// A degraded-width `complete` (a value->SQL->value round-trip re-parsed the 1/0 flag
-					// wider; the layout parser accepts it by IsIntegral) cannot be Copy'd into the
-					// canonical TINYINT lane — cast the flag down, preserving its 1/0/NULL value.
-					VectorOperations::DefaultCast(src_complete, *complete_out[f], count);
-				}
-			}
 		}
+	}
+
+	// The input row's spill mask is readable only under per-row set identity (the row's marker equals
+	// the input TYPE's hash): a raw by-name cast copies masks across shred sets in foreign numbering.
+	// A non-identity row recomputes each kept scalar's bit by probing the residual instead (a NULL
+	// lane whose path holds a non-null residual value is a spill — the same invariant validate
+	// enforces). Degraded integer widths (a value->SQL->value round-trip re-parsed the BIGINT fields
+	// wider; the layout parser accepts them by IsIntegral) take the same recompute path.
+	JsonoLayoutType src_layout;
+	TryParseJsonoLayoutType(input_vec.GetType(), src_layout);
+	vector<string> src_names;
+	src_names.reserve(src_layout.shreds.size());
+	for (auto &shred : src_layout.shreds) {
+		src_names.push_back(shred.first);
+	}
+	auto in_ranks = JsonoSpillRanksOfNames(src_names);
+	auto in_type_hash = int64_t(JsonoLayoutHashOf(input_vec.GetType()));
+	Vector &in_set_vec = JsonoShredSetVector(input_vec);
+	Vector &in_spill_vec = JsonoShredSpillVector(input_vec);
+	bool in_mask_readable =
+	    in_set_vec.GetType().id() == LogicalTypeId::BIGINT && in_spill_vec.GetType().id() == LogicalTypeId::BIGINT;
+	int64_t *in_set_data = nullptr;
+	int64_t *in_spill_data = nullptr;
+	if (in_mask_readable) {
+		in_set_data = FlatVector::GetData<int64_t>(in_set_vec);
+		in_spill_data = FlatVector::GetData<int64_t>(in_spill_vec);
 	}
 
 	vector<JsonoShredManifestEntryBytes> manifest_entries(fields.size());
@@ -1170,14 +1196,35 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		}
 
 		FlatVector::Validity(result).SetValid(row);
-		FlatVector::GetData<int64_t>(*set_out)[row] = layout_hash;
+		bool row_identity = in_mask_readable && !FlatVector::IsNull(in_set_vec, row) &&
+		                    (in_set_data[row] == in_type_hash ||
+		                     in_set_data[row] == int64_t(uint64_t(in_type_hash) ^ JSONO_DIRTY_HASH_FLIP));
+		uint64_t in_mask = row_identity && !FlatVector::IsNull(in_spill_vec, row) ? uint64_t(in_spill_data[row]) : 0;
+		uint64_t spill_mask = 0;
 		lstate.strip_paths.clear();
 		lstate.flat_strip_positions.clear();
 		stripped_fields.clear();
 		for (idx_t f = 0; f < fields.size(); f++) {
 			if (bind_data.keep_src[f] != DConstants::INVALID_INDEX) {
-				// The kept shred's stripped-or-not state, and its per-row completeness, carry over from
-				// the input row (the manifest, and the copied `complete` lane).
+				// The kept shred's stripped-or-not state carries over from the input row (the manifest);
+				// its spill bit is translated between the two sets' rank numberings — or, on a
+				// non-identity row (foreign mask) or a recognition-only >63-rank input, recomputed from
+				// the residual. The kept path cannot be a returned one (a retyped path is re-extracted,
+				// not kept), so the merged residual answers the probe exactly like the original.
+				if (fields[f].kind == ShredKind::Scalar) {
+					auto in_rank = in_ranks[bind_data.keep_src[f]];
+					bool bit;
+					if (row_identity && in_rank < JSONO_MAX_SHREDS) {
+						bit = (in_mask >> in_rank) & 1;
+					} else {
+						auto location = LocatePath(view, fields[f].path.steps);
+						bit = FlatVector::IsNull(*shred_out[f], row) && location.found &&
+						      SlotTag(view.SlotAt(location.cursor.pos)) != tag::VAL_NULL;
+					}
+					if (bit) {
+						spill_mask |= uint64_t(1) << out_ranks[f];
+					}
+				}
 				if (manifest_has_path(fields[f].path.text)) {
 					stripped_fields.push_back(f);
 				}
@@ -1185,10 +1232,10 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			}
 			auto &field = fields[f];
 			auto location = LocatePath(view, field.path.steps);
-			bool complete = true;
-			bool strippable = WriteShred(field, view, location, *shred_out[f], row, lstate.text, &complete);
-			if (complete_out[f]) {
-				FlatVector::GetData<int8_t>(*complete_out[f])[row] = complete ? 1 : 0;
+			bool spill = false;
+			bool strippable = WriteShred(field, view, location, *shred_out[f], row, lstate.text, &spill);
+			if (spill) {
+				spill_mask |= uint64_t(1) << out_ranks[f];
 			}
 			if (strippable) {
 				lstate.strip_paths.push_back(&field.path.steps);
@@ -1196,6 +1243,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 				stripped_fields.push_back(f);
 			}
 		}
+		JsonoStampShredRow(set_out_data, *spill_out, row, layout_hash, spill_mask);
 
 		if (lstate.strip_paths.empty()) {
 			// No path was stripped from this row's residual, so its blobs are unchanged. Copy them
@@ -1282,21 +1330,21 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
-	// one_pass_text requires every field to be a scalar object-key shred, so every field has a
-	// complete flag — gather both lanes per field.
+	// one_pass_text requires every field to be a scalar object-key shred.
 	vector<Vector *> shred_out(fields.size());
-	vector<Vector *> complete_out(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		shred_out[f] = &JsonoShredVector(result, f);
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
-		complete_out[f] = &JsonoShredCompleteVector(result, f);
-		complete_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
 	}
-	// Shred-set marker: the layout hash on every value row (NULL only on a SQL-NULL row). Per-shred
-	// completeness lives in each scalar shred's `complete` flag, written below.
+	// Shred-set marker + spill bitmap: the two-valued clean/dirty stamp on every value row
+	// (JsonoStampShredRow; both NULL only on a SQL-NULL row).
 	Vector *set_out = &JsonoShredSetVector(result);
 	set_out->SetVectorType(VectorType::FLAT_VECTOR);
-	auto layout_hash = int64_t(JsonoLayoutHashOf(result.GetType()));
+	auto set_data = FlatVector::GetData<int64_t>(*set_out);
+	auto layout_hash = JsonoLayoutHashOf(result.GetType());
+	Vector *spill_out = &JsonoShredSpillVector(result);
+	spill_out->SetVectorType(VectorType::FLAT_VECTOR);
+	auto spill_ranks = ShredFieldSpillRanks(fields);
 
 	vector<JsonoShredManifestEntryBytes> manifest_entries(fields.size());
 	jsono_dom::DomShredContext ctx;
@@ -1333,12 +1381,14 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 		try {
 			jsono_dom::EmitDomRowDirect(yyjson_doc_get_root(doc), dom, writer, row, &ctx);
 			FlatVector::Validity(result).SetValid(row);
-			FlatVector::GetData<int64_t>(*set_out)[row] = layout_hash;
+			uint64_t spill_mask = 0;
 			for (idx_t f = 0; f < fields.size(); f++) {
 				auto &cap = ctx.captures[f];
-				// A captured value (or an absent path) is complete — a bare lane read equals `->>`. A
-				// divert (diverted_scalar: a mismatched scalar or a container) is not.
-				bool complete = !cap.diverted_scalar;
+				// A captured value (or an absent path) needs no spill bit — a bare lane read equals
+				// `->>`. A divert (diverted_scalar: a mismatched scalar or a container) sets the bit.
+				if (cap.diverted_scalar) {
+					spill_mask |= uint64_t(1) << spill_ranks[f];
+				}
 				switch (cap.state) {
 				case jsono_dom::DomShredCapture::State::Missing:
 					FlatVector::SetNull(*shred_out[f], row, true);
@@ -1356,8 +1406,8 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 					WriteJsonoBooleanLane(*shred_out[f], row, cap.bool_value);
 					break;
 				}
-				FlatVector::GetData<int8_t>(*complete_out[f])[row] = complete ? 1 : 0;
 			}
+			JsonoStampShredRow(set_data, *spill_out, row, layout_hash, spill_mask);
 		} catch (...) {
 			yyjson_doc_free(doc);
 			throw;

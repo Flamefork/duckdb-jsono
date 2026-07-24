@@ -112,7 +112,12 @@ SELECT to_json(e)::VARCHAR FROM probe_shred ORDER BY 1;
 statement error
 SELECT jsono_storage_type('"$jsono$set" VARCHAR');
 ----
-reserved layout field name
+reserved
+
+statement error
+SELECT jsono_storage_type('"$jsono$spill" VARCHAR');
+----
+reserved
 
 statement error
 SELECT jsono_storage_type('body BIGINT');

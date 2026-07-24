@@ -25,10 +25,11 @@ SELECT struct_pack(
         body := res.body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$.commit.collection" := struct_pack(value := orig ->> '$.commit.collection', complete := 1::TINYINT),
-            "$.commit.operation"  := struct_pack(value := orig ->> '$.commit.operation', complete := 1::TINYINT),
-            "$.did"               := struct_pack(value := orig ->> '$.did', complete := 1::TINYINT),
-            "$.kind"              := struct_pack(value := orig ->> '$.kind', complete := 1::TINYINT)))
+            "$jsono$spill" := 0::BIGINT,
+            "$.commit.collection" := orig ->> '$.commit.collection',
+            "$.commit.operation"  := orig ->> '$.commit.operation',
+            "$.did"               := orig ->> '$.did',
+            "$.kind"              := orig ->> '$.kind'))
 ) AS j
 FROM res;
 
@@ -87,7 +88,8 @@ SELECT struct_pack(
         body := jsono('{"k":"RESIDUAL","c":"z"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$.k" := struct_pack(value := 'SHRED', complete := 1::TINYINT)))
+            "$jsono$spill" := 0::BIGINT,
+            "$.k" := 'SHRED'))
 ) AS j;
 
 query I
@@ -130,8 +132,9 @@ SELECT struct_pack(
         body := jsono('{"b":null,"c":"z"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$.a" := struct_pack(value := 'x', complete := 1::TINYINT),
-            "$.b" := struct_pack(value := NULL::VARCHAR, complete := 0::TINYINT)))
+            "$jsono$spill" := 0::BIGINT,
+            "$.a" := 'x',
+            "$.b" := NULL::VARCHAR))
 ) AS j;
 
 query I

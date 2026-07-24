@@ -1552,7 +1552,15 @@ BaseStatistics AlignStatsToReadType(const LogicalType &read_type, optional_ptr<c
 		return source->Copy();
 	}
 	if (!source || read_type.id() != LogicalTypeId::STRUCT || source->GetType().id() != LogicalTypeId::STRUCT) {
-		return BaseStatistics::CreateUnknown(read_type);
+		auto result = BaseStatistics::CreateUnknown(read_type);
+		if (source) {
+			// A type-divergent leaf (union_by_name widened this file's lane) keeps its VALUE stats
+			// unknown, but its null-validity flags describe the same rows regardless of the value
+			// type — carrying them over is what lets the per-lane no-NULL totality proof survive a
+			// lane widened across files (the widened read renders the same text the residual would).
+			result.CopyValidity(*source);
+		}
+		return result;
 	}
 	auto result = BaseStatistics::CreateUnknown(read_type);
 	auto &read_children = StructType::GetChildTypes(read_type);
@@ -1803,55 +1811,99 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 			auto &layout_stats = StructStats::GetChildStats(*stats, 0);
 			if (layout_stats.GetType().id() == LogicalTypeId::STRUCT &&
 			    StructType::GetChildCount(layout_stats.GetType()) >= 2) {
-				// layout child 1 is the `shreds` struct: child 0 is the shred-set marker, child
-				// 1 + shred.child_index is the shred (a scalar pair whose child 1 is `complete`).
+				// layout child 1 is the `shreds` struct: child 0 is the shred-set marker, child 1 the
+				// spill bitmap, child 2 + shred.child_index the shred's bare lane.
 				auto &shreds_stats = StructStats::GetChildStats(layout_stats, 1);
 				if (shreds_stats.GetType().id() == LogicalTypeId::STRUCT &&
-				    StructType::GetChildCount(shreds_stats.GetType()) >= 1) {
+				    StructType::GetChildCount(shreds_stats.GetType()) >= 2) {
 					auto shred_children = StructType::GetChildCount(shreds_stats.GetType());
-					// Schema identity fast path: the marker carries a single min==max layout hash equal to
-					// the read type's, so every scanned row was written under EXACTLY the read shred set —
-					// a NULL `complete` can then only come from a SQL-NULL row (min/max ignore nulls), and
-					// per-shred completeness alone decides totality. Without identity (union_by_name /
-					// DuckLake evolution / mixed-marker rows), a NULL `complete` may instead mean "row
-					// reconciled from a shred set LACKING this lane, value in the residual" — then the
-					// shred is total only when statistics also prove `complete` carries no NULL at all.
+					// Schema identity via the two-valued marker: every scanned row was written under
+					// EXACTLY the read shred set when the marker min/max stay within the {clean hash,
+					// dirty hash} pair. min==max==clean is the dominant all-clean proof — every scalar
+					// shred is total at once, with no spill statistics consulted (a plain NumericStats
+					// question that survives Parquet zone-maps, native storage and DuckLake's global
+					// min/max strings alike). Any dirty rows flip their markers, so identity-with-dirt
+					// falls through to the spill-bitmap statistics below. Only under identity is the
+					// bitmap readable — its bit numbering is the writing set's sorted-name ranks, and a
+					// NULL marker can only be a SQL-NULL row (min/max ignore NULLs; those rows are
+					// invisible here and contribute nothing to any read either).
 					auto &set_stats = StructStats::GetChildStats(shreds_stats, 0);
-					auto expected_hash = int64_t(JsonoLayoutHashOf(returned_types[table_index]));
-					bool schema_identity = NumericStats::HasMinMax(set_stats) &&
-					                       NumericStats::Min(set_stats).GetValue<int64_t>() == expected_hash &&
-					                       NumericStats::Max(set_stats).GetValue<int64_t>() == expected_hash;
+					auto clean_hash = int64_t(JsonoLayoutHashOf(returned_types[table_index]));
+					auto dirty_hash = int64_t(uint64_t(clean_hash) ^ JSONO_DIRTY_HASH_FLIP);
+					bool all_clean = false;
+					bool identity = false;
+					if (NumericStats::HasMinMax(set_stats)) {
+						auto marker_min = NumericStats::Min(set_stats).GetValue<int64_t>();
+						auto marker_max = NumericStats::Max(set_stats).GetValue<int64_t>();
+						all_clean = marker_min == clean_hash && marker_max == clean_hash;
+						identity = (marker_min == clean_hash || marker_min == dirty_hash) &&
+						           (marker_max == clean_hash || marker_max == dirty_hash);
+					}
+					// Spill-bitmap proofs under identity-with-dirt. Clean rows store NULL (never mask 0),
+					// so min/max describe the DIRTY rows alone: min==max==M is the exact decode — every
+					// dirty row carries the same mask, so shred rank r is total iff bit r is clear. That
+					// makes a systematic divert (one source consistently missing a lane type) quarantine
+					// to its own shreds instead of demoting the whole row-group. The mask is trusted only
+					// when fully in-domain (a real dirty mask: >= 1, no bits at or above the shred
+					// count) — an out-of-domain mask can only come from a hand-built row, and its
+					// in-range bits must not be believed either (see jsono_shredded_total.test). Mixed
+					// dirty masks (min != max) keep a one-sided bound: masks are non-negative, so bit r
+					// set in any row forces max >= 2^r — every rank with 2^r > max is provably clean.
+					bool exact_mask = false;
+					uint64_t mask = 0;
+					bool high_bound = false;
+					uint64_t mask_max = 0;
+					auto &spill_stats = StructStats::GetChildStats(shreds_stats, 1);
+					if (identity && !all_clean && NumericStats::HasMinMax(spill_stats)) {
+						auto spill_min = NumericStats::Min(spill_stats).GetValue<int64_t>();
+						auto spill_max = NumericStats::Max(spill_stats).GetValue<int64_t>();
+						if (spill_min >= 1 && spill_max >= 1) {
+							if (spill_min == spill_max && shreds.size() < 64 &&
+							    (uint64_t(spill_min) >> shreds.size()) == 0) {
+								exact_mask = true;
+								mask = uint64_t(spill_min);
+							} else {
+								high_bound = true;
+								mask_max = uint64_t(spill_max);
+							}
+						}
+					}
+					// Canonical spill-bit rank of each shred: its position in the byte-wise sorted name
+					// list (== child_index for canonically-ordered types; a reorder-only cast permutes
+					// fields while the order-independent set hash still matches).
+					JsonoLayoutType read_layout;
+					TryParseJsonoLayoutType(returned_types[table_index], read_layout);
+					vector<string> shred_names;
+					shred_names.reserve(read_layout.shreds.size());
+					for (auto &shred : read_layout.shreds) {
+						shred_names.push_back(shred.first);
+					}
+					auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
 					for (auto &shred : shreds) {
-						// A scalar shred is total (COALESCE-free) when its own `complete` flag carries
-						// no 0 (min == 1): no row spilled this shred's value into the residual, so a
-						// bare struct_extract of the lane is the full `->>` answer even where the lane is
-						// NULL (absent path / explicit null). A divert on another shred never demotes
-						// this one — completeness is per-shred. `complete` is a TINYINT 1/0 flag, not a
-						// BOOLEAN, because the Parquet stats reader omits BOOLEAN min/max. Array shreds
-						// carry no `complete` (their stat child is a LIST, not a pair) and stay non-total
-						// (always reconstructed). !HasMinMax → conservative (keep COALESCE).
-						idx_t shred_index = 1 + shred.child_index;
-						if (shred_index >= shred_children) {
+						// Array shreds stay non-total (always reconstructed). !HasMinMax / foreign hash /
+						// missing stats all fail safe: the residual COALESCE stays.
+						if (IsShredListType(shred.type)) {
 							continue;
 						}
-						auto &shred_stats = StructStats::GetChildStats(shreds_stats, shred_index);
-						if (shred_stats.GetType().id() != LogicalTypeId::STRUCT ||
-						    StructType::GetChildCount(shred_stats.GetType()) < 2) {
+						auto rank = spill_ranks[shred.child_index];
+						bool spill_clear =
+						    all_clean || (rank < JSONO_MAX_SHREDS && ((exact_mask && ((mask >> rank) & 1) == 0) ||
+						                                              (high_bound && (mask_max >> rank) == 0)));
+						if (spill_clear) {
+							per_shred[shred.child_index] = false;
 							continue;
 						}
-						auto &complete_stats = StructStats::GetChildStats(shred_stats, 1);
-						// Total only when every row's `complete` is exactly 1 (no spill anywhere). Require
-						// min == max == 1, not merely min != 0: `complete` is a 1/0 flag, so a malformed or
-						// out-of-domain value (e.g. 2 from a hand-built struct) must keep the safe COALESCE
-						// fallback rather than be trusted as total. Read as int64 so a non-canonical integer
-						// width (the parser tolerates any integral `complete`) cannot overflow the compare.
-						// Without the identity fast path, additionally require proven-no-NULL `complete`:
-						// reconciliation NULL-fills the lanes a row's writing shred set lacked, and those
-						// NULLs are invisible to min/max — the no-NULL proof closes exactly that hole.
-						if (NumericStats::HasMinMax(complete_stats) &&
-						    NumericStats::Min(complete_stats).GetValue<int64_t>() == 1 &&
-						    NumericStats::Max(complete_stats).GetValue<int64_t>() == 1 &&
-						    (schema_identity || !complete_stats.CanHaveNull())) {
+						// Per-lane no-NULL proof, independent of identity: the lane has no NULL at all, so
+						// nothing can be hiding behind it — no divert, no absent path, and no
+						// reconciliation NULL-fill (which is how a row written under a set LACKING this
+						// lane would look). Survives shred-set evolution for dense non-null lanes where
+						// the merged marker stats break identity (union_by_name / DuckLake evolution).
+						idx_t lane_child = 2 + shred.child_index;
+						if (lane_child >= shred_children) {
+							continue;
+						}
+						auto &lane_stats = StructStats::GetChildStats(shreds_stats, lane_child);
+						if (!lane_stats.CanHaveNull()) {
 							per_shred[shred.child_index] = false;
 						}
 					}
@@ -2195,14 +2247,13 @@ private:
 	}
 
 	// Scalar shred `child_index` (0-based over the shred set) of a shredded column, navigated to its
-	// VALUE lane: column -> [1] jsono -> [2] shreds -> [2 + child_index] <path> pair -> [1] value
-	// (the `shreds` struct is the marker at field 1 then the shreds, so shred k is field 2 + k; a
-	// scalar shred is a pair STRUCT(value, complete) whose value is field 1). Only ever called for
-	// scalar shreds (every reconstruct/read site gates list shreds out before reaching here).
+	// bare lane: column -> [1] jsono -> [2] shreds -> [3 + child_index] <path> (the `shreds` struct
+	// is the marker at field 1, the spill bitmap at field 2, then the shreds, so shred k is field
+	// 3 + k). Only ever called for scalar shreds (every reconstruct/read site gates list shreds out
+	// before reaching here).
 	unique_ptr<Expression> ShredExtract(const Expression &column, idx_t child_index) {
 		auto shreds = StructExtractAt(StructExtractAt(column.Copy(), 1), 2);
-		auto pair = StructExtractAt(std::move(shreds), int64_t(child_index) + 2);
-		return StructExtractAt(std::move(pair), 1);
+		return StructExtractAt(std::move(shreds), int64_t(child_index) + 3);
 	}
 
 	// True when statistics proved this shred carries no SQL NULL anywhere in the table: NULL-shred
