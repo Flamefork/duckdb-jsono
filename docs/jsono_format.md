@@ -45,9 +45,9 @@ STRUCT(
     body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB,
                 lengths BLOB, nums BLOB),
     shreds STRUCT(
-      "$jsono$set" BIGINT,      -- shred-set marker (see below)
-      "$jsono$spill" BIGINT,    -- spill bitmap column(s): "$jsono$spill1", … for sets past 63 shreds
-      "<path1>" <type1>,        -- scalar shred: the bare typed lane
+      "$jsono$set" BIGINT,       -- shred-set marker (see below)
+      "$jsono$spill$0" BIGINT,   -- spill bitmap column(s): "$jsono$spill$1", … for sets past 63 shreds
+      "<path1>" <type1>,         -- scalar shred: the bare typed lane
       "<path2>" <type2>,
       "<arrpath>" <list_type>,  -- array shred: a bare LIST
       …
@@ -121,13 +121,13 @@ on a null-count or has-valid-values signal):
   It is `NULL` only on a SQL-NULL row. It is a signed `BIGINT`, not `UBIGINT`,
   because DuckDB's Parquet writer omits min/max stats for unsigned integers — a
   `UBIGINT` marker would carry no zone-map on a Parquet scan.
-- **`shreds.$jsono$spill`** (`BIGINT` bitmap column(s), per row): bit
+- **`shreds.$jsono$spill$0`** (`BIGINT` bitmap column(s), per row): bit
   `rank % 63` of column `rank / 63` is set when the scalar shred at canonical
   *rank* diverted on this row (the value stayed in the residual). Canonical rank
   is the shred's position in the byte-wise **sorted name list** of the shred
   set — not the physical field position, which a reorder cast may permute while
   the order-independent marker still matches. A set of N shreds carries
-  `⌈N/63⌉` columns, named `$jsono$spill`, `$jsono$spill1`, `$jsono$spill2`, …
+  `⌈N/63⌉` columns, named `$jsono$spill$0`, `$jsono$spill$1`, `$jsono$spill$2`, …
   (63 bits per column — the sign bit stays clear so masks order as non-negative
   numbers in every zone-map). **All columns are `NULL` on a clean row** (an
   all-zero mask is never stored) **and all non-`NULL` on a dirty one** (zeroes

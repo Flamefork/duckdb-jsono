@@ -115,7 +115,7 @@ SELECT jsono_storage_type('"$jsono$set" VARCHAR');
 reserved
 
 statement error
-SELECT jsono_storage_type('"$jsono$spill" VARCHAR');
+SELECT jsono_storage_type('"$jsono$spill$0" VARCHAR');
 ----
 reserved
 

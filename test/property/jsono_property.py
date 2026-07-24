@@ -1716,7 +1716,7 @@ LANE_MUTATIONS = [
 def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
     j = f"jsono({doc_sql}, shredding := {{'$.arr':'BIGINT[]', k:'BIGINT', '$.items':'STRUCT(n BIGINT)[]'}})"
     marker = f'({j})."jsono".shreds."$jsono$set"'
-    spill = f'({j})."jsono".shreds."$jsono$spill"'
+    spill = f'({j})."jsono".shreds."$jsono$spill$0"'
     arr = f'({j})."jsono".shreds."$.arr"'
     items = f'({j})."jsono".shreds."$.items"'
     k_value = f'({j})."jsono".shreds."k"'
@@ -1747,7 +1747,7 @@ def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
     return (
         f'struct_pack("jsono" := struct_pack(body := ({j})."jsono".body, '
         f'shreds := struct_pack("$jsono$set" := {marker}, '
-        f'"$jsono$spill" := {spill}, '
+        f'"$jsono$spill$0" := {spill}, '
         f'"$.arr" := {arr}, '
         f'"$.items" := {items}, '
         f'"k" := {k_value})))'

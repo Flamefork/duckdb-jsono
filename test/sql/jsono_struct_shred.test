@@ -34,7 +34,7 @@ true	{"$.x":"v","y":1}
 query I
 SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR)))
 
 # The walk descends nested structs up to a deliberately high cap (JSONO_AUTO_SHRED_MAX_DEPTH), well
 # above realistic nesting, so every scalar leaf here lifts: $.b.c, $.b.d.e, and $.b.d.f.g. The cap
@@ -43,7 +43,7 @@ STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, ski
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep', 'f': {'g': 'deeper'}}}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.b.c" VARCHAR, "$.b.d.e" VARCHAR, "$.b.d.f.g" VARCHAR, a BIGINT)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.b.c" VARCHAR, "$.b.d.e" VARCHAR, "$.b.d.f.g" VARCHAR, a BIGINT)))
 
 # The nested shreds round-trip losslessly.
 query I
@@ -117,7 +117,7 @@ nested	flat
 query I
 SELECT typeof(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.commit.operation" VARCHAR)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.commit.operation" VARCHAR)))
 
 # Type-driven auto-shred is always complete: a shred's type IS its field's type, so a present
 # value always fits and a NULL is only an absent field, never a residual diversion. A typed shred

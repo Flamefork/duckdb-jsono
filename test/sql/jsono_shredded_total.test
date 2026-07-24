@@ -251,10 +251,10 @@ SELECT struct_pack(jsono := struct_pack(
   body := jsono('{"a":"oops"}')."jsono".body,
   shreds := struct_pack(
     "$jsono$set" := jsono('{"a":"oops"}', shredding := {'a':'BIGINT'}).jsono.shreds."$jsono$set",
-    "$jsono$spill" := 32::BIGINT,
+    "$jsono$spill$0" := 32::BIGINT,
     a := NULL::BIGINT
   )
-))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, a BIGINT))) AS j;
+))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT))) AS j;
 
 query I
 SELECT j ->> '$.a' FROM bad_spill;

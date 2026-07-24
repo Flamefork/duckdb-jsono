@@ -20,7 +20,7 @@ SELECT struct_pack(
         body := jsono('{"kind":"commit","did":"d1","extra":"e1"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$jsono$spill" := 0::BIGINT,
+            "$jsono$spill$0" := 0::BIGINT,
             "$.did"  := 'd1',
             "$.kind" := 'commit'))
 ) AS j;
@@ -75,7 +75,7 @@ SELECT struct_pack(
         body := jsono('{"kind":"commit","did":"d1"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$jsono$spill" := 0::BIGINT,
+            "$jsono$spill$0" := 0::BIGINT,
             "$.kind" := 'SENTINEL'))
 ) AS j;
 
@@ -182,7 +182,7 @@ SELECT struct_pack(
         body := jsono('{"n":5,"s":"blob_s"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$jsono$spill" := 0::BIGINT,
+            "$jsono$spill$0" := 0::BIGINT,
             "$.n" := 999::BIGINT,
             "$.s" := 'shred_s'))
 ) AS j;
@@ -215,7 +215,7 @@ SELECT struct_pack(
         body := jsono('{"n":"hello"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$jsono$spill" := 1::BIGINT,
+            "$jsono$spill$0" := 1::BIGINT,
             "$.n" := NULL::BIGINT))
 ) AS j;
 

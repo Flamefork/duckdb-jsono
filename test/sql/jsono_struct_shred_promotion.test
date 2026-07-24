@@ -12,7 +12,7 @@ require json
 query I
 SELECT typeof(jsono(struct_pack(qty := 1::INTEGER, cnt := 2::SMALLINT, usmall := 3::UINTEGER, price := 0.5::FLOAT)));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, cnt BIGINT, price DOUBLE, qty BIGINT, usmall BIGINT)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, cnt BIGINT, price DOUBLE, qty BIGINT, usmall BIGINT)))
 
 # Values land in the lanes widened, and unsigned values above INT32_MAX survive the promotion.
 query IIII
@@ -41,7 +41,7 @@ FROM (SELECT jsono(struct_pack(qty := 42::INTEGER, usmall := 4000000000::UINTEGE
 query I
 SELECT typeof(jsono(struct_pack(tny := 1::TINYINT, utny := 2::UTINYINT, usml := 3::USMALLINT)));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, tny BIGINT, usml BIGINT, utny BIGINT)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, tny BIGINT, usml BIGINT, utny BIGINT)))
 
 query III
 SELECT j.jsono.shreds."tny", j.jsono.shreds."utny", j.jsono.shreds."usml"

@@ -88,16 +88,14 @@ constexpr const char *JSONO_SHREDS = "shreds";
 // cannot occur in a shred path (the shred-spec parsers reject the reserved prefix), so no shred can
 // collide with either reserved field.
 constexpr const char *JSONO_SHRED_SET = "$jsono$set";
-// Reserved name prefix of the per-row spill bitmap columns, the fields right after the marker
-// inside `shreds`: "$jsono$spill", "$jsono$spill1", … (see JsonoShredSpillName in jsono.hpp for
-// the bit semantics).
+// Reserved name stem of the per-row spill bitmap columns, the fields right after the marker inside
+// `shreds`: "$jsono$spill$0", "$jsono$spill$1", … (see JsonoShredSpillName in jsono.hpp for the bit
+// semantics). Every column carries its ordinal — column 0 is not special-cased — so the names read
+// as a uniform indexed family.
 constexpr const char *JSONO_SHRED_SPILL = "$jsono$spill";
 
 string SpillColumnName(idx_t column) {
-	if (column == 0) {
-		return JSONO_SHRED_SPILL;
-	}
-	return string(JSONO_SHRED_SPILL) + std::to_string(column);
+	return string(JSONO_SHRED_SPILL) + "$" + std::to_string(column);
 }
 // The reserved layout-field namespace inside `shreds`: every non-shred member is named under it.
 constexpr const char *JSONO_RESERVED_PREFIX = "$jsono$";

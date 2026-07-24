@@ -237,7 +237,7 @@ invalid path
 # so jsono functions refuse it at bind instead of reading a read-copy lane. The same layout with an
 # object-key lane is recognized and binds.
 statement ok
-CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.arr[0]" BIGINT))));
+CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.arr[0]" BIGINT))));
 
 statement error
 SELECT jsono_array_length(x) FROM bad_lane_layout;
@@ -245,7 +245,7 @@ SELECT jsono_array_length(x) FROM bad_lane_layout;
 must be JSONO
 
 statement ok
-CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, "$.arr" BIGINT))));
+CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.arr" BIGINT))));
 
 query I
 SELECT count(*) FROM (SELECT jsono_array_length(x) FROM good_lane_layout);

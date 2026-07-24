@@ -25,7 +25,7 @@ SELECT struct_pack(
         body := res.body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$jsono$spill" := 0::BIGINT,
+            "$jsono$spill$0" := 0::BIGINT,
             "$.commit.collection" := orig ->> '$.commit.collection',
             "$.commit.operation"  := orig ->> '$.commit.operation',
             "$.did"               := orig ->> '$.did',
@@ -88,7 +88,7 @@ SELECT struct_pack(
         body := jsono('{"k":"RESIDUAL","c":"z"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$jsono$spill" := 0::BIGINT,
+            "$jsono$spill$0" := 0::BIGINT,
             "$.k" := 'SHRED'))
 ) AS j;
 
@@ -132,7 +132,7 @@ SELECT struct_pack(
         body := jsono('{"b":null,"c":"z"}')."jsono".body,
         shreds := struct_pack(
             "$jsono$set" := NULL::BIGINT,
-            "$jsono$spill" := 0::BIGINT,
+            "$jsono$spill$0" := 0::BIGINT,
             "$.a" := 'x',
             "$.b" := NULL::VARCHAR))
 ) AS j;

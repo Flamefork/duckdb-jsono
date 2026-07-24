@@ -73,7 +73,7 @@ LogicalType JsonoRawStructType();
 LogicalType JsonoBodyStructType();
 
 // The physical STRUCT of a shredded JSONO value: STRUCT("jsono" STRUCT(body STRUCT(6 BLOB),
-// shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT [, "$jsono$spill1" …], <shred fields>))).
+// shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT [, "$jsono$spill$1" …], <shred fields>))).
 // One shred field per `shreds` entry — a scalar shred is its bare value type, an array shred is the
 // LIST as-is. This is the single source of truth for the shredded shape: the constructor and
 // `jsono_storage_type` both build it here, so a column declared from the same shreds is
@@ -107,9 +107,9 @@ string JsonoShredsName();
 string JsonoShredSetName();
 
 // The reserved name of a per-row spill bitmap column — the ⌈N/63⌉ fields right after the marker
-// inside `shreds`: "$jsono$spill", then "$jsono$spill1", "$jsono$spill2", … (column 0 carries no
-// ordinal: nearly every real set fits one column). Each is a BIGINT whose bit b (0-based, low 63
-// bits — the sign bit stays clear so masks order as non-negative numbers in every zone-map) is set
+// inside `shreds`: "$jsono$spill$0", "$jsono$spill$1", "$jsono$spill$2", … (every column carries its
+// ordinal — nearly every real set fits column 0 alone). Each is a BIGINT whose bit b (0-based, low
+// 63 bits — the sign bit stays clear so masks order as non-negative numbers in every zone-map) is set
 // when the scalar shred at canonical rank 63*column + b diverted on this row: the value stayed in
 // the residual (a type-gate miss or a container at the path) and a bare lane read would miss it.
 // Canonical rank = the shred's position in the byte-wise sorted name list of the shred set, NOT

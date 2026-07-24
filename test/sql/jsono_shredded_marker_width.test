@@ -1,5 +1,5 @@
 # name: test/sql/jsono_shredded_marker_width.test
-# description: The reserved integer-width metadata fields ($jsono$set marker, $jsono$spill bitmap) are identified by name with any integer width, not strictly their canonical BIGINT — a shredded jsono value round-tripped through a generic value->SQL->value path (e.g. DuckLake inlined-data INSERT serializes them as bare integer literals that may re-parse wider, HUGEINT/INTEGER) must still be recognised as shredded jsono. A strict-width rule drops the whole value to a plain user struct, so to_json leaks the physical layout and `->>` reads NULL. The reserved fields are still positional: they must sit at `shreds` fields 0 and 1, so a hand-built struct with them elsewhere is rejected rather than mis-mapped onto a shred (which crashed on read).
+# description: The reserved integer-width metadata fields ($jsono$set marker, $jsono$spill$0 bitmap) are identified by name with any integer width, not strictly their canonical BIGINT — a shredded jsono value round-tripped through a generic value->SQL->value path (e.g. DuckLake inlined-data INSERT serializes them as bare integer literals that may re-parse wider, HUGEINT/INTEGER) must still be recognised as shredded jsono. A strict-width rule drops the whole value to a plain user struct, so to_json leaks the physical layout and `->>` reads NULL. The reserved fields are still positional: they must sit at `shreds` fields 0 and 1, so a hand-built struct with them elsewhere is rejected rather than mis-mapped onto a shred (which crashed on read).
 # group: [sql]
 
 require jsono
@@ -10,7 +10,7 @@ require json
 # inside `shreds`.
 query II
 SELECT typeof(jsono({'event_name':'pv','goals':'buy'}).jsono.shreds."$jsono$set"),
-       typeof(jsono({'event_name':'pv','goals':'buy'}).jsono.shreds."$jsono$spill");
+       typeof(jsono({'event_name':'pv','goals':'buy'}).jsono.shreds."$jsono$spill$0");
 ----
 BIGINT	BIGINT
 
@@ -27,11 +27,11 @@ SELECT
     body := c.jsono.body,
     shreds := struct_pack(
       "$jsono$set" := c.jsono.shreds."$jsono$set"::HUGEINT,
-      "$jsono$spill" := c.jsono.shreds."$jsono$spill"::INTEGER,
+      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0"::INTEGER,
       event_name := c.jsono.shreds.event_name,
       goals := c.jsono.shreds.goals
     )
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
 FROM v;
 
 # The reserved fields were recognized by name, so this round-trips.
@@ -64,11 +64,11 @@ SELECT to_json(
     body := c.jsono.body,
     shreds := struct_pack(
       "$jsono$set" := c.jsono.shreds."$jsono$set"::HUGEINT,
-      "$jsono$spill" := c.jsono.shreds."$jsono$spill"::HUGEINT,
+      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0"::HUGEINT,
       event_name := c.jsono.shreds.event_name,
       goals := c.jsono.shreds.goals
     )
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, event_name VARCHAR)))
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR)))
 )
 FROM v;
 ----
@@ -86,7 +86,7 @@ SELECT struct_pack(jsono := struct_pack(
     body := c.jsono.body,
     shreds := struct_pack(
       "$jsono$set" := c.jsono.shreds."$jsono$set",
-      "$jsono$spill" := c.jsono.shreds."$jsono$spill"::INTEGER,
+      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0"::INTEGER,
       event_name := c.jsono.shreds.event_name,
       goals := c.jsono.shreds.goals
     )
@@ -114,11 +114,11 @@ SELECT
     body := c.jsono.body,
     shreds := struct_pack(
       "$jsono$set" := c.jsono.shreds."$jsono$set",
-      "$jsono$spill" := c.jsono.shreds."$jsono$spill"::INTEGER,
+      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0"::INTEGER,
       event_name := c.jsono.shreds.event_name,
       goals := c.jsono.shreds.goals
     )
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
+  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
 FROM v;
 
 query I
@@ -140,7 +140,7 @@ reord AS (
     shreds := struct_pack(
       a := c.jsono.shreds.a,
       "$jsono$set" := c.jsono.shreds."$jsono$set",
-      "$jsono$spill" := c.jsono.shreds."$jsono$spill",
+      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0",
       b := c.jsono.shreds.b
     )
   )) AS r
@@ -157,7 +157,7 @@ reord AS (
   SELECT struct_pack(jsono := struct_pack(
     body := c.jsono.body,
     shreds := struct_pack(
-      "$jsono$spill" := c.jsono.shreds."$jsono$spill",
+      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0",
       "$jsono$set" := c.jsono.shreds."$jsono$set",
       a := c.jsono.shreds.a,
       b := c.jsono.shreds.b

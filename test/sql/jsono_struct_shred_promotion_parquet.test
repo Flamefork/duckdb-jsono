@@ -21,7 +21,7 @@ COPY prom TO '__TEST_DIR__/jsono_promotion.parquet' (FORMAT parquet);
 query I
 SELECT typeof(j) FROM '__TEST_DIR__/jsono_promotion.parquet';
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, cnt BIGINT, price DOUBLE, qty BIGINT, usmall BIGINT)))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, cnt BIGINT, price DOUBLE, qty BIGINT, usmall BIGINT)))
 
 # The document reads back byte-identical through the promoted lanes (unsigned narrow above INT32_MAX
 # kept its full magnitude; the FLOAT lane renders through double(float) exactly as before promotion).

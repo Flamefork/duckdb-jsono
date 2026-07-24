@@ -43,7 +43,7 @@ WHERE jsono(v) IS NOT DISTINCT FROM
 query I
 SELECT typeof(jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02'])));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, moments VARCHAR[])))
+STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, moments VARCHAR[])))
 
 # DefaultCast is deliberately independent of the session TimeZone: the lane and reconstructed
 # document both store the UTC representation.
