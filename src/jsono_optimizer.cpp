@@ -1839,40 +1839,49 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 						identity = (marker_min == clean_hash || marker_min == dirty_hash) &&
 						           (marker_max == clean_hash || marker_max == dirty_hash);
 					}
-					// Spill-bitmap proofs under identity-with-dirt. Clean rows store NULL (never mask 0),
-					// so min/max describe the DIRTY rows alone: min==max==M is the exact decode — every
-					// dirty row carries the same mask, so shred rank r is total iff bit r is clear. That
-					// makes a systematic divert (one source consistently missing a lane type) quarantine
-					// to its own shreds instead of demoting the whole row-group. The mask is trusted only
-					// when fully in-domain (a real dirty mask: >= 1, no bits at or above the shred
-					// count) — an out-of-domain mask can only come from a hand-built row, and its
-					// in-range bits must not be believed either (see jsono_shredded_total.test). Mixed
-					// dirty masks (min != max) keep a one-sided bound: masks are non-negative, so bit r
-					// set in any row forces max >= 2^r — every rank with 2^r > max is provably clean.
-					bool exact_mask = false;
-					uint64_t mask = 0;
-					bool high_bound = false;
-					uint64_t mask_max = 0;
-					auto &spill_stats = StructStats::GetChildStats(shreds_stats, 1);
-					if (identity && !all_clean && NumericStats::HasMinMax(spill_stats)) {
-						auto spill_min = NumericStats::Min(spill_stats).GetValue<int64_t>();
-						auto spill_max = NumericStats::Max(spill_stats).GetValue<int64_t>();
-						if (spill_min >= 1 && spill_max >= 1) {
-							if (spill_min == spill_max && shreds.size() < 64 &&
-							    (uint64_t(spill_min) >> shreds.size()) == 0) {
-								exact_mask = true;
-								mask = uint64_t(spill_min);
+					// Spill-column proofs under identity-with-dirt. Clean rows store NULL (never an
+					// all-zero mask), so per-column min/max describe the DIRTY rows alone: min==max==M
+					// is the exact decode — every dirty row carries the same mask word, so a shred
+					// whose bit is clear in M is total. That makes a systematic divert (one source
+					// consistently missing a lane type) quarantine to its own shreds instead of
+					// demoting the whole row-group. A word is trusted only when in-domain
+					// (non-negative, no bits at or above the shred count) — an out-of-domain mask can
+					// only come from a hand-built row, and its in-range bits must not be believed
+					// either (see jsono_shredded_total.test). Mixed dirty masks (min != max) keep a
+					// one-sided bound: masks are non-negative, so a bit set in any row forces
+					// max >= 2^bit — every bit with 2^bit > max is provably clean in that word.
+					JsonoLayoutType read_layout;
+					TryParseJsonoLayoutType(returned_types[table_index], read_layout);
+					auto spill_words = read_layout.spill_columns;
+					vector<bool> exact_mask(spill_words, false);
+					vector<uint64_t> mask(spill_words, 0);
+					vector<bool> high_bound(spill_words, false);
+					vector<uint64_t> mask_max(spill_words, 0);
+					if (identity && !all_clean) {
+						for (idx_t word = 0; word < spill_words; word++) {
+							auto &spill_stats = StructStats::GetChildStats(shreds_stats, 1 + word);
+							if (!NumericStats::HasMinMax(spill_stats)) {
+								continue;
+							}
+							auto spill_min = NumericStats::Min(spill_stats).GetValue<int64_t>();
+							auto spill_max = NumericStats::Max(spill_stats).GetValue<int64_t>();
+							if (spill_min < 0 || spill_max < 0) {
+								continue;
+							}
+							idx_t word_bits =
+							    MinValue<idx_t>(JSONO_SPILL_BITS, shreds.size() - word * JSONO_SPILL_BITS);
+							if (spill_min == spill_max && (uint64_t(spill_min) >> word_bits) == 0) {
+								exact_mask[word] = true;
+								mask[word] = uint64_t(spill_min);
 							} else {
-								high_bound = true;
-								mask_max = uint64_t(spill_max);
+								high_bound[word] = true;
+								mask_max[word] = uint64_t(spill_max);
 							}
 						}
 					}
 					// Canonical spill-bit rank of each shred: its position in the byte-wise sorted name
 					// list (== child_index for canonically-ordered types; a reorder-only cast permutes
 					// fields while the order-independent set hash still matches).
-					JsonoLayoutType read_layout;
-					TryParseJsonoLayoutType(returned_types[table_index], read_layout);
 					vector<string> shred_names;
 					shred_names.reserve(read_layout.shreds.size());
 					for (auto &shred : read_layout.shreds) {
@@ -1886,9 +1895,11 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 							continue;
 						}
 						auto rank = spill_ranks[shred.child_index];
+						auto word = rank / JSONO_SPILL_BITS;
+						auto bit = rank % JSONO_SPILL_BITS;
 						bool spill_clear =
-						    all_clean || (rank < JSONO_MAX_SHREDS && ((exact_mask && ((mask >> rank) & 1) == 0) ||
-						                                              (high_bound && (mask_max >> rank) == 0)));
+						    all_clean || (word < spill_words && ((exact_mask[word] && ((mask[word] >> bit) & 1) == 0) ||
+						                                         (high_bound[word] && (mask_max[word] >> bit) == 0)));
 						if (spill_clear) {
 							per_shred[shred.child_index] = false;
 							continue;
@@ -1898,7 +1909,7 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 						// reconciliation NULL-fill (which is how a row written under a set LACKING this
 						// lane would look). Survives shred-set evolution for dense non-null lanes where
 						// the merged marker stats break identity (union_by_name / DuckLake evolution).
-						idx_t lane_child = 2 + shred.child_index;
+						idx_t lane_child = 1 + spill_words + shred.child_index;
 						if (lane_child >= shred_children) {
 							continue;
 						}
@@ -2247,13 +2258,15 @@ private:
 	}
 
 	// Scalar shred `child_index` (0-based over the shred set) of a shredded column, navigated to its
-	// bare lane: column -> [1] jsono -> [2] shreds -> [3 + child_index] <path> (the `shreds` struct
-	// is the marker at field 1, the spill bitmap at field 2, then the shreds, so shred k is field
-	// 3 + k). Only ever called for scalar shreds (every reconstruct/read site gates list shreds out
-	// before reaching here).
+	// bare lane: column -> [1] jsono -> [2] shreds -> [2 + spill_columns + child_index] <path> (the
+	// `shreds` struct is the marker at field 1, the spill columns next, then the shreds). Only ever
+	// called for scalar shreds (every reconstruct/read site gates list shreds out before reaching
+	// here).
 	unique_ptr<Expression> ShredExtract(const Expression &column, idx_t child_index) {
+		JsonoLayoutType layout;
+		TryParseJsonoLayoutType(column.return_type, layout);
 		auto shreds = StructExtractAt(StructExtractAt(column.Copy(), 1), 2);
-		return StructExtractAt(std::move(shreds), int64_t(child_index) + 3);
+		return StructExtractAt(std::move(shreds), int64_t(2 + layout.spill_columns + child_index));
 	}
 
 	// True when statistics proved this shred carries no SQL NULL anywhere in the table: NULL-shred

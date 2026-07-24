@@ -486,13 +486,27 @@ inline Vector &JsonoShredsStructVector(Vector &result) {
 	return *StructVector::GetEntries(layout)[1];
 }
 
+// The spill column count of a shredded jsono vector's type: the consecutive `$jsono$spill…` fields
+// after the marker (see JsonoSpillColumnCount; a merged type may carry fewer than its shred count
+// needs).
+inline idx_t JsonoSpillColumnsOf(const Vector &result) {
+	auto &layout_type = StructType::GetChildTypes(result.GetType())[0].second;
+	auto &shreds_type = StructType::GetChildTypes(layout_type)[1].second;
+	auto &fields = StructType::GetChildTypes(shreds_type);
+	idx_t columns = 0;
+	while (1 + columns < fields.size() && fields[1 + columns].first == JsonoShredSpillName(columns)) {
+		columns++;
+	}
+	return columns;
+}
+
 // Shred `shred_index` (0-based over the shred set) of a shredded jsono vector: canonically the
-// `shreds` struct is the marker, the spill bitmap, then the shreds, so shred k is shreds child
-// 2 + k. A scalar shred is its bare typed lane, an array shred its LIST — the field itself either
-// way.
+// `shreds` struct is the marker, the spill columns, then the shreds, so shred k is shreds child
+// 1 + spill_columns + k. A scalar shred is its bare typed lane, an array shred its LIST — the
+// field itself either way.
 inline Vector &JsonoShredVector(Vector &result, idx_t shred_index) {
 	auto &shreds = JsonoShredsStructVector(result);
-	return *StructVector::GetEntries(shreds)[2 + shred_index];
+	return *StructVector::GetEntries(shreds)[1 + JsonoSpillColumnsOf(result) + shred_index];
 }
 
 // The shred-set marker vector (BIGINT) of a shredded jsono result: `shreds` child 0.
@@ -501,13 +515,67 @@ inline Vector &JsonoShredSetVector(Vector &result) {
 	return *StructVector::GetEntries(shreds)[0];
 }
 
-// The spill bitmap vector (BIGINT) of a shredded jsono result: `shreds` child 1.
-inline Vector &JsonoShredSpillVector(Vector &result) {
+// Spill bitmap column `column` of a shredded jsono result: `shreds` child 1 + column.
+inline Vector &JsonoShredSpillVector(Vector &result, idx_t column) {
 	auto &shreds = JsonoShredsStructVector(result);
-	return *StructVector::GetEntries(shreds)[1];
+	return *StructVector::GetEntries(shreds)[1 + column];
 }
 
-// Fill the clean shred-set marker (= the layout hash) AND a NULL spill bitmap on every row: for a
+// Write-side handle over a shredded result's marker + spill columns: the two-valued clean/dirty
+// stamp discipline every shred writer follows, plus the per-row mask scratch. A clean row (all-zero
+// masks) stamps the clean hash with every spill column NULL; a dirty row the flipped hash with
+// every column's mask word (zeroes allowed per column).
+struct JsonoSpillStamp {
+	int64_t *set_data = nullptr;
+	std::vector<Vector *> spill_columns;
+	uint64_t layout_hash = 0;
+	std::vector<uint64_t> row_masks; // scratch, reset per row via ResetRow
+
+	void Init(Vector &result) {
+		layout_hash = JsonoLayoutHashOf(result.GetType());
+		auto &set_vec = JsonoShredSetVector(result);
+		set_vec.SetVectorType(VectorType::FLAT_VECTOR);
+		set_data = FlatVector::GetData<int64_t>(set_vec);
+		auto columns = JsonoSpillColumnsOf(result);
+		spill_columns.clear();
+		for (idx_t column = 0; column < columns; column++) {
+			spill_columns.push_back(&JsonoShredSpillVector(result, column));
+			spill_columns.back()->SetVectorType(VectorType::FLAT_VECTOR);
+		}
+		row_masks.assign(columns, 0);
+	}
+
+	void ResetRow() {
+		std::fill(row_masks.begin(), row_masks.end(), 0);
+	}
+
+	// Set the spill bit of canonical rank `rank` in the row scratch. Ranks beyond the type's
+	// columns cannot happen for writer-built types (they always carry ⌈N/63⌉ columns).
+	void SetBit(idx_t rank) {
+		row_masks[rank / JSONO_SPILL_BITS] |= uint64_t(1) << (rank % JSONO_SPILL_BITS);
+	}
+
+	void StampRow(idx_t row) {
+		bool dirty = false;
+		for (auto mask : row_masks) {
+			dirty |= mask != 0;
+		}
+		if (!dirty) {
+			set_data[row] = int64_t(layout_hash);
+			for (auto *column : spill_columns) {
+				FlatVector::SetNull(*column, row, true);
+			}
+			return;
+		}
+		set_data[row] = int64_t(layout_hash ^ JSONO_DIRTY_HASH_FLIP);
+		for (idx_t column = 0; column < spill_columns.size(); column++) {
+			FlatVector::Validity(*spill_columns[column]).SetValid(row);
+			FlatVector::GetData<int64_t>(*spill_columns[column])[row] = int64_t(row_masks[column]);
+		}
+	}
+};
+
+// Fill the clean shred-set marker (= the layout hash) AND NULL spill columns on every row: for a
 // producer that by construction never diverts a present scalar into the residual — e.g. type-driven
 // auto-shred, where each shred's type IS its source field's type, so a present value always fits
 // and a NULL is only an absent field, never a residual diversion. The marker is part of the struct,
@@ -520,31 +588,10 @@ inline void JsonoFillShredMarker(Vector &result, idx_t count) {
 	if (fields.size() < 2 || fields[1].first != JsonoShredsName()) {
 		return;
 	}
-	auto layout_hash = int64_t(JsonoLayoutHashOf(result.GetType()));
-	auto &set_vec = JsonoShredSetVector(result);
-	set_vec.SetVectorType(VectorType::FLAT_VECTOR);
-	auto set_data = FlatVector::GetData<int64_t>(set_vec);
-	auto &spill_vec = JsonoShredSpillVector(result);
-	spill_vec.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &spill_validity = FlatVector::Validity(spill_vec);
+	JsonoSpillStamp stamp;
+	stamp.Init(result);
 	for (idx_t row = 0; row < count; row++) {
-		set_data[row] = layout_hash;
-		spill_validity.SetInvalid(row);
-	}
-}
-
-// Stamp one value row's marker + spill pair from its computed spill mask: a clean row (mask 0)
-// stamps the clean hash and a NULL spill, a dirty row the flipped hash and the mask. The single
-// owner of the two-valued stamp discipline every shred writer follows.
-inline void JsonoStampShredRow(int64_t *set_data, Vector &spill_vec, idx_t row, uint64_t layout_hash,
-                               uint64_t spill_mask) {
-	if (spill_mask == 0) {
-		set_data[row] = int64_t(layout_hash);
-		FlatVector::SetNull(spill_vec, row, true);
-	} else {
-		set_data[row] = int64_t(layout_hash ^ JSONO_DIRTY_HASH_FLIP);
-		FlatVector::Validity(spill_vec).SetValid(row);
-		FlatVector::GetData<int64_t>(spill_vec)[row] = int64_t(spill_mask);
+		stamp.StampRow(row);
 	}
 }
 

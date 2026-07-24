@@ -1693,7 +1693,7 @@ def test_diff_array_multiset_laws(prev_items: list[Any], cur_items: list[Any]) -
 #
 # The residual fuzz above mutates the six blobs; this lane mutates the typed shred columns —
 # truncating/extending an array lane against its skeleton, nulling lanes, flipping the shred-set
-# marker and complete flags, and swapping a scalar lane's value. Two properties per example:
+# marker and the spill bitmap, and swapping a scalar lane's value. Two properties per example:
 # no reader crashes, and jsono_validate never blesses a row that to_json then rejects
 # (validate=true implies readable — the lockstep contract).
 LANE_MUTATIONS = [
@@ -1705,7 +1705,8 @@ LANE_MUTATIONS = [
     "obj_arr_null",
     "scalar_swap",
     "scalar_null",
-    "complete_zero",
+    "spill_garbage",
+    "spill_null",
     "marker_null",
     "marker_flip",
     "intact",
@@ -1715,10 +1716,10 @@ LANE_MUTATIONS = [
 def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
     j = f"jsono({doc_sql}, shredding := {{'$.arr':'BIGINT[]', k:'BIGINT', '$.items':'STRUCT(n BIGINT)[]'}})"
     marker = f'({j})."jsono".shreds."$jsono$set"'
+    spill = f'({j})."jsono".shreds."$jsono$spill"'
     arr = f'({j})."jsono".shreds."$.arr"'
     items = f'({j})."jsono".shreds."$.items"'
-    k_value = f'({j})."jsono".shreds."k"."value"'
-    k_complete = f'({j})."jsono".shreds."k".complete'
+    k_value = f'({j})."jsono".shreds."k"'
     if mutation == "arr_truncate":
         arr = f"list_slice({arr}, 1, greatest(len({arr}) - 1, 0))"
     elif mutation == "arr_extend":
@@ -1735,8 +1736,10 @@ def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
         k_value = f"coalesce({k_value}, 0) + 7"
     elif mutation == "scalar_null":
         k_value = "NULL::BIGINT"
-    elif mutation == "complete_zero":
-        k_complete = "0::TINYINT"
+    elif mutation == "spill_garbage":
+        spill = "96::BIGINT"
+    elif mutation == "spill_null":
+        spill = "NULL::BIGINT"
     elif mutation == "marker_null":
         marker = "NULL::BIGINT"
     elif mutation == "marker_flip":
@@ -1744,9 +1747,10 @@ def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
     return (
         f'struct_pack("jsono" := struct_pack(body := ({j})."jsono".body, '
         f'shreds := struct_pack("$jsono$set" := {marker}, '
+        f'"$jsono$spill" := {spill}, '
         f'"$.arr" := {arr}, '
         f'"$.items" := {items}, '
-        f'"k" := struct_pack("value" := {k_value}, complete := {k_complete}))))'
+        f'"k" := {k_value})))'
     )
 
 
@@ -1764,7 +1768,7 @@ lane_documents = st.builds(
 @example(doc={"arr": [1, 2, 3], "k": 5}, mutation="arr_extend")
 @example(doc={"arr": [], "k": 5}, mutation="arr_extend")
 @example(doc={"arr": [1], "k": 5}, mutation="marker_flip")
-@example(doc={"arr": [1], "k": None}, mutation="complete_zero")
+@example(doc={"arr": [1], "k": None}, mutation="spill_garbage")
 @example(doc={"arr": [1], "k": 5, "items": [{"n": 1}, {"n": 2}]}, mutation="obj_arr_truncate")
 @example(doc={"arr": [1], "k": 5, "items": [{"n": 1}, {"n": 2}]}, mutation="obj_arr_extend")
 @example(doc={"arr": [1], "k": 5, "items": []}, mutation="obj_arr_extend")

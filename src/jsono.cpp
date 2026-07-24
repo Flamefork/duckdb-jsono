@@ -88,9 +88,17 @@ constexpr const char *JSONO_SHREDS = "shreds";
 // cannot occur in a shred path (the shred-spec parsers reject the reserved prefix), so no shred can
 // collide with either reserved field.
 constexpr const char *JSONO_SHRED_SET = "$jsono$set";
-// Reserved name of the per-row spill bitmap, the second field inside `shreds` (see
-// JsonoShredSpillName in jsono.hpp for the bit semantics).
+// Reserved name prefix of the per-row spill bitmap columns, the fields right after the marker
+// inside `shreds`: "$jsono$spill", "$jsono$spill1", … (see JsonoShredSpillName in jsono.hpp for
+// the bit semantics).
 constexpr const char *JSONO_SHRED_SPILL = "$jsono$spill";
+
+string SpillColumnName(idx_t column) {
+	if (column == 0) {
+		return JSONO_SHRED_SPILL;
+	}
+	return string(JSONO_SHRED_SPILL) + std::to_string(column);
+}
 // The reserved layout-field namespace inside `shreds`: every non-shred member is named under it.
 constexpr const char *JSONO_RESERVED_PREFIX = "$jsono$";
 
@@ -145,23 +153,34 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 	if (shreds_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(shreds_type)) {
 		return false;
 	}
-	// Inside `shreds`: the marker is field 0 and the spill bitmap field 1 (any integer width — a
-	// value round-tripped through a generic value->SQL->value path, e.g. DuckLake inlined-data
-	// INSERT, re-parses the bare-integer fields as BIGINT/HUGEINT, but the reserved names still
-	// identify them). They must sit at those fixed positions, not merely be present by name: every
-	// writer emits them first and every set-op merge keeps them first (they are the left branch's
-	// `shreds` fields 0 and 1 — the whole reason `shreds` is a nested struct), and all accessors
-	// (JsonoShredVector / ShredExtract / CollectShredTotality) index shred k as `shreds` field 2 + k.
-	// Accepting them at any other position would let a hand-built reordered struct parse as JSONO
-	// and then crash on read (the accessor would read a reserved field as a shred lane). Every
-	// following field is a shred — its type is the shred's value type (bare scalar or LIST).
+	// Inside `shreds`: the marker is field 0 and the spill bitmap columns fields 1..k (any integer
+	// width — a value round-tripped through a generic value->SQL->value path, e.g. DuckLake
+	// inlined-data INSERT, re-parses the bare-integer fields as BIGINT/HUGEINT, but the reserved
+	// names still identify them). They must sit at those fixed positions, not merely be present by
+	// name: every writer emits them first and every set-op merge keeps them first (they are the left
+	// branch's `shreds` leading fields — the whole reason `shreds` is a nested struct), and all
+	// accessors (JsonoShredVector / ShredExtract / CollectShredTotality) index shred k as `shreds`
+	// field 1 + spill_columns + k. Accepting them at any other position would let a hand-built
+	// reordered struct parse as JSONO and then crash on read (the accessor would read a reserved
+	// field as a shred lane). Every following field is a shred — its type is the shred's value type
+	// (bare scalar or LIST).
 	auto &shred_fields = StructType::GetChildTypes(shreds_type);
-	if (shred_fields.size() < 2 || shred_fields[0].first != JSONO_SHRED_SET || !shred_fields[0].second.IsIntegral() ||
-	    shred_fields[1].first != JSONO_SHRED_SPILL || !shred_fields[1].second.IsIntegral()) {
+	if (shred_fields.size() < 2 || shred_fields[0].first != JSONO_SHRED_SET || !shred_fields[0].second.IsIntegral()) {
+		return false;
+	}
+	idx_t spill_columns = 0;
+	while (1 + spill_columns < shred_fields.size() &&
+	       shred_fields[1 + spill_columns].first == SpillColumnName(spill_columns)) {
+		if (!shred_fields[1 + spill_columns].second.IsIntegral()) {
+			return false;
+		}
+		spill_columns++;
+	}
+	if (spill_columns == 0) {
 		return false;
 	}
 	child_list_t<LogicalType> shreds;
-	for (idx_t i = 2; i < shred_fields.size(); i++) {
+	for (idx_t i = 1 + spill_columns; i < shred_fields.size(); i++) {
 		// A lane name that is not a non-empty pure object-key chain (an array-index or root '$' path)
 		// cannot be a shred: no writer produces one, and every reconstruct-based reader would throw on
 		// it. A reserved-prefix name cannot be one either. Rejecting them here keeps such a raw-cast /
@@ -178,10 +197,17 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 	if (shreds.empty()) {
 		return false; // the reserved fields alone are not a valid shredded value
 	}
+	// A set-op merged type can carry FEWER spill columns than the crossing union's shred count
+	// needs (see JsonoSpillColumnCount) — readable, never provable past its columns — but never
+	// more: no writer over-provisions, so extra columns mean a hand-built struct.
+	if (spill_columns > JsonoSpillColumnCount(shreds.size())) {
+		return false;
+	}
 	out.kind = JsonoLayoutKind::Shredded;
 	out.layout_name = name;
 	out.layout_type = layout_type;
 	out.shreds = std::move(shreds);
+	out.spill_columns = spill_columns;
 	return true;
 }
 
@@ -261,8 +287,8 @@ string JsonoShredSetName() {
 	return JSONO_SHRED_SET;
 }
 
-string JsonoShredSpillName() {
-	return JSONO_SHRED_SPILL;
+string JsonoShredSpillName(idx_t column) {
+	return SpillColumnName(column);
 }
 
 void JsonoValidateShredFieldName(const string &name) {
@@ -316,26 +342,23 @@ uint64_t JsonoLayoutHashOf(const LogicalType &type) {
 }
 
 LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds) {
-	// `shreds` STRUCT: the marker, the spill bitmap, then one field per shred — a scalar shred is its
-	// bare value type, an array shred (LIST) is kept as-is. The marker (JsonoShredSetName) is the
-	// canonical layout hash of the shred set (its uint64 bits reinterpreted as a signed BIGINT), so
-	// the optimizer can confirm via its min/max zone-map that every scanned row was written under
-	// EXACTLY the read type's shred set; a multi-file read unioning narrower shred sets carries a
-	// different hash per file (min!=max), which keeps the residual COALESCE fallback (see
-	// CollectShredTotality). The spill bitmap (JsonoShredSpillName) carries the per-row diverted-shred
-	// bits; under schema identity its min==max==0 statistics prove every value row clean, and a
-	// min==max==M uniform mask decodes per-shred exactly. Both are BIGINT, not UBIGINT, on purpose:
-	// DuckDB's Parquet writer omits min/max stats for unsigned integers (the signed page-stat
-	// ordering would misrepresent them), so a UBIGINT field would carry no Parquet zone-map and never
-	// prove anything on a Parquet scan.
-	if (shreds.size() > JSONO_MAX_SHREDS) {
-		throw BinderException("jsono shred: shred set exceeds the maximum of %llu shreds (the '%s' bitmap runs out "
-		                      "of bits); shred fewer paths",
-		                      (unsigned long long)JSONO_MAX_SHREDS, JSONO_SHRED_SPILL);
-	}
+	// `shreds` STRUCT: the marker, the ⌈N/63⌉ spill bitmap columns, then one field per shred — a
+	// scalar shred is its bare value type, an array shred (LIST) is kept as-is. The marker
+	// (JsonoShredSetName) is the canonical layout hash of the shred set (its uint64 bits
+	// reinterpreted as a signed BIGINT), clean or bit-flipped dirty per row, so the optimizer can
+	// confirm via its min/max zone-map that every scanned row was written under EXACTLY the read
+	// type's shred set (and whether any was dirty); a multi-file read unioning narrower shred sets
+	// carries an unrelated hash per file, which keeps the residual COALESCE fallback (see
+	// CollectShredTotality). The spill columns (JsonoShredSpillName) carry the per-row
+	// diverted-shred bits of the dirty rows; a min==max==M uniform mask decodes per-shred exactly.
+	// All reserved fields are BIGINT, not UBIGINT, on purpose: DuckDB's Parquet writer omits
+	// min/max stats for unsigned integers (the signed page-stat ordering would misrepresent them),
+	// so a UBIGINT field would carry no Parquet zone-map and never prove anything on a Parquet scan.
 	child_list_t<LogicalType> shred_children;
 	shred_children.emplace_back(JSONO_SHRED_SET, LogicalType::BIGINT);
-	shred_children.emplace_back(JSONO_SHRED_SPILL, LogicalType::BIGINT);
+	for (idx_t column = 0; column < JsonoSpillColumnCount(shreds.size()); column++) {
+		shred_children.emplace_back(SpillColumnName(column), LogicalType::BIGINT);
+	}
 	for (auto &shred : shreds) {
 		shred_children.push_back(shred);
 	}

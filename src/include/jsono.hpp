@@ -73,14 +73,13 @@ LogicalType JsonoRawStructType();
 LogicalType JsonoBodyStructType();
 
 // The physical STRUCT of a shredded JSONO value: STRUCT("jsono" STRUCT(body STRUCT(6 BLOB),
-// shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT, <shred fields>))). One shred field per
-// `shreds` entry — a scalar shred is its bare value type, an array shred is the LIST as-is.
-// This is the single source of truth for the shredded shape: the constructor and
+// shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill" BIGINT [, "$jsono$spill1" …], <shred fields>))).
+// One shred field per `shreds` entry — a scalar shred is its bare value type, an array shred is the
+// LIST as-is. This is the single source of truth for the shredded shape: the constructor and
 // `jsono_storage_type` both build it here, so a column declared from the same shreds is
 // byte-identical to the value's type. Shred field order follows `shreds`; callers pass them in
 // canonical (name-sorted) order so the type is a pure function of the shred set, and they write
 // shreds in that same order (shreds are written by index, so field and value order must agree).
-// Throws when `shreds` exceeds JSONO_MAX_SHREDS (the spill bitmap runs out of bits).
 LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds);
 
 // The top-level field name of every layout (plain and shredded): "jsono".
@@ -107,36 +106,44 @@ string JsonoShredsName();
 // the width may shift to HUGEINT.
 string JsonoShredSetName();
 
-// The reserved name of the per-row spill bitmap, the second field inside `shreds`. A BIGINT whose
-// bit r (0-based, low 63 bits — the sign bit stays clear so masks order as non-negative numbers in
-// every zone-map) is set when the scalar shred at canonical rank r diverted on this row: the value
-// stayed in the residual (a type-gate miss or a container at the path) and a bare lane read would
-// miss it. Canonical rank = the shred's position in the byte-wise sorted name list of the shred set,
-// NOT the physical field position — a reorder-only cast (SameShredSet) keeps field order
+// The reserved name of a per-row spill bitmap column — the ⌈N/63⌉ fields right after the marker
+// inside `shreds`: "$jsono$spill", then "$jsono$spill1", "$jsono$spill2", … (column 0 carries no
+// ordinal: nearly every real set fits one column). Each is a BIGINT whose bit b (0-based, low 63
+// bits — the sign bit stays clear so masks order as non-negative numbers in every zone-map) is set
+// when the scalar shred at canonical rank 63*column + b diverted on this row: the value stayed in
+// the residual (a type-gate miss or a container at the path) and a bare lane read would miss it.
+// Canonical rank = the shred's position in the byte-wise sorted name list of the shred set, NOT
+// the physical field position — a reorder-only cast (SameShredSet) keeps field order
 // branch-dependent while the order-independent `$jsono$set` hash still matches, so the numbering
 // must be permutation-invariant too. Array shreds get ranks but never set bits (they are never
-// bare-read). NULL on a clean row (mask 0 is never stored) and on a SQL-NULL row, so min/max
-// statistics describe the DIRTY rows alone: a systematic divert gives min==max==M, which decodes
-// per shred exactly — one source's dirty lane never demotes its row-group's other shreds. The
-// all-clean case deliberately leaves the column with no values at all (the clean proof lives in
-// the marker, see JsonoShredSetName): DuckLake's global stats carry no num_values, so neither an
-// all-NULL bitmap nor an all-NULL LIST (the encoding rejected in plan 054 phase 0) can prove
-// anything there by itself. Interpretation is identity-gated: a raw by-name cast copies the bitmap
-// across shred sets, where the foreign `$jsono$set` hash fails the identity check and the foreign
-// numbering is conservatively ignored.
-string JsonoShredSpillName();
+// bare-read). All spill columns are NULL on a clean row (an all-zero mask is never stored) and on
+// a SQL-NULL row, and all non-NULL on a dirty one (zeroes allowed per column), so min/max
+// statistics describe the DIRTY rows alone: a systematic divert gives min==max==M per column,
+// which decodes per shred exactly — one source's dirty lane never demotes its row-group's other
+// shreds. The all-clean case deliberately leaves the columns with no values at all (the clean
+// proof lives in the marker, see JsonoShredSetName): DuckLake's global stats carry no num_values,
+// so neither an all-NULL bitmap nor an all-NULL LIST (the encoding rejected in plan 054 phase 0)
+// can prove anything there by itself. Interpretation is identity-gated: a raw by-name cast copies
+// the bitmaps across shred sets, where the foreign `$jsono$set` hash fails the identity check and
+// the foreign numbering is conservatively ignored.
+string JsonoShredSpillName(idx_t column);
 
 // The marker stamp of a dirty row: the layout hash with its lowest bit flipped. Two adjacent
 // values keep the marker's min/max decodable ({H} all-clean, {H^1} all-dirty, the pair mixed);
 // stamping the mask itself would scatter min/max across 2^63 values and prove nothing.
 constexpr uint64_t JSONO_DIRTY_HASH_FLIP = 1;
 
-// The number of spill bits one BIGINT bitmap carries (the sign bit stays clear), and therefore the
-// hard cap constructors enforce on a shred set's size. Recognition carries NO such cap: a set-op
-// merged type may unite two ≤63-shred branches past 63; such a type stays readable (identity never
-// holds for it — no writer can produce its hash — so every read keeps the residual COALESCE), while
-// the reshred normalization that would have to WRITE it fails loud at bind.
-constexpr idx_t JSONO_MAX_SHREDS = 63;
+// Bits per spill column (the sign bit stays clear).
+constexpr idx_t JSONO_SPILL_BITS = 63;
+
+// The spill columns a shred set of `shred_count` needs: ⌈N/63⌉. Recognition additionally accepts
+// FEWER columns than this (never more): a set-op merged type unites both branches' shreds but only
+// the by-name union of their spill columns, which can under-provision a crossing union's set. Such
+// a type stays fully readable — bits for ranks beyond its columns simply do not exist, so those
+// shreds are never proven total and every read keeps the residual COALESCE.
+inline idx_t JsonoSpillColumnCount(idx_t shred_count) {
+	return (shred_count + JSONO_SPILL_BITS - 1) / JSONO_SPILL_BITS;
+}
 
 // Throw a BinderException if `name` collides with a reserved layout field: `body` (the residual,
 // rejected for consistency — a value-path shred cannot be named it either) or the reserved
@@ -161,17 +168,17 @@ vector<idx_t> JsonoSpillRanksOfNames(const vector<string> &names);
 // The classification of one JSONO layout field.
 enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 
-// A parsed JSONO layout field: its top-level name, the inner STRUCT(body[, shreds]) type, and its
+// A parsed JSONO layout field: its top-level name, the inner STRUCT(body[, shreds]) type, its
 // shred (path, LOGICAL-value-type) columns (empty for plain; a scalar shred's bare lane and an
-// array shred's list are recorded by their value type). The single grammar all predicates read
-// against. The shred-set marker always sits at `shreds` field 0 and the spill bitmap at field 1;
-// readers navigate to them by name (CollectShredTotality) or by those fixed positions (the writer
-// accessors), so they are not carried here.
+// array shred's list are recorded by their value type), and the number of spill bitmap columns.
+// The single grammar all predicates read against. The shred-set marker always sits at `shreds`
+// field 0 and the spill columns at fields 1..spill_columns; shred k is field 1 + spill_columns + k.
 struct JsonoLayoutType {
 	JsonoLayoutKind kind;
 	string layout_name;
 	LogicalType layout_type;
 	child_list_t<LogicalType> shreds;
+	idx_t spill_columns = 0;
 };
 
 // Parse `type` as an ordinary JSONO value: a top-level STRUCT with exactly one valid `jsono`

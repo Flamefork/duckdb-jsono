@@ -355,6 +355,135 @@ bool ValidateJsonoBlob(const JsonoBlobRow &blob, ShredManifestVerifier &verifier
 	}
 }
 
+// The marker/spill discipline checker over a shredded input: per row, the two-valued marker must
+// agree with the spill bitmap and the bitmap's bits with the scalar lanes and the residual —
+// bit r set ⇔ the rank-r scalar lane is NULL AND the residual holds a non-null value at its path
+// (the exact condition a bare lane read would silently misread under the totality proofs).
+// Universal regardless of the marker: a set scalar lane means its path was stripped from the
+// residual (the value is stored exactly once). Rows whose marker is neither variant of the input
+// type's hash (foreign masks copied by a raw cast) skip the mask checks — their COALESCE reads
+// stay correct — as do degraded integer widths (the mask is not directly readable there).
+struct SpillLane {
+	vector<PathStep> steps;
+	idx_t rank = 0;
+	bool scalar = false;
+	UnifiedVectorFormat fmt;
+};
+
+struct SpillChecker {
+	bool active = false;
+	bool mask_readable = false;
+	bool full_provision = false;
+	int64_t clean_hash = 0;
+	int64_t dirty_hash = 0;
+	idx_t shred_count = 0;
+	UnifiedVectorFormat set_fmt;
+	vector<UnifiedVectorFormat> spill_fmt;
+	vector<SpillLane> lanes;
+};
+
+void InitSpillChecker(Vector &input, idx_t count, SpillChecker &checker) {
+	JsonoLayoutType layout;
+	if (!TryParseJsonoLayoutType(input.GetType(), layout) || layout.kind != JsonoLayoutKind::Shredded) {
+		return;
+	}
+	checker.active = true;
+	checker.clean_hash = int64_t(JsonoLayoutHashOf(input.GetType()));
+	checker.dirty_hash = int64_t(uint64_t(checker.clean_hash) ^ JSONO_DIRTY_HASH_FLIP);
+	checker.shred_count = layout.shreds.size();
+	checker.full_provision = layout.spill_columns == JsonoSpillColumnCount(layout.shreds.size());
+	auto &set_vec = JsonoShredSetVector(input);
+	checker.mask_readable = set_vec.GetType().id() == LogicalTypeId::BIGINT;
+	for (idx_t column = 0; column < layout.spill_columns; column++) {
+		checker.mask_readable =
+		    checker.mask_readable && JsonoShredSpillVector(input, column).GetType().id() == LogicalTypeId::BIGINT;
+	}
+	if (checker.mask_readable) {
+		set_vec.ToUnifiedFormat(count, checker.set_fmt);
+		checker.spill_fmt.resize(layout.spill_columns);
+		for (idx_t column = 0; column < layout.spill_columns; column++) {
+			JsonoShredSpillVector(input, column).ToUnifiedFormat(count, checker.spill_fmt[column]);
+		}
+	}
+	vector<string> names;
+	names.reserve(layout.shreds.size());
+	for (auto &shred : layout.shreds) {
+		names.push_back(shred.first);
+	}
+	auto ranks = JsonoSpillRanksOfNames(names);
+	checker.lanes.resize(layout.shreds.size());
+	for (idx_t f = 0; f < layout.shreds.size(); f++) {
+		auto &lane = checker.lanes[f];
+		lane.steps = ShredNamePath(layout.shreds[f].first, "jsono_validate shred");
+		lane.rank = ranks[f];
+		lane.scalar = ClassifyShredKind(layout.shreds[f].second) == ShredKind::Scalar;
+		JsonoShredVector(input, f).ToUnifiedFormat(count, lane.fmt);
+	}
+}
+
+bool SpillDisciplineValid(const JsonoBlobRow &blob, const SpillChecker &checker, idx_t row) {
+	JsonoView view = MakeJsonoView(blob);
+	view.ParseHeader(); // already validated by ValidateJsonoBlob
+	bool marker_known = false;
+	bool dirty = false;
+	vector<uint64_t> masks(checker.spill_fmt.size(), 0);
+	if (checker.mask_readable) {
+		auto set_idx = checker.set_fmt.sel->get_index(row);
+		if (checker.set_fmt.validity.RowIsValid(set_idx)) {
+			auto marker = UnifiedVectorFormat::GetData<int64_t>(checker.set_fmt)[set_idx];
+			marker_known = marker == checker.clean_hash || marker == checker.dirty_hash;
+			dirty = marker == checker.dirty_hash;
+		}
+		if (marker_known) {
+			bool any_bit = false;
+			for (idx_t word = 0; word < checker.spill_fmt.size(); word++) {
+				auto spill_idx = checker.spill_fmt[word].sel->get_index(row);
+				bool spill_set = checker.spill_fmt[word].validity.RowIsValid(spill_idx);
+				if (dirty != spill_set) {
+					return false; // clean marker with a mask, or dirty marker missing one
+				}
+				if (!spill_set) {
+					continue;
+				}
+				auto raw = UnifiedVectorFormat::GetData<int64_t>(checker.spill_fmt[word])[spill_idx];
+				auto word_bits = MinValue<idx_t>(JSONO_SPILL_BITS, checker.shred_count - word * JSONO_SPILL_BITS);
+				if (raw < 0 || (uint64_t(raw) >> word_bits) != 0) {
+					return false; // out-of-domain mask
+				}
+				masks[word] = uint64_t(raw);
+				any_bit |= raw != 0;
+			}
+			// A dirty row must carry at least one bit — unless the type under-provisions the spill
+			// columns (a crossing-union merged type), where the dirtying bit may have no column.
+			if (dirty && !any_bit && checker.full_provision) {
+				return false;
+			}
+		}
+	}
+	for (auto &lane : checker.lanes) {
+		auto lane_idx = lane.fmt.sel->get_index(row);
+		bool lane_set = lane.fmt.validity.RowIsValid(lane_idx);
+		auto word = lane.rank / JSONO_SPILL_BITS;
+		bool bit_known = marker_known && word < masks.size();
+		bool bit = bit_known && ((masks[word] >> (lane.rank % JSONO_SPILL_BITS)) & 1);
+		if (!lane.scalar) {
+			if (bit) {
+				return false; // array shreds never set spill bits
+			}
+			continue;
+		}
+		auto location = LocatePath(view, lane.steps);
+		bool residual_value = location.found && SlotTag(view.SlotAt(location.cursor.pos)) != tag::VAL_NULL;
+		if (lane_set && location.found) {
+			return false; // a set lane means the path was stripped from the residual
+		}
+		if (bit_known && bit != (!lane_set && residual_value)) {
+			return false; // a spill bit must mark exactly a hidden residual value
+		}
+	}
+	return true;
+}
+
 // One array shred's lockstep handle: the compiled skeleton path and the lane's list entries.
 struct LockstepLane {
 	vector<PathStep> steps;
@@ -422,6 +551,8 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 	verifier.InitFromType(args.data[0].GetType());
 	vector<LockstepLane> lockstep;
 	InitLockstepLanes(args.data[0], count, lockstep);
+	SpillChecker spill_checker;
+	InitSpillChecker(args.data[0], count, spill_checker);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<bool>(result);
@@ -435,6 +566,9 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 		result_data[row] = ValidateJsonoBlob(blob, verifier);
 		if (result_data[row] && !lockstep.empty()) {
 			result_data[row] = LanesLockstepValid(blob, lockstep, row);
+		}
+		if (result_data[row] && spill_checker.active) {
+			result_data[row] = SpillDisciplineValid(blob, spill_checker, row);
 		}
 	}
 	if (args.AllConstant()) {

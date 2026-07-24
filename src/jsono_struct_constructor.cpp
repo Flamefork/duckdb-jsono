@@ -1596,13 +1596,6 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 		// (bind_data->shreds) and the type's shred order must agree.
 		std::sort(auto_shreds.begin(), auto_shreds.end(),
 		          [](const AutoShredCandidate &a, const AutoShredCandidate &b) { return a.name < b.name; });
-		// Auto-shred is best-effort: a struct wider than the spill bitmap keeps its first
-		// JSONO_MAX_SHREDS lanes in canonical name order (deterministic — a pure function of the
-		// field-name set) and leaves the rest in the residual, where reads still fall back correctly.
-		// Only the explicit shredding spec fails loud on the cap (JsonoShreddedStructType).
-		if (auto_shreds.size() > JSONO_MAX_SHREDS) {
-			auto_shreds.resize(JSONO_MAX_SHREDS);
-		}
 		child_list_t<LogicalType> shred_types;
 		for (auto &shred : auto_shreds) {
 			bind_data->shreds.emplace_back(shred.name, shred.type);

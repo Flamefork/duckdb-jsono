@@ -2704,12 +2704,8 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	JsonoBodyWriter writer;
 	writer.Init(result);
-	auto layout_hash = JsonoLayoutHashOf(result.GetType());
-	auto &set_vec = jsono::JsonoShredSetVector(result);
-	set_vec.SetVectorType(VectorType::FLAT_VECTOR);
-	auto set_data = FlatVector::GetData<int64_t>(set_vec);
-	auto &spill_vec = jsono::JsonoShredSpillVector(result);
-	spill_vec.SetVectorType(VectorType::FLAT_VECTOR);
+	jsono::JsonoSpillStamp stamp;
+	stamp.Init(result);
 	vector<string> shred_names;
 	shred_names.reserve(bind_data.shreds.size());
 	for (auto &shred : bind_data.shreds) {
@@ -2740,7 +2736,8 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		bool live = direct && direct->kind != DirectShreddedAcc::Kind::Empty;
 		if (!live) {
 			// The group had input but folded to an empty object -> {} with NULL shreds (absent, no spill).
-			jsono::JsonoStampShredRow(set_data, spill_vec, rid, layout_hash, 0);
+			stamp.ResetRow();
+			stamp.StampRow(rid);
 			empty_builder.Reset();
 			empty_builder.EmitObjectStart(0);
 			empty_builder.EmitObjectEnd();
@@ -2759,7 +2756,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		                            SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START &&
 		                            ContainerChildCount(SlotPayload(acc_view.SlotAt(0))) > 0;
 		stripped_fields.clear();
-		uint64_t spill_mask = 0;
+		stamp.ResetRow();
 		D_ASSERT(direct->lanes.size() == bind_data.shreds.size());
 		for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 			auto &plan = bind_data.shred_plan[f];
@@ -2775,7 +2772,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 				switch (ClassifyResidualPath(acc_view, plan.steps, depth_reached)) {
 				case ResidualPathOutcome::Present:
 					// a later diverted write outranks the older lane; the value lives in the residual
-					spill_mask |= uint64_t(1) << spill_ranks[f];
+					stamp.SetBit(spill_ranks[f]);
 					break;
 				case ResidualPathOutcome::Absent:
 					if (lane_active) {
@@ -2813,7 +2810,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 				FlatVector::SetNull(*lane_out[f], rid, true);
 			}
 		}
-		jsono::JsonoStampShredRow(set_data, spill_vec, rid, layout_hash, spill_mask);
+		stamp.StampRow(rid);
 		auto &blob = direct->residual;
 		writer.data[BODY_SLOTS][rid] = WriteBlobInto(writer.Slots(), blob.slots.data(), blob.slots.size());
 		writer.data[BODY_KEY_HEAP][rid] = WriteBlobInto(writer.KeyHeap(), blob.key_heap.data(), blob.key_heap.size());
@@ -4637,10 +4634,8 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		shred_out[f] = &JsonoShredVector(result, f);
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
 	}
-	Vector *set_out = &JsonoShredSetVector(result);
-	set_out->SetVectorType(VectorType::FLAT_VECTOR);
-	Vector *spill_out = &JsonoShredSpillVector(result);
-	spill_out->SetVectorType(VectorType::FLAT_VECTOR);
+	JsonoSpillStamp stamp;
+	stamp.Init(result);
 	vector<string> shred_names;
 	shred_names.reserve(bind_data.shreds.size());
 	for (auto &shred : bind_data.shreds) {
@@ -4648,10 +4643,6 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	}
 	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
 
-	// The shred-set marker value, order-independent over the shred set (see JsonoLayoutHashOf): the
-	// optimizer recomputes it from the read type, which a set-op/reorder cast may present in a
-	// different field order than this finalize built.
-	auto manifest_layout_hash = JsonoLayoutHashOf(result.GetType());
 	vector<JsonoShredManifestEntryBytes> manifest_entries(bind_data.shreds.size());
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 		manifest_entries[f] = JsonoShredManifestEntry(bind_data.shreds[f].first, bind_data.shreds[f].second);
@@ -4670,7 +4661,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		}
 		// The clean/dirty marker + spill stamp lands after the scalar loop below has collected this
 		// row's divert bits (a no-input group emits SQL NULL instead).
-		uint64_t spill_mask = 0;
+		stamp.ResetRow();
 
 		auto &state = *state_data[RowIndex(state_fmt, i)];
 		builder.Reset();
@@ -4725,7 +4716,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 					stripped_shred_indices.push_back(shred.child);
 				}
 				if (diverted) {
-					spill_mask |= uint64_t(1) << spill_ranks[shred.child];
+					stamp.SetBit(spill_ranks[shred.child]);
 				}
 			}
 			for (idx_t s = 0; s < list_shreds.size(); s++) {
@@ -4754,7 +4745,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		std::sort(stripped_child_indices.begin(), stripped_child_indices.end());
 		EmitLWWTreeNodeWithListOverrides(*state.root, builder, scalar_strip_paths, stripped_child_indices,
 		                                 list_override_indices, list_shreds, state.list_lanes, 0);
-		JsonoStampShredRow(FlatVector::GetData<int64_t>(*set_out), *spill_out, rid, manifest_layout_hash, spill_mask);
+		stamp.StampRow(rid);
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_shred_indices.empty()) {
 			std::sort(stripped_shred_indices.begin(), stripped_shred_indices.end());
