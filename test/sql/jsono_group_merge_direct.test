@@ -316,3 +316,24 @@ SELECT to_json(jsono_group_merge(j)), jsono_group_merge(j) IS NULL
 FROM (VALUES (jsono('{"a":null}', shredding := {a:'BIGINT'}))) t(j);
 ----
 {}	false
+
+# Regression guard for the subset overlay: the type KEEPS the array lane but the row lost a scalar
+# shred, so DirectFoldPrepare folds only the array shreds through JsonoOverlayShredsToPlain. That
+# overlay verifies each row's manifest against ALL of the type's shreds, not just the folded subset
+# — narrowing the check to the subset would let this row silently drop the value of 'a'.
+statement ok
+CREATE TABLE gm_narrow_arr AS SELECT jsono('{}', shredding := {'tags':'BIGINT[]'}) AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO gm_narrow_arr SELECT jsono('{"a":1,"tags":[1,2]}', shredding := {'a':'BIGINT','tags':'BIGINT[]'});
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT jsono_group_merge(e) FROM gm_narrow_arr;
+----
+narrowed by a raw struct cast

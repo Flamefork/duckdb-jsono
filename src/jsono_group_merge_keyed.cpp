@@ -62,8 +62,9 @@ using namespace jsono;
 
 struct GroupMergeLWWBindData : public FunctionData {
 	OrderModifiers modifiers;
-	// Same sticky-shredded contract as jsono_group_merge: a shredded input reshreds back to its
-	// own type in Finalize (empty for a plain input).
+	// Same sticky-shredded contract as jsono_group_merge: the result stays shredded in this type
+	// (empty for a plain input). Drives the direct fold plan; only when that path declines does
+	// Finalize reshred a plain result back into this type.
 	vector<std::pair<string, LogicalType>> shreds;
 	// Carried into Update/Combine to account the LWW tree/lane growth; re-captured on plan round-trips
 	// (no serialize callback, so deserialize re-runs the bind).
@@ -1980,8 +1981,9 @@ unique_ptr<FunctionData> JsonoGroupMergeLWWBind(ClientContext &context, Aggregat
 	auto bind_data = make_uniq<GroupMergeLWWBindData>(OrderModifiers(direction, OrderByNullType::NULLS_FIRST),
 	                                                  BufferManager::GetBufferManager(context));
 	if (IsShreddedJsonoType(type)) {
-		// Sticky shredding, same as jsono_group_merge: keep the shredded argument native (Update
-		// reconstructs it to plain) and capture the shreds so Finalize reshreds back to this type.
+		// Sticky shredding, same as jsono_group_merge: keep the shredded argument native and capture
+		// the shreds. Update folds shredded rows directly and Finalize writes the native lanes out;
+		// the reconstruct-to-plain / reshred pair is the fallback taken only when those decline.
 		JsonoLayoutType layout;
 		TryParseJsonoLayoutType(type, layout);
 		for (auto &shred : layout.shreds) {

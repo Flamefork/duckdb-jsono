@@ -113,8 +113,11 @@ JSONO_ALWAYS_INLINE bool MemberSurvivesStrip(const jsono::JsonoView &view, size_
 	return merge_mode == MergeMode::Patch || ValueSurvivesIgnoreNulls(view, vp);
 }
 
-inline void EmitObjectStrip(const jsono::JsonoView &view, const jsono::JsonoCursor &obj_cursor,
-                            jsono::JsonoBuilder &builder, MergeMode merge_mode, size_t depth) {
+// Forced-inline: as a single-TU static this folded entirely into EmitValueStrip, and vague linkage
+// alone lets the inliner tail-branch instead — an out-of-line call per object node in the hot merge
+// loop. The mutual recursion still terminates through EmitValueStrip, which stays plain `inline`.
+JSONO_ALWAYS_INLINE void EmitObjectStrip(const jsono::JsonoView &view, const jsono::JsonoCursor &obj_cursor,
+                                         jsono::JsonoBuilder &builder, MergeMode merge_mode, size_t depth) {
 	if (depth > jsono::JSONO_MAX_NESTING_DEPTH) {
 		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
 		                            (unsigned long long)jsono::JSONO_MAX_NESTING_DEPTH);
@@ -244,7 +247,14 @@ inline void MergeTwoObjects(const jsono::JsonoView &va, const jsono::JsonoCursor
                             const jsono::JsonoCursor &cursor_b, jsono::JsonoBuilder &builder, MergeMode merge_mode,
                             size_t depth);
 
-// Merge two object views into the builder (B patches A), sorted-key linear merge.
+// Merge two object views into the builder as a sorted-key linear merge; which side wins is
+// merge_mode's business (see MergeMode above — B patches A under Patch/IgnoreNulls, A is
+// authoritative under Overlay).
+//
+// The three scratch vectors let the top-level caller reuse its buffers across rows, and they must
+// NEVER be threaded into the recursion: the plan loop keeps reading children_a/children_b/plan
+// after each nested merge returns, so a child writing into the parent's vectors would corrupt the
+// walk mid-object. Hence the recursion goes through MergeTwoObjects, which allocates fresh ones.
 inline void MergeTwoObjectsWithScratch(const jsono::JsonoView &va, const jsono::JsonoCursor &cursor_a,
                                        const jsono::JsonoView &vb, const jsono::JsonoCursor &cursor_b,
                                        jsono::JsonoBuilder &builder, MergeMode merge_mode, size_t depth,

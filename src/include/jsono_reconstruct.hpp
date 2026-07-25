@@ -41,7 +41,9 @@ void JsonoReconstructToPlain(Vector &input, idx_t count, Vector &result);
 // type drops back into the residual with this, leaving the kept shreds untouched. Each row's shred
 // manifest is still verified against ALL of the type's shreds, not just the overlaid ones — callers
 // that fold a subset (the non-keyed group_merge array path) rely on that for their loud narrowing
-// failure.
+// failure. `shreds` must be non-empty: an empty list overlays nothing and yields the bare residual,
+// which is a narrowed document the manifest check cannot catch — callers branch on emptiness before
+// reaching here rather than asking for a no-op overlay.
 void JsonoOverlayShredsToPlain(Vector &input, idx_t count, const vector<idx_t> &shreds, Vector &result);
 
 // Render a shredded JSONO carrying top-level LIST shreds directly to JSON text. Scalar shreds are

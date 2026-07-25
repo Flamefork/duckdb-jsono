@@ -23,8 +23,9 @@ public:
 };
 
 // Per-feature registration hooks; LoadInternal calls every one, so this list is the extension's
-// feature roster — a new feature file adds its hook here. Order is free except for the first entry:
-// RegisterJsonoType creates the type and its casts, which the rest bind against.
+// feature roster — a new feature file adds its hook here. Order is free: JsonoType() is a plain
+// accessor over the physical struct (there is no registered type to create first), and each hook
+// registers into the catalog independently.
 void RegisterJsonoType(ExtensionLoader &loader);              // jsono.cpp
 void RegisterJsonoStructConstructor(ExtensionLoader &loader); // jsono_struct_constructor.cpp
 void RegisterJsonoParse(ExtensionLoader &loader);             // jsono_parse.cpp

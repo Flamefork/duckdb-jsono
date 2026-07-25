@@ -254,3 +254,19 @@ SELECT to_json(j)::VARCHAR FROM map_docs ORDER BY 1;
 ----
 [1,2]
 {"a":1,"b":2}
+
+# ARRAY is a separate cast registration from LIST, and JSON a separate one from VARCHAR; each
+# reaches jsono storage on its own, so dropping either registration must fail this INSERT.
+statement ok
+INSERT INTO map_docs SELECT array_value(3, 4);
+
+statement ok
+INSERT INTO map_docs SELECT '{"j":1}'::JSON;
+
+query I
+SELECT to_json(j)::VARCHAR FROM map_docs ORDER BY 1;
+----
+[1,2]
+[3,4]
+{"a":1,"b":2}
+{"j":1}

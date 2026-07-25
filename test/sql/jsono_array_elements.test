@@ -184,7 +184,7 @@ VARCHAR
 
 query I
 SELECT to_json(jsono_array_elements(jsono('[{"a":1},[2,3],"hi",4.5]'))[3])::VARCHAR
-     = jsono_extract(jsono('[{"a":1},[2,3],"hi",4.5]'), 2);
+     = to_json(jsono_extract(jsono('[{"a":1},[2,3],"hi",4.5]'), 2))::VARCHAR;
 ----
 true
 
