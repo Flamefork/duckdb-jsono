@@ -9,8 +9,8 @@ require json
 # A canonical shredded value carries the marker and the spill bitmap as BIGINT, the first two fields
 # inside `shreds`.
 query II
-SELECT typeof(jsono({'event_name':'pv','goals':'buy'}).jsono.shreds."$jsono$set"),
-       typeof(jsono({'event_name':'pv','goals':'buy'}).jsono.shreds."$jsono$spill$0");
+SELECT typeof(jsono({'event_name':'pv','goals':'buy'}).jsono."shreds$1"."$jsono$set"),
+       typeof(jsono({'event_name':'pv','goals':'buy'}).jsono."shreds$1"."$jsono$spill$0");
 ----
 BIGINT	BIGINT
 
@@ -24,14 +24,14 @@ CREATE TABLE marker_rt AS
 WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT
   struct_pack(jsono := struct_pack(
-    body := c.jsono.body,
-    shreds := struct_pack(
-      "$jsono$set" := c.jsono.shreds."$jsono$set"::HUGEINT,
-      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0"::INTEGER,
-      event_name := c.jsono.shreds.event_name,
-      goals := c.jsono.shreds.goals
+    "body$1" := c.jsono."body$1",
+    "shreds$1" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$1"."$jsono$set"::HUGEINT,
+      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0"::INTEGER,
+      event_name := c.jsono."shreds$1".event_name,
+      goals := c.jsono."shreds$1".goals
     )
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
+  ))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
 FROM v;
 
 # The reserved fields were recognized by name, so this round-trips.
@@ -61,14 +61,14 @@ query I
 WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT to_json(
   struct_pack(jsono := struct_pack(
-    body := c.jsono.body,
-    shreds := struct_pack(
-      "$jsono$set" := c.jsono.shreds."$jsono$set"::HUGEINT,
-      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0"::HUGEINT,
-      event_name := c.jsono.shreds.event_name,
-      goals := c.jsono.shreds.goals
+    "body$1" := c.jsono."body$1",
+    "shreds$1" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$1"."$jsono$set"::HUGEINT,
+      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0"::HUGEINT,
+      event_name := c.jsono."shreds$1".event_name,
+      goals := c.jsono."shreds$1".goals
     )
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR)))
+  ))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR)))
 )
 FROM v;
 ----
@@ -83,12 +83,12 @@ statement ok
 CREATE TABLE spill_deg AS
 WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT struct_pack(jsono := struct_pack(
-    body := c.jsono.body,
-    shreds := struct_pack(
-      "$jsono$set" := c.jsono.shreds."$jsono$set",
-      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0"::INTEGER,
-      event_name := c.jsono.shreds.event_name,
-      goals := c.jsono.shreds.goals
+    "body$1" := c.jsono."body$1",
+    "shreds$1" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0"::INTEGER,
+      event_name := c.jsono."shreds$1".event_name,
+      goals := c.jsono."shreds$1".goals
     )
   )) AS r
 FROM v;
@@ -111,14 +111,14 @@ CREATE TABLE spill_rt AS
 WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT
   struct_pack(jsono := struct_pack(
-    body := c.jsono.body,
-    shreds := struct_pack(
-      "$jsono$set" := c.jsono.shreds."$jsono$set",
-      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0"::INTEGER,
-      event_name := c.jsono.shreds.event_name,
-      goals := c.jsono.shreds.goals
+    "body$1" := c.jsono."body$1",
+    "shreds$1" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0"::INTEGER,
+      event_name := c.jsono."shreds$1".event_name,
+      goals := c.jsono."shreds$1".goals
     )
-  ))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
+  ))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
 FROM v;
 
 query I
@@ -128,43 +128,41 @@ true
 
 # The reserved fields are identified by name BUT must sit at `shreds` fields 0 and 1: every writer and
 # set-op merge emits them first, and all accessors index shred k as physical field 2 + k. A hand-built
-# struct with the marker NOT at field 0 is therefore NOT a canonical JSONO layout — the parser rejects
-# it (reads it as a plain user struct) rather than mis-mapping a shred onto a reserved field, which
-# crashed on every read. to_json then dumps the raw struct (keeping the literal `$jsono$set` key) and a
-# jsono extract returns NULL — no internal error.
-query II
+# struct with the marker NOT at field 0 is therefore not a readable layout — and since it still carries
+# the layout anchor, reading it fails loud instead of silently dumping the raw struct or answering NULL.
+statement error
 WITH v AS (SELECT jsono({'a':'x','b':'y'}) AS c),
 reord AS (
   SELECT struct_pack(jsono := struct_pack(
-    body := c.jsono.body,
-    shreds := struct_pack(
-      a := c.jsono.shreds.a,
-      "$jsono$set" := c.jsono.shreds."$jsono$set",
-      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0",
-      b := c.jsono.shreds.b
-    )
-  )) AS r
-  FROM v
-)
-SELECT to_json(r)::VARCHAR LIKE '%"$jsono$set":%', r ->> '$.a' FROM reord;
-----
-true	NULL
-
-# The spill bitmap out of position (swapped with the marker) is rejected the same way.
-query I
-WITH v AS (SELECT jsono({'a':'x','b':'y'}) AS c),
-reord AS (
-  SELECT struct_pack(jsono := struct_pack(
-    body := c.jsono.body,
-    shreds := struct_pack(
-      "$jsono$spill$0" := c.jsono.shreds."$jsono$spill$0",
-      "$jsono$set" := c.jsono.shreds."$jsono$set",
-      a := c.jsono.shreds.a,
-      b := c.jsono.shreds.b
+    "body$1" := c.jsono."body$1",
+    "shreds$1" := struct_pack(
+      a := c.jsono."shreds$1".a,
+      "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0",
+      b := c.jsono."shreds$1".b
     )
   )) AS r
   FROM v
 )
 SELECT r ->> '$.a' FROM reord;
 ----
-NULL
+structure is not a readable layout
+
+# The spill bitmap out of position (swapped with the marker) is rejected the same way.
+statement error
+WITH v AS (SELECT jsono({'a':'x','b':'y'}) AS c),
+reord AS (
+  SELECT struct_pack(jsono := struct_pack(
+    "body$1" := c.jsono."body$1",
+    "shreds$1" := struct_pack(
+      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0",
+      "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
+      a := c.jsono."shreds$1".a,
+      b := c.jsono."shreds$1".b
+    )
+  )) AS r
+  FROM v
+)
+SELECT r ->> '$.a' FROM reord;
+----
+structure is not a readable layout

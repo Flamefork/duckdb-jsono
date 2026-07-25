@@ -156,7 +156,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
         )
 
         self.assertIn(
-            "SELECT CAST(payload AS STRUCT(jsono STRUCT(body STRUCT(",
+            'SELECT CAST(payload AS STRUCT(jsono STRUCT("body$1" STRUCT(',
             query.timed_sql,
         )
         self.assertNotIn("jsono(payload)", query.timed_sql)

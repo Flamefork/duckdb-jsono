@@ -22,8 +22,8 @@ SELECT to_json(jsono('{"s":"hello","empty":"","i":7,"neg":-42,"big":576460752303
 # directly: 4 entries x 4 bytes, and 5 nums entries x 8 bytes (i, neg, big, u, d).
 query II
 SELECT
-  octet_length(j."jsono".body.lengths) / 4,
-  octet_length(j."jsono".body.nums) / 8
+  octet_length(j."jsono"."body$1".lengths) / 4,
+  octet_length(j."jsono"."body$1".nums) / 8
 FROM (SELECT jsono('{"s":"hi","empty":"","i":7,"neg":-42,"big":576460752303423488,"u":18446744073709551615,"d":2.5,"bn":123456789012345678901234567890,"e":1.5e-3,"t":true,"n":null}') AS j);
 ----
 4	5
@@ -32,9 +32,9 @@ FROM (SELECT jsono('{"s":"hi","empty":"","i":7,"neg":-42,"big":57646075230342348
 # the bare 12-byte metadata header. A non-empty array stores one (12 + 4 id + 24 span).
 query III
 SELECT
-  octet_length(jsono('{"a":1,"b":"x"}')."jsono".body.skips),
-  octet_length(jsono('[]')."jsono".body.skips),
-  octet_length(jsono('[1,2]')."jsono".body.skips);
+  octet_length(jsono('{"a":1,"b":"x"}')."jsono"."body$1".skips),
+  octet_length(jsono('[]')."jsono"."body$1".skips),
+  octet_length(jsono('[1,2]')."jsono"."body$1".skips);
 ----
 12	12	40
 
@@ -42,8 +42,8 @@ SELECT
 # is a bounded subtree walk. A nested non-empty array stores its own span.
 query II
 SELECT
-  octet_length(jsono('{"a":1,"o":{"x":1}}')."jsono".body.skips),
-  octet_length(jsono('{"a":1,"l":[1,2]}')."jsono".body.skips);
+  octet_length(jsono('{"a":1,"o":{"x":1}}')."jsono"."body$1".skips),
+  octet_length(jsono('{"a":1,"l":[1,2]}')."jsono"."body$1".skips);
 ----
 12	40
 
@@ -51,7 +51,7 @@ SELECT
 # navigation would otherwise replay the whole subtree on every row.
 query II
 SELECT
-  octet_length(jsono('{"root":{"a":1,"l":[1,2,3,4,5,6,7,8,9,10]},"z":1}')."jsono".body.skips),
+  octet_length(jsono('{"root":{"a":1,"l":[1,2,3,4,5,6,7,8,9,10]},"z":1}')."jsono"."body$1".skips),
   jsono_validate(jsono('{"root":{"a":1,"l":[1,2,3,4,5,6,7,8,9,10]},"z":1}'));
 ----
 96	true

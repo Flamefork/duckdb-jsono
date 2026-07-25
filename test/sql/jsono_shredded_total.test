@@ -248,13 +248,13 @@ SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)) FROM merge
 statement ok
 CREATE TABLE bad_spill AS
 SELECT struct_pack(jsono := struct_pack(
-  body := jsono('{"a":"oops"}')."jsono".body,
-  shreds := struct_pack(
-    "$jsono$set" := jsono('{"a":"oops"}', shredding := {'a':'BIGINT'}).jsono.shreds."$jsono$set",
+  "body$1" := jsono('{"a":"oops"}')."jsono"."body$1",
+  "shreds$1" := struct_pack(
+    "$jsono$set" := jsono('{"a":"oops"}', shredding := {'a':'BIGINT'}).jsono."shreds$1"."$jsono$set",
     "$jsono$spill$0" := 32::BIGINT,
     a := NULL::BIGINT
   )
-))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT))) AS j;
+))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT))) AS j;
 
 query I
 SELECT j ->> '$.a' FROM bad_spill;

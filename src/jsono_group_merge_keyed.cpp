@@ -1994,6 +1994,7 @@ unique_ptr<FunctionData> JsonoGroupMergeLWWBind(ClientContext &context, Aggregat
 	} else if (type.id() == LogicalTypeId::SQLNULL || IsJsonoType(type)) {
 		function.arguments[0] = JsonoType();
 	} else {
+		JsonoRejectForeignLayout(type, function.name);
 		throw BinderException("%s value argument must be JSONO", function.name);
 	}
 	// arguments[1] (order key) stays its own type (function.arguments[1] is ANY → no cast) so

@@ -1,0 +1,197 @@
+# name: test/sql/jsono_layout_revision.test
+# description: A foreign layout revision is refused loudly on every reading path; transport still works
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+# Closed-revision fixtures. A legacy value is assembled with a struct literal over a REAL current
+# body, so no old build and no committed binary is needed: the fixture is text, diffs and reviews
+# like code. When a compat reader for a revision lands, these same fixtures flip from asserting the
+# refusal to asserting the value they decode to.
+
+statement ok
+CREATE TABLE src AS SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}) AS v;
+
+# Revision 0, shredded: unrevisioned field names, and the pre-plan-054 lane shape
+# (STRUCT(value, complete) pairs, no spill bitmap).
+statement ok
+CREATE TABLE rev0_shredded AS
+SELECT {'jsono': {'body': v.jsono."body$1",
+                  'shreds': {'$jsono$set': v.jsono."shreds$1"."$jsono$set",
+                             'a': {'value': v.jsono."shreds$1".a, 'complete': true}}}} AS v
+FROM src;
+
+# Revision 0, plain: the body layout of that era happens to match this build's, which is exactly the
+# trap — without a revision in the name nothing distinguishes it, and every reader would happily read
+# a body whose encoding contract it does not actually know.
+statement ok
+CREATE TABLE rev0_plain AS SELECT {'jsono': {'body': v.jsono."body$1"}} AS v FROM src;
+
+# The intermediate plan-054 shapes: bare lanes with a single unordinal spill column, then an ordinal
+# family with a different spelling. Both were written by real builds between ada4d30 and cc7d8cb.
+statement ok
+CREATE TABLE rev0_bare_spill AS
+SELECT {'jsono': {'body': v.jsono."body$1",
+                  'shreds': {'$jsono$set': v.jsono."shreds$1"."$jsono$set",
+                             '$jsono$spill': v.jsono."shreds$1"."$jsono$spill$0",
+                             'a': v.jsono."shreds$1".a}}} AS v
+FROM src;
+
+# A future revision: the same anchor, a revision this build does not know.
+statement ok
+CREATE TABLE rev99 AS
+SELECT {'jsono': {'body$1': v.jsono."body$1",
+                  'shreds$99': {'$jsono$set': v.jsono."shreds$1"."$jsono$set",
+                                '$jsono$spill$0': v.jsono."shreds$1"."$jsono$spill$0",
+                                'a': v.jsono."shreds$1".a}}} AS v
+FROM src;
+
+# --- Every reading path refuses, ours and core json's alike. Before this, the core-json paths
+# returned NULL or serialized the raw blob struct: silent data loss. ---
+
+statement error
+SELECT jsono_validate(v) FROM rev0_shredded;
+----
+layout revision body=0 shreds=0
+
+statement error
+SELECT v ->> 'a' FROM rev0_shredded;
+----
+layout revision body=0 shreds=0
+
+statement error
+SELECT to_json(v) FROM rev0_shredded;
+----
+layout revision body=0 shreds=0
+
+statement error
+SELECT v::JSON FROM rev0_shredded;
+----
+layout revision body=0 shreds=0
+
+statement error
+SELECT json_extract_string(v, 'a') FROM rev0_shredded;
+----
+layout revision body=0 shreds=0
+
+# The constructor must not treat a foreign JSONO value as an ordinary struct to wrap into a document.
+statement error
+SELECT jsono(v) FROM rev0_shredded;
+----
+layout revision body=0 shreds=0
+
+statement error
+SELECT jsono_transform(v, {'a': 'BIGINT'}) FROM rev0_shredded;
+----
+layout revision body=0 shreds=0
+
+statement error
+SELECT jsono_group_merge(v) FROM rev0_shredded;
+----
+layout revision body=0 shreds=0
+
+# Plain revision 0 is refused for the same reason, and the message names only the body revision
+# because that value carries no shreds at all.
+statement error
+SELECT v ->> 'a' FROM rev0_plain;
+----
+layout revision body=0,
+
+statement error
+SELECT jsono_validate(v) FROM rev0_plain;
+----
+this build reads body=1 shreds=1
+
+statement error
+SELECT v ->> 'a' FROM rev0_bare_spill;
+----
+layout revision body=0 shreds=0
+
+statement error
+SELECT v ->> 'a' FROM rev99;
+----
+layout revision body=1 shreds=99
+
+# --- Split revisions: a value whose residual is current and whose shreds are foreign is refused,
+# while a current plain value beside it keeps reading. This is the point of versioning `body$N` and
+# `shreds$M` separately — a shred-layout change must not invalidate the plain data. ---
+
+query I
+SELECT jsono('{"a":1}') ->> 'a';
+----
+1
+
+query I
+SELECT to_json(jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}));
+----
+{"a":1,"b":"x"}
+
+# --- Transport lives: a bare column reference is not a read, so the data can always be inspected
+# and moved out. Only interpretation is refused. ---
+
+query I
+SELECT count(*) FROM (SELECT * FROM rev0_shredded);
+----
+1
+
+statement ok
+COPY rev0_shredded TO '__TEST_DIR__/rev0_shredded.parquet';
+
+statement ok
+CREATE TABLE rev0_copy AS SELECT * FROM rev0_shredded;
+
+# …and the refusal survives the Parquet round-trip, where a stored old file is the real scenario.
+statement error
+SELECT v ->> 'a' FROM '__TEST_DIR__/rev0_shredded.parquet';
+----
+layout revision body=0 shreds=0
+
+# --- Mixed revisions in one scan are refused, not silently emptied. union_by_name merges the branch
+# types before the extension sees anything, so the merged type is no revision at all; previously this
+# returned NULL for every row INCLUDING the current-revision file's. A compat reader cannot fix this
+# either (there is no single revision to upgrade from) — read the files separately and UNION ALL the
+# upgraded values. ---
+
+statement ok
+COPY src TO '__TEST_DIR__/current.parquet';
+
+statement error
+SELECT v ->> 'a' FROM read_parquet(['__TEST_DIR__/rev0_shredded.parquet', '__TEST_DIR__/current.parquet'], union_by_name := true);
+----
+JSONO
+
+# --- The anchor is narrow: a struct that merely has a field named `jsono` is still someone else's
+# data and stays silent (NotJsono), not refused. ---
+
+statement error
+SELECT jsono_validate({'jsono': {'a': 1}});
+----
+argument must be JSONO
+
+statement error
+SELECT jsono_validate({'jsono': 42});
+----
+argument must be JSONO
+
+query I
+SELECT to_json({'jsono': {'a': 1}});
+----
+{"jsono":{"a":1}}
+
+# A near-miss body (five blobs) under the anchor IS refused: the anchor claims JSONO, so an
+# unreadable structure is a broken layout rather than a user struct.
+statement error
+SELECT jsono_validate({'jsono': {'body$1': {'slots': ''::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB}}});
+----
+structure is not a readable layout
+
+# A revision name must be canonical: `body$01` is not a revision spelling, so it is not the anchor
+# and the value stays someone else's struct.
+statement error
+SELECT jsono_validate({'jsono': {'body$01': {'slots': ''::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}});
+----
+argument must be JSONO

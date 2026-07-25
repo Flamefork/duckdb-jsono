@@ -64,7 +64,7 @@ SELECT jsono_suggest_shredding(jsono(d)) FROM (VALUES
 statement ok
 CREATE TABLE double_docs AS
 SELECT CAST(jsono({'v': v}) AS
-  STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+  STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 ) AS j
 FROM (VALUES (1.5::DOUBLE), (2.5::DOUBLE), (3.5::DOUBLE)) AS t(v);
 

@@ -25,15 +25,21 @@ Two non-obvious rules govern how the `jsono` storage type is spelled in tests:
 
 1. `jsono_storage_type()` returns a `VARCHAR`, so it cannot follow `::` (you
    cannot write `x::jsono_storage_type()`). When you need the raw 6-blob layout
-   as a cast *target*, spell it out as the `::STRUCT(jsono STRUCT(body
+   as a cast *target*, spell it out as the `::STRUCT(jsono STRUCT("body$1"
    STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB,
-   nums BLOB)))` literal.
-2. The storage-path anchor checks (`jsono_storage_type.test`,
-   `jsono_roundtrip.test`, `jsono_parquet.test`) spell that literal raw *on
-   purpose* — they are the anchor that pins the physical layout, so rewriting
-   them to `= jsono_storage_type()` would make the assertion circular (the
-   function reading from the same source it is meant to verify). Everywhere else
-   prefer `typeof(x) = jsono_storage_type(spec)`.
+   nums BLOB)))` literal (`$1` is the layout revision — see
+   `docs/jsono_format.md` → Layout revisions).
+2. The storage-path anchor checks (`jsono_layout_golden.test`,
+   `jsono_storage_type.test`, `jsono_roundtrip.test`, `jsono_parquet.test`)
+   spell that literal raw *on purpose* — they are the anchor that pins the
+   physical layout, so rewriting them to `= jsono_storage_type()` would make the
+   assertion circular (the function reading from the same source it is meant to
+   verify). Everywhere else prefer `typeof(x) = jsono_storage_type(spec)`.
+3. `jsono_layout_golden.test` additionally pins the body BYTES, which is the
+   only tripwire for a semantic layout change the type cannot show (spill bit
+   numbering, marker value). When it goes red on purpose, follow the
+   revision-close checklist in `docs/jsono_format.md` → Layout revisions;
+   `jsono_layout_revision.test` is where the closed revision's fixture lands.
 
 ## Python guards (non-SQLLogic)
 

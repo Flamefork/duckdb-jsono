@@ -75,10 +75,51 @@ void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, 
 	});
 }
 
+// The permanent anchor: the layout field name never carries a revision, so a value written under
+// any revision stays recognizable as JSONO rather than decaying into an anonymous struct.
 constexpr const char *JSONO_LAYOUT = "jsono";
-// Name of the nested STRUCT holding the shred set: it sits beside `body` inside the layout struct.
-// Shredded-ness is exactly the presence of this field.
-constexpr const char *JSONO_SHREDS = "shreds";
+// Name stems of the two revisioned layout fields. The residual holds the binary body; the nested
+// `shreds` STRUCT beside it holds the shred set, and shredded-ness is exactly its presence.
+constexpr const char *JSONO_BODY_STEM = "body";
+constexpr const char *JSONO_SHREDS_STEM = "shreds";
+
+string RevisionedName(const char *stem, idx_t revision) {
+	return string(stem) + "$" + std::to_string(revision);
+}
+
+// Read a revisioned layout field name: "<stem>$<digits>" yields its revision, a bare "<stem>"
+// yields revision 0 (every value written before layout revisions existed). Digits are canonical —
+// no leading zeros, no sign, no overflow — so exactly one spelling names a revision and a
+// near-miss name is not a layout field at all.
+bool TryReadRevisionedName(const string &name, const char *stem, idx_t &revision) {
+	auto stem_size = strlen(stem);
+	if (name.compare(0, stem_size, stem) != 0) {
+		return false;
+	}
+	if (name.size() == stem_size) {
+		revision = 0;
+		return true;
+	}
+	if (name[stem_size] != '$') {
+		return false;
+	}
+	auto digits = name.substr(stem_size + 1);
+	if (digits.empty() || (digits.size() > 1 && digits[0] == '0')) {
+		return false;
+	}
+	idx_t parsed = 0;
+	for (auto c : digits) {
+		if (c < '0' || c > '9') {
+			return false;
+		}
+		if (parsed > (NumericLimits<idx_t>::Maximum() - idx_t(c - '0')) / 10) {
+			return false;
+		}
+		parsed = parsed * 10 + idx_t(c - '0');
+	}
+	revision = parsed;
+	return true;
+}
 // Reserved name of the shred-set marker, the first field inside `shreds`. It is a BIGINT hash of the
 // shred set (paths + types) — schema identity across files, and the mandatory shared member that lets
 // a by-name struct cast bind between any two shred sets (even disjoint ones). The `$jsono$` prefix
@@ -111,42 +152,53 @@ bool UnwrapShredFieldType(const LogicalType &type, LogicalType &value_type) {
 	return false;
 }
 
-// Parse one layout field (top-level child name + its STRUCT type) into `out`. The body must be the
-// six-BLOB body struct as field 0; a shredded layout adds a `shreds` STRUCT sibling holding the
-// shred-set marker plus one field per shred. The single layout name (`jsono` for plain and shredded)
-// is deliberate: DuckDB reconciles set-operation branch types by field name (CombineStructTypes), so
-// differently-shredded branches merge into one shredded type whose `shreds` is the union of the
-// branches' shreds, and the marker stays the left branch's `shreds` field 0. The nested `shreds`
-// struct keeps the marker contiguous with the shreds (a flat sibling layout interleaved it among
-// the shreds under set-ops), and the marker is the mandatory shared member that lets a by-name cast
-// bind between ANY two shred sets — including fully disjoint ones.
-bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type, JsonoLayoutType &out) {
+// Classify one layout field (top-level child name + its STRUCT type) into `out`. The anchor is the
+// field name `jsono` plus a field 0 named `body` or `body$<digits>`; it is narrow enough that no
+// user struct hits it by accident and permanent, so a value of ANY revision is classified Foreign
+// rather than silently passed over. Past the anchor the current grammar is: the six-BLOB body
+// struct at `body$1`, optionally a `shreds$1` STRUCT sibling holding the shred-set marker, the
+// spill bitmap columns and one field per shred. The single, unrevisioned layout name (`jsono` for
+// plain and shredded) is deliberate: DuckDB reconciles set-operation branch types by field name
+// (CombineStructTypes), so differently-shredded branches merge into one shredded type whose
+// `shreds` is the union of the branches' shreds, and the marker stays the left branch's `shreds`
+// field 0. The nested `shreds` struct keeps the marker contiguous with the shreds (a flat sibling
+// layout interleaved it among the shreds under set-ops), and the marker is the mandatory shared
+// member that lets a by-name cast bind between ANY two shred sets — including fully disjoint ones.
+JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &layout_type, JsonoLayoutType &out) {
 	if (name != JSONO_LAYOUT) {
-		return false;
+		return JsonoLayoutMatch::NotJsono;
 	}
 	if (layout_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(layout_type)) {
-		return false;
+		return JsonoLayoutMatch::NotJsono;
 	}
 	auto &fields = StructType::GetChildTypes(layout_type);
-	if (fields.empty() || fields[0].first != "body" || fields[0].second != JsonoBodyStructType()) {
-		return false;
+	if (fields.empty() || !TryReadRevisionedName(fields[0].first, JSONO_BODY_STEM, out.body_revision)) {
+		return JsonoLayoutMatch::NotJsono;
+	}
+	// The anchor holds from here on, so every remaining mismatch is a foreign layout — never silence.
+	out.layout_name = name;
+	out.layout_type = layout_type;
+	if (fields.size() == 2) {
+		// Read the shreds revision before deciding on the body one, so a refusal can name both
+		// revisions of a value that is foreign in the residual and the shreds at once.
+		TryReadRevisionedName(fields[1].first, JSONO_SHREDS_STEM, out.shreds_revision);
+	}
+	if (out.body_revision != JSONO_BODY_REVISION || fields[0].second != JsonoBodyStructType()) {
+		return JsonoLayoutMatch::Foreign;
 	}
 	if (fields.size() == 1) {
 		out.kind = JsonoLayoutKind::Plain;
-		out.layout_name = name;
-		out.layout_type = layout_type;
 		out.shreds.clear();
-		return true;
+		return JsonoLayoutMatch::Current;
 	}
-	// Shredded: exactly `body` plus a `shreds` STRUCT. The set-op merge keeps the layout struct at
-	// these two by-name fields, so a third sibling means this is not a JSONO struct (a user struct
-	// that merely carries a body-shaped field stays theirs).
-	if (fields.size() != 2 || fields[1].first != JSONO_SHREDS) {
-		return false;
+	// Shredded: exactly the residual plus a `shreds` STRUCT. The set-op merge keeps the layout struct
+	// at these two by-name fields, so a third sibling is a broken layout, not a user struct.
+	if (fields.size() != 2 || out.shreds_revision != JSONO_SHREDS_REVISION) {
+		return JsonoLayoutMatch::Foreign;
 	}
 	auto &shreds_type = fields[1].second;
 	if (shreds_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(shreds_type)) {
-		return false;
+		return JsonoLayoutMatch::Foreign;
 	}
 	// Inside `shreds`: the marker is field 0 and the spill bitmap columns fields 1..k (any integer
 	// width — a value round-tripped through a generic value->SQL->value path, e.g. DuckLake
@@ -161,18 +213,18 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 	// (bare scalar or LIST).
 	auto &shred_fields = StructType::GetChildTypes(shreds_type);
 	if (shred_fields.size() < 2 || shred_fields[0].first != JSONO_SHRED_SET || !shred_fields[0].second.IsIntegral()) {
-		return false;
+		return JsonoLayoutMatch::Foreign;
 	}
 	idx_t spill_columns = 0;
 	while (1 + spill_columns < shred_fields.size() &&
 	       shred_fields[1 + spill_columns].first == SpillColumnName(spill_columns)) {
 		if (!shred_fields[1 + spill_columns].second.IsIntegral()) {
-			return false;
+			return JsonoLayoutMatch::Foreign;
 		}
 		spill_columns++;
 	}
 	if (spill_columns == 0) {
-		return false;
+		return JsonoLayoutMatch::Foreign;
 	}
 	child_list_t<LogicalType> shreds;
 	for (idx_t i = 1 + spill_columns; i < shred_fields.size(); i++) {
@@ -181,42 +233,78 @@ bool TryParseJsonoLayoutField(const string &name, const LogicalType &layout_type
 		// it. A reserved-prefix name cannot be one either. Rejecting them here keeps such a raw-cast /
 		// stored struct from being recognized as JSONO.
 		if (HasJsonoReservedPrefix(shred_fields[i].first) || !ShredNameIsObjectKeyPath(shred_fields[i].first)) {
-			return false;
+			return JsonoLayoutMatch::Foreign;
 		}
 		LogicalType value_type;
 		if (!UnwrapShredFieldType(shred_fields[i].second, value_type)) {
-			return false;
+			return JsonoLayoutMatch::Foreign;
 		}
 		shreds.emplace_back(shred_fields[i].first, value_type);
 	}
 	if (shreds.empty()) {
-		return false; // the reserved fields alone are not a valid shredded value
+		return JsonoLayoutMatch::Foreign; // the reserved fields alone are not a valid shredded value
 	}
 	// A set-op merged type can carry FEWER spill columns than the crossing union's shred count
 	// needs (see JsonoSpillColumnCount) — readable, never provable past its columns — but never
 	// more: no writer over-provisions, so extra columns mean a hand-built struct.
 	if (spill_columns > JsonoSpillColumnCount(shreds.size())) {
-		return false;
+		return JsonoLayoutMatch::Foreign;
 	}
 	out.kind = JsonoLayoutKind::Shredded;
-	out.layout_name = name;
-	out.layout_type = layout_type;
 	out.shreds = std::move(shreds);
 	out.spill_columns = spill_columns;
-	return true;
+	return JsonoLayoutMatch::Current;
 }
 
 } // namespace
 
-bool TryParseJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out) {
+JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out) {
 	if (type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(type)) {
-		return false;
+		return JsonoLayoutMatch::NotJsono;
 	}
 	auto &children = StructType::GetChildTypes(type);
 	if (children.size() != 1) {
-		return false; // an ordinary value has exactly one layout field
+		return JsonoLayoutMatch::NotJsono; // an ordinary value has exactly one layout field
 	}
-	return TryParseJsonoLayoutField(children[0].first, children[0].second, out);
+	return MatchJsonoLayoutField(children[0].first, children[0].second, out);
+}
+
+void JsonoRejectForeignLayout(const LogicalType &type, const string &context) {
+	JsonoLayoutType layout;
+	if (MatchJsonoLayoutType(type, layout) != JsonoLayoutMatch::Foreign) {
+		return;
+	}
+	// Two different failures wear the same anchor, and they need different advice. A value whose
+	// revisions ARE this build's got here through a broken structure — a hand-built or reordered
+	// struct, an unreadable lane type — and no rewrite of the data will help.
+	bool current_revisions =
+	    layout.body_revision == JSONO_BODY_REVISION &&
+	    (layout.shreds_revision == DConstants::INVALID_INDEX || layout.shreds_revision == JSONO_SHREDS_REVISION);
+	if (current_revisions) {
+		throw InvalidInputException("%s: value carries the JSONO layout anchor at revision body=%llu shreds=%llu but "
+		                            "its structure is not a readable layout (reserved fields out of order, an "
+		                            "unsupported lane type, or a hand-built struct). Type: %s",
+		                            context, (unsigned long long)JSONO_BODY_REVISION,
+		                            (unsigned long long)JSONO_SHREDS_REVISION, type.ToString());
+	}
+	// The revisions are named machine-readably on purpose: they are the key a compat reader would
+	// dispatch on, and the only thing that tells a user which build wrote the data.
+	string read = layout.body_revision == DConstants::INVALID_INDEX
+	                  ? "body=?"
+	                  : StringUtil::Format("body=%llu", (unsigned long long)layout.body_revision);
+	if (layout.shreds_revision != DConstants::INVALID_INDEX) {
+		read += StringUtil::Format(" shreds=%llu", (unsigned long long)layout.shreds_revision);
+	}
+	throw InvalidInputException(
+	    "%s: JSONO value carries layout revision %s, this build reads body=%llu shreds=%llu. Reading it would "
+	    "silently lose data, so it is refused; rewrite the value with jsono(...) (a build that reads the old "
+	    "revision can export it to JSON first) or drop the data. Type: %s",
+	    context, read, (unsigned long long)JSONO_BODY_REVISION, (unsigned long long)JSONO_SHREDS_REVISION,
+	    type.ToString());
+}
+
+bool TryParseJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out) {
+	return MatchJsonoLayoutType(type, out) == JsonoLayoutMatch::Current;
 }
 
 bool IsJsonoType(const LogicalType &type) {
@@ -249,6 +337,7 @@ LogicalType JsonoResolveJsonoArgument(ClientContext &context, const Expression &
 		throw ParameterNotResolvedException();
 	}
 	auto &type = arg.return_type;
+	JsonoRejectForeignLayout(type, function_name);
 	JsonoRequireExtensionOptimizerForShredded(context, type, function_name);
 	if (IsShreddedJsonoType(type)) {
 		return reconstruct_shredded ? JsonoType() : type;
@@ -274,8 +363,12 @@ string JsonoLayoutName() {
 	return JSONO_LAYOUT;
 }
 
+string JsonoBodyName() {
+	return RevisionedName(JSONO_BODY_STEM, JSONO_BODY_REVISION);
+}
+
 string JsonoShredsName() {
-	return JSONO_SHREDS;
+	return RevisionedName(JSONO_SHREDS_STEM, JSONO_SHREDS_REVISION);
 }
 
 string JsonoShredSetName() {
@@ -287,8 +380,8 @@ string JsonoShredSpillName(idx_t column) {
 }
 
 void JsonoValidateShredFieldName(const string &name) {
-	if (name == "body") {
-		// `body` is the residual field beside the `shreds` struct in the layout. A bare 'body' shred name
+	if (name == JSONO_BODY_STEM) {
+		// The residual field beside the `shreds` struct is named after this stem. A bare 'body' shred name
 		// is rejected for clarity and to keep the DDL path consistent with the constructor; the path form
 		// '$.body' is a different name and is fine.
 		throw BinderException("jsono shred: a shred cannot be named 'body' (the residual field); "
@@ -358,8 +451,8 @@ LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds) {
 		shred_children.push_back(shred);
 	}
 	child_list_t<LogicalType> layout_children;
-	layout_children.emplace_back("body", JsonoBodyStructType());
-	layout_children.emplace_back(JSONO_SHREDS, LogicalType::STRUCT(std::move(shred_children)));
+	layout_children.emplace_back(JsonoBodyName(), JsonoBodyStructType());
+	layout_children.emplace_back(JsonoShredsName(), LogicalType::STRUCT(std::move(shred_children)));
 	child_list_t<LogicalType> top;
 	top.emplace_back(JsonoLayoutName(), LogicalType::STRUCT(std::move(layout_children)));
 	return LogicalType::STRUCT(std::move(top));
@@ -367,7 +460,7 @@ LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds) {
 
 LogicalType JsonoRawStructType() {
 	child_list_t<LogicalType> layout_children;
-	layout_children.emplace_back("body", JsonoBodyStructType());
+	layout_children.emplace_back(JsonoBodyName(), JsonoBodyStructType());
 	child_list_t<LogicalType> top;
 	top.emplace_back(JsonoLayoutName(), LogicalType::STRUCT(std::move(layout_children)));
 	return LogicalType::STRUCT(std::move(top));

@@ -16,7 +16,7 @@ CREATE TABLE events AS
 query I
 SELECT typeof(j) FROM events LIMIT 1;
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 statement ok
 COPY events TO '__TEST_DIR__/events_jsono.parquet';
@@ -25,7 +25,7 @@ COPY events TO '__TEST_DIR__/events_jsono.parquet';
 query I
 SELECT typeof(j) FROM '__TEST_DIR__/events_jsono.parquet' LIMIT 1;
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 # jsono ops bind to the STRUCT structurally, so to_json works on the read-back value directly.
 query II
@@ -47,9 +47,9 @@ SELECT count(*) FROM '__TEST_DIR__/events_jsono.parquet';
 # bare STRUCT, so the BLOB children are read directly (the native-side cast is a no-op kept
 # for symmetry with the read side).
 query I
-WITH src AS (SELECT j."jsono".body AS native
+WITH src AS (SELECT j."jsono"."body$1" AS native
              FROM events WHERE rid = 42),
-     pq  AS (SELECT j."jsono".body AS roundtripped
+     pq  AS (SELECT j."jsono"."body$1" AS roundtripped
              FROM '__TEST_DIR__/events_jsono.parquet' WHERE rid = 42)
 SELECT
   src.native.key_heap = pq.roundtripped.key_heap

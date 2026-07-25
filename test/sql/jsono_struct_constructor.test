@@ -41,7 +41,7 @@ SELECT to_json(jsono({'b': NULL, 'a': 1, 'nested': {'x': NULL, 'y': 2}}));
 query II
 SELECT typeof(jsono({'a': 1})), to_json(jsono({'b': 2, 'a': 'x'}));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT)))	{"a":"x","b":2}
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT)))	{"a":"x","b":2}
 
 # Top-level NULL STRUCT becomes SQL NULL, matching jsono(NULL).
 query I
@@ -167,7 +167,7 @@ unnamed
 
 # The bare STRUCT -> jsono cast shares the constructor plan and the same guard.
 statement error
-SELECT row(1, 2)::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
+SELECT row(1, 2)::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
 ----
 unnamed
 
@@ -177,7 +177,7 @@ unnamed
 # passes through and still fails loud at the first reader. Corrupt storage is never laundered
 # into SQL NULL, TRY_CAST or not.
 statement error
-SELECT jsono_extract_string(TRY_CAST(struct_pack(jsono := struct_pack(body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))) AS STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))), '$.a');
+SELECT jsono_extract_string(TRY_CAST(struct_pack(jsono := struct_pack("body$1" := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))) AS STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))), '$.a');
 ----
 corrupt JSONO storage
 
@@ -187,10 +187,10 @@ corrupt JSONO storage
 statement error
 SELECT struct_pack(
         "jsono" := struct_pack(
-            body := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
-            shreds := struct_pack(
+            "body$1" := NULL::STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
+            "shreds$1" := struct_pack(
                 "$jsono$set" := NULL::BIGINT,
                 "$jsono$spill$0" := 0::BIGINT,
-                a := 'v')))::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
+                a := 'v')))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
 ----
 body is NULL

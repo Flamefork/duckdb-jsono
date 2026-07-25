@@ -10,7 +10,7 @@ require json
 statement ok
 CREATE MACRO jsono_residual(j) AS struct_pack(
     "jsono" := struct_pack(
-        body := struct_extract_at(struct_extract_at(j, 1), 1)));
+        "body$1" := struct_extract_at(struct_extract_at(j, 1), 1)));
 
 # ---------------------------------------------------------------------------
 # Core: a regular array of fixed-shape objects shreds into LIST<STRUCT>; both
@@ -25,7 +25,7 @@ SELECT to_json(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
 
 # The shred column is a real typed LIST<STRUCT>, queryable directly.
 query II
-SELECT (j."jsono"."shreds"."$.products")[1].name, (j."jsono"."shreds"."$.products")[2].id
+SELECT (j."jsono"."shreds$1"."$.products")[1].name, (j."jsono"."shreds$1"."$.products")[2].id
 FROM (SELECT jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}) AS j);
 ----
@@ -160,7 +160,7 @@ FROM orders ORDER BY id;
 # ---------------------------------------------------------------------------
 query I
 SELECT to_json(jsono('{"products":[{"id":1,"name":"a","sku":"x"}]}',
-                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})::STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+                     shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 {"products":[{"id":1,"name":"a","sku":"x"}]}
 
@@ -189,7 +189,7 @@ SELECT to_json(jsono({'kind': 'order', 'products': [{'id': 1::UBIGINT, 'name': '
 
 # The array shred column is the typed list, queryable directly (bare field name).
 query II
-SELECT (j."jsono"."shreds"."products")[1].name, (j."jsono"."shreds"."products")[2].id
+SELECT (j."jsono"."shreds$1"."products")[1].name, (j."jsono"."shreds$1"."products")[2].id
 FROM (SELECT jsono({'products': [{'id': 1::UBIGINT, 'name': 'a'}, {'id': 2::UBIGINT, 'name': 'b'}]}) AS j);
 ----
 a	2

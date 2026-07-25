@@ -9,7 +9,7 @@ require json
 require icu
 
 statement ok
-CREATE MACRO plain_jsono_promoted_list(v) AS CAST(v AS STRUCT(jsono STRUCT(body STRUCT(
+CREATE MACRO plain_jsono_promoted_list(v) AS CAST(v AS STRUCT(jsono STRUCT("body$1" STRUCT(
   slots BLOB,
   key_heap BLOB,
   string_heap BLOB,
@@ -43,7 +43,7 @@ WHERE jsono(v) IS NOT DISTINCT FROM
 query I
 SELECT typeof(jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02'])));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, moments VARCHAR[])))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, moments VARCHAR[])))
 
 # DefaultCast is deliberately independent of the session TimeZone: the lane and reconstructed
 # document both store the UTC representation.
@@ -51,7 +51,7 @@ statement ok
 SET TimeZone='Europe/Madrid';
 
 query II
-SELECT j.jsono.shreds."moments"[1], to_json(j)::VARCHAR
+SELECT j.jsono."shreds$1"."moments"[1], to_json(j)::VARCHAR
 FROM (SELECT jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02'])) AS j);
 ----
 2024-01-01 10:34:56+00	{"moments":["2024-01-01 10:34:56+00"]}
@@ -60,7 +60,7 @@ statement ok
 SET TimeZone='Asia/Tokyo';
 
 query II
-SELECT j.jsono.shreds."moments"[1], to_json(j)::VARCHAR
+SELECT j.jsono."shreds$1"."moments"[1], to_json(j)::VARCHAR
 FROM (SELECT jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02'])) AS j);
 ----
 2024-01-01 10:34:56+00	{"moments":["2024-01-01 10:34:56+00"]}

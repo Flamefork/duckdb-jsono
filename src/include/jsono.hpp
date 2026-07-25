@@ -62,7 +62,7 @@ class ClientContext;
 // JsonoRawStructType (kept as the name the function registrations read against).
 LogicalType JsonoType();
 
-// The physical plain JSONO STRUCT: STRUCT("jsono" STRUCT(body STRUCT(6 BLOB))). There is no
+// The physical plain JSONO STRUCT: STRUCT("jsono" STRUCT("body$1" STRUCT(6 BLOB))). There is no
 // logical-type alias on top (DuckLake/Parquet reject user-defined aliases, so jsono carries none);
 // this is the single source of truth for the plain layout. `jsono_storage_type()` exposes its DDL
 // string so writers can declare storage columns without hardcoding the fields.
@@ -72,8 +72,8 @@ LogicalType JsonoRawStructType();
 // string_heap BLOB, skips BLOB). The binary JSONO body lives here, identical for plain and shredded.
 LogicalType JsonoBodyStructType();
 
-// The physical STRUCT of a shredded JSONO value: STRUCT("jsono" STRUCT(body STRUCT(6 BLOB),
-// shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT [, "$jsono$spill$1" …], <shred fields>))).
+// The physical STRUCT of a shredded JSONO value: STRUCT("jsono" STRUCT("body$1" STRUCT(6 BLOB),
+// "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT [, "$jsono$spill$1" …], <shred fields>))).
 // One shred field per `shreds` entry — a scalar shred is its bare value type, an array shred is the
 // LIST as-is. This is the single source of truth for the shredded shape: the constructor and
 // `jsono_storage_type` both build it here, so a column declared from the same shreds is
@@ -82,11 +82,15 @@ LogicalType JsonoBodyStructType();
 // shreds in that same order (shreds are written by index, so field and value order must agree).
 LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds);
 
-// The top-level field name of every layout (plain and shredded): "jsono".
+// The top-level field name of every layout (plain and shredded): "jsono". The permanent anchor —
+// it never carries a revision, so a value of ANY revision stays recognizable as JSONO.
 string JsonoLayoutName();
 
-// The name of the nested STRUCT (sibling of `body`) that holds the shred set. Shredded-ness is
-// exactly the presence of this field.
+// The revisioned name of the residual field inside the layout struct: "body$1".
+string JsonoBodyName();
+
+// The revisioned name of the nested STRUCT (sibling of the residual) that holds the shred set:
+// "shreds$1". Shredded-ness is exactly the presence of this field.
 string JsonoShredsName();
 
 // The reserved name of the shred-set marker, the first field inside `shreds`. A BIGINT carrying the
@@ -168,22 +172,68 @@ vector<idx_t> JsonoSpillRanksOfNames(const vector<string> &names);
 // The classification of one JSONO layout field.
 enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 
-// A parsed JSONO layout field: its top-level name, the inner STRUCT(body[, shreds]) type, its
+// The layout revisions this build reads and writes. They are carried in the layout field NAMES
+// (`body$1`, `shreds$1`) because a name is the only thing that survives Parquet and DuckLake, and
+// they are split because they version independent things: `body$N` the residual's column layout
+// (the set, names and types of the body blobs), `shreds$M` the shred layout (the reserved fields
+// inside `shreds`, the lane shape, the spill bit numbering, the marker's meaning). Splitting them
+// keeps a shred-layout change from invalidating plain values, which are the bulk of stored data.
+// Neither versions the bytes INSIDE the blobs — that is jsono::VERSION.
+//
+// Bump `body$N` when a body blob column is added, removed, renamed or retyped. Bump `shreds$M`
+// when the reserved field set inside `shreds`, the lane shape, the canonical rank numbering, the
+// marker semantics or the spill bit encoding change — INCLUDING purely semantic changes the type
+// cannot show, which is the case golden-byte tests exist to catch. Neither is bumped by the user's
+// shred set or by the ⌈N/63⌉ spill column count: those are data under a fixed layout.
+//
+// Closing a revision is a three-step commit: bump the name here, move the current golden bytes into
+// a closed-revision fixture asserting the loud refusal, and write the closed revision's FULL layout
+// into docs/jsono_format.md → "Revision history" — a later compat reader has nothing else to be
+// written against.
+constexpr idx_t JSONO_BODY_REVISION = 1;
+constexpr idx_t JSONO_SHREDS_REVISION = 1;
+
+// A parsed JSONO layout field: its top-level name, the inner STRUCT(body$1[, shreds$1]) type, its
 // shred (path, LOGICAL-value-type) columns (empty for plain; a scalar shred's bare lane and an
 // array shred's list are recorded by their value type), and the number of spill bitmap columns.
 // The single grammar all predicates read against. The shred-set marker always sits at `shreds`
 // field 0 and the spill columns at fields 1..spill_columns; shred k is field 1 + spill_columns + k.
+// `body_revision` / `shreds_revision` are filled whenever the names parsed, current revision or
+// not (DConstants::INVALID_INDEX when the name was not revisioned at all), so the refusal can name
+// what it saw.
 struct JsonoLayoutType {
 	JsonoLayoutKind kind;
 	string layout_name;
 	LogicalType layout_type;
 	child_list_t<LogicalType> shreds;
 	idx_t spill_columns = 0;
+	idx_t body_revision = DConstants::INVALID_INDEX;
+	idx_t shreds_revision = DConstants::INVALID_INDEX;
 };
 
-// Parse `type` as an ordinary JSONO value: a top-level STRUCT with exactly one valid `jsono`
-// layout field (`body` only for plain, `body` + non-empty `shreds` for shredded).
-// The single classifier the thin predicates (IsJsonoType / IsShreddedJsonoType) delegate to.
+// How a type relates to the JSONO layout grammar. `Foreign` is the whole point of the anchor: a
+// value written by another layout revision (or a corrupt/hand-built one) stays recognizable AS
+// JSONO instead of decaying into "some struct", which is what let core json silently serialize it.
+enum class JsonoLayoutMatch : uint8_t { NotJsono, Current, Foreign };
+
+// Classify `type` against the layout grammar. NEVER throws — the refusal is a policy decision and
+// lives in exactly one place (JsonoRejectForeignLayout), which is the seam a future compat reader
+// grows into (it turns "throw" into "wrap the source in an upgrade"). The anchor is deliberately
+// narrow and permanent: a top-level STRUCT with exactly one field named `jsono` whose own field 0
+// is named `body` or `body$<digits>`. Everything else about the layout may change across revisions;
+// the anchor may not.
+JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out);
+
+// The single refusal point for a foreign layout. No-op unless `type` is JsonoLayoutMatch::Foreign;
+// otherwise throws an InvalidInputException naming both revisions read and expected. `context` is
+// the user-facing operation (a function name, "cast", …).
+void JsonoRejectForeignLayout(const LogicalType &type, const string &context);
+
+// Parse `type` as an ordinary JSONO value of the CURRENT revision: a top-level STRUCT with exactly
+// one valid `jsono` layout field (`body$1` only for plain, `body$1` + non-empty `shreds$1` for
+// shredded). The single classifier the thin predicates (IsJsonoType / IsShreddedJsonoType) delegate
+// to; a foreign layout answers false here, so callers that must reject it loudly go through
+// JsonoRejectForeignLayout first.
 bool TryParseJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out);
 
 // True when `type` is the plain JSONO STRUCT (a `jsono` layout field carrying only `body`). Strict:

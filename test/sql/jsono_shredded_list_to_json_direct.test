@@ -7,7 +7,7 @@ require jsono
 require json
 
 statement ok
-CREATE MACRO plain_jsono_list_render(v) AS CAST(v AS STRUCT(jsono STRUCT(body STRUCT(
+CREATE MACRO plain_jsono_list_render(v) AS CAST(v AS STRUCT(jsono STRUCT("body$1" STRUCT(
   slots BLOB,
   key_heap BLOB,
   string_heap BLOB,

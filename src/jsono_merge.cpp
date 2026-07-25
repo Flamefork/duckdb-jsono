@@ -123,6 +123,7 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 			bound_function.arguments.push_back(JsonoType());
 			continue;
 		}
+		JsonoRejectForeignLayout(type, "jsono_merge_patch()");
 		throw BinderException("jsono_merge_patch() arguments must be JSONO");
 	}
 	if (shreds.empty()) {

@@ -14,20 +14,20 @@ require json
 statement ok
 CREATE TABLE lockstep AS
 SELECT struct_pack("jsono" := struct_pack(
-           body := j."jsono".body,
-           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
-                                 "$jsono$spill$0" := j."jsono".shreds."$jsono$spill$0",
+           "body$1" := j."jsono"."body$1",
+           "shreds$1" := struct_pack("$jsono$set" := j."jsono"."shreds$1"."$jsono$set",
+                                 "$jsono$spill$0" := j."jsono"."shreds$1"."$jsono$spill$0",
                                  "$.a" := [1, 2]::BIGINT[]))) AS truncated,
        struct_pack("jsono" := struct_pack(
-           body := j."jsono".body,
-           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
-                                 "$jsono$spill$0" := j."jsono".shreds."$jsono$spill$0",
+           "body$1" := j."jsono"."body$1",
+           "shreds$1" := struct_pack("$jsono$set" := j."jsono"."shreds$1"."$jsono$set",
+                                 "$jsono$spill$0" := j."jsono"."shreds$1"."$jsono$spill$0",
                                  "$.a" := [1, 2, 3, 4]::BIGINT[]))) AS extended,
        struct_pack("jsono" := struct_pack(
-           body := j."jsono".body,
-           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
-                                 "$jsono$spill$0" := j."jsono".shreds."$jsono$spill$0",
-                                 "$.a" := j."jsono".shreds."$.a"))) AS intact
+           "body$1" := j."jsono"."body$1",
+           "shreds$1" := struct_pack("$jsono$set" := j."jsono"."shreds$1"."$jsono$set",
+                                 "$jsono$spill$0" := j."jsono"."shreds$1"."$jsono$spill$0",
+                                 "$.a" := j."jsono"."shreds$1"."$.a"))) AS intact
 FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := {'$.a':'BIGINT[]'}) AS j);
 
 # The readers fail loud on the mismatched rows (existing contract) and read the intact one.
@@ -57,15 +57,15 @@ false	false	true
 statement ok
 CREATE TABLE lockstep_obj AS
 SELECT struct_pack("jsono" := struct_pack(
-           body := j."jsono".body,
-           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
-                                 "$jsono$spill$0" := j."jsono".shreds."$jsono$spill$0",
+           "body$1" := j."jsono"."body$1",
+           "shreds$1" := struct_pack("$jsono$set" := j."jsono"."shreds$1"."$jsono$set",
+                                 "$jsono$spill$0" := j."jsono"."shreds$1"."$jsono$spill$0",
                                  "$.m.items" := [{'n': 1::BIGINT}]::STRUCT(n BIGINT)[]))) AS truncated,
        struct_pack("jsono" := struct_pack(
-           body := j."jsono".body,
-           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
-                                 "$jsono$spill$0" := j."jsono".shreds."$jsono$spill$0",
-                                 "$.m.items" := j."jsono".shreds."$.m.items"))) AS intact
+           "body$1" := j."jsono"."body$1",
+           "shreds$1" := struct_pack("$jsono$set" := j."jsono"."shreds$1"."$jsono$set",
+                                 "$jsono$spill$0" := j."jsono"."shreds$1"."$jsono$spill$0",
+                                 "$.m.items" := j."jsono"."shreds$1"."$.m.items"))) AS intact
 FROM (SELECT jsono('{"m":{"items":[{"n":1},{"n":2}]},"z":1}', shredding := {'$.m.items':'STRUCT(n BIGINT)[]'}) AS j);
 
 query II
@@ -77,9 +77,9 @@ false	true
 # value, exactly what readers use.
 query I
 SELECT jsono_validate(struct_pack("jsono" := struct_pack(
-           body := j."jsono".body,
-           shreds := struct_pack("$jsono$set" := j."jsono".shreds."$jsono$set",
-                                 "$jsono$spill$0" := j."jsono".shreds."$jsono$spill$0",
+           "body$1" := j."jsono"."body$1",
+           "shreds$1" := struct_pack("$jsono$set" := j."jsono"."shreds$1"."$jsono$set",
+                                 "$jsono$spill$0" := j."jsono"."shreds$1"."$jsono$spill$0",
                                  "$.a" := NULL::BIGINT[]))))
 FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := {'$.a':'BIGINT[]'}) AS j);
 ----

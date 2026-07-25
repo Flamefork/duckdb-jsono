@@ -17,13 +17,13 @@ WITH src AS (
 ),
 res AS (
     SELECT orig,
-           jsono_merge_patch(orig, jsono('{"did":null,"kind":null}'))."jsono".body AS body
+           jsono_merge_patch(orig, jsono('{"did":null,"kind":null}'))."jsono"."body$1" AS body
     FROM src
 )
 SELECT struct_pack(
     "jsono" := struct_pack(
-        body := res.body,
-        shreds := struct_pack(
+        "body$1" := res.body,
+        "shreds$1" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
             "$.commit.collection" := orig ->> '$.commit.collection',
@@ -37,7 +37,7 @@ FROM res;
 # reconstruct) shows the top-level hot paths really are gone from the body.
 query I
 SELECT to_json(struct_pack("jsono" := struct_pack(
-    body := j."jsono".body))) FROM stripped;
+    "body$1" := j."jsono"."body$1"))) FROM stripped;
 ----
 {"commit":{"collection":"c1","operation":"create"},"extra":"e1"}
 
@@ -85,8 +85,8 @@ statement ok
 CREATE TABLE ov_conflict AS
 SELECT struct_pack(
     "jsono" := struct_pack(
-        body := jsono('{"k":"RESIDUAL","c":"z"}')."jsono".body,
-        shreds := struct_pack(
+        "body$1" := jsono('{"k":"RESIDUAL","c":"z"}')."jsono"."body$1",
+        "shreds$1" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
             "$.k" := 'SHRED'))
@@ -129,8 +129,8 @@ statement ok
 CREATE TABLE ov_null AS
 SELECT struct_pack(
     "jsono" := struct_pack(
-        body := jsono('{"b":null,"c":"z"}')."jsono".body,
-        shreds := struct_pack(
+        "body$1" := jsono('{"b":null,"c":"z"}')."jsono"."body$1",
+        "shreds$1" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
             "$.a" := 'x',

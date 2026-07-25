@@ -1483,9 +1483,9 @@ void CollectAutoShreds(const LogicalType &struct_type, const JsonoStructPlan &st
 	for (idx_t field = 0; field < children.size(); field++) {
 		auto &child = children[field];
 		auto &child_plan = struct_plan.children[field];
-		// A top-level field named 'body' or the reserved shred-set marker would collide with a layout
-		// field name, so it stays in the residual instead of becoming a shred (auto-shred must not
-		// error on field names). Only depth-1 names collide: a nested `$.URL.body` lane is safe.
+		// A top-level field named 'body' or the reserved shred-set marker is a name the shred-name
+		// validation rejects, so it stays in the residual instead of becoming a shred (auto-shred must
+		// not error on field names). Only depth-1 names are affected: a nested `$.URL.body` lane is safe.
 		if (depth == 1 && (child.first == "body" || child.first == JsonoShredSetName())) {
 			continue;
 		}
@@ -1572,6 +1572,9 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
                                          vector<unique_ptr<Expression>> &arguments) {
 	(void)context;
 	auto &input_type = arguments[0]->return_type;
+	// A foreign-layout value is a JSONO value we cannot read, not an ordinary struct to wrap into a
+	// document — refuse it instead of building a document out of its blob columns.
+	JsonoRejectForeignLayout(input_type, "jsono()");
 	auto plan = BuildStructConstructorPlan(input_type, "jsono()");
 	idx_t next_key_cache_index = 0;
 	AssignStructConstructorKeyCacheIndexes(plan, next_key_cache_index);
@@ -2353,6 +2356,7 @@ bool JsonoShreddedReconstructCast(Vector &source, Vector &result, idx_t count, C
 BoundCastInfo JsonoStructCastBind(BindCastInput &input, const LogicalType &source, const LogicalType &target) {
 	(void)input;
 	(void)target;
+	JsonoRejectForeignLayout(source, "cast to JSONO");
 	if (IsShreddedJsonoType(source)) {
 		// A shredded value reaching a plain-JSONO context (cast or INSERT): reconstruct the
 		// full value so the shred data is preserved rather than dropped.

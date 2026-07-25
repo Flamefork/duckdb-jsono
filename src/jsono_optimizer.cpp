@@ -2411,7 +2411,7 @@ private:
 		FunctionBinder function_binder(context);
 		auto body_struct = StructExtractAt(StructExtractAt(column.Copy(), 1), 1);
 		auto body = soft ? StripManifestBody(*body_struct) : std::move(body_struct);
-		body->SetAlias("body");
+		body->SetAlias(JsonoBodyName());
 		vector<unique_ptr<Expression>> inner_children;
 		inner_children.push_back(std::move(body));
 		auto inner = function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(inner_children));
@@ -3093,7 +3093,52 @@ void RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &pl
 	}
 }
 
+// Name the operation that is about to consume a value, for the refusal message.
+string ForeignConsumerContext(const Expression &consumer) {
+	switch (consumer.GetExpressionClass()) {
+	case ExpressionClass::BOUND_FUNCTION:
+		return consumer.Cast<BoundFunctionExpression>().function.name;
+	case ExpressionClass::BOUND_AGGREGATE:
+		return consumer.Cast<BoundAggregateExpression>().function.name;
+	case ExpressionClass::BOUND_CAST:
+		return "cast to " + consumer.return_type.ToString();
+	default:
+		return ExpressionTypeToString(consumer.GetExpressionType());
+	}
+}
+
+// Refuse a foreign-layout value the moment an expression CONSUMES it. Our own binders already
+// refuse it (JsonoResolveJsonoArgument), but `->>`, `to_json`, `::JSON` and friends belong to core
+// json: they bind against any struct and would silently serialize the raw blob layout or return
+// NULL. This walk is the only place that sees them.
+//
+// It deliberately locates the foreign SOURCE (the child whose type is foreign) rather than the
+// consuming node: a future compat reader replaces the throw with "wrap the source in an upgrade
+// function", and everything downstream then sees a current-revision value. A bare column reference
+// is left alone, so `SELECT *` and `COPY … TO` keep working — transport lives, interpretation
+// fails. Under `disabled_optimizers=extension` this hook does not run and the core-json paths go
+// quiet again, the same trade JsonoRequireExtensionOptimizerForShredded already takes.
+void RejectForeignLayoutsInExpression(Expression &expr) {
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
+		JsonoRejectForeignLayout(child.return_type, ForeignConsumerContext(expr));
+		RejectForeignLayoutsInExpression(child);
+	});
+}
+
+void RejectForeignLayouts(LogicalOperator &op) {
+	LogicalOperatorVisitor::EnumerateExpressions(
+	    op, [](unique_ptr<Expression> *child) { RejectForeignLayoutsInExpression(**child); });
+	for (auto &child : op.children) {
+		RejectForeignLayouts(*child);
+	}
+}
+
 void JsonoOptimizerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	// Before any rewrite: a value of a foreign layout revision must never reach a reader, ours or
+	// core json's.
+	if (plan) {
+		RejectForeignLayouts(*plan);
+	}
 	// Run the built-in CTE inliner first: CTEs are planned materialized and the pipeline's own
 	// CTE_INLINING pass only runs after this hook, so without it every rewrite below sees CTE_SCAN
 	// boundaries instead of the real plan shapes (set-op branches, scans). Its decision inputs

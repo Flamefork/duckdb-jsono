@@ -198,6 +198,7 @@ unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFu
 	} else if (type.id() == LogicalTypeId::SQLNULL || IsJsonoType(type)) {
 		function.arguments[0] = JsonoType();
 	} else {
+		JsonoRejectForeignLayout(type, "jsono_group_merge()");
 		throw BinderException("jsono_group_merge() input must be JSONO");
 	}
 	return std::move(bind_data);

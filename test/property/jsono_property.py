@@ -211,7 +211,7 @@ def blob_hex_expr(body_expr: str) -> str:
 
 
 def jsono_blob_hex_expr(text: str) -> str:
-    body_expr = f'jsono({sql_literal(text)})."jsono".body'
+    body_expr = f'jsono({sql_literal(text)})."jsono"."body$1"'
     return blob_hex_expr(body_expr)
 
 
@@ -226,7 +226,7 @@ def jsono_struct_sql(blobs: BlobHex) -> str:
         f"'nums': unhex('{nums}')",
     ]
     body = "{" + ", ".join(body_fields) + "}"
-    return "{'jsono': {'body': " + body + "}}"
+    return "{'jsono': {'body$1': " + body + "}}"
 
 
 def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
@@ -332,7 +332,7 @@ def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
 
 
 def shredded_blob_hex_expr(text: str, spec_sql: str) -> str:
-    body_expr = f'jsono({sql_literal(text)}, shredding := {spec_sql})."jsono".body'
+    body_expr = f'jsono({sql_literal(text)}, shredding := {spec_sql})."jsono"."body$1"'
     return blob_hex_expr(body_expr)
 
 
@@ -646,7 +646,7 @@ def shred_spec_sql(spec: dict[str, str]) -> str:
     return "{" + ", ".join(f"'{path}': '{stype}'" for path, stype in spec.items()) + "}"
 
 
-PLAIN_JSONO_TYPE_SQL = "STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))"
+PLAIN_JSONO_TYPE_SQL = 'STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))'
 
 
 @settings(PROPERTY_SETTINGS)
@@ -1715,11 +1715,11 @@ LANE_MUTATIONS = [
 
 def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
     j = f"jsono({doc_sql}, shredding := {{'$.arr':'BIGINT[]', k:'BIGINT', '$.items':'STRUCT(n BIGINT)[]'}})"
-    marker = f'({j})."jsono".shreds."$jsono$set"'
-    spill = f'({j})."jsono".shreds."$jsono$spill$0"'
-    arr = f'({j})."jsono".shreds."$.arr"'
-    items = f'({j})."jsono".shreds."$.items"'
-    k_value = f'({j})."jsono".shreds."k"'
+    marker = f'({j})."jsono"."shreds$1"."$jsono$set"'
+    spill = f'({j})."jsono"."shreds$1"."$jsono$spill$0"'
+    arr = f'({j})."jsono"."shreds$1"."$.arr"'
+    items = f'({j})."jsono"."shreds$1"."$.items"'
+    k_value = f'({j})."jsono"."shreds$1"."k"'
     if mutation == "arr_truncate":
         arr = f"list_slice({arr}, 1, greatest(len({arr}) - 1, 0))"
     elif mutation == "arr_extend":
@@ -1745,8 +1745,8 @@ def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
     elif mutation == "marker_flip":
         marker = f"{marker} + 1"
     return (
-        f'struct_pack("jsono" := struct_pack(body := ({j})."jsono".body, '
-        f'shreds := struct_pack("$jsono$set" := {marker}, '
+        f'struct_pack("jsono" := struct_pack("body$1" := ({j})."jsono"."body$1", '
+        f'"shreds$1" := struct_pack("$jsono$set" := {marker}, '
         f'"$jsono$spill$0" := {spill}, '
         f'"$.arr" := {arr}, '
         f'"$.items" := {items}, '

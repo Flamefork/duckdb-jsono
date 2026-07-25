@@ -17,7 +17,7 @@ SELECT jsono_version();
 # undetectable downstream). The hand-built value uses the nested storage layout.
 statement error
 SELECT jsono_extract_string(
-  {'jsono': {'body': {'slots': '\x4A\x53\x4E\x4F\x05\x00\x00\x00'::BLOB,
+  {'jsono': {'body$1': {'slots': '\x4A\x53\x4E\x4F\x05\x00\x00\x00'::BLOB,
    'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}, '$.a');
 ----
 JSONO format version mismatch
@@ -26,7 +26,7 @@ JSONO format version mismatch
 # reads as SQL NULL. This is the only non-throwing case: the value is absent, not corrupt.
 query I
 SELECT jsono_extract_string(
-  {'jsono': {'body': {'slots': '\x4A\x53\x4E\x4F\x04\x00\x00\x00'::BLOB,
+  {'jsono': {'body$1': {'slots': '\x4A\x53\x4E\x4F\x04\x00\x00\x00'::BLOB,
    'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}, '$.a');
 ----
 NULL
@@ -36,7 +36,7 @@ NULL
 # a version drift. (Only a slots blob too short to hold a header reads as NULL: absent value.)
 statement error
 SELECT jsono_extract_string(
-  {'jsono': {'body': {'slots': '\xDE\xAD\xBE\xEF\x04\x00\x00\x00'::BLOB,
+  {'jsono': {'body$1': {'slots': '\xDE\xAD\xBE\xEF\x04\x00\x00\x00'::BLOB,
    'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}, '$.a');
 ----
 not a JSONO value
@@ -45,7 +45,7 @@ not a JSONO value
 # rather than erroring: non-JSONO bytes -> false, not a raised error.
 query I
 SELECT jsono_validate(
-  {'jsono': {'body': {'slots': '\xDE\xAD\xBE\xEF\x04\x00\x00\x00'::BLOB,
+  {'jsono': {'body$1': {'slots': '\xDE\xAD\xBE\xEF\x04\x00\x00\x00'::BLOB,
    'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}});
 ----
 false
@@ -54,7 +54,7 @@ false
 # so it reads as SQL NULL (the only non-throwing path).
 query I
 SELECT jsono_extract_string(
-  {'jsono': {'body': {'slots': '\x4A\x53'::BLOB,
+  {'jsono': {'body$1': {'slots': '\x4A\x53'::BLOB,
    'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}, '$.a');
 ----
 NULL
@@ -63,8 +63,8 @@ NULL
 # from the writer (it always emits the 12-byte header): it is corruption and must FAIL LOUD,
 # not silently read as "no spans / no manifest". Only a fully empty skips blob stays readable.
 statement error
-WITH src AS (SELECT jsono('{"a":1}').jsono.body AS b)
-SELECT jsono_extract_string({'jsono': {'body': {'slots': b.slots, 'key_heap': b.key_heap,
+WITH src AS (SELECT jsono('{"a":1}').jsono."body$1" AS b)
+SELECT jsono_extract_string({'jsono': {'body$1': {'slots': b.slots, 'key_heap': b.key_heap,
   'string_heap': b.string_heap, 'skips': '\x01'::BLOB, 'lengths': b.lengths, 'nums': b.nums}}}, '$.a')
 FROM src;
 ----
@@ -72,8 +72,8 @@ malformed JSONO
 
 # jsono_validate recovers false from the same corruption instead of erroring.
 query I
-WITH src AS (SELECT jsono('{"a":1}').jsono.body AS b)
-SELECT jsono_validate({'jsono': {'body': {'slots': b.slots, 'key_heap': b.key_heap,
+WITH src AS (SELECT jsono('{"a":1}').jsono."body$1" AS b)
+SELECT jsono_validate({'jsono': {'body$1': {'slots': b.slots, 'key_heap': b.key_heap,
   'string_heap': b.string_heap, 'skips': '\x01'::BLOB, 'lengths': b.lengths, 'nums': b.nums}}})
 FROM src;
 ----

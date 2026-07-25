@@ -54,7 +54,7 @@ true
 # An absent body row stays NULL even if other body blobs contain bytes that a present row would parse.
 query I
 SELECT jsono_shred_manifest(
-  {'jsono': {'body': {'slots': '\x4A\x53'::BLOB,
+  {'jsono': {'body$1': {'slots': '\x4A\x53'::BLOB,
    'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': '\x01'::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}
 ) IS NULL;
 ----

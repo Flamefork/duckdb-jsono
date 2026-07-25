@@ -3,12 +3,12 @@
 JSONO stores JSON as a sequence of 64-bit slots plus two byte heaps, two
 fixed-width payload streams, and a navigation block. There is no logical type
 alias; physically a JSONO value is a nested DuckDB STRUCT with exactly one
-layout field, `jsono`, wrapping the six-BLOB `body`:
+layout field, `jsono`, wrapping the six-BLOB residual `body$1`:
 
 ```
 STRUCT(
-  jsono STRUCT(
-    body STRUCT(
+  jsono STRUCT(                -- the anchor: never revisioned
+    "body$1" STRUCT(           -- residual column layout, revision 1
       slots       BLOB,   -- [Header 8 bytes][Slots n × 8 bytes]
       key_heap    BLOB,   -- key bytes, addressed by KEY slots
       string_heap BLOB,   -- string/number-text bytes, consumed by a cursor in walk order
@@ -35,16 +35,17 @@ handles far better.
 ## Shredded layout
 
 For fast columnar reads of hot paths, a JSONO value can be stored *shredded*:
-the `jsono` layout field carries the `body` plus a sibling `shreds` STRUCT — a
-reserved shred-set marker followed by one typed *shred* per chosen path
+the `jsono` layout field carries the residual `body$1` plus a sibling
+`shreds$1` STRUCT — a reserved shred-set marker followed by one typed *shred*
+per chosen path
 (produced by `jsono(value, shredding := spec)`).
 
 ```
 STRUCT(
   jsono STRUCT(
-    body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB,
-                lengths BLOB, nums BLOB),
-    shreds STRUCT(
+    "body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB,
+                    lengths BLOB, nums BLOB),
+    "shreds$1" STRUCT(         -- shred layout, revision 1
       "$jsono$set" BIGINT,       -- shred-set marker (see below)
       "$jsono$spill$0" BIGINT,   -- spill bitmap column(s): "$jsono$spill$1", … for sets past 63 shreds
       "<path1>" <type1>,         -- scalar shred: the bare typed lane
@@ -59,8 +60,8 @@ STRUCT(
 Shredding does **not** change the binary slot format. The six `body` blobs are
 an ordinary JSONO value — the *residual* — so everything else in this spec
 applies to them unchanged, including `version`. A plain (unshredded) value has
-**no** `shreds` field (`STRUCT(jsono STRUCT(body …))`); shredded-ness is exactly
-the presence of `shreds`. Each scalar *shred* is the value at its canonical path
+**no** `shreds` field (`STRUCT(jsono STRUCT("body$1" …))`); shredded-ness is
+exactly the presence of `shreds$1`. Each scalar *shred* is the value at its canonical path
 (`$.kind`, `$.commit.operation`, …) materialized as a plain typed DuckDB column
 (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`) with the path as the field
 name. Nested shred paths are allowed. No JSON key is reserved: a JSON key named
@@ -333,6 +334,86 @@ missing their values and the residual alone cannot reproduce them). The binary b
 format is unchanged — `VAL_NULL` is an existing slot tag and the manifest reuses the
 same framing — so no `version` bump is needed; the shred `LIST<TYPE>` is a
 DuckDB/Parquet column inside the `shreds` struct.
+
+## Layout revisions
+
+Three things are versioned independently, because they fail in different ways
+and invalidate different data:
+
+| What | Where the version lives | Current |
+|------|-------------------------|---------|
+| The bytes **inside** the body blobs | `version` byte in `slots` | 4 |
+| The residual's **column** layout (the set, names and types of the body blobs) | the field name `body$<N>` | 1 |
+| The **shred** layout (reserved fields inside `shreds`, lane shape, spill bit numbering, marker semantics) | the field name `shreds$<M>` | 1 |
+
+The layout field name `jsono` is the **anchor** and never carries a revision.
+Recognition is anchor-first: a top-level STRUCT with exactly one field named
+`jsono` whose own field 0 is named `body` or `body$<digits>` is a JSONO value of
+*some* revision. Past that point every mismatch — an unknown revision, an
+unreadable structure — is refused loudly (`JsonoRejectForeignLayout`), never
+silently treated as an ordinary struct. That silence was the actual failure mode
+before revisions existed: an older shredded value bound to core `json`'s
+`->>`/`to_json`, which returned `NULL` or serialized the raw blob struct.
+
+Splitting `body$N` from `shreds$M` is what keeps a shred-layout change from
+invalidating plain values, which are the bulk of stored data.
+
+**Bump `body$N`** when a body blob column is added, removed, renamed or
+retyped. **Bump `shreds$M`** when the reserved field set inside `shreds`, the
+lane shape, the canonical rank numbering, the marker semantics or the spill bit
+encoding change — including purely *semantic* changes the type cannot show.
+Neither is bumped by the user's shred set or by the ⌈N/63⌉ spill column count:
+those are data under a fixed layout.
+
+Closing a revision is one commit with three parts:
+
+1. bump the name (`JSONO_BODY_REVISION` / `JSONO_SHREDS_REVISION` in
+   `src/include/jsono.hpp`);
+2. move the current golden bytes from `test/sql/jsono_layout_golden.test` into a
+   closed-revision fixture in `test/sql/jsono_layout_revision.test` asserting
+   the loud refusal;
+3. write the closed revision's **full** layout into the Revision history below —
+   field names and types, the meaning of every reserved field, the writer's
+   state table. A changelog of what moved is not enough: a compat reader has
+   nothing else to be written against once the knowledge leaves working memory.
+
+### Revision history
+
+**Revision 0** (everything written before layout revisions existed; unreadable
+by this build, refused loudly). Unrevisioned field names, `body` and `shreds`:
+
+```
+STRUCT(
+  jsono STRUCT(
+    body STRUCT(slots, key_heap, string_heap, skips, lengths, nums),   -- as body$1
+    shreds STRUCT(
+      "$jsono$set" BIGINT,                    -- clean layout hash on EVERY row, no dirty flip
+      "<path>" STRUCT(value <T>, complete BOOLEAN),  -- scalar shred: a value/complete pair
+      "<arrpath>" <list_type>                 -- array shred: a bare LIST, as in revision 1
+    )
+  )
+)
+```
+
+The scalar pair's writer produced exactly three states: `(V, complete=1)` a
+fitting scalar, `(NULL, 1)` an absent path or JSON null, `(NULL, 0)` a divert (a
+container at the path or a type-gate miss); `(V, 0)` never existed. The marker
+was the plain clean hash — computed, as in revision 1, over the shred set's
+(path, value type) signatures, so the *same* set hashes identically in both
+revisions. There was no spill bitmap; per-row divert information lived entirely
+in the `complete` flags.
+
+Two intermediate spellings shipped inside the plan-054 arc and are revision 0
+as well: a single unordinal `"$jsono$spill"` column (commit `ada4d30`), and the
+`"$jsono$spill"`/`"$jsono$spill1"`/… family (commit `f450a5b`). Both already
+used bare lanes and the two-valued marker of revision 1.
+
+*Compat note (no reader is implemented).* Revision 0 → 1 is a pure per-row
+function: lane = the pair's `value`, spill bit `r` = `NOT complete`, marker =
+the same hash with bit 0 flipped when the mask is non-zero. Were it ever
+implemented, it belongs in a plan-boundary normalization function that hands the
+readers a current-revision value — never as a revision branch inside a read
+path.
 
 ## Compatibility policy
 

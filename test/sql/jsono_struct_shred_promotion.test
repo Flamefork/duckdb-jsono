@@ -12,11 +12,11 @@ require json
 query I
 SELECT typeof(jsono(struct_pack(qty := 1::INTEGER, cnt := 2::SMALLINT, usmall := 3::UINTEGER, price := 0.5::FLOAT)));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, cnt BIGINT, price DOUBLE, qty BIGINT, usmall BIGINT)))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, cnt BIGINT, price DOUBLE, qty BIGINT, usmall BIGINT)))
 
 # Values land in the lanes widened, and unsigned values above INT32_MAX survive the promotion.
 query IIII
-SELECT j.jsono.shreds."qty", j.jsono.shreds."cnt", j.jsono.shreds."usmall", j.jsono.shreds."price"
+SELECT j.jsono."shreds$1"."qty", j.jsono."shreds$1"."cnt", j.jsono."shreds$1"."usmall", j.jsono."shreds$1"."price"
 FROM (SELECT jsono(struct_pack(qty := -5::INTEGER, cnt := 7::SMALLINT, usmall := 4000000000::UINTEGER, price := 0.5::FLOAT)) AS j);
 ----
 -5	7	4000000000	0.5
@@ -41,10 +41,10 @@ FROM (SELECT jsono(struct_pack(qty := 42::INTEGER, usmall := 4000000000::UINTEGE
 query I
 SELECT typeof(jsono(struct_pack(tny := 1::TINYINT, utny := 2::UTINYINT, usml := 3::USMALLINT)));
 ----
-STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), shreds STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, tny BIGINT, usml BIGINT, utny BIGINT)))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, tny BIGINT, usml BIGINT, utny BIGINT)))
 
 query III
-SELECT j.jsono.shreds."tny", j.jsono.shreds."utny", j.jsono.shreds."usml"
+SELECT j.jsono."shreds$1"."tny", j.jsono."shreds$1"."utny", j.jsono."shreds$1"."usml"
 FROM (SELECT jsono(struct_pack(tny := -5::TINYINT, utny := 200::UTINYINT, usml := 60000::USMALLINT)) AS j);
 ----
 -5	200	60000
@@ -70,7 +70,7 @@ SELECT jsono_shred_manifest(jsono(struct_pack(ids := [1::INTEGER, 2::INTEGER], i
 
 # NULL narrow fields keep the NULL-shred = value-in-residual contract.
 query III
-SELECT j.jsono.shreds."qty" IS NULL, j->>'qty', to_json(j)::VARCHAR
+SELECT j.jsono."shreds$1"."qty" IS NULL, j->>'qty', to_json(j)::VARCHAR
 FROM (SELECT jsono(struct_pack(qty := NULL::INTEGER, k := 1::BIGINT)) AS j);
 ----
 true	NULL	{"k":1,"qty":null}

@@ -41,9 +41,9 @@ query IIII
 SELECT
   jsono_validate(jsono('{"a":"x","b":[1,true,null]}')),
   jsono_validate(jsono(NULL)) IS NULL,
-  jsono_validate({'jsono': {'body': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}),
+  jsono_validate({'jsono': {'body$1': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}),
   jsono_validate({
-    'jsono': {'body': {
+    'jsono': {'body$1': {
       'slots': unhex('4A534E4F040100000000000000000000'),
       'key_heap': ''::BLOB,
       'string_heap': ''::BLOB,
@@ -61,7 +61,7 @@ true	true	false	false
 # index before the 24-byte spans (u32 slot_span, u32 string_byte_span, u64 shape_hash,
 # u32 length_count, u32 num_count); the "x" length lives in the lengths stream.
 query I
-SELECT jsono_validate({'jsono': {'body': {
+SELECT jsono_validate({'jsono': {'body$1': {
   'slots': unhex('4A534E4F0401000000000000000000200000000100000020000000000000008000000000000000'||'30'),
   'key_heap': ''::BLOB,
   'string_heap': unhex('78'),
@@ -79,13 +79,13 @@ WITH base AS (
 )
 SELECT
   jsono_validate(jsono('{"\u00e9":1}')),
-  jsono_validate({'jsono': {'body': {
-    'slots': raw."jsono".body.slots,
+  jsono_validate({'jsono': {'body$1': {
+    'slots': raw."jsono"."body$1".slots,
     'key_heap': unhex('FF'),
-    'string_heap': raw."jsono".body.string_heap,
-    'skips': raw."jsono".body.skips,
-    'lengths': raw."jsono".body.lengths,
-    'nums': raw."jsono".body.nums
+    'string_heap': raw."jsono"."body$1".string_heap,
+    'skips': raw."jsono"."body$1".skips,
+    'lengths': raw."jsono"."body$1".lengths,
+    'nums': raw."jsono"."body$1".nums
   }}})
 FROM base;
 ----
