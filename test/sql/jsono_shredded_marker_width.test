@@ -128,9 +128,13 @@ true
 
 # The reserved fields are identified by name BUT must sit at `shreds` fields 0 and 1: every writer and
 # set-op merge emits them first, and all accessors index shred k as physical field 2 + k. A hand-built
-# struct with the marker NOT at field 0 is therefore not a readable layout — and since it still carries
-# the layout anchor, reading it fails loud instead of silently dumping the raw struct or answering NULL.
-statement error
+# struct with the marker NOT at field 0 is therefore NOT a canonical JSONO layout — the parser rejects
+# it (reads it as a plain user struct) rather than mis-mapping a shred onto a reserved field, which
+# crashed on every read. It stays silent rather than refused because a type carrying the CURRENT
+# revision can also fail the grammar through a legal type round-trip (see MatchJsonoLayoutField); only
+# a foreign REVISION is refused. to_json then dumps the raw struct (keeping the literal `$jsono$set`
+# key) and a jsono extract returns NULL — no internal error.
+query II
 WITH v AS (SELECT jsono({'a':'x','b':'y'}) AS c),
 reord AS (
   SELECT struct_pack(jsono := struct_pack(
@@ -144,12 +148,12 @@ reord AS (
   )) AS r
   FROM v
 )
-SELECT r ->> '$.a' FROM reord;
+SELECT to_json(r)::VARCHAR LIKE '%"$jsono$set":%', r ->> '$.a' FROM reord;
 ----
-structure is not a readable layout
+true	NULL
 
 # The spill bitmap out of position (swapped with the marker) is rejected the same way.
-statement error
+query I
 WITH v AS (SELECT jsono({'a':'x','b':'y'}) AS c),
 reord AS (
   SELECT struct_pack(jsono := struct_pack(
@@ -165,4 +169,4 @@ reord AS (
 )
 SELECT r ->> '$.a' FROM reord;
 ----
-structure is not a readable layout
+NULL

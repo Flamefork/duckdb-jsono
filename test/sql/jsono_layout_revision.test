@@ -182,12 +182,14 @@ SELECT to_json({'jsono': {'a': 1}});
 ----
 {"jsono":{"a":1}}
 
-# A near-miss body (five blobs) under the anchor IS refused: the anchor claims JSONO, so an
-# unreadable structure is a broken layout rather than a user struct.
+# A near-miss body (five blobs) under the CURRENT revision stays silent rather than refused: a type
+# carrying this revision can fail the grammar through a legal value->SQL->value round-trip (DuckLake's
+# inlined-data flush narrows an all-NULL spill column to SQLNULL), and refusing that would break a
+# write path to catch a hand-built struct. Only a foreign REVISION is refused.
 statement error
 SELECT jsono_validate({'jsono': {'body$1': {'slots': ''::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB}}});
 ----
-structure is not a readable layout
+argument must be JSONO
 
 # A revision name must be canonical: `body$01` is not a revision spelling, so it is not the anchor
 # and the value stays someone else's struct.

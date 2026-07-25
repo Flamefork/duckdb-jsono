@@ -349,11 +349,19 @@ and invalidate different data:
 The layout field name `jsono` is the **anchor** and never carries a revision.
 Recognition is anchor-first: a top-level STRUCT with exactly one field named
 `jsono` whose own field 0 is named `body` or `body$<digits>` is a JSONO value of
-*some* revision. Past that point every mismatch — an unknown revision, an
-unreadable structure — is refused loudly (`JsonoRejectForeignLayout`), never
-silently treated as an ordinary struct. That silence was the actual failure mode
-before revisions existed: an older shredded value bound to core `json`'s
-`->>`/`to_json`, which returned `NULL` or serialized the raw blob struct.
+*some* revision. A value whose revision is **known but different** is refused
+loudly (`JsonoRejectForeignLayout`), never silently treated as an ordinary
+struct — that silence was the actual failure mode before revisions existed: an
+older shredded value bound to core `json`'s `->>`/`to_json`, which returned
+`NULL` or serialized the raw blob struct.
+
+A value carrying the *current* revision that nevertheless fails the grammar
+stays silently non-JSONO, as before. This is deliberate and not a hole: such a
+type also arises on a legal write path, where a generic value→SQL→value
+round-trip (DuckLake's inlined-data flush) narrows an all-NULL spill column to
+`SQLNULL` and a small lane to `INTEGER` on its way to the declared column type.
+Refusing that would break writing in order to catch a hand-built struct, and a
+hand-built struct is not data anyone can lose.
 
 Splitting `body$N` from `shreds$M` is what keeps a shred-layout change from
 invalidating plain values, which are the bulk of stored data.

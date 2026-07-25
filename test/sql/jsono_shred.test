@@ -233,16 +233,16 @@ SELECT jsono('{"a":[7]}', shredding := {'$[0]':'BIGINT'});
 invalid path
 
 # Layout recognition enforces the same rule on stored/cast structs: a lane name that is not an
-# object-key chain is not a readable layout (no writer produces such a lane), and since the struct
-# still carries the layout anchor the refusal names that reason rather than reading a bogus lane. The
-# same layout with an object-key lane is recognized and binds.
+# object-key chain keeps the struct from being recognized as JSONO (no writer produces such a lane),
+# so jsono functions refuse it at bind instead of reading a read-copy lane. The same layout with an
+# object-key lane is recognized and binds.
 statement ok
 CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.arr[0]" BIGINT))));
 
 statement error
 SELECT jsono_array_length(x) FROM bad_lane_layout;
 ----
-structure is not a readable layout
+must be JSONO
 
 statement ok
 CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.arr" BIGINT))));

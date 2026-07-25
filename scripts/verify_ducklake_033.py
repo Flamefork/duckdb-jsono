@@ -7,15 +7,24 @@ network, so this runs locally against the release build:
     uv run --frozen python scripts/verify_ducklake_033.py
 
 Checks, over a DuckLake table of shredded jsono rows evolved with
-`ALTER TABLE ... ADD COLUMN j.jsono.shreds."$.b" ...`:
+`ALTER TABLE ... ADD COLUMN j.jsono."shreds$1"."$.b" VARCHAR`:
 
 - A3: the OLD lane's extract folds back to a bare struct_extract (no residual
   COALESCE) after the ALTER — schema identity is broken by the evolved read
-  type, so this is exactly the null-aware per-shred totality path.
+  type (the `$jsono$set` marker of the old files hashes the one-shred set), so
+  this is exactly the null-aware per-shred totality path.
 - Soundness (the §5 open question): the ALTER-ADDED lane must NOT fold, even
   after new files carry it complete — old files lack the lane and their values
   live in the residual, so a fold would silently read NULLs. The value check
   fails loudly if DuckLake ever reports misleading no-NULL stats for it.
+
+Layout note (plan 054 + 055): a scalar shred is a BARE typed lane, so the ALTER
+adds `VARCHAR`, not a value/complete pair; per-row divert information lives in
+the `$jsono$spill$0` bitmap column that the table already carries, and the
+layout fields are revisioned (`body$1` / `shreds$1`). The spill bits of the old
+files are numbered for the one-shred set they were written under, so after the
+ALTER the marker no longer matches and they are conservatively ignored — which
+is why this scenario exercises lane statistics rather than the bitmap.
 """
 
 import re
@@ -65,7 +74,7 @@ def main() -> None:
             {marker}
             EXPLAIN SELECT MIN(CAST(j->>'$.a' AS BIGINT)) FROM dl.t;
             {marker}
-            ALTER TABLE dl.t ADD COLUMN j.jsono.shreds."$.b" STRUCT("value" VARCHAR, complete TINYINT);
+            ALTER TABLE dl.t ADD COLUMN j.jsono."shreds$1"."$.b" VARCHAR;
             EXPLAIN SELECT MIN(CAST(j->>'$.a' AS BIGINT)) FROM dl.t;
             {marker}
             EXPLAIN SELECT MIN(j->>'$.b') FROM dl.t;
