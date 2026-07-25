@@ -1,10 +1,13 @@
 #include "jsono.hpp"
 #include "jsono_copy.hpp"
 #include "jsono_dom.hpp"
+#include "jsono_extension.hpp"
 #include "jsono_number.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_reconstruct.hpp"
 #include "jsono_row_read.hpp"
 #include "jsono_shred.hpp"
+#include "jsono_struct_constructor.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/types.hpp"

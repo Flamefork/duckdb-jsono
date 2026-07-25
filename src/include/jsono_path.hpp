@@ -5,6 +5,8 @@
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/vector.hpp"
 
+#include "string_view.hpp"
+
 #include <cctype>
 #include <limits>
 #include <utility>
@@ -273,6 +275,41 @@ inline bool PathStepsMayShareBranch(const vector<PathStep> &read, const vector<P
 		}
 	}
 	return true;
+}
+
+// True if a pure object-key path ends at / continues past `key` when matched at `depth`. The
+// size check precedes the [depth] read, so a path shorter than depth+1 never indexes OOB. The
+// path ref is std::vector so duckdb::vector<PathStep> binds too (derived-to-base). Shared by the
+// array read overlay, the residual skeleton emit, and the LWW tree strip.
+inline bool PathTerminatesOnKey(const std::vector<PathStep> &path, size_t depth, nonstd::string_view key) {
+	return path.size() == depth + 1 && nonstd::string_view(path[depth].key.data(), path[depth].key.size()) == key;
+}
+
+inline bool PathContinuesPastKey(const std::vector<PathStep> &path, size_t depth, nonstd::string_view key) {
+	return path.size() > depth + 1 && nonstd::string_view(path[depth].key.data(), path[depth].key.size()) == key;
+}
+
+// Multi-path variants: "does any active path terminate on `key`" and "collect the active paths
+// that continue past `key`". Templated over the path-pointer container so both the std::vector
+// skeleton side and the duckdb::vector LWW side share them; both delegate to the predicates above.
+template <class Paths>
+inline bool AnyPathTerminatesOnKey(const Paths &paths, size_t depth, nonstd::string_view key) {
+	for (auto *path : paths) {
+		if (PathTerminatesOnKey(*path, depth, key)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+template <class Paths>
+inline void CollectContinuingPaths(const Paths &paths, size_t depth, nonstd::string_view key, Paths &out) {
+	out.clear();
+	for (auto *path : paths) {
+		if (PathContinuesPastKey(*path, depth, key)) {
+			out.push_back(path);
+		}
+	}
 }
 
 } // namespace duckdb

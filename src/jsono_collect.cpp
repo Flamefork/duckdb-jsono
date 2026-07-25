@@ -1,6 +1,6 @@
-#include "jsono_ops.hpp"
 #include "jsono.hpp"
 #include "jsono_copy.hpp"
+#include "jsono_extension.hpp"
 #include "jsono_memory.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_row_read.hpp"
@@ -13,6 +13,7 @@
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 

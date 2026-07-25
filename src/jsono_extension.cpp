@@ -1,12 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "jsono_extension.hpp"
-#include "jsono_extract.hpp"
-#include "jsono.hpp"
-#include "jsono_ops.hpp"
-#include "jsono_optimizer.hpp"
-#include "jsono_shred.hpp"
-#include "jsono_transform.hpp"
 
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -14,7 +8,21 @@ namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterJsonoType(loader);
-	RegisterJsonoOps(loader);
+	RegisterJsonoStructConstructor(loader);
+	RegisterJsonoParse(loader);
+	RegisterJsonoToJson(loader);
+	RegisterJsonoPathOps(loader);
+	RegisterJsonoEntries(loader);
+	RegisterJsonoArrayElements(loader);
+	RegisterJsonoValidate(loader);
+	RegisterJsonoStorageSize(loader);
+	RegisterJsonoMerge(loader);
+	RegisterJsonoReconstruct(loader);
+	RegisterJsonoGroupMerge(loader);
+	RegisterJsonoGroupMergeKeyed(loader);
+	RegisterJsonoDiff(loader);
+	RegisterJsonoAdvisor(loader);
+	RegisterJsonoCollect(loader);
 	RegisterJsonoTransform(loader);
 	RegisterJsonoShred(loader);
 	RegisterJsonoExtract(loader);

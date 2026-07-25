@@ -212,32 +212,6 @@ LogicalType JsonoResolveJsonoArgument(ClientContext &context, const Expression &
 
 class Vector;
 
-// Reconstruct a shredded JSONO `input` (six-BLOB residual + shred columns) into the
-// lossless plain JSONO `result` by overlaying each row's shred values onto its residual.
-// This is how a shredded value becomes usable where a plain JSONO is required (an implicit
-// cast, an INSERT into a plain JSONO column) without dropping the shred data. Top-level shreds
-// overlay in one flat pass; a nested-path shred overlays its single key chain onto the residual.
-void JsonoReconstructToPlain(Vector &input, idx_t count, Vector &result);
-
-// Wrap a shredded JSONO argument expression in the internal __jsono_reconstruct scalar operator,
-// whose executor is JsonoReconstructToPlain. Only jsono_transform's array-shred reconstruct path uses
-// this wrapper: it would otherwise redeclare the argument as plain JSONO and let the binder insert an
-// anonymous reconstruct cast, so the wrapper makes that 3-10x shredded->plain cost an explicit, named
-// operator in EXPLAIN / EXPLAIN ANALYZE. The other reconstruct binds (collect, elements, diff fallback)
-// still inject anonymous casts. Returns the wrapping expression (plain JSONO return type);
-// `shredded_arg` must have a shredded JSONO type.
-unique_ptr<Expression> MakeJsonoReconstructExpression(unique_ptr<Expression> shredded_arg);
-
-// Overlay only `shreds` (shred indices over the shred set) of the shredded `input` onto its
-// residual, producing plain JSONO. The single-pass narrowing reshred folds the shreds the target
-// type drops back into the residual with this, leaving the kept shreds untouched.
-void JsonoOverlayShredsToPlain(Vector &input, idx_t count, const vector<idx_t> &shreds, Vector &result);
-
-// Render a shredded JSONO carrying top-level LIST shreds directly to JSON text. Scalar shreds are
-// first overlaid into the residual; list lanes then merge into their residual arrays by index,
-// without materializing the reconstructed arrays as a plain JSONO blob.
-void JsonoRenderShreddedListsToJson(Vector &input, idx_t count, Vector &result);
-
 // Parse a VARCHAR/JSON `source` vector into a plain JSONO `result` vector, throwing on
 // invalid JSON (the jsono() text contract). Exposed so the shred constructor overload can
 // parse-then-shred in one pass without duplicating the parser.

@@ -12,7 +12,6 @@
 
 namespace duckdb {
 
-class ExtensionLoader;
 class ScalarFunction;
 
 // How deep auto-shred (the struct constructor) and jsono_suggest_shredding descend when lifting
@@ -41,8 +40,6 @@ enum class ShredKind : uint8_t { Scalar, Array, ScalarArray };
 // scalar nor an array shred — the single fail-loud point, so readers carry no swallowing `default`.
 // Bind validates shred types up front, so a miss here is a broken invariant, not user input.
 ShredKind ClassifyShredKind(const LogicalType &type);
-
-void RegisterJsonoShred(ExtensionLoader &loader);
 
 // The jsono(jsono, shredding := spec) overload, exposed so the optimizer's set-operation
 // normalization can reshred a branch to the merged shred set without a catalog lookup.

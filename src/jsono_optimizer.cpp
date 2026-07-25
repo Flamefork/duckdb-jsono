@@ -1,14 +1,18 @@
-#include "jsono_optimizer.hpp"
 #include "jsono.hpp"
+#include "jsono_extension.hpp"
+#include "jsono_extract.hpp"
 #include "jsono_locate.hpp"
+#include "jsono_merge.hpp"
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
 #include "jsono_path_bind.hpp"
 #include "jsono_projection.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_reconstruct.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
 #include "jsono_shred.hpp"
+#include "jsono_struct_constructor.hpp"
 #include "jsono_trie_shape_plan.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -62,15 +66,6 @@
 #include <vector>
 
 namespace duckdb {
-
-// Exposed jsono function factories used to build the constant-node reconstruction
-// and to read non-shred paths natively off the residual.
-ScalarFunction JsonoShreddedPatchFunction(const LogicalType &input_type);
-ScalarFunction JsonoOverlayFunction();
-ScalarFunction JsonoCheckedResidualFunction();
-ScalarFunction JsonoStripManifestFunction();
-ScalarFunction JsonoExtractStringFunction(const LogicalType &path_type);
-ScalarFunction JsonoExtractFunction(const LogicalType &path_type);
 
 namespace {
 

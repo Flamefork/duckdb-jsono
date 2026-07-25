@@ -1,4 +1,5 @@
 #include "jsono.hpp"
+#include "jsono_extension.hpp"
 #include "jsono_shred.hpp"
 
 #include "duckdb/common/enums/optimizer_type.hpp"
@@ -19,10 +20,6 @@
 #include <algorithm>
 
 namespace duckdb {
-
-void RegisterJsonoParse(ExtensionLoader &loader);
-void RegisterJsonoStructConstructor(ExtensionLoader &loader);
-void RegisterJsonoToJson(ExtensionLoader &loader);
 
 namespace {
 
@@ -398,10 +395,6 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 		set.AddFunction(ScalarFunction({}, LogicalType::INTEGER, JsonoVersionExecute));
 		loader.RegisterFunction(set);
 	}
-
-	RegisterJsonoStructConstructor(loader);
-	RegisterJsonoParse(loader);
-	RegisterJsonoToJson(loader);
 }
 
 } // namespace duckdb

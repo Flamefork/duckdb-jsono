@@ -1,4 +1,4 @@
-# name: test/sql/jsono_ops.test
+# name: test/sql/jsono_basics.test
 # description: JSONO construction, introspection, and merge primitives
 # group: [sql]
 

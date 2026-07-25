@@ -1,5 +1,6 @@
 #include "jsono.hpp"
 #include "jsono_dom.hpp"
+#include "jsono_extension.hpp"
 #include "jsono_writer.hpp"
 
 #include "duckdb/common/operator/cast_operators.hpp"

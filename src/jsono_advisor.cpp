@@ -1,4 +1,5 @@
 #include "jsono.hpp"
+#include "jsono_extension.hpp"
 #include "jsono_locate.hpp"
 #include "jsono_memory.hpp"
 #include "jsono_path.hpp"

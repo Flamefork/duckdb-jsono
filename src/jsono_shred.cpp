@@ -2,10 +2,12 @@
 #include "jsono.hpp"
 #include "jsono_copy.hpp"
 #include "jsono_dom.hpp"
+#include "jsono_extension.hpp"
 #include "jsono_locate.hpp"
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_reconstruct.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
 #include "jsono_scalar_write.hpp"
@@ -33,24 +35,203 @@
 
 namespace duckdb {
 
-// Build the residual: `view` minus the located leaf of each path (defined in jsono_merge.cpp).
-void JsonoEmitObjectStrippingPaths(const jsono::JsonoView &view,
-                                   const std::vector<const std::vector<PathStep> *> &paths,
-                                   jsono::JsonoBuilder &builder);
-
-// Build the residual skeleton: `view` minus the located scalar leaves (`scalar_paths`) AND, for
-// each array shred, the located array rebuilt with the lifted element subfields stripped per
-// element (`array_specs`). The array stays in place as the skeleton — its length, element order,
-// non-object/null elements and per-element tail carry the lossless reconstruct (jsono_merge.cpp).
-void JsonoEmitResidualSkeleton(const jsono::JsonoView &view,
-                               const std::vector<const std::vector<PathStep> *> &scalar_paths,
-                               const std::vector<const JsonoArrayShredSpec *> &array_specs,
-                               jsono::JsonoBuilder &builder);
-
 namespace {
 
 using namespace jsono;
 using namespace duckdb_yyjson;
+
+// ---- Residual emit (the write-side twin of the reconstruct overlay) ----
+
+// The residual-emit core (defined below, after the array-skeleton helpers it dispatches to):
+// copy `view`'s object minus the leaves named by `scalar_paths`, and replace each terminal
+// array-shred key with its skeleton array. An empty `array_specs` reduces it to the plain leaf
+// strip — the shredded scalar writer's residual emit.
+void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cursor, JsonoBuilder &builder,
+                        const std::vector<const std::vector<PathStep> *> &scalar_paths,
+                        const std::vector<const JsonoArrayShredSpec *> &array_specs, size_t depth);
+
+// ---- Residual skeleton emit for array shreds (write side) ----
+// The array stays in the residual as a skeleton: each object element keeps its tail keys but loses
+// the subfields lifted into the LIST<STRUCT> shred column. Length, element order, and non-object/
+// null elements carry the lossless reconstruct (the parallel shred LIST overlays back). The strip
+// gate is JsonoScalarFitsPrimitive — the same one WriteArrayShred uses — so write and skeleton agree.
+
+// True if `name` is present in the element object at `element_cursor` as a scalar that fits `primitive`
+// byte-for-byte (so its shred captured it and the skeleton drops it). Mirrors WriteShred's gate.
+bool ElementSubfieldStrippable(const JsonoView &view, const JsonoCursor &element_cursor, const string &name,
+                               JsonoScalarPrimitive primitive) {
+	JsonoCursor probe = element_cursor;
+	if (!LocatePathStep(nullptr, 0, view, PathStep {PathStepKind::Key, name, 0}, probe)) {
+		return false;
+	}
+	auto tag = SlotTag(view.SlotAt(probe.pos));
+	if (tag == tag::OBJ_START || tag == tag::ARR_START) {
+		return false;
+	}
+	auto scalar = DecodeScalarAt(view, probe);
+	return JsonoScalarFitsPrimitive(scalar, primitive);
+}
+
+// Emit the skeleton array (cursor at ARR_START) for either array shred kind. `spec.kind` is fixed
+// per array, so the lane dispatch hoists out of the element loop.
+//
+// ScalarArray lane: each element the lane lifts (a scalar fitting `spec.element_primitive`) becomes a
+// VAL_NULL placeholder — it carries no value, the parallel LIST<element_type> shred does — every
+// other element (a non-conforming scalar, a null, an object or array) stays verbatim. The lift gate
+// is JsonoScalarFitsPrimitive, the same one WriteScalarArrayShred uses, so the placeholder positions
+// match the shred's non-NULL slots exactly. On reconstruct the placeholder is never read: a non-NULL
+// shred slot overrides it, a NULL slot means the element was kept (and a kept element is never a
+// placeholder), so a placeholder and an explicit JSON null never collide.
+//
+// Array lane: each object element loses its strippable `spec.subfields` (lifted into the LIST<STRUCT>
+// shred), every other element verbatim.
+void EmitSkeletonArray(const JsonoView &view, const JsonoCursor &array_cursor, JsonoBuilder &builder,
+                       const JsonoArrayShredSpec &spec, size_t depth) {
+	auto end_pos = ReadArrayEndPos(view, array_cursor.pos);
+	builder.EmitArrayStart();
+	JsonoCursor cursor = array_cursor;
+	cursor.pos++;                                     // first element; ARR_START consumes no stream entries
+	std::vector<std::vector<PathStep>> strip_storage; // Array lane: per-element strip paths
+	std::vector<const std::vector<PathStep> *> strip;
+	while (cursor.pos < end_pos) {
+		if (spec.kind == ShredKind::ScalarArray) {
+			auto value_tag = SlotTag(view.SlotAt(cursor.pos));
+			if (value_tag != tag::OBJ_START && value_tag != tag::ARR_START) {
+				JsonoCursor probe = cursor;
+				auto scalar = DecodeScalarAt(view, probe);
+				if (JsonoScalarFitsPrimitive(scalar, spec.element_primitive)) {
+					builder.EmitNull(); // lifted: placeholder; the shred holds the value
+					SkipValueFast(view, cursor);
+					continue;
+				}
+			}
+			EmitValueVerbatim(view, cursor, builder, depth + 1);
+		} else if (SlotTag(view.SlotAt(cursor.pos)) == tag::OBJ_START) {
+			strip_storage.clear();
+			for (auto &sub : spec.subfields) {
+				if (ElementSubfieldStrippable(view, cursor, sub.first, sub.second)) {
+					strip_storage.push_back({PathStep {PathStepKind::Key, sub.first, 0}});
+				}
+			}
+			strip.clear();
+			for (auto &path : strip_storage) {
+				strip.push_back(&path);
+			}
+			EmitSkeletonObject(view, cursor, builder, strip, {}, 0);
+			SkipValueFast(view, cursor);
+		} else {
+			EmitValueVerbatim(view, cursor, builder, depth + 1);
+		}
+	}
+	builder.EmitArrayEnd();
+}
+
+// One object level of the residual emit (the strip core forward-declared above): strip the scalar
+// leaves (`scalar_paths`) and replace the array at each terminal array-shred key with its skeleton,
+// recursing for deeper paths. With an empty `array_specs` this is the plain leaf strip a top-level
+// path drops a root key, a nested path drops only its leaf and keeps the surrounding object;
+// surrounding keys are emitted verbatim. Every scalar path has length > depth by construction.
+void EmitSkeletonObject(const JsonoView &view, const JsonoCursor &obj_cursor, JsonoBuilder &builder,
+                        const std::vector<const std::vector<PathStep> *> &scalar_paths,
+                        const std::vector<const JsonoArrayShredSpec *> &array_specs, size_t depth) {
+	auto layout = ReadObjectLayout(view, obj_cursor.pos);
+	auto key_at = [&](size_t i) {
+		auto key_slot = view.SlotAt(layout.key_start + i);
+		if (SlotTag(key_slot) != tag::KEY) {
+			throw InvalidInputException("malformed JSONO: expected KEY slot");
+		}
+		return view.KeyAt(SlotPayload(key_slot));
+	};
+	// Cache the per-member keep decision once. AnyPathTerminatesOnKey scans the path set,
+	// so recomputing it across the count/key/value passes is wasteful. A stack mask avoids a
+	// per-object heap alloc; objects wider than it (rare) fall back to recomputing the predicate.
+	static constexpr size_t MASK_STACK = 128;
+	char keep[MASK_STACK];
+	bool cached = layout.key_count <= MASK_STACK;
+	size_t surviving = 0;
+	for (size_t i = 0; i < layout.key_count; i++) {
+		bool survives = !AnyPathTerminatesOnKey(scalar_paths, depth, key_at(i));
+		if (cached) {
+			keep[i] = survives ? 1 : 0;
+		}
+		surviving += survives ? 1 : 0;
+	}
+	builder.EmitObjectStart(surviving);
+	for (size_t i = 0; i < layout.key_count; i++) {
+		auto key = key_at(i);
+		if (cached ? keep[i] != 0 : !AnyPathTerminatesOnKey(scalar_paths, depth, key)) {
+			builder.EmitKeySlot(key);
+		}
+	}
+	JsonoCursor value_cursor = obj_cursor;
+	value_cursor.pos = layout.value_start;
+	for (size_t i = 0; i < layout.key_count; i++) {
+		auto key = key_at(i);
+		if (cached ? keep[i] == 0 : AnyPathTerminatesOnKey(scalar_paths, depth, key)) {
+			SkipValueFast(view, value_cursor);
+			continue;
+		}
+		builder.EmitObjectChildStart();
+		std::vector<const std::vector<PathStep> *> deeper_scalar;
+		for (auto *path : scalar_paths) {
+			auto &step = (*path)[depth];
+			if (depth + 1 < path->size() && nonstd::string_view(step.key.data(), step.key.size()) == key) {
+				deeper_scalar.push_back(path);
+			}
+		}
+		const JsonoArrayShredSpec *terminal_array = nullptr;
+		std::vector<const JsonoArrayShredSpec *> deeper_array;
+		for (auto *spec : array_specs) {
+			if (PathTerminatesOnKey(spec->path, depth, key)) {
+				terminal_array = spec;
+			} else if (PathContinuesPastKey(spec->path, depth, key)) {
+				deeper_array.push_back(spec);
+			}
+		}
+		auto value_tag = SlotTag(view.SlotAt(value_cursor.pos));
+		if (terminal_array && value_tag == tag::ARR_START) {
+			EmitSkeletonArray(view, value_cursor, builder, *terminal_array, depth);
+			SkipValueFast(view, value_cursor);
+		} else if ((!deeper_scalar.empty() || !deeper_array.empty()) && value_tag == tag::OBJ_START) {
+			EmitSkeletonObject(view, value_cursor, builder, deeper_scalar, deeper_array, depth + 1);
+			SkipValueFast(view, value_cursor);
+		} else {
+			EmitValueVerbatim(view, value_cursor, builder, depth + 1);
+		}
+	}
+	builder.EmitObjectEnd();
+}
+
+// Emit `view` into `builder` with the located leaf of each path removed, used by the
+// shredded writer to build the residual once it knows which paths were losslessly lifted
+// into shreds. Paths are object-key sequences: a top-level path drops a root key, a nested
+// path drops only its leaf and keeps the surrounding object. An empty path set or a
+// non-object value is copied verbatim. Reuses the cursor-walk and EmitValueVerbatim so the
+// residual's blocks/checkpoints are rebuilt correctly.
+void JsonoEmitObjectStrippingPaths(const JsonoView &view, const std::vector<const std::vector<PathStep> *> &paths,
+                                   JsonoBuilder &builder) {
+	if (paths.empty() || view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+		JsonoCursor cursor;
+		EmitValueVerbatim(view, cursor, builder, 0);
+		return;
+	}
+	EmitSkeletonObject(view, JsonoCursor(), builder, paths, {}, 0);
+}
+
+// Build the residual skeleton: `view` minus the located scalar leaves (`scalar_paths`) AND, for
+// each array shred, the located array rebuilt with the lifted element subfields stripped per
+// element (`array_specs`). The array stays in place as the skeleton — its length, element order,
+// non-object/null elements and per-element tail carry the lossless reconstruct.
+void JsonoEmitResidualSkeleton(const JsonoView &view, const std::vector<const std::vector<PathStep> *> &scalar_paths,
+                               const std::vector<const JsonoArrayShredSpec *> &array_specs, JsonoBuilder &builder) {
+	if ((scalar_paths.empty() && array_specs.empty()) || view.Slots() == 0 ||
+	    SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+		JsonoCursor cursor;
+		EmitValueVerbatim(view, cursor, builder, 0);
+		return;
+	}
+	EmitSkeletonObject(view, JsonoCursor(), builder, scalar_paths, array_specs, 0);
+}
 
 // One subfield lifted out of each array element into the LIST<STRUCT> shred column.
 struct ShredArraySubfield {

@@ -1,6 +1,8 @@
 #include "jsono.hpp"
+#include "jsono_extension.hpp"
 #include "jsono_number.hpp"
 #include "jsono_reader.hpp"
+#include "jsono_reconstruct.hpp"
 #include "jsono_render.hpp"
 #include "jsono_row_read.hpp"
 
