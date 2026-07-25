@@ -601,6 +601,7 @@ unique_ptr<FunctionData> JsonoSuggestBind(ClientContext &context, AggregateFunct
 		                      "shredded from (jsono_shred_stats reports on an existing shredded column)");
 	}
 	if (type.id() != LogicalTypeId::SQLNULL && !IsJsonoType(type)) {
+		JsonoRejectForeignLayout(type, "jsono_suggest_shredding");
 		throw BinderException("jsono_suggest_shredding: input must be plain JSONO");
 	}
 	function.arguments[0] = JsonoType();
@@ -841,6 +842,7 @@ unique_ptr<FunctionData> JsonoShredStatsBind(ClientContext &context, AggregateFu
 	auto &type = arguments[0]->return_type;
 	JsonoRequireExtensionOptimizerForShredded(context, type, "jsono_shred_stats");
 	if (!IsShreddedJsonoType(type)) {
+		JsonoRejectForeignLayout(type, "jsono_shred_stats");
 		throw BinderException("jsono_shred_stats() input must be shredded JSONO; use jsono_suggest_shredding to "
 		                      "propose shreds for a plain column");
 	}

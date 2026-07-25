@@ -1479,8 +1479,8 @@ bool RewriteProjectionProjector(OptimizerExtensionInput &input, LogicalProjectio
 // Shredded JSONO transparency
 //
 // A shredded JSONO column reaches the binder as a plain STRUCT: a `jsono` layout field wrapping a
-// six-blob `body` and a sibling `shreds` struct of typed columns named by canonical path (each a
-// STRUCT(value, complete) or a LIST). No implicit cast turns
+// six-blob `body$1` and a sibling `shreds$1` struct of typed columns named by canonical path (each a
+// bare scalar lane or a LIST, with the per-row divert bits in the spill bitmap). No implicit cast turns
 // that struct into JSONO, so a bare `j->>'path'` / `to_json(j)` binds to core json's
 // STRUCT->JSON path, which serializes the raw struct (wrong: leaks the blobs, never
 // reads the value). This pre-optimize pass rewrites those bound expressions off the
@@ -1713,10 +1713,10 @@ using ShredTotalityColumns = vector<vector<bool>>;
 // same one DuckDB's own StatisticsPropagator uses; native tables and Parquet both register it).
 // Propagate that proof through projection outputs that forward a bare column reference unchanged.
 // Descend the returned StructStats: top struct child 0 is the layout, layout child 1 is the `shreds`
-// struct (child 0 the shred-set marker, child 1 + child_index a scalar shred pair whose child 1 is
-// `complete`). A shred is total iff the marker proves schema identity (min==max==read-type hash) AND
-// the shred's own `complete` (TINYINT 1/0) carries no 0 (min == 1). Fail-safe: no statistics function,
-// nullptr stats, a missing min/max, or a hash/spill mismatch leaves the shred non-total (true).
+// struct (child 0 the shred-set marker, children 1..k the spill bitmap columns). A shred is total iff
+// the marker proves schema identity (min==max==the read type's clean hash) AND its own spill bit is
+// proven clear by the bitmap statistics — see CollectSpillProvenPaths. Fail-safe: no statistics
+// function, nullptr stats, a missing min/max, or a hash/spill mismatch leaves the shred non-total (true).
 // CTEs are planned materialized and only inlined by the built-in pipeline AFTER this pre-optimize
 // pass, so the proof is also bridged across them: the definition side's per-output-column totality is
 // snapshotted under the cte index (cte_totality) and replayed onto each CTE_SCAN's bindings.
@@ -2392,9 +2392,9 @@ private:
 		return function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(body_children));
 	}
 
-	// Read only the residual body of a shredded column as plain JSONO: extract its `.body` struct
+	// Read only the residual body of a shredded column as plain JSONO: extract its `body$1` struct
 	// (layout field [1] -> body [1], already STRUCT(slots,key_heap,string_heap,skips,...)) and wrap it
-	// back into the plain layout STRUCT("jsono" STRUCT(body ...)). The result type IS plain JSONO, so
+	// back into the plain layout STRUCT("jsono" STRUCT("body$1" ...)). The result type IS plain JSONO, so
 	// the cast is a no-op reinterpret rather than a reconstruction.
 	//
 	// `soft` selects which manifest discipline the residual carries. A hard residual (the default)
@@ -2482,8 +2482,8 @@ private:
 			return nullptr;
 		}
 		for (auto &shred : CollectShreddedShreds(shredded_cast->child->return_type)) {
-			// MakeTypedShredRead navigates the scalar pair STRUCT(value, complete) via ShredExtract; a
-			// list shred stays a bare LIST (no pair), so folding it crashes the extract. Leave the inner
+			// MakeTypedShredRead reads a bare scalar lane via ShredExtract; a list shred is reconstructed
+			// element-wise instead, so folding it crashes the extract. Leave the inner
 			// `->>` to RewriteShreddedExtract (which reconstructs for list shreds) and the cast on top.
 			if (!PathStepsEqual(shred.steps, path.steps) || shred.type != target || IsShredListType(shred.type)) {
 				continue;
@@ -3112,15 +3112,30 @@ string ForeignConsumerContext(const Expression &consumer) {
 // json: they bind against any struct and would silently serialize the raw blob layout or return
 // NULL. This walk is the only place that sees them.
 //
-// It deliberately locates the foreign SOURCE (the child whose type is foreign) rather than the
-// consuming node: a future compat reader replaces the throw with "wrap the source in an upgrade
-// function", and everything downstream then sees a current-revision value. A bare column reference
-// is left alone, so `SELECT *` and `COPY … TO` keep working — transport lives, interpretation
-// fails. Under `disabled_optimizers=extension` this hook does not run and the core-json paths go
-// quiet again, the same trade JsonoRequireExtensionOptimizerForShredded already takes.
+// It classifies the CHILD's type rather than the consuming node's, because a consumer's own type is
+// never foreign (`to_json` returns JSON, `->>` VARCHAR) — the child is the only place the situation
+// is visible. A root expression is therefore not classified at all, which is what leaves a bare
+// column reference alone, so the value can still be MOVED — `SELECT *`, `INSERT … SELECT`, `COPY …
+// TO` Parquet — while every expression that consumes it fails. (The same rule is why an equality
+// JOIN condition over the raw value stays legal: the planner hands each side to this walk as a root
+// of its own. Comparing the bytes is not reading the document.) Rendering as text is not transport:
+// that goes through the VARCHAR cast, which refuses in its own bind (see JsonoStructToVarcharCastBind),
+// which is what stops `COPY … TO … (FORMAT CSV)` from writing an unrecoverable dump.
+//
+// Two known limits. The walk inspects a child's own type, not types nested inside it, so a foreign
+// value sitting in a field of another struct is not caught — tightening that would refuse reads of
+// its SIBLING fields, which are not interpretations of the JSONO value. And under
+// `disabled_optimizers=extension` this hook does not run at all and the core-json paths go quiet
+// again, the same trade JsonoRequireExtensionOptimizerForShredded already takes.
 void RejectForeignLayoutsInExpression(Expression &expr) {
 	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
-		JsonoRejectForeignLayout(child.return_type, ForeignConsumerContext(expr));
+		// Classify first, name the consumer only on the refusal: this runs on every child of every
+		// expression of every plan, and naming a BOUND_CAST consumer renders its whole return type
+		// (kilobytes for a wide shredded value).
+		JsonoLayoutType layout;
+		if (MatchJsonoLayoutType(child.return_type, layout) == JsonoLayoutMatch::Foreign) {
+			JsonoRejectForeignLayout(child.return_type, ForeignConsumerContext(expr));
+		}
 		RejectForeignLayoutsInExpression(child);
 	});
 }

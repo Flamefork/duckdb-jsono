@@ -258,7 +258,9 @@ void EmitArrayOverlay(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &
 void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
                                     const vector<idx_t> *shred_filter = nullptr) {
 	JsonoLayoutType layout;
-	TryParseJsonoLayoutType(input.GetType(), layout);
+	if (!TryParseJsonoLayoutType(input.GetType(), layout)) {
+		throw InternalException("jsono reconstruct: input type '%s' is not a JSONO value", input.GetType().ToString());
+	}
 	vector<ReconShred> shreds;
 	vector<ArrayReconShred> array_shreds;
 	for (idx_t i = 0; i < layout.shreds.size(); i++) {

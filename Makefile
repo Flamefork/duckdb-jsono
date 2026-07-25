@@ -71,3 +71,12 @@ verify:
 	$(MAKE) test_relassert
 	$(MAKE) test_constructor_matrix_relassert
 	$(MAKE) format-check-all
+
+# DuckLake verification, deliberately OUTSIDE `verify` and CI: DuckLake cannot be vendored here
+# (INSTALL needs the network), so a hermetic gate cannot own it. Run it by hand after touching layout
+# recognition (MatchJsonoLayoutType and friends) or shred totality — DuckLake's inlined-data flush
+# round-trips values through generic SQL and narrows their types, which is the exact case the
+# recognition grammar must keep tolerating; a suite that is green says nothing about it.
+.PHONY: verify-ducklake
+verify-ducklake:
+	uv run --frozen python scripts/verify_ducklake_033.py

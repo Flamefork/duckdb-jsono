@@ -81,7 +81,7 @@ struct JsonoMergeBindData : public FunctionData {
 unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunction &bound_function,
                                              vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.empty()) {
-		throw BinderException("jsono_merge_patch() requires at least one argument");
+		throw BinderException(bound_function.name + "() requires at least one argument");
 	}
 	// Union the shreds of any shredded inputs (later inputs win a name conflict, matching
 	// the patch-wins fold). A shredded input keeps its type so the executor can read its
@@ -93,7 +93,7 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 			throw ParameterNotResolvedException();
 		}
 		auto &type = argument->return_type;
-		JsonoRequireExtensionOptimizerForShredded(context, type, "jsono_merge_patch");
+		JsonoRequireExtensionOptimizerForShredded(context, type, bound_function.name);
 		if (type.id() == LogicalTypeId::SQLNULL) {
 			bound_function.arguments.push_back(JsonoType());
 			continue;
@@ -123,8 +123,9 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 			bound_function.arguments.push_back(JsonoType());
 			continue;
 		}
-		JsonoRejectForeignLayout(type, "jsono_merge_patch()");
-		throw BinderException("jsono_merge_patch() arguments must be JSONO");
+		// The bind is shared with jsono_overlay, so both diagnostics name the function actually called.
+		JsonoRejectForeignLayout(type, bound_function.name + "()");
+		throw BinderException(bound_function.name + "() arguments must be JSONO");
 	}
 	if (shreds.empty()) {
 		bound_function.return_type = JsonoType();

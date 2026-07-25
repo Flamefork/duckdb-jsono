@@ -343,7 +343,7 @@ SELECT to_json(jsono('{"kind":"commit","time_us":1700,"extra":"e1"}',
 -- {"extra":"e1","kind":"commit","time_us":1700}
 ```
 
-Transparent reads over a shredded value go through the bundled `json` extension (present in every standard DuckDB distribution) and the extension's query optimizer. The shredded shape — the `jsono` layout wrapping the `body` blobs and the named `shreds` columns — survives a plain Parquet round-trip and reads back transparently; the scalar shred leaves keep projection and filter pushdown.
+Transparent reads over a shredded value go through the bundled `json` extension (present in every standard DuckDB distribution) and the extension's query optimizer. The shredded shape — the `jsono` layout wrapping the `body$1` blobs and the named `shreds$1` columns — survives a plain Parquet round-trip and reads back transparently; the scalar shred leaves keep projection and filter pushdown.
 
 Two things decide whether a filter actually **prunes** Parquet row groups (skips them on the per-row-group min/max statistics) rather than scanning the whole file:
 

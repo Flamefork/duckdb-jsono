@@ -547,6 +547,7 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 	if (arg_type.id() == LogicalTypeId::STRUCT) {
 		JsonoLayoutType src_layout;
 		if (!TryParseJsonoLayoutType(arg_type, src_layout)) {
+			JsonoRejectForeignLayout(arg_type, "jsono(value, shredding := ...)");
 			throw BinderException("jsono shred: value must be JSON text or a jsono value");
 		}
 		// Reshred a shredded value in one pass: surviving shreds copy through, dropped/retyped

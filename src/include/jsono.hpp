@@ -31,11 +31,12 @@ class ExtensionLoader;
 class ClientContext;
 
 // A jsono value is physically a nested STRUCT with exactly one layout field, named "jsono" for
-// both plain and shredded values. Inside the layout field live a `body` STRUCT of six BLOBs (the
-// binary JSONO body, see JsonoBodyStructType) and, for shredded values, a `shreds` STRUCT holding a
-// reserved `$jsono$set` marker (the shred-set hash), a reserved `$jsono$spill` bitmap (per-row
-// spilled-shred bits) plus one field per shred — a scalar shred is a bare typed lane, an array
-// shred is a LIST. The single layout name is
+// both plain and shredded values. Inside the layout field live a `body$1` STRUCT of six BLOBs (the
+// binary JSONO body, see JsonoBodyStructType) and, for shredded values, a `shreds$1` STRUCT holding
+// a reserved `$jsono$set` marker (the shred-set hash), the reserved `$jsono$spill$0`, `$jsono$spill$1`,
+// … bitmap columns (per-row spilled-shred bits) plus one field per shred — a scalar shred is a bare
+// typed lane, an array shred is a LIST. The `$<N>` suffixes are the layout revisions (see
+// JSONO_BODY_REVISION); the layout field name `jsono` never carries one. The single layout name is
 // deliberate: DuckDB reconciles set-operation branch types by field name (CombineStructTypes), so
 // differently-shredded branches merge into one ordinary shredded type whose `shreds` is the union of
 // the branches' shred sets — never a field-superset "union-merged" double struct. The struct cast
@@ -69,7 +70,8 @@ LogicalType JsonoType();
 LogicalType JsonoRawStructType();
 
 // The six-BLOB body STRUCT shared by every layout: STRUCT(slots BLOB, key_heap BLOB,
-// string_heap BLOB, skips BLOB). The binary JSONO body lives here, identical for plain and shredded.
+// string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB). The binary JSONO body lives here,
+// identical for plain and shredded.
 LogicalType JsonoBodyStructType();
 
 // The physical STRUCT of a shredded JSONO value: STRUCT("jsono" STRUCT("body$1" STRUCT(6 BLOB),
@@ -149,8 +151,8 @@ inline idx_t JsonoSpillColumnCount(idx_t shred_count) {
 	return (shred_count + JSONO_SPILL_BITS - 1) / JSONO_SPILL_BITS;
 }
 
-// Throw a BinderException if `name` collides with a reserved layout field: `body` (the residual,
-// rejected for consistency — a value-path shred cannot be named it either) or the reserved
+// Throw a BinderException if `name` collides with a reserved layout field: the `body` stem (the
+// residual, rejected for consistency — a value-path shred cannot be named it either) or the reserved
 // `$jsono$` name prefix (the marker and the spill bitmap live there; reserving the whole prefix
 // keeps future layout fields collision-free). Shared by the shredding-spec constructor
 // (ParseShredSpec) and the DDL path (jsono_storage_type) so both reject the same names —
@@ -186,25 +188,29 @@ enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 // cannot show, which is the case golden-byte tests exist to catch. Neither is bumped by the user's
 // shred set or by the ⌈N/63⌉ spill column count: those are data under a fixed layout.
 //
-// Closing a revision is a three-step commit: bump the name here, move the current golden bytes into
-// a closed-revision fixture asserting the loud refusal, and write the closed revision's FULL layout
-// into docs/jsono_format.md → "Revision history" — a later compat reader has nothing else to be
-// written against.
+// Closing a revision is a three-step commit: bump the name here; add a closed-revision fixture
+// (a struct literal over a live body) to test/sql/jsono_layout_revision.test asserting the loud
+// refusal — without the golden bytes, which assert nothing there, since the refusal is decided by
+// the field NAME before a single blob is read; and add one row to the revision map in
+// docs/jsono_format.md → "Revision history": the commit range that wrote the closed shape and how
+// it differs from the new one. Not its full layout — the build that wrote it and its golden bytes
+// are in git, and a second copy in the doc can only drift from them. The doc owes a user holding
+// old files the way back (which commit to build, or the struct rebuild that upgrades in place),
+// not an archive.
 constexpr idx_t JSONO_BODY_REVISION = 1;
 constexpr idx_t JSONO_SHREDS_REVISION = 1;
 
-// A parsed JSONO layout field: its top-level name, the inner STRUCT(body$1[, shreds$1]) type, its
-// shred (path, LOGICAL-value-type) columns (empty for plain; a scalar shred's bare lane and an
-// array shred's list are recorded by their value type), and the number of spill bitmap columns.
-// The single grammar all predicates read against. The shred-set marker always sits at `shreds`
-// field 0 and the spill columns at fields 1..spill_columns; shred k is field 1 + spill_columns + k.
-// `body_revision` / `shreds_revision` are filled whenever the names parsed, current revision or
-// not (DConstants::INVALID_INDEX when the name was not revisioned at all), so the refusal can name
-// what it saw.
+// A parsed JSONO layout field: its shred (path, LOGICAL-value-type) columns (empty for plain; a
+// scalar shred's bare lane and an array shred's list are recorded by their value type) and the
+// number of spill bitmap columns. The single grammar all predicates read against. The shred-set
+// marker always sits at `shreds$1` field 0 and the spill columns at fields 1..spill_columns; shred k
+// is field 1 + spill_columns + k. `body_revision` is set whenever the anchor parsed (so it is always
+// known on a refusal); `shreds_revision` stays DConstants::INVALID_INDEX for a value carrying no
+// shreds field at all. When several revisioned stems of one kind are present — a revision MIXTURE —
+// the revision recorded is a foreign one, so the refusal reads the same whatever order the branches
+// were merged in.
 struct JsonoLayoutType {
-	JsonoLayoutKind kind;
-	string layout_name;
-	LogicalType layout_type;
+	JsonoLayoutKind kind = JsonoLayoutKind::Plain;
 	child_list_t<LogicalType> shreds;
 	idx_t spill_columns = 0;
 	idx_t body_revision = DConstants::INVALID_INDEX;
@@ -212,21 +218,24 @@ struct JsonoLayoutType {
 };
 
 // How a type relates to the JSONO layout grammar. `Foreign` is the whole point of the anchor: a
-// value written by another layout revision (or a corrupt/hand-built one) stays recognizable AS
-// JSONO instead of decaying into "some struct", which is what let core json silently serialize it.
+// value written by another layout revision — or a type mixing revisions, which is what a
+// `union_by_name` scan over an old and a current file produces — stays recognizable AS JSONO instead
+// of decaying into "some struct", which is what let core json silently serialize it. A type carrying
+// only THIS revision but failing the grammar is NotJsono, not Foreign (see MatchJsonoLayoutField).
 enum class JsonoLayoutMatch : uint8_t { NotJsono, Current, Foreign };
 
-// Classify `type` against the layout grammar. NEVER throws — the refusal is a policy decision and
-// lives in exactly one place (JsonoRejectForeignLayout), which is the seam a future compat reader
-// grows into (it turns "throw" into "wrap the source in an upgrade"). The anchor is deliberately
-// narrow and permanent: a top-level STRUCT with exactly one field named `jsono` whose own field 0
-// is named `body` or `body$<digits>`. Everything else about the layout may change across revisions;
-// the anchor may not.
+// Classify `type` against the layout grammar. NEVER throws — most callers only want to know what
+// they are holding, so refusing is a separate decision and lives in exactly one place
+// (JsonoRejectForeignLayout): one wording of the message, one place to change the policy. The
+// anchor is deliberately narrow and permanent: a top-level STRUCT with exactly one field named
+// `jsono` whose own field 0 is named `body` or `body$<digits>` AND is a STRUCT of nothing but
+// BLOBs. Everything else about the layout may change across revisions; the anchor may not.
 JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out);
 
 // The single refusal point for a foreign layout. No-op unless `type` is JsonoLayoutMatch::Foreign;
-// otherwise throws an InvalidInputException naming both revisions read and expected. `context` is
-// the user-facing operation (a function name, "cast", …).
+// otherwise throws an InvalidInputException naming the revisions read (the body one always, the
+// shreds one when the value carries shreds) and the ones this build expects. `context` is the
+// user-facing operation (a function name, "cast to VARCHAR", …).
 void JsonoRejectForeignLayout(const LogicalType &type, const string &context);
 
 // Parse `type` as an ordinary JSONO value of the CURRENT revision: a top-level STRUCT with exactly
@@ -236,13 +245,13 @@ void JsonoRejectForeignLayout(const LogicalType &type, const string &context);
 // JsonoRejectForeignLayout first.
 bool TryParseJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out);
 
-// True when `type` is the plain JSONO STRUCT (a `jsono` layout field carrying only `body`). Strict:
+// True when `type` is the plain JSONO STRUCT (a `jsono` layout field carrying only `body$1`). Strict:
 // a shredded value is not a plain value (extending this to shredded would give silently wrong
 // results where call sites read only the residual body).
 bool IsJsonoType(const LogicalType &type);
 
-// True when `type` is a shredded JSONO struct: a `jsono` layout field carrying `body` plus a
-// non-empty `shreds`. Set operations over differently-shredded values reconcile into this same
+// True when `type` is a shredded JSONO struct: a `jsono` layout field carrying `body$1` plus a
+// non-empty `shreds$1`. Set operations over differently-shredded values reconcile into this same
 // shape (the shred union), so there is no separate merged classification.
 bool IsShreddedJsonoType(const LogicalType &type);
 
@@ -1246,7 +1255,5 @@ inline void VerifyShredManifestEntries(const std::vector<ShredManifestEntry> &ma
 }
 
 } // namespace jsono
-
-void RegisterJsonoType(ExtensionLoader &loader);
 
 } // namespace duckdb

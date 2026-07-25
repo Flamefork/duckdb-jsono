@@ -175,3 +175,50 @@ SELECT count(*) FILTER (WHERE jsono_storage_type(s) IS NOT NULL)
 FROM (VALUES (NULL::VARCHAR), (NULL::VARCHAR), (NULL::VARCHAR)) t(s);
 ----
 0
+
+# ---- Why the DDL helper exists: a hand-declared column can miss the grammar silently ----
+
+# A lane type the constructor itself rejects (INTEGER is not a shred value type) is still accepted by
+# CREATE TABLE, and the value written into it stops being recognizable as JSONO: every read answers
+# NULL, including for paths that were never shredded. Nothing is lost — the bytes are intact and one
+# cast to the correct lane type brings the whole document back — but nothing warns at write time
+# either. Refusing this at write time is not possible without breaking a legal path (a generic
+# value->SQL->value round-trip narrows lanes the same way; see docs/jsono_format.md "Layout
+# revisions"), so the answer is to declare storage columns with jsono_storage_type().
+statement ok
+CREATE TABLE hand_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a INTEGER))));
+
+statement ok
+INSERT INTO hand_declared SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'});
+
+query II
+SELECT v ->> 'a', v ->> 'b' FROM hand_declared;
+----
+NULL	NULL
+
+# The same bytes read back in full once the column type matches what the constructor produces.
+query I
+SELECT to_json(v::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT))))
+FROM hand_declared;
+----
+{"a":1,"b":"x"}
+
+# Declared with the type the helper emits for the same shred set, the INSERT reads back as written.
+statement ok
+CREATE TABLE helper_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT))));
+
+
+statement ok
+INSERT INTO helper_declared SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'});
+
+query II
+SELECT v ->> 'a', v ->> 'b' FROM helper_declared;
+----
+1	x
+
+# …and that column type IS what the helper emits for the shred set — the declaration above is the
+# helper's own output, not a lucky hand-written match.
+query I
+SELECT jsono_storage_type('a BIGINT') = typeof(v) FROM helper_declared;
+----
+true

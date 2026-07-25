@@ -91,9 +91,17 @@ bool JsonoShreddedToVarcharCast(Vector &source, Vector &result, idx_t count, Cas
 // shredded too, so the shredded branch must be checked first. There is no equivalent for ->JSON:
 // core json owns STRUCT(any)->JSON and the cast registry keeps the first registration, so shredded
 // ::JSON / to_json stay the optimizer's job.
+//
+// A foreign revision is refused HERE, not only in the plan walk: the CSV writer (and through it
+// EXPORT DATABASE, whose default format is CSV) resolves this cast from the registry at execution
+// time, with no expression in the plan for the walk to see. Without the refusal, `COPY … TO … (FORMAT
+// CSV)` fell through to the default struct text and wrote an unrecoverable dump of the raw blobs
+// without an error — a "backup" of exactly the data being refused elsewhere — while
+// `value::VARCHAR` on the same value threw.
 BoundCastInfo JsonoStructToVarcharCastBind(BindCastInput &input, const LogicalType &source, const LogicalType &target) {
 	(void)input;
 	(void)target;
+	JsonoRejectForeignLayout(source, "cast to VARCHAR");
 	if (IsShreddedJsonoType(source)) {
 		return BoundCastInfo(JsonoShreddedToVarcharCast);
 	}

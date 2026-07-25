@@ -89,8 +89,9 @@ string RevisionedName(const char *stem, idx_t revision) {
 
 // Read a revisioned layout field name: "<stem>$<digits>" yields its revision, a bare "<stem>"
 // yields revision 0 (every value written before layout revisions existed). Digits are canonical —
-// no leading zeros, no sign, no overflow — so exactly one spelling names a revision and a
-// near-miss name is not a layout field at all.
+// no leading zeros, no sign, no overflow — so a near-miss name is not a layout field at all.
+// Revision 0 is the only one with two spellings ("body" and "body$0"); the bare one is what every
+// pre-revision value carries, and no writer emits the "$0" form.
 bool TryReadRevisionedName(const string &name, const char *stem, idx_t &revision) {
 	auto stem_size = strlen(stem);
 	if (name.compare(0, stem_size, stem) != 0) {
@@ -152,12 +153,33 @@ bool UnwrapShredFieldType(const LogicalType &type, LogicalType &value_type) {
 	return false;
 }
 
+// The anchor's shape requirement: a named STRUCT of nothing but BLOBs. Revision-neutral — every
+// revision's residual is a set of blob columns, whatever their number or names — and it is what
+// keeps an ordinary user struct that merely spells `{'jsono': {'body': ...}}` from being refused as
+// a foreign JSONO value.
+bool IsBlobStruct(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(type)) {
+		return false;
+	}
+	auto &children = StructType::GetChildTypes(type);
+	if (children.empty()) {
+		return false;
+	}
+	for (auto &child : children) {
+		if (child.second.id() != LogicalTypeId::BLOB) {
+			return false;
+		}
+	}
+	return true;
+}
+
 // Classify one layout field (top-level child name + its STRUCT type) into `out`. The anchor is the
-// field name `jsono` plus a field 0 named `body` or `body$<digits>`; it is narrow enough that no
-// user struct hits it by accident and permanent, so a value written under a DIFFERENT revision is
-// classified Foreign rather than silently passed over. Past the anchor the current grammar is: the six-BLOB body
-// struct at `body$1`, optionally a `shreds$1` STRUCT sibling holding the shred-set marker, the
-// spill bitmap columns and one field per shred. The single, unrevisioned layout name (`jsono` for
+// field name `jsono` plus a field 0 named `body` or `body$<digits>` whose type is a STRUCT of pure
+// BLOBs; it is narrow enough that no user struct hits it by accident and permanent, so a value
+// written under a DIFFERENT revision is classified Foreign rather than silently passed over. Past
+// the anchor the current grammar is: the six-BLOB body struct at `body$1`, optionally a `shreds$1`
+// STRUCT sibling holding the shred-set marker, the spill bitmap columns and one field per shred.
+// The single, unrevisioned layout name (`jsono` for
 // plain and shredded) is deliberate: DuckDB reconciles set-operation branch types by field name
 // (CombineStructTypes), so differently-shredded branches merge into one shredded type whose
 // `shreds` is the union of the branches' shreds, and the marker stays the left branch's `shreds`
@@ -172,15 +194,35 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		return JsonoLayoutMatch::NotJsono;
 	}
 	auto &fields = StructType::GetChildTypes(layout_type);
-	if (fields.empty() || !TryReadRevisionedName(fields[0].first, JSONO_BODY_STEM, out.body_revision)) {
+	if (fields.empty() || !TryReadRevisionedName(fields[0].first, JSONO_BODY_STEM, out.body_revision) ||
+	    !IsBlobStruct(fields[0].second)) {
 		return JsonoLayoutMatch::NotJsono;
 	}
-	out.layout_name = name;
-	out.layout_type = layout_type;
-	if (fields.size() == 2) {
-		// Read the shreds revision alongside the body one, so a refusal can name both revisions of a
-		// value that is foreign in the residual and in the shreds at once.
-		TryReadRevisionedName(fields[1].first, JSONO_SHREDS_STEM, out.shreds_revision);
+	// Read every revisioned stem, not just the leading pair. Two stems of the same kind mean the type
+	// is a MIXTURE of revisions — a multi-file scan (`union_by_name`) merges per-file schemas by name,
+	// so an old file beside a current one yields `body$1, shreds$1, body, shreds` in whichever order
+	// the files were listed. Without this the classification depended on that order: an old file first
+	// was refused, a current file first passed the anchor, failed the grammar and went silently
+	// NotJsono — the whole scan, current rows included, then read as NULL through core json. Naming a
+	// FOREIGN revision (rather than the one that sorted first) makes the refusal order-independent.
+	idx_t body_stems = 0;
+	idx_t shreds_stems = 0;
+	for (auto &field : fields) {
+		idx_t revision;
+		if (TryReadRevisionedName(field.first, JSONO_BODY_STEM, revision)) {
+			body_stems++;
+			if (revision != JSONO_BODY_REVISION) {
+				out.body_revision = revision;
+			}
+		} else if (TryReadRevisionedName(field.first, JSONO_SHREDS_STEM, revision)) {
+			shreds_stems++;
+			if (out.shreds_revision == DConstants::INVALID_INDEX || revision != JSONO_SHREDS_REVISION) {
+				out.shreds_revision = revision;
+			}
+		}
+	}
+	if (body_stems > 1 || shreds_stems > 1) {
+		return JsonoLayoutMatch::Foreign;
 	}
 	// A KNOWN-BUT-DIFFERENT revision is the loud case: such a value was written by another build and
 	// reading it would silently lose data. Everything that fails below stays silent (NotJsono) — the
@@ -271,6 +313,7 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 } // namespace
 
 JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out) {
+	out = JsonoLayoutType(); // never inherit a previous parse: callers reuse one `out` across types
 	if (type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(type)) {
 		return JsonoLayoutMatch::NotJsono;
 	}
@@ -286,18 +329,19 @@ void JsonoRejectForeignLayout(const LogicalType &type, const string &context) {
 	if (MatchJsonoLayoutType(type, layout) != JsonoLayoutMatch::Foreign) {
 		return;
 	}
-	// The revisions are named machine-readably on purpose: they are the key a compat reader would
-	// dispatch on, and the only thing that tells a user which build wrote the data.
-	string read = layout.body_revision == DConstants::INVALID_INDEX
-	                  ? "body=?"
-	                  : StringUtil::Format("body=%llu", (unsigned long long)layout.body_revision);
+	// The revisions are named machine-readably on purpose: they are the only thing that tells a user
+	// which build wrote the data, and the key into the revision map in docs/jsono_format.md, which
+	// turns them into a commit range and an upgrade recipe. The body revision is always known here
+	// (the anchor parsed it); the shreds one only for a value carrying shreds.
+	string read = StringUtil::Format("body=%llu", (unsigned long long)layout.body_revision);
 	if (layout.shreds_revision != DConstants::INVALID_INDEX) {
 		read += StringUtil::Format(" shreds=%llu", (unsigned long long)layout.shreds_revision);
 	}
 	throw InvalidInputException(
 	    "%s: JSONO value carries layout revision %s, this build reads body=%llu shreds=%llu. Reading it would "
-	    "silently lose data, so it is refused; rewrite the value with jsono(...) (a build that reads the old "
-	    "revision can export it to JSON first) or drop the data. Type: %s",
+	    "silently lose data, so it is refused. This build can still MOVE the value (SELECT *, INSERT ... SELECT, "
+	    "COPY ... TO a Parquet file) but not read or render it: carry it to a build that reads that revision and "
+	    "rewrite it there with jsono(...), or drop the data. Type: %s",
 	    context, read, (unsigned long long)JSONO_BODY_REVISION, (unsigned long long)JSONO_SHREDS_REVISION,
 	    type.ToString());
 }

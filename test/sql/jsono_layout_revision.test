@@ -10,8 +10,8 @@ require parquet
 
 # Closed-revision fixtures. A legacy value is assembled with a struct literal over a REAL current
 # body, so no old build and no committed binary is needed: the fixture is text, diffs and reviews
-# like code. When a compat reader for a revision lands, these same fixtures flip from asserting the
-# refusal to asserting the value they decode to.
+# like code. Only the field NAMES matter here — that is what the refusal reads, before a blob is
+# touched — so the bodies below are current bytes and carry no meaning of their own.
 
 statement ok
 CREATE TABLE src AS SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}) AS v;
@@ -41,13 +41,23 @@ SELECT {'jsono': {'body': v.jsono."body$1",
                              'a': v.jsono."shreds$1".a}}} AS v
 FROM src;
 
-# A future revision: the same anchor, a revision this build does not know.
+# A future revision: the same anchor, a revision this build does not know. Two of them, one per
+# stem, because they version independent things and each must be refused on its own: a future SHRED
+# layout beside a current residual, and a future RESIDUAL layout beside current shreds.
 statement ok
 CREATE TABLE rev99 AS
 SELECT {'jsono': {'body$1': v.jsono."body$1",
                   'shreds$99': {'$jsono$set': v.jsono."shreds$1"."$jsono$set",
                                 '$jsono$spill$0': v.jsono."shreds$1"."$jsono$spill$0",
                                 'a': v.jsono."shreds$1".a}}} AS v
+FROM src;
+
+statement ok
+CREATE TABLE body_rev2 AS
+SELECT {'jsono': {'body$2': v.jsono."body$1",
+                  'shreds$1': {'$jsono$set': v.jsono."shreds$1"."$jsono$set",
+                               '$jsono$spill$0': v.jsono."shreds$1"."$jsono$spill$0",
+                               'a': v.jsono."shreds$1".a}}} AS v
 FROM src;
 
 # --- Every reading path refuses, ours and core json's alike. Before this, the core-json paths
@@ -94,6 +104,49 @@ SELECT jsono_group_merge(v) FROM rev0_shredded;
 ----
 layout revision body=0 shreds=0
 
+statement error
+SELECT jsono_merge_patch(v, jsono('{"c":1}')) FROM rev0_shredded;
+----
+jsono_merge_patch(): JSONO value carries layout revision body=0 shreds=0
+
+# jsono_overlay shares merge_patch's bind, so the refusal must name the function actually called.
+statement error
+SELECT jsono_overlay(v, jsono('{"c":1}')) FROM rev0_shredded;
+----
+jsono_overlay(): JSONO value carries layout revision body=0 shreds=0
+
+statement error
+SELECT jsono_group_merge_max(v, 1) FROM rev0_shredded;
+----
+jsono_group_merge_max: JSONO value carries layout revision body=0 shreds=0
+
+# The advisors resolve their argument themselves, so each has to refuse rather than report the shape
+# complaint it would give for an ordinary struct.
+statement error
+SELECT jsono_suggest_shredding(v) FROM rev0_shredded;
+----
+jsono_suggest_shredding: JSONO value carries layout revision body=0 shreds=0
+
+statement error
+SELECT jsono_shred_stats(v) FROM rev0_shredded;
+----
+jsono_shred_stats: JSONO value carries layout revision body=0 shreds=0
+
+statement error
+SELECT jsono(v, shredding := {'a':'BIGINT'}) FROM rev0_shredded;
+----
+jsono(value, shredding := ...): JSONO value carries layout revision body=0 shreds=0
+
+# Inserting a foreign value into a current-revision column: the by-name struct cast would drop the
+# whole document silently, so the cast's bind refuses.
+statement ok
+CREATE TABLE current_column (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+
+statement error
+INSERT INTO current_column SELECT v FROM rev0_plain;
+----
+cast to JSONO: JSONO value carries layout revision body=0,
+
 # Plain revision 0 is refused for the same reason, and the message names only the body revision
 # because that value carries no shreds at all.
 statement error
@@ -116,6 +169,11 @@ SELECT v ->> 'a' FROM rev99;
 ----
 layout revision body=1 shreds=99
 
+statement error
+SELECT v ->> 'a' FROM body_rev2;
+----
+layout revision body=2 shreds=1
+
 # --- Split revisions: a value whose residual is current and whose shreds are foreign is refused,
 # while a current plain value beside it keeps reading. This is the point of versioning `body$N` and
 # `shreds$M` separately — a shred-layout change must not invalidate the plain data. ---
@@ -130,8 +188,8 @@ SELECT to_json(jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}));
 ----
 {"a":1,"b":"x"}
 
-# --- Transport lives: a bare column reference is not a read, so the data can always be inspected
-# and moved out. Only interpretation is refused. ---
+# --- Binary transport lives: a bare column reference is not a read, so the data can always be moved
+# out to a build that reads it. Only interpretation is refused. ---
 
 query I
 SELECT count(*) FROM (SELECT * FROM rev0_shredded);
@@ -144,17 +202,48 @@ COPY rev0_shredded TO '__TEST_DIR__/rev0_shredded.parquet';
 statement ok
 CREATE TABLE rev0_copy AS SELECT * FROM rev0_shredded;
 
+# --- …but rendering to TEXT is not transport. The CSV writer resolves the VARCHAR cast from the
+# registry at execution time, with no expression in the plan for the pre-optimize walk to see, so the
+# refusal has to live in the cast's own bind. Without it, `COPY … TO … (FORMAT CSV)` (and EXPORT
+# DATABASE, whose default format is CSV) wrote the raw blob struct as text — an unrecoverable
+# "backup", taken without an error, of exactly the data the refusal message tells you to back up —
+# while `value::VARCHAR` on the same value threw. ---
+
+statement error
+COPY rev0_shredded TO '__TEST_DIR__/rev0_shredded.csv' (FORMAT CSV);
+----
+cast to VARCHAR: JSONO value carries layout revision body=0 shreds=0
+
+statement error
+SELECT v::VARCHAR FROM rev0_shredded;
+----
+cast to VARCHAR: JSONO value carries layout revision body=0 shreds=0
+
+statement error
+SELECT v::VARCHAR FROM rev0_plain;
+----
+cast to VARCHAR: JSONO value carries layout revision body=0,
+
+# The current revision keeps rendering, through the same cast entry.
+query I
+SELECT v::VARCHAR FROM src;
+----
+{"a":1,"b":"x"}
+
 # …and the refusal survives the Parquet round-trip, where a stored old file is the real scenario.
 statement error
 SELECT v ->> 'a' FROM '__TEST_DIR__/rev0_shredded.parquet';
 ----
 layout revision body=0 shreds=0
 
-# --- Mixed revisions in one scan are refused, not silently emptied. union_by_name merges the branch
-# types before the extension sees anything, so the merged type is no revision at all; previously this
-# returned NULL for every row INCLUDING the current-revision file's. A compat reader cannot fix this
-# either (there is no single revision to upgrade from) — read the files separately and UNION ALL the
-# upgraded values. ---
+# --- Mixed revisions in one scan are refused, not silently emptied, IN EITHER FILE ORDER.
+# union_by_name merges the per-file schemas by name before the extension sees anything, so the merged
+# layout carries both revisions' stems ("body$1", "shreds$1", "body", "shreds") ordered by which file
+# came first. Reading only the leading stem made the classification order-dependent: the old file
+# first was refused, the current file first passed the anchor, failed the grammar and went silently
+# NotJsono — the whole scan, current rows included, then read as NULL through core json. A compat
+# reader cannot fix a mixed scan either (there is no single revision to upgrade from) — read the files
+# separately and UNION ALL the upgraded values. ---
 
 statement ok
 COPY src TO '__TEST_DIR__/current.parquet';
@@ -162,7 +251,32 @@ COPY src TO '__TEST_DIR__/current.parquet';
 statement error
 SELECT v ->> 'a' FROM read_parquet(['__TEST_DIR__/rev0_shredded.parquet', '__TEST_DIR__/current.parquet'], union_by_name := true);
 ----
-JSONO
+layout revision body=0 shreds=0
+
+# The other order: the refusal names the FOREIGN revision, not the leading one, so both orders read
+# identically.
+statement error
+SELECT v ->> 'a' FROM read_parquet(['__TEST_DIR__/current.parquet', '__TEST_DIR__/rev0_shredded.parquet'], union_by_name := true);
+----
+layout revision body=0 shreds=0
+
+statement error
+SELECT to_json(v) FROM read_parquet(['__TEST_DIR__/current.parquet', '__TEST_DIR__/rev0_shredded.parquet'], union_by_name := true);
+----
+layout revision body=0 shreds=0
+
+# A plain current file mixed with a plain revision-0 one carries two `body` stems and no `shreds` at
+# all: the mixture is caught by the stem count, not by the shreds field.
+statement ok
+COPY rev0_plain TO '__TEST_DIR__/rev0_plain.parquet';
+
+statement ok
+COPY (SELECT jsono('{"a":1}') AS v) TO '__TEST_DIR__/current_plain.parquet';
+
+statement error
+SELECT v ->> 'a' FROM read_parquet(['__TEST_DIR__/current_plain.parquet', '__TEST_DIR__/rev0_plain.parquet'], union_by_name := true);
+----
+layout revision body=0,
 
 # --- The anchor is narrow: a struct that merely has a field named `jsono` is still someone else's
 # data and stays silent (NotJsono), not refused. ---
@@ -197,3 +311,86 @@ statement error
 SELECT jsono_validate({'jsono': {'body$01': {'slots': ''::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}});
 ----
 argument must be JSONO
+
+# The anchor also requires field 0 to be a STRUCT of nothing but BLOBs. Without that requirement an
+# ordinary user struct that merely spells `{'jsono': {'body': ...}}` was refused as JSONO data whose
+# revision could not be read. The requirement is revision-neutral: every revision's residual is blob
+# columns, so a genuinely foreign body still gets refused (see rev0_plain above).
+query II
+SELECT ({'jsono': {'body': 42}}).jsono.body, to_json({'jsono': {'body': 42}});
+----
+42	{"jsono":{"body":42}}
+
+# --- Documented boundaries. Both are pre-existing gaps that the refusal cannot close without
+# refusing legal work; docs/jsono_format.md "Layout revisions" states them. They are pinned here so
+# that closing one goes red rather than unnoticed. ---
+
+# 1. A foreign value nested in a field of another struct: the plan walk inspects a child expression's
+# own type, not the types nested inside it. Tightening it would refuse reads of the SIBLING fields.
+statement ok
+CREATE TABLE nested_foreign AS
+SELECT (ROW(ROW(ROW(ROW(v.jsono."body$1".slots, v.jsono."body$1".key_heap, v.jsono."body$1".string_heap,
+                        v.jsono."body$1".skips, v.jsono."body$1".lengths, v.jsono."body$1".nums))), 7))
+       ::STRUCT(payload STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))), id INTEGER) AS x
+FROM src;
+
+query I
+SELECT to_json(x)::VARCHAR LIKE '{"payload":{"jsono":{"body":{"slots":"JSNO%' FROM nested_foreign;
+----
+true
+
+statement error
+SELECT to_json(x.payload) FROM nested_foreign;
+----
+layout revision body=0,
+
+# 2. With the extension optimizer disabled the plan walk does not run, so the core-json paths go
+# quiet again. The casts and our own binders do not depend on the optimizer and still refuse.
+statement ok
+SET disabled_optimizers='extension';
+
+query I
+SELECT v ->> 'a' FROM rev0_plain;
+----
+NULL
+
+statement error
+SELECT v::VARCHAR FROM rev0_plain;
+----
+cast to VARCHAR: JSONO value carries layout revision body=0,
+
+statement ok
+RESET disabled_optimizers;
+
+# --- The documented way forward (docs/jsono_format.md → "Revision history"). A revision-0 value
+# whose only difference is the field names — the shape stored files overwhelmingly carry — is moved
+# to the current revision by rebuilding the layout struct under the revisioned names, in SQL, with no
+# per-row work. It needs the optimizer off for that one statement: the rebuild reads the foreign
+# value with struct_extract, which is exactly what the plan walk refuses. Pinned because the doc
+# promises it — a tightening of the refusal that also closed this path would leave a user holding old
+# files with no way forward at all, and the suite would stay green. ---
+
+statement ok
+CREATE TABLE rev0_renameable AS
+SELECT {'jsono': {'body': v.jsono."body$1", 'shreds': v.jsono."shreds$1"}} AS v FROM src;
+
+statement error
+SELECT to_json(v) FROM rev0_renameable;
+----
+layout revision body=0 shreds=0
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TABLE rev0_upgraded AS
+SELECT {'jsono': {'body$1': v.jsono.body, 'shreds$1': v.jsono.shreds}} AS v FROM rev0_renameable;
+
+statement ok
+RESET disabled_optimizers;
+
+# The upgraded value is the original in every respect: same type, same document, same shred read.
+query III
+SELECT typeof(v) = jsono_storage_type('a BIGINT'), to_json(v), v ->> 'a' FROM rev0_upgraded;
+----
+true	{"a":1,"b":"x"}	1

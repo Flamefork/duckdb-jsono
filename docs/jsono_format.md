@@ -66,7 +66,7 @@ exactly the presence of `shreds$1`. Each scalar *shred* is the value at its cano
 (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`) with the path as the field
 name. Nested shred paths are allowed. No JSON key is reserved: a JSON key named
 `body` can still be shredded through its `$.`-prefixed path form (`$.body`),
-which lands inside `shreds` and cannot collide with the layout's `body` (the
+which lands inside `shreds$1` and cannot collide with the layout's `body$1` (the
 `$jsono$` name prefix is reserved for the layout's own fields).
 
 The single layout name (`jsono` for both plain and shredded) and the nested
@@ -348,23 +348,66 @@ and invalidate different data:
 
 The layout field name `jsono` is the **anchor** and never carries a revision.
 Recognition is anchor-first: a top-level STRUCT with exactly one field named
-`jsono` whose own field 0 is named `body` or `body$<digits>` is a JSONO value of
-*some* revision. A value whose revision is **known but different** is refused
-loudly (`JsonoRejectForeignLayout`), never silently treated as an ordinary
-struct — that silence was the actual failure mode before revisions existed: an
-older shredded value bound to core `json`'s `->>`/`to_json`, which returned
-`NULL` or serialized the raw blob struct.
+`jsono` whose own field 0 is named `body` or `body$<digits>` **and is a STRUCT of
+nothing but BLOBs** is a JSONO value of *some* revision. (The blob requirement is
+revision-neutral — every revision's residual is blob columns — and is what keeps
+an ordinary user struct that happens to spell `{'jsono': {'body': …}}` from being
+refused as JSONO data.) A value whose revision is **known but different** is
+refused loudly (`JsonoRejectForeignLayout`), never silently treated as an
+ordinary struct — that silence was the actual failure mode before revisions
+existed: an older shredded value bound to core `json`'s `->>`/`to_json`, which
+returned `NULL` or serialized the raw blob struct.
+
+A layout struct carrying **more than one** revisioned stem of a kind (`body` and
+`body$1` side by side, say) is a *mixture* of revisions and is refused the same
+way. That is what a multi-file scan produces: `read_parquet(…, union_by_name :=
+true)` merges the per-file schemas by name, so an old file beside a current one
+yields `body$1, shreds$1, body, shreds` in whichever order the files were
+listed. Nothing can be done to such a scan as a whole (there is no single
+revision to upgrade from) — upgrade the old files separately and `UNION ALL` the
+results. The refusal names a *foreign* revision rather than whichever sorted
+first, so it reads the same in both orders.
 
 A value carrying the *current* revision that nevertheless fails the grammar
-stays silently non-JSONO, as before. This is deliberate and not a hole: such a
-type also arises on a legal write path, where a generic value→SQL→value
-round-trip (DuckLake's inlined-data flush) narrows an all-NULL spill column to
-`SQLNULL` and a small lane to `INTEGER` on its way to the declared column type.
-Refusing that would break writing in order to catch a hand-built struct, and a
-hand-built struct is not data anyone can lose.
+stays silently non-JSONO, as before. This is deliberate: such a type also arises
+on a legal write path, where a generic value→SQL→value round-trip (DuckLake's
+inlined-data flush) narrows an all-NULL spill column to `SQLNULL` and a small
+lane to `INTEGER` on its way to the declared column type. Refusing that would
+break writing in order to catch a hand-built struct. The cost is real but
+bounded: a column *declared* with a near-miss shred lane (`a INTEGER`, which the
+constructor itself rejects as a shred type) accepts a valid current-revision
+value silently, and every read of that column then answers `NULL` — the bytes are
+intact and one explicit cast to the correct lane type (`a BIGINT`) brings the
+whole document back, but nothing warns you at write time. Declare storage columns
+with `jsono_storage_type(...)` and this cannot happen.
 
 Splitting `body$N` from `shreds$M` is what keeps a shred-layout change from
 invalidating plain values, which are the bulk of stored data.
+
+**What a foreign value can still do.** Interpretation fails; *binary* transport
+lives. Moving the bytes works — a bare column reference in `SELECT *`, `INSERT …
+SELECT`, `CREATE TABLE … AS`, `UNION ALL`, `GROUP BY`/`ORDER BY`, `COPY … TO`
+Parquet, `EXPORT DATABASE (FORMAT PARQUET)` — so an old value can always be
+carried to a build that reads it. Everything that reads or *renders* the value
+refuses, including rendering to text: `->>`, `to_json`, `::JSON`, `::VARCHAR`,
+every `jsono_*` function, and also `COPY … TO … (FORMAT CSV)`, `EXPORT DATABASE`
+with its default CSV format, and simply printing the column in a shell — those
+all go through the same VARCHAR cast, which would otherwise write an
+unrecoverable dump of the raw blobs with no error at all. Composition refuses
+too: `CASE`, `COALESCE`, `IS NOT NULL`, `=`, window functions, wrapping the value
+in a struct or list.
+
+Two boundaries are known and not caught:
+
+- a foreign JSONO value **nested inside another struct** (`STRUCT(payload
+  <foreign>, id INT)`) is invisible to the plan walk, which inspects the type of
+  an expression's child, not the types nested inside it. `to_json(x)` on the
+  outer struct serializes the raw blobs; `to_json(x.payload)` refuses. Tightening
+  this would refuse `x.id` as well — reading a sibling field is not an
+  interpretation of the JSONO value — so the walk stays at the top level;
+- under `SET disabled_optimizers='extension'` the plan walk does not run at all,
+  and the core-json paths (`->>`, `to_json`, `::JSON`) go quiet again. The casts
+  and our own binders still refuse, since they do not depend on the optimizer.
 
 **Bump `body$N`** when a body blob column is added, removed, renamed or
 retyped. **Bump `shreds$M`** when the reserved field set inside `shreds`, the
@@ -377,51 +420,67 @@ Closing a revision is one commit with three parts:
 
 1. bump the name (`JSONO_BODY_REVISION` / `JSONO_SHREDS_REVISION` in
    `src/include/jsono.hpp`);
-2. move the current golden bytes from `test/sql/jsono_layout_golden.test` into a
-   closed-revision fixture in `test/sql/jsono_layout_revision.test` asserting
-   the loud refusal;
-3. write the closed revision's **full** layout into the Revision history below —
-   field names and types, the meaning of every reserved field, the writer's
-   state table. A changelog of what moved is not enough: a compat reader has
-   nothing else to be written against once the knowledge leaves working memory.
+2. add a closed-revision fixture — a struct literal over a live body, as in
+   `test/sql/jsono_layout_revision.test` — asserting the loud refusal. Do **not**
+   carry the golden bytes into it: a foreign revision is decided by the field
+   *name* before a single blob is read, so bytes in a refusal fixture assert
+   nothing;
+3. add one row to the revision map below: the commit range that wrote the closed
+   shape, and how it differs from the new current one. Not its full layout — the
+   build that wrote it, and the golden bytes it wrote, are in git, and a second
+   copy here can only drift from them. What a user holding old files needs is the
+   way back: the commit range, plus the statement that moves the data forward
+   whenever a rebuild of the layout struct is enough.
 
 ### Revision history
 
-**Revision 0** (everything written before layout revisions existed; unreadable
-by this build, refused loudly). Unrevisioned field names, `body` and `shreds`:
+There is no compat reader and none is planned: this build refuses old data, it
+does not upgrade it. So what follows is not an archive of closed layouts — those
+live in git, in the build that wrote them and in the golden bytes of
+`test/sql/jsono_layout_golden.test` at that commit. It is the way back to your
+bytes: which commit range wrote which shape, and what it takes to move it
+forward.
 
+**Revision 0** is everything written before layout revisions existed: the
+unrevisioned field names `body` and `shreds`. Four shapes shipped under it.
+
+| Shape | Written by | Difference from revision 1 |
+|-------|------------|----------------------------|
+| 0.d | `cc7d8cb`…`31ba960` | the two field names, nothing else |
+| 0.c | `f450a5b`…`cc7d8cb`~ | …and spill column 0 spelled `"$jsono$spill"`, the rest `"$jsono$spill1"`, `"$jsono$spill2"`, … |
+| 0.b | `ada4d30`…`f450a5b`~ | …and exactly one spill column, `"$jsono$spill"`, capping a shred set at 63 |
+| 0.a | before `ada4d30` | scalar shreds were `STRUCT(value <T>, complete TINYINT)` pairs, no spill bitmap, and the marker was the clean hash on every row with no dirty flip |
+
+Stored files overwhelmingly carry 0.d: it lived from `cc7d8cb` until revisions
+landed in `bf99fb2`.
+
+**0.d, 0.c and 0.b upgrade in place, in SQL.** Nothing inside the blobs changed
+across them, so the whole migration is a rebuild of the layout struct under the
+current field names:
+
+```sql
+-- The extension optimizer refuses struct_extract over a foreign value — which is
+-- exactly the read this rebuild needs — so it is off for this one statement.
+SET disabled_optimizers='extension';
+CREATE TABLE upgraded AS
+SELECT {'jsono': {'body$1': v.jsono.body,           -- a plain value stops here
+                  'shreds$1': v.jsono.shreds}} AS v
+FROM old;
+RESET disabled_optimizers;
 ```
-STRUCT(
-  jsono STRUCT(
-    body STRUCT(slots, key_heap, string_heap, skips, lengths, nums),   -- as body$1
-    shreds STRUCT(
-      "$jsono$set" BIGINT,                    -- clean layout hash on EVERY row, no dirty flip
-      "<path>" STRUCT(value <T>, complete BOOLEAN),  -- scalar shred: a value/complete pair
-      "<arrpath>" <list_type>                 -- array shred: a bare LIST, as in revision 1
-    )
-  )
-)
-```
 
-The scalar pair's writer produced exactly three states: `(V, complete=1)` a
-fitting scalar, `(NULL, 1)` an absent path or JSON null, `(NULL, 0)` a divert (a
-container at the path or a type-gate miss); `(V, 0)` never existed. The marker
-was the plain clean hash — computed, as in revision 1, over the shred set's
-(path, value type) signatures, so the *same* set hashes identically in both
-revisions. There was no spill bitmap; per-row divert information lived entirely
-in the `complete` flags.
+For 0.c and 0.b the inner struct is rebuilt the same way one level deeper, with
+the spill columns respelled `"$jsono$spill$0"`, `"$jsono$spill$1"`, …. Read the
+result back with the optimizer on: a value that reads is a value that upgraded.
 
-Two intermediate spellings shipped inside the plan-054 arc and are revision 0
-as well: a single unordinal `"$jsono$spill"` column (commit `ada4d30`), and the
-`"$jsono$spill"`/`"$jsono$spill1"`/… family (commit `f450a5b`). Both already
-used bare lanes and the two-valued marker of revision 1.
-
-*Compat note (no reader is implemented).* Revision 0 → 1 is a pure per-row
-function: lane = the pair's `value`, spill bit `r` = `NOT complete`, marker =
-the same hash with bit 0 flipped when the mask is non-zero. Were it ever
-implemented, it belongs in a plan-boundary normalization function that hands the
-readers a current-revision value — never as a revision branch inside a read
-path.
+**0.a needs the build that wrote it.** Its per-row divert information lived in
+the `complete` flags, which the current lane shape does not have, and the
+conversion (lane = the pair's `value`, spill bit `r` = `NOT complete`, marker
+flipped when the resulting mask is non-zero) is not expressible as a rename.
+Rather than reimplement it here, read the data with the build that understands
+it — `git checkout ada4d30~`, build, `COPY … TO 'x.json'` — and re-ingest with
+`jsono(...)`. That old build is the compat reader, which is the other half of
+why closed layouts are not restated in this document.
 
 ## Compatibility policy
 
