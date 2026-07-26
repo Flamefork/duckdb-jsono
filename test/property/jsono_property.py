@@ -1788,6 +1788,79 @@ def test_fuzz_shredded_lanes_no_lie(doc: dict[str, Any], mutation: str) -> None:
         ), f"validate blessed an unreadable row: doc={doc!r} mutation={mutation} -> {rendered!r}"
 
 
+# A shred set wide enough that subsets can straddle the 63-lane spill boundary
+# (JsonoSpillColumnCount): a set of <= 63 lanes carries one `$jsono$spill$0`, a wider one a second
+# `$jsono$spill$1`. Both branches shred the SAME document, so every row of a union is the same
+# logical value whatever set it was written under — the oracle is then just the unmerged branch.
+merge_width_keys = [f"m{i:02d}" for i in range(70)]
+merge_width_text = json_dumps({key: index for index, key in enumerate(merge_width_keys)})
+# Two tables + two union directions + several reads per example, over 70-key documents: the SQL is
+# the cost here, not the generation, so this runs on the small per-example budget.
+MERGE_WIDTH_PROPERTY_SETTINGS = settings(
+    max_examples=max(25, MAX_EXAMPLES // 6),
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+
+
+@MERGE_WIDTH_PROPERTY_SETTINGS
+@example(left_size=3, right_size=64, probe=63)  # the production shape: narrow branch first
+@example(left_size=64, right_size=3, probe=0)  # wide first — readable even before the by-name fix
+@example(left_size=62, right_size=64, probe=63)  # right at the boundary
+@example(left_size=63, right_size=64, probe=0)  # 63 is still one spill column, 64 is two
+@example(left_size=1, right_size=70, probe=69)  # widest crossing
+@given(
+    left_size=st.integers(min_value=1, max_value=len(merge_width_keys)),
+    right_size=st.integers(min_value=1, max_value=len(merge_width_keys)),
+    probe=st.integers(min_value=0, max_value=len(merge_width_keys) - 1),
+)
+def test_setop_merge_reserved_fields_by_name(left_size: int, right_size: int, probe: int) -> None:
+    # DuckDB merges two branches' `shreds` structs by name, keeping the LEFT branch's field order and
+    # appending the right branch's unique fields at the END. When the two sets straddle 63 lanes the
+    # wider branch alone carries `$jsono$spill$1`, so that reserved column lands after the narrow
+    # branch's shreds and the reserved fields stop being contiguous. Recognition and every accessor
+    # must find them by name: a positional rule silently classifies the union as a plain user struct,
+    # at which point `->>` reads NULL and to_json serializes the physical layout instead of failing.
+    left_spec = shred_spec_sql({key: "BIGINT" for key in merge_width_keys[:left_size]})
+    right_spec = shred_spec_sql({key: "BIGINT" for key in merge_width_keys[:right_size]})
+    doc_sql = sql_literal(merge_width_text)
+    for table, spec in (("mw_left", left_spec), ("mw_right", right_spec)):
+        SESSION.statement(f"DROP TABLE IF EXISTS {table};")
+        SESSION.statement(f"CREATE TABLE {table} AS SELECT jsono({doc_sql}, shredding := {spec}) AS j;")
+    # Oracles read from the UNMERGED branch, whose field order is canonical by construction.
+    oracle_json = SESSION.value("(SELECT to_json(j)::VARCHAR FROM mw_left)")
+    probe_path = f"$.{merge_width_keys[probe]}"
+    oracle_probe = SESSION.value(f"(SELECT j ->> '{probe_path}' FROM mw_left)")
+    assert oracle_json is not None and oracle_probe is not None, f"oracle unreadable for {left_size} lanes"
+    lanes_of = {"mw_left": left_size, "mw_right": right_size}
+    for first, second in (("mw_left", "mw_right"), ("mw_right", "mw_left")):
+        union_sql = f"(SELECT j FROM {first} UNION ALL SELECT j FROM {second})"
+        # The union branch order is what decides the merged field order, so it leads the message.
+        direction = f"{lanes_of[first]} lanes first, then {lanes_of[second]}, probe {probe_path}"
+        # Both rows are the same logical document, so both must render to the oracle's JSON. A
+        # positional read leaks the physical layout here, which the `$jsono$set` key makes visible
+        # even when the leaked struct happens to render without erroring.
+        rendered = SESSION.read(
+            f"(SELECT count(*) FROM {union_sql} WHERE to_json(j)::VARCHAR = {sql_literal(oracle_json)})"
+        )
+        assert not isinstance(rendered, JsonoSession.Errored), f"to_json errored: {direction} -> {rendered.message!r}"
+        assert rendered == "2", f"to_json diverged from the unmerged branch: {direction} -> {rendered!r}"
+        leaked = SESSION.value(f"(SELECT count(*) FROM {union_sql} WHERE to_json(j)::VARCHAR LIKE '%$jsono$set%')")
+        assert leaked == "0", f"to_json leaked the physical layout: {direction}"
+        # `->>` on the merged type: a misclassified type sends it to core json, which reads NULL.
+        probed = SESSION.read(
+            f"(SELECT count(*) FROM {union_sql} WHERE (j ->> '{probe_path}') = {sql_literal(oracle_probe)})"
+        )
+        assert not isinstance(probed, JsonoSession.Errored), f"extract errored: {direction} -> {probed.message!r}"
+        assert probed == "2", f"extract diverged from the unmerged branch: {direction} -> {probed!r}"
+        # The bind-time symptom the production failure surfaced as: a jsono-only function refuses the
+        # merged type outright ("argument must be JSONO") when recognition misses it.
+        entries = SESSION.read(f"(SELECT count(*) FROM (SELECT unnest(jsono_entries(j)) FROM {union_sql}))")
+        assert not isinstance(
+            entries, JsonoSession.Errored
+        ), f"jsono_entries refused the merged type: {direction} -> {entries.message!r}"
+
+
 PROPERTIES = [
     test_round_trip_idempotent,
     test_value_parity,
@@ -1815,6 +1888,7 @@ PROPERTIES = [
     test_fuzz_validish_blob_no_crash,
     test_fuzz_manifest_no_crash,
     test_fuzz_shredded_lanes_no_lie,
+    test_setop_merge_reserved_fields_by_name,
 ]
 
 
