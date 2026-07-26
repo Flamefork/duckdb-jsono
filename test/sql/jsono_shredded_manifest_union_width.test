@@ -1,0 +1,109 @@
+# name: test/sql/jsono_shredded_manifest_union_width.test
+# description: A set-op union of two shredded branches whose shred counts straddle the 63-lane spill boundary (see JsonoSpillColumnCount) merges the narrower branch's `shreds` struct type with the wider one via CombineStructTypes, which keeps each branch's own field order but appends fields unique to the wider branch at the END. Crossing 63 lanes means the wider branch alone carries a second `$jsono$spill$1` column, so that column lands AFTER the narrow branch's own shreds in the merged type — the reserved fields are no longer contiguous. MatchJsonoLayoutField and every accessor must locate the marker/spill columns/shreds by NAME, not by a fixed position, or the merged type is silently misclassified as a plain struct (jsono_entries/->>/to_json then read the raw physical layout instead of the JSON value).
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+statement ok
+CREATE TABLE narrow3 AS SELECT jsono('{"k0":1, "k1":1, "k2":1}', shredding := {'k0':'BIGINT', 'k1':'BIGINT', 'k2':'BIGINT'}) AS j;
+
+statement ok
+CREATE TABLE wide64 AS SELECT jsono('{"k0":1, "k1":1, "k2":1, "k3":1, "k4":1, "k5":1, "k6":1, "k7":1, "k8":1, "k9":1, "k10":1, "k11":1, "k12":1, "k13":1, "k14":1, "k15":1, "k16":1, "k17":1, "k18":1, "k19":1, "k20":1, "k21":1, "k22":1, "k23":1, "k24":1, "k25":1, "k26":1, "k27":1, "k28":1, "k29":1, "k30":1, "k31":1, "k32":1, "k33":1, "k34":1, "k35":1, "k36":1, "k37":1, "k38":1, "k39":1, "k40":1, "k41":1, "k42":1, "k43":1, "k44":1, "k45":1, "k46":1, "k47":1, "k48":1, "k49":1, "k50":1, "k51":1, "k52":1, "k53":1, "k54":1, "k55":1, "k56":1, "k57":1, "k58":1, "k59":1, "k60":1, "k61":1, "k62":1, "k63":1}', shredding := {'k0':'BIGINT', 'k1':'BIGINT', 'k2':'BIGINT', 'k3':'BIGINT', 'k4':'BIGINT', 'k5':'BIGINT', 'k6':'BIGINT', 'k7':'BIGINT', 'k8':'BIGINT', 'k9':'BIGINT', 'k10':'BIGINT', 'k11':'BIGINT', 'k12':'BIGINT', 'k13':'BIGINT', 'k14':'BIGINT', 'k15':'BIGINT', 'k16':'BIGINT', 'k17':'BIGINT', 'k18':'BIGINT', 'k19':'BIGINT', 'k20':'BIGINT', 'k21':'BIGINT', 'k22':'BIGINT', 'k23':'BIGINT', 'k24':'BIGINT', 'k25':'BIGINT', 'k26':'BIGINT', 'k27':'BIGINT', 'k28':'BIGINT', 'k29':'BIGINT', 'k30':'BIGINT', 'k31':'BIGINT', 'k32':'BIGINT', 'k33':'BIGINT', 'k34':'BIGINT', 'k35':'BIGINT', 'k36':'BIGINT', 'k37':'BIGINT', 'k38':'BIGINT', 'k39':'BIGINT', 'k40':'BIGINT', 'k41':'BIGINT', 'k42':'BIGINT', 'k43':'BIGINT', 'k44':'BIGINT', 'k45':'BIGINT', 'k46':'BIGINT', 'k47':'BIGINT', 'k48':'BIGINT', 'k49':'BIGINT', 'k50':'BIGINT', 'k51':'BIGINT', 'k52':'BIGINT', 'k53':'BIGINT', 'k54':'BIGINT', 'k55':'BIGINT', 'k56':'BIGINT', 'k57':'BIGINT', 'k58':'BIGINT', 'k59':'BIGINT', 'k60':'BIGINT', 'k61':'BIGINT', 'k62':'BIGINT', 'k63':'BIGINT'}) AS j;
+
+statement ok
+CREATE TABLE narrow62 AS SELECT jsono('{"k0":1, "k1":1, "k2":1, "k3":1, "k4":1, "k5":1, "k6":1, "k7":1, "k8":1, "k9":1, "k10":1, "k11":1, "k12":1, "k13":1, "k14":1, "k15":1, "k16":1, "k17":1, "k18":1, "k19":1, "k20":1, "k21":1, "k22":1, "k23":1, "k24":1, "k25":1, "k26":1, "k27":1, "k28":1, "k29":1, "k30":1, "k31":1, "k32":1, "k33":1, "k34":1, "k35":1, "k36":1, "k37":1, "k38":1, "k39":1, "k40":1, "k41":1, "k42":1, "k43":1, "k44":1, "k45":1, "k46":1, "k47":1, "k48":1, "k49":1, "k50":1, "k51":1, "k52":1, "k53":1, "k54":1, "k55":1, "k56":1, "k57":1, "k58":1, "k59":1, "k60":1, "k61":1}', shredding := {'k0':'BIGINT', 'k1':'BIGINT', 'k2':'BIGINT', 'k3':'BIGINT', 'k4':'BIGINT', 'k5':'BIGINT', 'k6':'BIGINT', 'k7':'BIGINT', 'k8':'BIGINT', 'k9':'BIGINT', 'k10':'BIGINT', 'k11':'BIGINT', 'k12':'BIGINT', 'k13':'BIGINT', 'k14':'BIGINT', 'k15':'BIGINT', 'k16':'BIGINT', 'k17':'BIGINT', 'k18':'BIGINT', 'k19':'BIGINT', 'k20':'BIGINT', 'k21':'BIGINT', 'k22':'BIGINT', 'k23':'BIGINT', 'k24':'BIGINT', 'k25':'BIGINT', 'k26':'BIGINT', 'k27':'BIGINT', 'k28':'BIGINT', 'k29':'BIGINT', 'k30':'BIGINT', 'k31':'BIGINT', 'k32':'BIGINT', 'k33':'BIGINT', 'k34':'BIGINT', 'k35':'BIGINT', 'k36':'BIGINT', 'k37':'BIGINT', 'k38':'BIGINT', 'k39':'BIGINT', 'k40':'BIGINT', 'k41':'BIGINT', 'k42':'BIGINT', 'k43':'BIGINT', 'k44':'BIGINT', 'k45':'BIGINT', 'k46':'BIGINT', 'k47':'BIGINT', 'k48':'BIGINT', 'k49':'BIGINT', 'k50':'BIGINT', 'k51':'BIGINT', 'k52':'BIGINT', 'k53':'BIGINT', 'k54':'BIGINT', 'k55':'BIGINT', 'k56':'BIGINT', 'k57':'BIGINT', 'k58':'BIGINT', 'k59':'BIGINT', 'k60':'BIGINT', 'k61':'BIGINT'}) AS j;
+
+# Narrow (3 lanes, 1 spill column) unioned with wide (64 lanes, 2 spill columns) narrow-first: the
+# merged type is narrow3's fields (marker, spill$0, k0..k2) then wide64's unique fields
+# (spill$1, k3..k63) — the spill columns are not contiguous.
+statement ok
+CREATE TABLE merged_narrow_first AS SELECT j FROM narrow3 UNION ALL SELECT j FROM wide64;
+
+query I
+SELECT count(*) FROM (SELECT unnest(jsono_entries(j)) FROM merged_narrow_first);
+----
+67
+
+query I
+SELECT j ->> '$.k0' FROM merged_narrow_first ORDER BY 1 LIMIT 1;
+----
+1
+
+query I
+SELECT j ->> '$.k63' FROM merged_narrow_first ORDER BY 1 LIMIT 1;
+----
+1
+
+# Same union, wide branch first: CombineStructTypes keeps the left (wide) branch's fields contiguous,
+# so this direction stayed readable even before the fix — kept as a control.
+statement ok
+CREATE TABLE merged_wide_first AS SELECT j FROM wide64 UNION ALL SELECT j FROM narrow3;
+
+query I
+SELECT j ->> '$.k0' FROM merged_wide_first ORDER BY 1 LIMIT 1;
+----
+1
+
+# 62 lanes (1 spill column) unioned with 64 lanes (2 spill columns): the crossing sits right at the
+# 63-lane spill boundary.
+statement ok
+CREATE TABLE merged_62_64 AS SELECT j FROM narrow62 UNION ALL SELECT j FROM wide64;
+
+query I
+SELECT j ->> '$.k0' FROM merged_62_64 ORDER BY 1 LIMIT 1;
+----
+1
+
+query I
+SELECT j ->> '$.k63' FROM merged_62_64 ORDER BY 1 LIMIT 1;
+----
+1
+
+# The production shape this fix came from: a `d_union_all` over per-source tables fixes the MERGED
+# type in the catalog once (`CREATE TABLE … LIMIT 0`), and every later load inserts into that stored
+# type. So the reordered `shreds` struct is not a transient expression type — it is the column type
+# new canonical-order values are cast INTO on every write, and it must round-trip through Parquet
+# (where nested reads arrive as DICTIONARY vectors, not FLAT).
+statement ok
+SET debug_verify_vector='dictionary_expression';
+
+statement ok
+CREATE TABLE events AS SELECT j FROM (SELECT j FROM narrow3 UNION ALL SELECT j FROM wide64) LIMIT 0;
+
+statement ok
+INSERT INTO events SELECT j FROM narrow3;
+
+statement ok
+INSERT INTO events SELECT j FROM wide64;
+
+# A fresh canonical-order value inserted into the stored merged type: the cast reorders it to the
+# column's field order, and it must still read as JSONO.
+statement ok
+INSERT INTO events SELECT jsono('{"k0":0, "k1":1, "k2":2}', shredding := {'k0':'BIGINT', 'k1':'BIGINT', 'k2':'BIGINT'});
+
+query III
+SELECT count(*), count(j ->> '$.k0'), count(j ->> '$.k63') FROM events;
+----
+3	3	1
+
+statement ok
+COPY events TO '__TEST_DIR__/events_merged_width.parquet' (FORMAT PARQUET);
+
+statement ok
+SET debug_verify_vector='nested_shuffle';
+
+# Rows, in `k0` order: the freshly inserted narrow value (k0 = 0, no k63), then wide64 (k0 = k63 = 1)
+# and narrow3 (k0 = 1, no k63) from the two seed tables.
+query II
+SELECT j ->> '$.k0', j ->> '$.k63' FROM '__TEST_DIR__/events_merged_width.parquet' ORDER BY 1, 2 NULLS LAST;
+----
+0	NULL
+1	1
+1	NULL
+
+statement ok
+SET debug_verify_vector='none';

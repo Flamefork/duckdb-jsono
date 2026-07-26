@@ -87,9 +87,30 @@ string RevisionedName(const char *stem, idx_t revision) {
 	return string(stem) + "$" + std::to_string(revision);
 }
 
+// Read the canonical decimal index a `$`-suffixed layout name carries: no leading zeros, no sign,
+// no overflow, so a near-miss spelling is not that layout field at all rather than an alias of it.
+// Shared by both `$`-suffixed name families (the revisioned stems and the spill columns) so the two
+// cannot drift into accepting different spellings of the same number.
+bool TryReadCanonicalIndex(const string &digits, idx_t &index) {
+	if (digits.empty() || (digits.size() > 1 && digits[0] == '0')) {
+		return false;
+	}
+	idx_t parsed = 0;
+	for (auto c : digits) {
+		if (c < '0' || c > '9') {
+			return false;
+		}
+		if (parsed > (NumericLimits<idx_t>::Maximum() - idx_t(c - '0')) / 10) {
+			return false;
+		}
+		parsed = parsed * 10 + idx_t(c - '0');
+	}
+	index = parsed;
+	return true;
+}
+
 // Read a revisioned layout field name: "<stem>$<digits>" yields its revision, a bare "<stem>"
-// yields revision 0 (every value written before layout revisions existed). Digits are canonical —
-// no leading zeros, no sign, no overflow — so a near-miss name is not a layout field at all.
+// yields revision 0 (every value written before layout revisions existed).
 // Revision 0 is the only one with two spellings ("body" and "body$0"); the bare one is what every
 // pre-revision value carries, and no writer emits the "$0" form.
 bool TryReadRevisionedName(const string &name, const char *stem, idx_t &revision) {
@@ -104,30 +125,15 @@ bool TryReadRevisionedName(const string &name, const char *stem, idx_t &revision
 	if (name[stem_size] != '$') {
 		return false;
 	}
-	auto digits = name.substr(stem_size + 1);
-	if (digits.empty() || (digits.size() > 1 && digits[0] == '0')) {
-		return false;
-	}
-	idx_t parsed = 0;
-	for (auto c : digits) {
-		if (c < '0' || c > '9') {
-			return false;
-		}
-		if (parsed > (NumericLimits<idx_t>::Maximum() - idx_t(c - '0')) / 10) {
-			return false;
-		}
-		parsed = parsed * 10 + idx_t(c - '0');
-	}
-	revision = parsed;
-	return true;
+	return TryReadCanonicalIndex(name.substr(stem_size + 1), revision);
 }
-// Reserved name of the shred-set marker, the first field inside `shreds`. It is a BIGINT hash of the
+// Reserved name of the shred-set marker, the field every writer emits first inside `shreds`. It is a BIGINT hash of the
 // shred set (paths + types) — schema identity across files, and the mandatory shared member that lets
 // a by-name struct cast bind between any two shred sets (even disjoint ones). The `$jsono$` prefix
 // cannot occur in a shred path (the shred-spec parsers reject the reserved prefix), so no shred can
 // collide with either reserved field.
 constexpr const char *JSONO_SHRED_SET = "$jsono$set";
-// Reserved name stem of the per-row spill bitmap columns, the fields right after the marker inside
+// Reserved name stem of the per-row spill bitmap columns, the fields every writer emits right after the marker inside
 // `shreds`: "$jsono$spill$0", "$jsono$spill$1", … (see JsonoShredSpillName in jsono.hpp for the bit
 // semantics). Every column carries its ordinal — column 0 is not special-cased — so the names read
 // as a uniform indexed family.
@@ -135,6 +141,17 @@ constexpr const char *JSONO_SHRED_SPILL = "$jsono$spill";
 
 string SpillColumnName(idx_t column) {
 	return string(JSONO_SHRED_SPILL) + "$" + std::to_string(column);
+}
+
+// Parse a spill column name ("$jsono$spill$<digits>") back into its column number. Unlike
+// TryReadRevisionedName there is no bare-stem spelling: every writer numbers every spill column
+// (column 0 included), so a name without a "$<digits>" suffix is not one.
+bool TryParseSpillColumnName(const string &name, idx_t &column) {
+	auto stem_size = strlen(JSONO_SHRED_SPILL);
+	if (name.size() <= stem_size + 1 || name.compare(0, stem_size, JSONO_SHRED_SPILL) != 0 || name[stem_size] != '$') {
+		return false;
+	}
+	return TryReadCanonicalIndex(name.substr(stem_size + 1), column);
 }
 // The reserved layout-field namespace inside `shreds`: every non-shred member is named under it.
 constexpr const char *JSONO_RESERVED_PREFIX = "$jsono$";
@@ -254,39 +271,72 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 	if (shreds_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(shreds_type)) {
 		return JsonoLayoutMatch::NotJsono;
 	}
-	// Inside `shreds`: the marker is field 0 and the spill bitmap columns fields 1..k (any integer
-	// width — a value round-tripped through a generic value->SQL->value path, e.g. DuckLake
-	// inlined-data INSERT, re-parses the bare-integer fields as BIGINT/HUGEINT, but the reserved
-	// names still identify them). They must sit at those fixed positions, not merely be present by
-	// name: every writer emits them first and every set-op merge keeps them first (they are the left
-	// branch's `shreds` leading fields — the whole reason `shreds` is a nested struct), and all
-	// accessors (JsonoShredVector / ShredExtract / CollectShredTotality) index shred k as `shreds`
-	// field 1 + spill_columns + k. Accepting them at any other position would let a hand-built
-	// reordered struct parse as JSONO and then crash on read (the accessor would read a reserved
-	// field as a shred lane). Every following field is a shred — its type is the shred's value type
-	// (bare scalar or LIST).
+	// Inside `shreds`: the marker and the spill bitmap columns (any integer width — a value
+	// round-tripped through a generic value->SQL->value path, e.g. DuckLake inlined-data INSERT,
+	// re-parses the bare-integer fields as BIGINT/HUGEINT, but the reserved names still identify
+	// them) are found BY NAME, not by fixed position. A set-op merge of two shredded branches
+	// (CombineStructTypes) keeps each branch's own field order but appends fields unique to the
+	// right branch at the END — so a union of a narrow-shred-set branch with a wide one (needing a
+	// second spill column) produces `$jsono$set, $jsono$spill$0, <narrow's shreds...>,
+	// $jsono$spill$1, <wide-only shreds...>`: the reserved fields are no longer contiguous. Every
+	// accessor (JsonoShredVector / JsonoShredSpillVector / JsonoSpillColumnsOf) matches the same way,
+	// so recognition and reads agree regardless of which fields a merge displaced.
 	auto &shred_fields = StructType::GetChildTypes(shreds_type);
-	if (shred_fields.size() < 2 || shred_fields[0].first != JSONO_SHRED_SET || !shred_fields[0].second.IsIntegral()) {
+	if (shred_fields.empty()) {
 		return JsonoLayoutMatch::NotJsono;
 	}
+	idx_t marker_index = shred_fields.size();
 	idx_t spill_columns = 0;
-	while (1 + spill_columns < shred_fields.size() &&
-	       shred_fields[1 + spill_columns].first == SpillColumnName(spill_columns)) {
-		if (!shred_fields[1 + spill_columns].second.IsIntegral()) {
-			return JsonoLayoutMatch::NotJsono;
+	for (idx_t i = 0; i < shred_fields.size(); i++) {
+		if (shred_fields[i].first == JSONO_SHRED_SET) {
+			if (marker_index != shred_fields.size()) {
+				// duplicate marker: not a value any writer or merge produced
+				return JsonoLayoutMatch::NotJsono;
+			}
+			marker_index = i;
+			continue;
 		}
-		spill_columns++;
+		idx_t column;
+		if (TryParseSpillColumnName(shred_fields[i].first, column)) {
+			spill_columns++;
+		}
+	}
+	if (marker_index == shred_fields.size()) {
+		return JsonoLayoutMatch::NotJsono;
+	}
+	if (!shred_fields[marker_index].second.IsIntegral()) {
+		return JsonoLayoutMatch::NotJsono;
 	}
 	if (spill_columns == 0) {
 		return JsonoLayoutMatch::NotJsono;
 	}
+	// Spill columns are a dense 0..spill_columns-1 family (see SpillColumnName) — a gap or a
+	// duplicate column number means a hand-built struct, not one any writer or merge produced.
+	vector<bool> spill_seen(spill_columns, false);
 	child_list_t<LogicalType> shreds;
-	for (idx_t i = 1 + spill_columns; i < shred_fields.size(); i++) {
+	for (idx_t i = 0; i < shred_fields.size(); i++) {
+		if (i == marker_index) {
+			continue;
+		}
+		idx_t column;
+		if (TryParseSpillColumnName(shred_fields[i].first, column)) {
+			if (column >= spill_columns || spill_seen[column]) {
+				return JsonoLayoutMatch::NotJsono;
+			}
+			if (!shred_fields[i].second.IsIntegral()) {
+				return JsonoLayoutMatch::NotJsono;
+			}
+			spill_seen[column] = true;
+			continue;
+		}
 		// A lane name that is not a non-empty pure object-key chain (an array-index or root '$' path)
 		// cannot be a shred: no writer produces one, and every reconstruct-based reader would throw on
 		// it. A reserved-prefix name cannot be one either. Rejecting them here keeps such a raw-cast /
 		// stored struct from being recognized as JSONO.
-		if (HasJsonoReservedPrefix(shred_fields[i].first) || !ShredNameIsObjectKeyPath(shred_fields[i].first)) {
+		if (HasJsonoReservedPrefix(shred_fields[i].first)) {
+			return JsonoLayoutMatch::NotJsono;
+		}
+		if (!ShredNameIsObjectKeyPath(shred_fields[i].first)) {
 			return JsonoLayoutMatch::NotJsono;
 		}
 		LogicalType value_type;
@@ -296,7 +346,8 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		shreds.emplace_back(shred_fields[i].first, value_type);
 	}
 	if (shreds.empty()) {
-		return JsonoLayoutMatch::NotJsono; // the reserved fields alone are not a valid shredded value
+		// the reserved fields alone are not a valid shredded value
+		return JsonoLayoutMatch::NotJsono;
 	}
 	// A set-op merged type can carry FEWER spill columns than the crossing union's shred count
 	// needs (see JsonoSpillColumnCount) — readable, never provable past its columns — but never
@@ -319,7 +370,7 @@ JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &
 	}
 	auto &children = StructType::GetChildTypes(type);
 	if (children.size() != 1) {
-		return JsonoLayoutMatch::NotJsono; // an ordinary value has exactly one layout field
+		return JsonoLayoutMatch::NotJsono;
 	}
 	return MatchJsonoLayoutField(children[0].first, children[0].second, out);
 }
@@ -420,6 +471,21 @@ string JsonoShredSetName() {
 
 string JsonoShredSpillName(idx_t column) {
 	return SpillColumnName(column);
+}
+
+bool JsonoIsShredSpillName(const string &name) {
+	idx_t column;
+	return TryParseSpillColumnName(name, column);
+}
+
+idx_t JsonoFindShredsFieldIndex(const LogicalType &shreds_type, const string &name) {
+	auto &fields = StructType::GetChildTypes(shreds_type);
+	for (idx_t i = 0; i < fields.size(); i++) {
+		if (fields[i].first == name) {
+			return i;
+		}
+	}
+	return DConstants::INVALID_INDEX;
 }
 
 void JsonoValidateShredFieldName(const string &name) {

@@ -486,39 +486,80 @@ inline Vector &JsonoShredsStructVector(Vector &result) {
 	return *StructVector::GetEntries(layout)[1];
 }
 
-// The spill column count of a shredded jsono vector's type: the consecutive `$jsono$spill…` fields
-// after the marker (see JsonoSpillColumnCount; a merged type may carry fewer than its shred count
-// needs).
-inline idx_t JsonoSpillColumnsOf(const Vector &result) {
+// `shreds` struct field names of a shredded jsono vector's type, by field index — shared by every
+// accessor below so recognition (MatchJsonoLayoutField) and reads agree on which field is the
+// marker, which are spill columns and which are shreds regardless of their position: a set-op merge
+// of a narrow and a wide shred set (CombineStructTypes) appends the wide branch's unique fields —
+// including a second spill column — at the END, past the narrow branch's shreds, so the reserved
+// fields are not always contiguous (see MatchJsonoLayoutField for the full merge shape).
+inline const child_list_t<LogicalType> &JsonoShredsStructFields(const Vector &result) {
 	auto &layout_type = StructType::GetChildTypes(result.GetType())[0].second;
 	auto &shreds_type = StructType::GetChildTypes(layout_type)[1].second;
-	auto &fields = StructType::GetChildTypes(shreds_type);
+	return StructType::GetChildTypes(shreds_type);
+}
+
+// The spill column count of a shredded jsono vector's type: every `$jsono$spill$<n>` field by name,
+// wherever it sits (see JsonoSpillColumnsOf; a merged type may carry fewer than its shred count
+// needs).
+inline idx_t JsonoSpillColumnsOf(const Vector &result) {
+	auto &fields = JsonoShredsStructFields(result);
 	idx_t columns = 0;
-	while (1 + columns < fields.size() && fields[1 + columns].first == JsonoShredSpillName(columns)) {
-		columns++;
+	for (auto &field : fields) {
+		if (JsonoIsShredSpillName(field.first)) {
+			columns++;
+		}
 	}
 	return columns;
 }
 
-// Shred `shred_index` (0-based over the shred set) of a shredded jsono vector: canonically the
-// `shreds` struct is the marker, the spill columns, then the shreds, so shred k is shreds child
-// 1 + spill_columns + k. A scalar shred is its bare typed lane, an array shred its LIST — the
-// field itself either way.
+// Shred `shred_index` (0-based over the shred set, in struct field order) of a shredded jsono
+// vector: every `shreds` field that is neither the marker nor a spill column, in the order they
+// appear in the struct. A scalar shred is its bare typed lane, an array shred its LIST — the field
+// itself either way.
 inline Vector &JsonoShredVector(Vector &result, idx_t shred_index) {
 	auto &shreds = JsonoShredsStructVector(result);
-	return *StructVector::GetEntries(shreds)[1 + JsonoSpillColumnsOf(result) + shred_index];
+	auto &entries = StructVector::GetEntries(shreds);
+	auto &fields = JsonoShredsStructFields(result);
+	idx_t seen = 0;
+	for (idx_t i = 0; i < fields.size(); i++) {
+		if (fields[i].first == JsonoShredSetName() || JsonoIsShredSpillName(fields[i].first)) {
+			continue;
+		}
+		if (seen == shred_index) {
+			return *entries[i];
+		}
+		seen++;
+	}
+	throw InternalException("JsonoShredVector: shred index %llu out of range", shred_index);
 }
 
-// The shred-set marker vector (BIGINT) of a shredded jsono result: `shreds` child 0.
+// The shred-set marker vector (BIGINT) of a shredded jsono result: the `shreds` field named
+// `$jsono$set`.
 inline Vector &JsonoShredSetVector(Vector &result) {
 	auto &shreds = JsonoShredsStructVector(result);
-	return *StructVector::GetEntries(shreds)[0];
+	auto &entries = StructVector::GetEntries(shreds);
+	auto &fields = JsonoShredsStructFields(result);
+	for (idx_t i = 0; i < fields.size(); i++) {
+		if (fields[i].first == JsonoShredSetName()) {
+			return *entries[i];
+		}
+	}
+	throw InternalException("JsonoShredSetVector: no marker field in shreds struct");
 }
 
-// Spill bitmap column `column` of a shredded jsono result: `shreds` child 1 + column.
+// Spill bitmap column `column` (its canonical column NUMBER, not its struct position) of a
+// shredded jsono result: the `shreds` field named `$jsono$spill$<column>`.
 inline Vector &JsonoShredSpillVector(Vector &result, idx_t column) {
 	auto &shreds = JsonoShredsStructVector(result);
-	return *StructVector::GetEntries(shreds)[1 + column];
+	auto &entries = StructVector::GetEntries(shreds);
+	auto &fields = JsonoShredsStructFields(result);
+	auto name = JsonoShredSpillName(column);
+	for (idx_t i = 0; i < fields.size(); i++) {
+		if (fields[i].first == name) {
+			return *entries[i];
+		}
+	}
+	throw InternalException("JsonoShredSpillVector: no spill column %llu in shreds struct", column);
 }
 
 // Write-side handle over a shredded result's marker + spill columns: the two-valued clean/dirty

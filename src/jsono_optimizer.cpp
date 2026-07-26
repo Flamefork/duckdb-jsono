@@ -1634,9 +1634,14 @@ void CollectSpillProvenPaths(const BaseStatistics &stats, const LogicalType &typ
 	if (shreds_stats.GetType().id() != LogicalTypeId::STRUCT || StructType::GetChildCount(shreds_stats.GetType()) < 2) {
 		return;
 	}
+	auto &shreds_type = shreds_stats.GetType();
+	auto marker_index = JsonoFindShredsFieldIndex(shreds_type, JsonoShredSetName());
+	if (marker_index == DConstants::INVALID_INDEX) {
+		return; // no marker field: not a shreds struct any writer or merge produced
+	}
 	auto clean_hash = int64_t(JsonoLayoutHashOf(type));
 	auto dirty_hash = int64_t(uint64_t(clean_hash) ^ JSONO_DIRTY_HASH_FLIP);
-	auto &set_stats = StructStats::GetChildStats(shreds_stats, 0);
+	auto &set_stats = StructStats::GetChildStats(shreds_stats, marker_index);
 	bool all_clean = false;
 	bool identity = false;
 	if (NumericStats::HasMinMax(set_stats)) {
@@ -1653,7 +1658,11 @@ void CollectSpillProvenPaths(const BaseStatistics &stats, const LogicalType &typ
 	vector<uint64_t> mask_max(spill_words, 0);
 	if (identity && !all_clean) {
 		for (idx_t word = 0; word < spill_words; word++) {
-			auto &spill_stats = StructStats::GetChildStats(shreds_stats, 1 + word);
+			auto spill_index = JsonoFindShredsFieldIndex(shreds_type, JsonoShredSpillName(word));
+			if (spill_index == DConstants::INVALID_INDEX) {
+				continue;
+			}
+			auto &spill_stats = StructStats::GetChildStats(shreds_stats, spill_index);
 			if (!NumericStats::HasMinMax(spill_stats)) {
 				continue;
 			}
@@ -1911,13 +1920,14 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 					auto &shreds_stats = StructStats::GetChildStats(layout_stats, 1);
 					if (shreds_stats.GetType().id() == LogicalTypeId::STRUCT &&
 					    StructType::GetChildCount(shreds_stats.GetType()) >= 2) {
-						auto shred_children = StructType::GetChildCount(shreds_stats.GetType());
+						auto &shreds_stats_type = shreds_stats.GetType();
 						for (auto &shred : shreds) {
 							if (!per_shred[shred.child_index] || IsShredListType(shred.type)) {
 								continue;
 							}
-							idx_t lane_child = 1 + read_layout.spill_columns + shred.child_index;
-							if (lane_child >= shred_children) {
+							auto lane_child = JsonoFindShredsFieldIndex(shreds_stats_type,
+							                                            read_layout.shreds[shred.child_index].first);
+							if (lane_child == DConstants::INVALID_INDEX) {
 								continue;
 							}
 							auto &lane_stats = StructStats::GetChildStats(shreds_stats, lane_child);
@@ -2342,15 +2352,27 @@ private:
 	}
 
 	// Scalar shred `child_index` (0-based over the shred set) of a shredded column, navigated to its
-	// bare lane: column -> [1] jsono -> [2] shreds -> [2 + spill_columns + child_index] <path> (the
-	// `shreds` struct is the marker at field 1, the spill columns next, then the shreds). Only ever
-	// called for scalar shreds (every reconstruct/read site gates list shreds out before reaching
-	// here).
+	// bare lane: column -> [1] jsono -> [2] shreds -> [<path> field, found BY NAME]. The `shreds`
+	// struct's field order is not fixed — a set-op merge of a narrow and a wide shred set
+	// (CombineStructTypes) can push the marker/spill columns and shreds out of their canonical
+	// relative positions (see MatchJsonoLayoutField) — so the shred's actual struct position is
+	// looked up by name rather than computed from spill_columns. Only ever called for scalar shreds
+	// (every reconstruct/read site gates list shreds out before reaching here).
 	unique_ptr<Expression> ShredExtract(const Expression &column, idx_t child_index) {
 		JsonoLayoutType layout;
 		TryParseJsonoLayoutType(column.return_type, layout);
+		auto &layout_type = StructType::GetChildTypes(column.return_type)[0].second;
+		auto &shreds_type = StructType::GetChildTypes(layout_type)[1].second;
+		auto field_index = JsonoFindShredsFieldIndex(shreds_type, layout.shreds[child_index].first);
+		if (field_index == DConstants::INVALID_INDEX) {
+			// The name came from this very type's parsed layout, so it is always there. Refusing loudly
+			// rather than asserting keeps a release build (where D_ASSERT is stripped) from folding
+			// INVALID_INDEX into a positional read of some unrelated field.
+			throw InternalException("jsono: shred '%s' is absent from the shreds struct it was parsed from",
+			                        layout.shreds[child_index].first);
+		}
 		auto shreds = StructExtractAt(StructExtractAt(column.Copy(), 1), 2);
-		return StructExtractAt(std::move(shreds), int64_t(2 + layout.spill_columns + child_index));
+		return StructExtractAt(std::move(shreds), int64_t(field_index + 1));
 	}
 
 	// True when statistics proved this shred carries no SQL NULL anywhere in the table: NULL-shred

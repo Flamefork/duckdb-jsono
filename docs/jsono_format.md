@@ -79,8 +79,8 @@ losslessly by construction. The `$jsono$set` marker is the mandatory shared
 member inside `shreds`, so DuckDB's by-name struct cast *binds* between any two
 shred sets — fully disjoint ones included — and the extension optimizer can
 rewrite every such cast into a lossless reconstruct + reshred. The nested struct
-also keeps the marker contiguous with its shreds across set-op merges (a flat
-sibling layout interleaved it among the shreds). The remaining flip side — a raw
+also keeps the marker and the shreds inside one field of the layout struct, so a
+merge cannot interleave them with `body`. The remaining flip side — a raw
 by-name cast silently *dropping* a shred when the optimizer is not running — is
 caught at read time by the shred manifest (below), not by the type system.
 
@@ -88,10 +88,24 @@ Shreds are emitted in canonical order (sorted by name), so a constructed
 type is a pure function of the shred *set*: `jsono_storage_type(<shred DDL>)` and
 the constructor produce the identical type for the same shreds regardless of the
 order they are listed in, so a column declared from one accepts a value built
-from the other. (A type DuckDB merges out of differently-shredded branches lists
-the left branch's shreds first — same shred set, branch-dependent field order.)
+from the other.
 Shred `value` lanes stay scalar columns, so Parquet/DuckLake projection and
 filter pushdown act on them directly.
+
+**A merged type's field order is not canonical.** DuckDB merges two branches'
+`shreds` structs by name, keeping the left branch's own field order and
+appending the fields unique to the right branch at the **end**. When the two
+branches straddle the 63-shred spill boundary the right branch alone carries a
+`$jsono$spill$1`, so that reserved column lands *after* the left branch's
+shreds: in a merged type the marker, the spill columns and the shreds are
+neither contiguous nor in their canonical relative order. Recognition
+(`MatchJsonoLayoutField`) and every accessor therefore locate all three **by
+name**, never by field position — a positional rule silently misclassifies such
+a union as a plain user struct, at which point `->>` reads `NULL`, `::json`
+serializes the physical layout and only a `COPY … TO … (FORMAT CSV)` fails
+loudly. Shred *k* is the *k*-th field that is neither the marker nor a spill
+column, in the order the struct lists them; that ordering is what
+`JsonoLayoutType::shreds` records, so parse and read agree by construction.
 
 ### Shred-set marker and spill bitmap
 

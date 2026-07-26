@@ -95,7 +95,7 @@ string JsonoBodyName();
 // "shreds$1". Shredded-ness is exactly the presence of this field.
 string JsonoShredsName();
 
-// The reserved name of the shred-set marker, the first field inside `shreds`. A BIGINT carrying the
+// The reserved name of the shred-set marker, the field every writer emits first inside `shreds`. A BIGINT carrying the
 // canonical layout hash (JsonoLayoutHashOf) of the shred set the row was written under — its uint64
 // bits reinterpreted as signed — on a clean row, and that hash with its lowest bit flipped
 // (JSONO_DIRTY_HASH_FLIP) on a dirty row (one whose `$jsono$spill` bitmap is non-empty); NULL only
@@ -112,7 +112,7 @@ string JsonoShredsName();
 // the width may shift to HUGEINT.
 string JsonoShredSetName();
 
-// The reserved name of a per-row spill bitmap column — the ⌈N/63⌉ fields right after the marker
+// The reserved name of a per-row spill bitmap column — the ⌈N/63⌉ fields every writer emits right after the marker
 // inside `shreds`: "$jsono$spill$0", "$jsono$spill$1", "$jsono$spill$2", … (every column carries its
 // ordinal — nearly every real set fits column 0 alone). Each is a BIGINT whose bit b (0-based, low
 // 63 bits — the sign bit stays clear so masks order as non-negative numbers in every zone-map) is set
@@ -133,6 +133,19 @@ string JsonoShredSetName();
 // the bitmaps across shred sets, where the foreign `$jsono$set` hash fails the identity check and
 // the foreign numbering is conservatively ignored.
 string JsonoShredSpillName(idx_t column);
+
+// Whether `name` is a shred-spill column name ("$jsono$spill$<digits>"), whatever its column
+// number. Shared by MatchJsonoLayoutField and the JsonoShredVector/JsonoShredSetVector/
+// JsonoSpillColumnsOf family so recognition and reads classify the same field the same way.
+bool JsonoIsShredSpillName(const string &name);
+
+// The struct field index of `name` inside a `shreds` STRUCT LogicalType, or DConstants::INVALID_INDEX
+// if absent. A set-op merge of a narrow and a wide shred set (CombineStructTypes) appends the wide
+// branch's unique fields — including a second spill column — past the narrow branch's own fields, so
+// the marker, the spill columns and the shreds are not always contiguous nor in a fixed relative
+// order; every reader of a `shreds`-shaped STRUCT/stats pair must locate a field by this name lookup,
+// never by a positional formula.
+idx_t JsonoFindShredsFieldIndex(const LogicalType &shreds_type, const string &name);
 
 // The marker stamp of a dirty row: the layout hash with its lowest bit flipped. Two adjacent
 // values keep the marker's min/max decodable ({H} all-clean, {H^1} all-dirty, the pair mixed);
@@ -202,13 +215,17 @@ constexpr idx_t JSONO_SHREDS_REVISION = 1;
 
 // A parsed JSONO layout field: its shred (path, LOGICAL-value-type) columns (empty for plain; a
 // scalar shred's bare lane and an array shred's list are recorded by their value type) and the
-// number of spill bitmap columns. The single grammar all predicates read against. The shred-set
-// marker always sits at `shreds$1` field 0 and the spill columns at fields 1..spill_columns; shred k
-// is field 1 + spill_columns + k. `body_revision` is set whenever the anchor parsed (so it is always
-// known on a refusal); `shreds_revision` stays DConstants::INVALID_INDEX for a value carrying no
-// shreds field at all. When several revisioned stems of one kind are present — a revision MIXTURE —
-// the revision recorded is a foreign one, so the refusal reads the same whatever order the branches
-// were merged in.
+// number of spill bitmap columns. The single grammar all predicates read against. Every writer
+// emits the shred-set marker, then the spill columns, then the shreds, contiguously in that order —
+// but a set-op merge of a narrow and a wide shred set (CombineStructTypes) can push a wide-only spill
+// column and its wide-only shreds past the narrow branch's own shreds, so a READ type's `shreds`
+// struct is not guaranteed to keep them contiguous or in that relative order. All three are
+// therefore located BY NAME (JsonoFindShredsFieldIndex / JsonoIsShredSpillName), never by a
+// positional formula. `body_revision` is set whenever the anchor parsed (so it is always known on a
+// refusal); `shreds_revision` stays DConstants::INVALID_INDEX for a value carrying no shreds field at
+// all. When several revisioned stems of one kind are present — a revision MIXTURE — the revision
+// recorded is a foreign one, so the refusal reads the same whatever order the branches were merged
+// in.
 struct JsonoLayoutType {
 	JsonoLayoutKind kind = JsonoLayoutKind::Plain;
 	child_list_t<LogicalType> shreds;
