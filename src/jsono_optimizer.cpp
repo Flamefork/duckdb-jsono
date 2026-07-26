@@ -3150,6 +3150,13 @@ string ForeignConsumerContext(const Expression &consumer) {
 // `disabled_optimizers=extension` this hook does not run at all and the core-json paths go quiet
 // again, the same trade JsonoRequireExtensionOptimizerForShredded already takes.
 void RejectForeignLayoutsInExpression(Expression &expr) {
+	// The one consumer that must survive a foreign child: it answers a question ABOUT the type and
+	// never reads a byte of the value, so refusing it would silence the only tool a user has for
+	// diagnosing the very value being refused.
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+	    expr.Cast<BoundFunctionExpression>().function.name == "jsono_layout_diagnose") {
+		return;
+	}
 	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
 		// Classify first, name the consumer only on the refusal: this runs on every child of every
 		// expression of every plan, and naming a BOUND_CAST consumer renders its whole return type

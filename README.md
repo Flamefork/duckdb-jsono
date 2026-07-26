@@ -55,6 +55,7 @@ Inspect:
 - [`jsono_storage_type()`](#introspection) — DDL of the physical `STRUCT` backing a JSONO value.
 - [`jsono_shred_manifest(value)`](#introspection) — paths stripped into shred columns and their types as a `LIST<STRUCT(path, type)>`.
 - [`jsono_version()`](#introspection) — the current JSONO binary format version as `INTEGER`.
+- [`jsono_layout_diagnose(value)`](#introspection) — whether this build sees the value's type as JSONO, and which rule failed if not.
 
 ## Quick Start
 
@@ -676,6 +677,7 @@ jsono_storage_size(value)         -> STRUCT     -- physical byte sizes (body blo
 jsono_storage_type()              -> VARCHAR    -- DDL of the physical STRUCT backing JSONO
 jsono_shred_manifest(value)       -> STRUCT[]   -- paths stripped into shred columns, with their types
 jsono_version()                   -> INTEGER    -- current JSONO binary format version
+jsono_layout_diagnose(value)      -> VARCHAR    -- whether the extension sees the value's TYPE as JSONO, and why not
 ```
 
 `jsono_type` and `jsono_keys` inspect the shape of unknown JSON before extracting it with `jsono_transform`. The optional `path` is a constant JSONPath (same grammar as `jsono_transform`, without wildcards) that points at a nested position; a missing path yields `NULL`.
@@ -715,6 +717,19 @@ SELECT jsono_storage_type();
 SELECT jsono_shred_manifest(jsono('{"a":"x","b":1}', shredding := {'a':'VARCHAR','b':'BIGINT'}));
 -- [{'path': a, 'type': VARCHAR}, {'path': b, 'type': BIGINT}]
 ```
+
+`jsono_layout_diagnose` answers whether this build recognises the argument's **type** as a JSONO value, and if not, which rule failed. It is a question about the type, answered at bind — the value's bytes are never read, and a `NULL` value diagnoses the same as any other.
+
+It exists for one specific failure mode. A value carrying the current layout revision that nevertheless fails the layout grammar is classified "not JSONO" *silently*: refusing it would break legal write paths (a DuckLake inlined-data flush narrows an all-NULL column on its way to the declared column type). From SQL that silence is indistinguishable from ordinary data — `->>` falls through to core json and reads `NULL`, `to_json` serializes the raw physical struct — so when a JSONO column starts answering `NULL` for paths you know are there, this is the function that says why.
+
+```sql
+SELECT jsono_layout_diagnose(jsono('{"a":1,"b":2}', shredding := {'a':'BIGINT'}));
+-- jsono: shredded, body revision 1, shreds revision 1, 1 shreds, 1 spill column(s)
+SELECT jsono_layout_diagnose({'a': 1});
+-- not jsono: the value's single field is named 'a', not the layout anchor 'jsono'
+```
+
+A value of a foreign layout revision is *diagnosed* rather than refused here, even though every other consumer of it throws — a diagnostic that fails on the value you are diagnosing is no diagnostic.
 
 These helpers are primarily used by the JSONO workflows and tests. Treat their exact surface as less stable than `jsono_transform`, `jsono`, and `to_json`.
 

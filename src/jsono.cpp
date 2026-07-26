@@ -16,6 +16,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 
 #include <algorithm>
 
@@ -43,6 +44,39 @@ void JsonoVersionExecute(DataChunk &args, ExpressionState &state, Vector &result
 	(void)state;
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	result.SetValue(0, Value::INTEGER(int32_t(jsono::VERSION)));
+}
+
+// jsono_layout_diagnose(value) -> why the extension does or does not see `value` as JSONO. Purely a
+// question about the argument's TYPE, so it is answered at bind and returned as a constant; the
+// value's bytes are never read. It exists because the "current revision, fails the grammar" case is
+// deliberately silent (refusing it would break the legal DuckLake write path, see
+// MatchJsonoLayoutField) — and silence is indistinguishable from an ordinary NULL until something
+// downstream fails. This is the one place to ask.
+struct JsonoLayoutDiagnoseBindData : public FunctionData {
+	explicit JsonoLayoutDiagnoseBindData(string diagnosis_p) : diagnosis(std::move(diagnosis_p)) {
+	}
+	string diagnosis;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<JsonoLayoutDiagnoseBindData>(diagnosis);
+	}
+	bool Equals(const FunctionData &other) const override {
+		return diagnosis == other.Cast<JsonoLayoutDiagnoseBindData>().diagnosis;
+	}
+};
+
+unique_ptr<FunctionData> JsonoLayoutDiagnoseBind(ClientContext &context, ScalarFunction &bound_function,
+                                                 vector<unique_ptr<Expression>> &arguments) {
+	(void)context;
+	(void)bound_function;
+	return make_uniq<JsonoLayoutDiagnoseBindData>(JsonoExplainLayoutMatch(arguments[0]->return_type));
+}
+
+void JsonoLayoutDiagnoseExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)args;
+	auto &info = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoLayoutDiagnoseBindData>();
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	result.SetValue(0, Value(info.diagnosis));
 }
 
 // jsono_storage_type(shreds) -> the shredded storage type's DDL: the 6-BLOB residual plus the
@@ -190,6 +224,19 @@ bool IsBlobStruct(const LogicalType &type) {
 	return true;
 }
 
+// Record why the grammar refused and return the refusal. `reason == nullptr` is the hot path —
+// every bind classifies ordinary types through the grammar, and almost all of them are refused on
+// the first check — so the message is only formatted when someone asked for it. Carrying the
+// explanation out of the grammar itself is the point: a separate "why not" routine would be a
+// second copy of the rules and would drift from the one that decides.
+template <class... ARGS>
+JsonoLayoutMatch RejectNotJsono(string *reason, const char *format, ARGS... args) {
+	if (reason) {
+		*reason = StringUtil::Format(format, args...);
+	}
+	return JsonoLayoutMatch::NotJsono;
+}
+
 // Classify one layout field (top-level child name + its STRUCT type) into `out`. The anchor is the
 // field name `jsono` plus a field 0 named `body` or `body$<digits>` whose type is a STRUCT of pure
 // BLOBs; it is narrow enough that no user struct hits it by accident and permanent, so a value
@@ -203,17 +250,22 @@ bool IsBlobStruct(const LogicalType &type) {
 // field 0. The nested `shreds` struct keeps the marker contiguous with the shreds (a flat sibling
 // layout interleaved it among the shreds under set-ops), and the marker is the mandatory shared
 // member that lets a by-name cast bind between ANY two shred sets — including fully disjoint ones.
-JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &layout_type, JsonoLayoutType &out) {
+JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &layout_type, JsonoLayoutType &out,
+                                       string *reason) {
 	if (name != JSONO_LAYOUT) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "the value's single field is named '%s', not the layout anchor '%s'", name,
+		                      JSONO_LAYOUT);
 	}
 	if (layout_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(layout_type)) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "the '%s' field is %s, not a named STRUCT", JSONO_LAYOUT, layout_type.ToString());
 	}
 	auto &fields = StructType::GetChildTypes(layout_type);
 	if (fields.empty() || !TryReadRevisionedName(fields[0].first, JSONO_BODY_STEM, out.body_revision) ||
 	    !IsBlobStruct(fields[0].second)) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason,
+		                      "field 0 of '%s' is not the residual anchor: it must be named '%s' (optionally "
+		                      "'%s$<revision>') and be a STRUCT of nothing but BLOBs",
+		                      JSONO_LAYOUT, JSONO_BODY_STEM, JSONO_BODY_STEM);
 	}
 	// Read every revisioned stem, not just the leading pair. Two stems of the same kind mean the type
 	// is a MIXTURE of revisions — a multi-file scan (`union_by_name`) merges per-file schemas by name,
@@ -255,7 +307,9 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		return JsonoLayoutMatch::Foreign;
 	}
 	if (fields[0].second != JsonoBodyStructType()) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "'%s' carries revision %llu but its type is %s, not this build's %s",
+		                      fields[0].first, (unsigned long long)out.body_revision, fields[0].second.ToString(),
+		                      JsonoBodyStructType().ToString());
 	}
 	if (fields.size() == 1) {
 		out.kind = JsonoLayoutKind::Plain;
@@ -265,11 +319,15 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 	// Shredded: exactly the residual plus a `shreds` STRUCT. The set-op merge keeps the layout struct
 	// at these two by-name fields, so a third sibling is not a JSONO value.
 	if (fields.size() != 2 || out.shreds_revision != JSONO_SHREDS_REVISION) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason,
+		                      "'%s' has %llu fields; a shredded value has exactly 2 (the residual and a '%s$%llu' "
+		                      "STRUCT), a plain value exactly 1",
+		                      JSONO_LAYOUT, (unsigned long long)fields.size(), JSONO_SHREDS_STEM,
+		                      (unsigned long long)JSONO_SHREDS_REVISION);
 	}
 	auto &shreds_type = fields[1].second;
 	if (shreds_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(shreds_type)) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "'%s' is %s, not a named STRUCT", fields[1].first, shreds_type.ToString());
 	}
 	// Inside `shreds`: the marker and the spill bitmap columns (any integer width — a value
 	// round-tripped through a generic value->SQL->value path, e.g. DuckLake inlined-data INSERT,
@@ -283,7 +341,7 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 	// so recognition and reads agree regardless of which fields a merge displaced.
 	auto &shred_fields = StructType::GetChildTypes(shreds_type);
 	if (shred_fields.empty()) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "'%s' is an empty STRUCT", fields[1].first);
 	}
 	idx_t marker_index = shred_fields.size();
 	idx_t spill_columns = 0;
@@ -291,7 +349,8 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		if (shred_fields[i].first == JSONO_SHRED_SET) {
 			if (marker_index != shred_fields.size()) {
 				// duplicate marker: not a value any writer or merge produced
-				return JsonoLayoutMatch::NotJsono;
+				return RejectNotJsono(reason, "'%s' carries more than one '%s' marker field", fields[1].first,
+				                      JSONO_SHRED_SET);
 			}
 			marker_index = i;
 			continue;
@@ -302,13 +361,14 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		}
 	}
 	if (marker_index == shred_fields.size()) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "'%s' has no '%s' marker field", fields[1].first, JSONO_SHRED_SET);
 	}
 	if (!shred_fields[marker_index].second.IsIntegral()) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "the '%s' marker is %s, not an integer", JSONO_SHRED_SET,
+		                      shred_fields[marker_index].second.ToString());
 	}
 	if (spill_columns == 0) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "'%s' has no '%s$<n>' spill bitmap column", fields[1].first, JSONO_SHRED_SPILL);
 	}
 	// Spill columns are a dense 0..spill_columns-1 family (see SpillColumnName) — a gap or a
 	// duplicate column number means a hand-built struct, not one any writer or merge produced.
@@ -321,10 +381,12 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		idx_t column;
 		if (TryParseSpillColumnName(shred_fields[i].first, column)) {
 			if (column >= spill_columns || spill_seen[column]) {
-				return JsonoLayoutMatch::NotJsono;
+				return RejectNotJsono(reason, "spill column '%s' breaks the dense 0..%llu numbering every writer emits",
+				                      shred_fields[i].first, (unsigned long long)(spill_columns - 1));
 			}
 			if (!shred_fields[i].second.IsIntegral()) {
-				return JsonoLayoutMatch::NotJsono;
+				return RejectNotJsono(reason, "spill column '%s' is %s, not an integer", shred_fields[i].first,
+				                      shred_fields[i].second.ToString());
 			}
 			spill_seen[column] = true;
 			continue;
@@ -334,26 +396,33 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		// it. A reserved-prefix name cannot be one either. Rejecting them here keeps such a raw-cast /
 		// stored struct from being recognized as JSONO.
 		if (HasJsonoReservedPrefix(shred_fields[i].first)) {
-			return JsonoLayoutMatch::NotJsono;
+			return RejectNotJsono(reason, "field '%s' uses the reserved '%s' namespace but is not a layout field",
+			                      shred_fields[i].first, JSONO_RESERVED_PREFIX);
 		}
 		if (!ShredNameIsObjectKeyPath(shred_fields[i].first)) {
-			return JsonoLayoutMatch::NotJsono;
+			return RejectNotJsono(reason,
+			                      "field '%s' is not a shred path: a shred is named by a non-empty object-key "
+			                      "path (array-index and root '$' paths cannot be shredded)",
+			                      shred_fields[i].first);
 		}
 		LogicalType value_type;
 		if (!UnwrapShredFieldType(shred_fields[i].second, value_type)) {
-			return JsonoLayoutMatch::NotJsono;
+			return RejectNotJsono(reason, "shred '%s' is %s, which is not a shred value type or LIST of one",
+			                      shred_fields[i].first, shred_fields[i].second.ToString());
 		}
 		shreds.emplace_back(shred_fields[i].first, value_type);
 	}
 	if (shreds.empty()) {
 		// the reserved fields alone are not a valid shredded value
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "'%s' carries only reserved layout fields and no shred", fields[1].first);
 	}
 	// A set-op merged type can carry FEWER spill columns than the crossing union's shred count
 	// needs (see JsonoSpillColumnCount) — readable, never provable past its columns — but never
 	// more: no writer over-provisions, so extra columns mean a hand-built struct.
 	if (spill_columns > JsonoSpillColumnCount(shreds.size())) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "%llu spill columns for %llu shreds; at most %llu can be provisioned",
+		                      (unsigned long long)spill_columns, (unsigned long long)shreds.size(),
+		                      (unsigned long long)JsonoSpillColumnCount(shreds.size()));
 	}
 	out.kind = JsonoLayoutKind::Shredded;
 	out.shreds = std::move(shreds);
@@ -363,23 +432,47 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 
 } // namespace
 
-JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out) {
+JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out, string *reason) {
 	out = JsonoLayoutType(); // never inherit a previous parse: callers reuse one `out` across types
 	if (type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(type)) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason, "the value is %s, not a named STRUCT", type.ToString());
 	}
 	auto &children = StructType::GetChildTypes(type);
 	if (children.size() != 1) {
-		return JsonoLayoutMatch::NotJsono;
+		return RejectNotJsono(reason,
+		                      "the value's STRUCT has %llu fields; a JSONO value has exactly one (the '%s' "
+		                      "layout field)",
+		                      (unsigned long long)children.size(), JSONO_LAYOUT);
 	}
-	return MatchJsonoLayoutField(children[0].first, children[0].second, out);
+	return MatchJsonoLayoutField(children[0].first, children[0].second, out, reason);
 }
 
-void JsonoRejectForeignLayout(const LogicalType &type, const string &context) {
+string JsonoExplainLayoutMatch(const LogicalType &type) {
 	JsonoLayoutType layout;
-	if (MatchJsonoLayoutType(type, layout) != JsonoLayoutMatch::Foreign) {
-		return;
+	string reason;
+	switch (MatchJsonoLayoutType(type, layout, &reason)) {
+	case JsonoLayoutMatch::Current:
+		if (layout.kind == JsonoLayoutKind::Plain) {
+			return StringUtil::Format("jsono: plain, body revision %llu", (unsigned long long)layout.body_revision);
+		}
+		return StringUtil::Format("jsono: shredded, body revision %llu, shreds revision %llu, %llu shreds, %llu spill "
+		                          "column(s)",
+		                          (unsigned long long)layout.body_revision, (unsigned long long)layout.shreds_revision,
+		                          (unsigned long long)layout.shreds.size(), (unsigned long long)layout.spill_columns);
+	case JsonoLayoutMatch::Foreign:
+		// Same wording source as the refusal itself, so the diagnosis and the error a read raises
+		// cannot describe the same value differently.
+		return StringUtil::Format("foreign: %s", JsonoDescribeForeignLayout(layout));
+	default:
+		// A value of the CURRENT revision that fails the grammar is deliberately NOT refused at read
+		// time (it stays silent NotJsono — see MatchJsonoLayoutField), which is exactly the case this
+		// function exists to make visible: the read path will hand the value to core json, where an
+		// extract reads NULL and to_json serializes the physical struct.
+		return StringUtil::Format("not jsono: %s", reason);
 	}
+}
+
+string JsonoDescribeForeignLayout(const JsonoLayoutType &layout) {
 	// The revisions are named machine-readably on purpose: they are the only thing that tells a user
 	// which build wrote the data, and the key into the revision map in docs/jsono_format.md, which
 	// turns them into a commit range and an upgrade recipe. The body revision is always known here
@@ -388,13 +481,21 @@ void JsonoRejectForeignLayout(const LogicalType &type, const string &context) {
 	if (layout.shreds_revision != DConstants::INVALID_INDEX) {
 		read += StringUtil::Format(" shreds=%llu", (unsigned long long)layout.shreds_revision);
 	}
+	return StringUtil::Format("layout revision %s, this build reads body=%llu shreds=%llu", read,
+	                          (unsigned long long)JSONO_BODY_REVISION, (unsigned long long)JSONO_SHREDS_REVISION);
+}
+
+void JsonoRejectForeignLayout(const LogicalType &type, const string &context) {
+	JsonoLayoutType layout;
+	if (MatchJsonoLayoutType(type, layout) != JsonoLayoutMatch::Foreign) {
+		return;
+	}
 	throw InvalidInputException(
-	    "%s: JSONO value carries layout revision %s, this build reads body=%llu shreds=%llu. Reading it would "
+	    "%s: JSONO value carries %s. Reading it would "
 	    "silently lose data, so it is refused. This build can still MOVE the value (SELECT *, INSERT ... SELECT, "
 	    "COPY ... TO a Parquet file) but not read or render it: carry it to a build that reads that revision and "
 	    "rewrite it there with jsono(...), or drop the data. Type: %s",
-	    context, read, (unsigned long long)JSONO_BODY_REVISION, (unsigned long long)JSONO_SHREDS_REVISION,
-	    type.ToString());
+	    context, JsonoDescribeForeignLayout(layout), type.ToString());
 }
 
 bool TryParseJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out) {
@@ -595,6 +696,14 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet set("jsono_version");
 		set.AddFunction(ScalarFunction({}, LogicalType::INTEGER, JsonoVersionExecute));
+		loader.RegisterFunction(set);
+	}
+	{
+		// ANY, and no jsono check in the bind: the whole point is answering for a value the grammar
+		// REFUSED, which a JSONO-typed parameter could never receive.
+		ScalarFunctionSet set("jsono_layout_diagnose");
+		set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::VARCHAR, JsonoLayoutDiagnoseExecute,
+		                               JsonoLayoutDiagnoseBind));
 		loader.RegisterFunction(set);
 	}
 }

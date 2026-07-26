@@ -1,0 +1,84 @@
+# name: test/sql/jsono_layout_diagnose.test
+# description: jsono_layout_diagnose(value) answers why the extension does or does not see the argument's TYPE as JSONO. It exists for the deliberately silent case: a value carrying the CURRENT revision that fails the grammar is classified NotJsono without a word (refusing it would break the legal DuckLake write path, see MatchJsonoLayoutField), and from SQL that is indistinguishable from an ordinary NULL — `->>` reads NULL through core json and to_json serializes the physical struct. The diagnosis comes out of the grammar itself (MatchJsonoLayoutType's `reason` sink), so it cannot drift from the rules that decide. It is a bind-time question about the type: the value's bytes are never read.
+# group: [sql]
+
+require jsono
+
+require json
+
+# Recognised values report their layout, not an error.
+query I
+SELECT jsono_layout_diagnose(jsono('{"a":1}'));
+----
+jsono: plain, body revision 1
+
+query I
+SELECT jsono_layout_diagnose(jsono('{"a":1,"b":2}', shredding := {'a':'BIGINT'}));
+----
+jsono: shredded, body revision 1, shreds revision 1, 1 shreds, 1 spill column(s)
+
+# Ordinary values: the reason names the first rule that failed, from the outside in.
+query I
+SELECT jsono_layout_diagnose(42);
+----
+not jsono: the value is INTEGER, not a named STRUCT
+
+query I
+SELECT jsono_layout_diagnose({'a': 1});
+----
+not jsono: the value's single field is named 'a', not the layout anchor 'jsono'
+
+# The case the function exists for: a value of the CURRENT revision that fails the grammar. Reads of
+# it stay silent by design, so this is the only way to see why.
+query I
+WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$1" := struct_pack(a := c.jsono."shreds$1".a, b := c.jsono."shreds$1".b))))
+FROM v;
+----
+not jsono: 'shreds$1' has no '$jsono$set' marker field
+
+query I
+WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$1" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0",
+    a := {'weird': 1}))))
+FROM v;
+----
+not jsono: shred 'a' is STRUCT(weird INTEGER), which is not a shred value type or LIST of one
+
+# A foreign revision is DIAGNOSED, not refused. Every other consumer of such a value throws
+# (RejectForeignLayoutsInExpression), so exempting this one is what keeps a diagnostic available for
+# exactly the value that needs diagnosing — it reads the type, never the bytes.
+query I
+WITH v AS (SELECT jsono('{"a":1}') AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))) FROM v;
+----
+foreign: layout revision body=0, this build reads body=1 shreds=1
+
+# The exemption is narrow: any OTHER consumer of the same foreign value still fails loud, and the
+# refusal quotes the same revision phrase the diagnosis does (JsonoDescribeForeignLayout).
+statement error
+WITH v AS (SELECT jsono('{"a":1}') AS c)
+SELECT to_json(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))) FROM v;
+----
+JSONO value carries layout revision body=0, this build reads body=1 shreds=1
+
+# The reordered-reserved-fields shape a set-op merge produces IS recognised (it is read by name), so
+# it diagnoses as ordinary shredded jsono rather than as a broken struct.
+query I
+WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$1" := struct_pack(
+    a := c.jsono."shreds$1".a,
+    "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0",
+    b := c.jsono."shreds$1".b))))
+FROM v;
+----
+jsono: shredded, body revision 1, shreds revision 1, 2 shreds, 1 spill column(s)

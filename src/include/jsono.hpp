@@ -247,7 +247,22 @@ enum class JsonoLayoutMatch : uint8_t { NotJsono, Current, Foreign };
 // anchor is deliberately narrow and permanent: a top-level STRUCT with exactly one field named
 // `jsono` whose own field 0 is named `body` or `body$<digits>` AND is a STRUCT of nothing but
 // BLOBs. Everything else about the layout may change across revisions; the anchor may not.
-JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out);
+// `reason` is the explain-mode sink: pass nullptr (the hot path — every bind classifies ordinary
+// types here) to skip formatting entirely, or a string to receive why a NotJsono was refused.
+JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out, string *reason = nullptr);
+
+// Human-readable one-line classification of `type` against the grammar, for `jsono_layout_diagnose`.
+// A NotJsono answer carries the grammar's OWN reason (see MatchJsonoLayoutType's `reason`), which is
+// what makes the diagnosis trustworthy: there is no second copy of the rules to drift from the one
+// that decides. This is the only way to see why a value of the current revision failed the grammar —
+// that case is deliberately silent at read time, so the read path hands the value to core json
+// instead (an extract reads NULL, to_json serializes the physical struct).
+string JsonoExplainLayoutMatch(const LogicalType &type);
+
+// The revision phrase a foreign layout is described by ("layout revision body=0 shreds=0, this build
+// reads body=1 shreds=1"), shared by the refusal and the diagnosis so the two cannot describe the
+// same value differently.
+string JsonoDescribeForeignLayout(const JsonoLayoutType &layout);
 
 // The single refusal point for a foreign layout. No-op unless `type` is JsonoLayoutMatch::Foreign;
 // otherwise throws an InvalidInputException naming the revisions read (the body one always, the
