@@ -260,8 +260,26 @@ struct ShredField {
 	JsonoScalarPrimitive element_primitive; // valid when kind == ScalarArray
 };
 
-struct ShredBindData : public FunctionData {
+// A shred set compiled for writing: the lanes, plus the per-lane tables every per-row write reads.
+// Built where the set is decided — a bind, or the layout-driven fallback that mints one per call —
+// because each table decodes every lane name and allocates; rebuilding them per chunk charged the
+// whole shred set to every batch of rows.
+struct ShredWriteSet {
 	vector<ShredField> fields;
+	JsonoShredWriteModel model;
+	// The non-scalar lanes' residual-skeleton specs (path + lifted-element description). The skeleton
+	// emit strips, per array element, exactly what the WriteArrayShred / WriteScalarArrayShred pass
+	// reports lifted (both gate on JsonoScalarFitsPrimitive), keeping the array as the position
+	// carrier. Empty — the common case — means the plain leaf-strip emit.
+	vector<JsonoArrayShredSpec> array_specs;
+
+	void Build();
+};
+
+struct ShredBindData : public FunctionData {
+	// The shred set with its write-side tables (ShredWriteSet::Build, called once the spec parse has
+	// settled the lanes). Copy() copies them: they hold no pointers into themselves.
+	ShredWriteSet write;
 	LogicalType return_type;
 	// Single-pass reshred over a shredded input: each target field either copies its source shred
 	// (keep_src holds the source shred index) or extracts a new path from the residual
@@ -471,7 +489,7 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 		ShredField field;
 		BindShredFieldType(type_name, context, path, field);
 		for (idx_t j = 0; j < i; j++) {
-			if (bind_data->fields[j].lane_name == field.lane_name) {
+			if (bind_data->write.fields[j].lane_name == field.lane_name) {
 				// Two spellings of one path ('a' and '$.a') used to mint two lanes for one document key;
 				// they now name one lane, and a STRUCT cannot carry it twice. Refuse loudly here rather
 				// than let DuckDB report an opaque duplicate-field error over an encoded name.
@@ -479,9 +497,9 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 				                      path);
 			}
 		}
-		bind_data->fields.push_back(std::move(field));
+		bind_data->write.fields.push_back(std::move(field));
 	}
-	if (bind_data->fields.empty()) {
+	if (bind_data->write.fields.empty()) {
 		throw BinderException("jsono shred: empty shredding spec");
 	}
 	// Canonical shred order (sorted by lane name) makes the shredded type a pure function of the shred
@@ -490,10 +508,12 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 	// same key every other canonical sort uses (merge bind, the optimizer's SortedShreds,
 	// jsono_storage_type) and the same key the canonical spill ranks are derived from. The shred-set
 	// marker hash is order-independent regardless.
-	std::sort(bind_data->fields.begin(), bind_data->fields.end(),
+	std::sort(bind_data->write.fields.begin(), bind_data->write.fields.end(),
 	          [](const ShredField &a, const ShredField &b) { return a.lane_name < b.lane_name; });
+	// The lanes are settled: derive the write-side tables here, once, rather than in each execute.
+	bind_data->write.Build();
 	vector<JsonoLaneSpec> shreds;
-	for (auto &field : bind_data->fields) {
+	for (auto &field : bind_data->write.fields) {
 		shreds.push_back(JsonoLaneSpec {field.steps, ShredFieldType(field)});
 	}
 	// JsonoShreddedStructType builds the canonical layout type purely from the shred set, so a column
@@ -502,8 +522,8 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 
 	bind_data->one_pass_text = true;
 	bind_data->trie.emplace_back();
-	for (idx_t f = 0; f < bind_data->fields.size(); f++) {
-		auto &field = bind_data->fields[f];
+	for (idx_t f = 0; f < bind_data->write.fields.size(); f++) {
+		auto &field = bind_data->write.fields[f];
 		if (field.kind != ShredKind::Scalar) {
 			// Array shreds (object or scalar) extract per element from the parsed value (the two-pass
 			// plain shred path); the one-pass text DOM writer's trie addresses object-key scalar leaves only.
@@ -535,9 +555,9 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 	// shred is a scalar object-key path.
 	bind_data->one_pass_jsono = true;
 	bind_data->jsono_trie.Reset();
-	bind_data->jsono_trie.PrepareFieldMetadata(bind_data->fields.size());
-	for (idx_t f = 0; f < bind_data->fields.size(); f++) {
-		auto &field = bind_data->fields[f];
+	bind_data->jsono_trie.PrepareFieldMetadata(bind_data->write.fields.size());
+	for (idx_t f = 0; f < bind_data->write.fields.size(); f++) {
+		auto &field = bind_data->write.fields[f];
 		if (field.kind != ShredKind::Scalar) {
 			bind_data->one_pass_jsono = false;
 			continue;
@@ -589,12 +609,12 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 		// scalar target paths extract from that residual. Array shreds can ride this path only when
 		// they survive unchanged: their residual skeleton and list lane are copied as a pair.
 		if (src_layout.kind == JsonoLayoutKind::Shredded) {
-			bind_data->keep_src.assign(bind_data->fields.size(), DConstants::INVALID_INDEX);
+			bind_data->keep_src.assign(bind_data->write.fields.size(), DConstants::INVALID_INDEX);
 			vector<bool> src_kept(src_layout.shreds.size(), false);
-			for (idx_t f = 0; f < bind_data->fields.size(); f++) {
-				auto field_type = ShredFieldType(bind_data->fields[f]);
+			for (idx_t f = 0; f < bind_data->write.fields.size(); f++) {
+				auto field_type = ShredFieldType(bind_data->write.fields[f]);
 				for (idx_t k = 0; k < src_layout.shreds.size(); k++) {
-					if (src_layout.shreds[k].first == bind_data->fields[f].lane_name &&
+					if (src_layout.shreds[k].first == bind_data->write.fields[f].lane_name &&
 					    src_layout.shreds[k].second == field_type) {
 						bind_data->keep_src[f] = k;
 						src_kept[k] = true;
@@ -603,8 +623,8 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 				}
 			}
 			bool can_single_pass = true;
-			for (idx_t f = 0; f < bind_data->fields.size(); f++) {
-				if (bind_data->fields[f].kind != ShredKind::Scalar &&
+			for (idx_t f = 0; f < bind_data->write.fields.size(); f++) {
+				if (bind_data->write.fields[f].kind != ShredKind::Scalar &&
 				    bind_data->keep_src[f] == DConstants::INVALID_INDEX) {
 					can_single_pass = false;
 					break;
@@ -842,33 +862,39 @@ struct ShredTrieWalkPolicy {
 	}
 };
 
-// The canonical spill-bit rank of each shred field (see JsonoSpillRanksOfNames): rank == index for
-// the sorted field lists the binds produce, recomputed here so an unsorted caller list stays
-// correct. It is the PHYSICAL lane name that ranks, because every reader recomputes the ranks from
-// the stored type's field names (jsono_validate, jsono_shred_stats, the optimizer's spill proof) —
-// writer and readers must rank the same string or the bits mean different lanes on each side.
-vector<idx_t> ShredFieldSpillRanks(const vector<ShredField> &fields) {
-	vector<string> names;
-	names.reserve(fields.size());
-	for (auto &field : fields) {
-		names.push_back(field.lane_name);
-	}
-	return JsonoSpillRanksOfNames(names);
-}
-
-// The per-field manifest entries, through the one builder every writer shares — so the paths it
-// records are decoded from the lane names exactly as a reader decodes its own type's.
-JsonoShredManifestEntries ShredFieldManifestEntries(const vector<ShredField> &fields) {
+void ShredWriteSet::Build() {
 	vector<std::pair<string, LogicalType>> shreds;
 	shreds.reserve(fields.size());
 	for (auto &field : fields) {
 		shreds.emplace_back(field.lane_name, ShredFieldType(field));
 	}
-	return JsonoBuildShredManifestEntries(shreds);
+	// Through the one builder every writer shares, so the paths recorded are decoded from the lane
+	// names exactly as a reader decodes its own type's.
+	model = JsonoBuildShredWriteModel(shreds);
+	array_specs.clear();
+	for (auto &field : fields) {
+		if (field.kind == ShredKind::Scalar) {
+			continue;
+		}
+		JsonoArrayShredSpec spec;
+		spec.path = field.steps;
+		spec.kind = field.kind;
+		if (field.kind == ShredKind::ScalarArray) {
+			spec.element_primitive = field.element_primitive;
+		} else {
+			for (auto &sub : field.subfields) {
+				// The skeleton emit strips the element's JSON keys, so the spec carries the logical name.
+				spec.subfields.emplace_back(sub.key, sub.primitive);
+			}
+		}
+		array_specs.push_back(std::move(spec));
+	}
 }
 
-void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &fields, Vector &result,
+void ApplyShredFields(Vector &input_vec, idx_t count, const ShredWriteSet &write, Vector &result,
                       ShredLocalState &lstate, const JsonoTrie *trie = nullptr) {
+	auto &fields = write.fields;
+	auto &spill_ranks = write.model.spill_ranks;
 	// The input is plain JSONO, which never carries a manifest of its own: the reader fails
 	// loud on a narrowed row, whose re-emit below would otherwise replace the old manifest
 	// with a fresh one and launder the loss into permanent undetectability.
@@ -881,7 +907,6 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 	// (JsonoSpillStamp; all NULL only on a SQL-NULL row).
 	JsonoSpillStamp stamp;
 	stamp.Init(result);
-	auto spill_ranks = ShredFieldSpillRanks(fields);
 	vector<Vector *> shred_children;
 	shred_children.reserve(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
@@ -897,36 +922,12 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		JsonoSetRowMarkerNull(result, row);
 	};
 
-	// Per-field manifest entry bytes, built once: the per-row manifest concatenates the entries
-	// of the paths actually stripped from that row's residual, in manifest order.
-	auto manifest_entries = ShredFieldManifestEntries(fields);
-
-	// Array shred specs (path + lifted-element description), built once for the residual skeleton
-	// emit. The skeleton emit strips, per array element, exactly what the WriteArrayShred /
-	// WriteScalarArrayShred pass reports lifted (both gate on JsonoScalarFitsPrimitive), keeping the
-	// array as the position carrier.
-	bool has_array = false;
-	vector<JsonoArrayShredSpec> array_specs;
-	for (auto &field : fields) {
-		if (field.kind == ShredKind::Scalar) {
-			continue;
-		}
-		has_array = true;
-		JsonoArrayShredSpec spec;
-		spec.path = field.steps;
-		spec.kind = field.kind;
-		if (field.kind == ShredKind::ScalarArray) {
-			spec.element_primitive = field.element_primitive;
-		} else {
-			for (auto &sub : field.subfields) {
-				// The skeleton emit strips the element's JSON keys, so the spec carries the logical name.
-				spec.subfields.emplace_back(sub.key, sub.primitive);
-			}
-		}
-		array_specs.push_back(std::move(spec));
-	}
+	// The skeleton emit subsets its spec list as it descends, so it takes pointers; binding them to
+	// the write set's specs here costs nothing in the all-scalar case (no array lane, no allocation).
+	bool has_array = !write.array_specs.empty();
 	vector<const JsonoArrayShredSpec *> array_spec_ptrs;
-	for (auto &spec : array_specs) {
+	array_spec_ptrs.reserve(write.array_specs.size());
+	for (auto &spec : write.array_specs) {
 		array_spec_ptrs.push_back(&spec);
 	}
 
@@ -996,7 +997,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
+			JsonoAppendShredManifest(manifest, write.model, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, lstate.builder, manifest_ptr);
@@ -1294,7 +1295,8 @@ bool TryWriteFlatObjectStrippingPaths(const JsonoView &view, const std::vector<c
 // of paths that were already shredded.
 void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &bind_data, Vector &result,
                           ShredLocalState &lstate) {
-	auto &fields = bind_data.fields;
+	auto &fields = bind_data.write.fields;
+	auto &model = bind_data.write.model;
 
 	input_vec.Flatten(count);
 
@@ -1321,7 +1323,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 	// sorted-name ranks), a newly-extracted shred's bit is recomputed by WriteShred.
 	JsonoSpillStamp stamp;
 	stamp.Init(result);
-	auto out_ranks = ShredFieldSpillRanks(fields);
+	auto &out_ranks = model.spill_ranks;
 	vector<Vector *> shred_out(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		shred_out[f] = &JsonoShredVector(result, f);
@@ -1367,13 +1369,9 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		}
 	}
 
-	auto manifest_entries = ShredFieldManifestEntries(fields);
 	// The kept lanes' logical paths, in field order: the input row's manifest records paths, so the
-	// carry-over probe below must ask about the path, not the lane name.
-	vector<string> field_paths(fields.size());
-	for (idx_t f = 0; f < fields.size(); f++) {
-		field_paths[f] = JsonoLaneLogicalPath(fields[f].lane_name);
-	}
+	// carry-over probe below asks about the path, not the lane name.
+	auto &field_paths = model.paths;
 
 	const std::vector<ShredManifestEntry> *old_manifest = nullptr;
 	std::vector<ShredManifestEntry> src_manifest;
@@ -1490,7 +1488,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			if (reads_merged && !stripped_lanes.Empty()) {
 				manifest.clear();
 				manifest.append(blob.skips.GetData(), blob.skips.GetSize());
-				JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
+				JsonoAppendShredManifest(manifest, model, stripped_lanes);
 				writer.data[BODY_SKIPS][row] = WriteBlobInto(writer.Skips(), manifest.data(), manifest.size());
 			} else {
 				writer.data[BODY_SKIPS][row] =
@@ -1502,7 +1500,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
+			JsonoAppendShredManifest(manifest, model, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		if (TryWriteFlatObjectStrippingPaths(view, lstate.strip_paths, lstate.flat_strip_positions,
@@ -1524,7 +1522,7 @@ void JsonoShredExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 		ApplyReshredShredded(args.data[0], args.size(), bind_data, result, lstate);
 	} else {
 		const JsonoTrie *trie = bind_data.one_pass_jsono ? &bind_data.jsono_trie : nullptr;
-		ApplyShredFields(args.data[0], args.size(), bind_data.fields, result, lstate, trie);
+		ApplyShredFields(args.data[0], args.size(), bind_data.write, result, lstate, trie);
 	}
 	if (input_constant) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -1545,14 +1543,14 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	if (!bind_data.one_pass_text) {
 		Vector plain(JsonoType(), count);
 		JsonoParseTextVector(args.data[0], count, plain);
-		ApplyShredFields(plain, count, bind_data.fields, result, lstate);
+		ApplyShredFields(plain, count, bind_data.write, result, lstate);
 		if (input_constant) {
 			result.SetVectorType(VectorType::CONSTANT_VECTOR);
 		}
 		return;
 	}
 
-	auto &fields = bind_data.fields;
+	auto &fields = bind_data.write.fields;
 	UnifiedVectorFormat input_fmt;
 	args.data[0].ToUnifiedFormat(count, input_fmt);
 	auto inputs = UnifiedVectorFormat::GetData<string_t>(input_fmt);
@@ -1569,12 +1567,11 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	// (JsonoSpillStamp; all NULL only on a SQL-NULL row).
 	JsonoSpillStamp stamp;
 	stamp.Init(result);
-	auto spill_ranks = ShredFieldSpillRanks(fields);
+	auto &spill_ranks = bind_data.write.model.spill_ranks;
 
-	auto manifest_entries = ShredFieldManifestEntries(fields);
 	jsono_dom::DomShredContext ctx;
 	ctx.nodes = &bind_data.trie;
-	ctx.manifest_entries = &manifest_entries;
+	ctx.model = &bind_data.write.model;
 	ctx.kinds.resize(fields.size());
 	ctx.stripped_lanes.Init(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
@@ -1763,49 +1760,51 @@ void JsonoAppendShredManifestInternal(std::string &manifest, idx_t entry_count, 
 
 } // namespace
 
-JsonoShredManifestEntries JsonoBuildShredManifestEntries(const vector<std::pair<string, LogicalType>> &shreds) {
-	vector<string> paths;
-	paths.reserve(shreds.size());
+JsonoShredWriteModel JsonoBuildShredWriteModel(const vector<std::pair<string, LogicalType>> &shreds) {
+	JsonoShredWriteModel model;
+	model.paths.reserve(shreds.size());
+	vector<string> names;
+	names.reserve(shreds.size());
 	for (auto &shred : shreds) {
-		paths.push_back(JsonoLaneLogicalPath(shred.first));
+		model.paths.push_back(JsonoLaneLogicalPath(shred.first));
+		names.push_back(shred.first);
 	}
+	model.spill_ranks = JsonoSpillRanksOfNames(names);
 	// The manifest's own order, which is the logical-path order — NOT the lane order the shred set is
 	// listed in (that follows the encoded name, and the two genuinely differ: `$.a-c` sorts before
 	// `$.a.b` as text while the nested path sorts first structurally). Reusing the rank helper keeps
 	// "rank == position in the byte-sorted list" spelled once; inverting the ranks turns it into the
 	// walk order every per-row write follows.
-	auto ranks = JsonoSpillRanksOfNames(paths);
-	JsonoShredManifestEntries table;
-	table.entries.resize(shreds.size());
-	table.manifest_order.resize(shreds.size());
+	auto ranks = JsonoSpillRanksOfNames(model.paths);
+	model.entries.resize(shreds.size());
+	model.manifest_order.resize(shreds.size());
 	for (idx_t f = 0; f < shreds.size(); f++) {
 		auto type_name = JsonoLaneLogicalType(shreds[f].second).ToString();
-		auto &entry = table.entries[f];
-		table.manifest_order[ranks[f]] = f;
-		AppendManifestLV(entry.full, paths[f]);
+		auto &entry = model.entries[f];
+		model.manifest_order[ranks[f]] = f;
+		AppendManifestLV(entry.full, model.paths[f]);
 		AppendManifestLV(entry.full, type_name);
-		AppendManifestLV(entry.compact, paths[f]);
+		AppendManifestLV(entry.compact, model.paths[f]);
 		auto type_code = ShredManifestCompactTypeCode(type_name);
 		entry.compact.push_back(char(type_code));
 		if (type_code == jsono::SHRED_MANIFEST_TYPE_EXTENDED) {
 			AppendManifestLV(entry.compact, type_name);
 		}
 	}
-	return table;
+	return model;
 }
 
-void JsonoAppendShredManifest(std::string &manifest, const JsonoShredManifestEntries &table) {
+void JsonoAppendShredManifest(std::string &manifest, const JsonoShredWriteModel &model) {
 	JsonoAppendShredManifestInternal(
-	    manifest, table.manifest_order.size(),
-	    [&](idx_t i) -> const JsonoShredManifestEntryBytes & { return table.entries[table.manifest_order[i]]; });
+	    manifest, model.manifest_order.size(),
+	    [&](idx_t i) -> const JsonoShredManifestEntryBytes & { return model.entries[model.manifest_order[i]]; });
 }
 
-void JsonoAppendShredManifest(std::string &manifest, const JsonoShredManifestEntries &table,
-                              JsonoStrippedLanes &lanes) {
+void JsonoAppendShredManifest(std::string &manifest, const JsonoShredWriteModel &model, JsonoStrippedLanes &lanes) {
 	lanes.selected.clear();
-	for (auto lane : table.manifest_order) {
+	for (auto lane : model.manifest_order) {
 		if (lanes.marks[lane]) {
-			lanes.selected.push_back(&table.entries[lane]);
+			lanes.selected.push_back(&model.entries[lane]);
 		}
 	}
 	JsonoAppendShredManifestInternal(
@@ -1815,8 +1814,8 @@ void JsonoAppendShredManifest(std::string &manifest, const JsonoShredManifestEnt
 
 void JsonoShredFromLayout(Vector &input, idx_t count, const vector<std::pair<string, LogicalType>> &shreds,
                           Vector &result) {
-	vector<ShredField> fields;
-	fields.reserve(shreds.size());
+	ShredWriteSet write;
+	write.fields.reserve(shreds.size());
 	for (auto &shred : shreds) {
 		ShredField field;
 		// The names arrive PHYSICAL — from a layout type or from a bind that already minted them — so
@@ -1827,10 +1826,11 @@ void JsonoShredFromLayout(Vector &input, idx_t count, const vector<std::pair<str
 		if (!FillShredFieldFromLayoutType(shred.second, field)) {
 			throw InternalException("jsono shred field '%s' has a non-shred type", shred.first);
 		}
-		fields.push_back(std::move(field));
+		write.fields.push_back(std::move(field));
 	}
+	write.Build();
 	ShredLocalState lstate;
-	ApplyShredFields(input, count, fields, result, lstate);
+	ApplyShredFields(input, count, write, result, lstate);
 }
 
 // The jsono(jsono, shredding := spec) overload, exposed so the optimizer's cast normalization

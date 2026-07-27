@@ -680,7 +680,7 @@ void EmitDomRowDirect(yyjson_val *root, DomDirectState &state, JsonoBodyWriter &
 			}
 		}
 		if (!shred->stripped_lanes.Empty()) {
-			JsonoAppendShredManifest(shred->manifest, *shred->manifest_entries, shred->stripped_lanes);
+			JsonoAppendShredManifest(shred->manifest, *shred->model, shred->stripped_lanes);
 		}
 	} else {
 		SizeDomElement(root, state, 0);

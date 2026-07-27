@@ -121,6 +121,11 @@ struct JsonoStructBindData : public FunctionData {
 	JsonoStructPlan nested_residual_plan;
 	vector<idx_t> residual_fields;
 	JsonoStructPlan residual_plan;
+	// Derived from `shreds` (not part of Equals): the write-side tables the one-pass writers emit each
+	// row's manifest from, plus the all-lanes-stripped manifest their hot row shares. Building them
+	// decodes every lane name, so they are bind facts.
+	JsonoShredWriteModel write_model;
+	string hot_manifest;
 
 	explicit JsonoStructBindData(JsonoStructPlan plan_p) : plan(std::move(plan_p)) {
 	}
@@ -137,6 +142,8 @@ struct JsonoStructBindData : public FunctionData {
 		copy->nested_residual_plan = nested_residual_plan;
 		copy->residual_fields = residual_fields;
 		copy->residual_plan = residual_plan;
+		copy->write_model = write_model;
+		copy->hot_manifest = hot_manifest;
 		return std::move(copy);
 	}
 
@@ -1556,6 +1563,8 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 			lanes.push_back(JsonoLaneSpec {std::move(shred.path), shred.type});
 		}
 		bound_function.return_type = JsonoShreddedStructType(lanes);
+		bind_data->write_model = JsonoBuildShredWriteModel(bind_data->shreds);
+		JsonoAppendShredManifest(bind_data->hot_manifest, bind_data->write_model);
 
 		bind_data->one_pass_shred = true;
 		for (idx_t f = 0; f < bind_data->shreds.size(); f++) {
@@ -1862,8 +1871,6 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 		}
 	}
 
-	auto manifest_entries = JsonoBuildShredManifestEntries(shreds);
-
 	JsonoBodyWriter writer;
 	writer.Init(result);
 	JsonoFillShredMarker(result, count);
@@ -1933,7 +1940,7 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
+			JsonoAppendShredManifest(manifest, bind_data.write_model, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, builder, manifest_ptr);
@@ -2036,10 +2043,9 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		residual_pos[bind_data.residual_fields[j]] = j;
 	}
 
-	// Manifest bytes: per-shred entry once, plus the full all-stripped manifest (the hot case).
-	auto manifest_entries = JsonoBuildShredManifestEntries(shreds);
-	std::string hot_manifest;
-	JsonoAppendShredManifest(hot_manifest, manifest_entries);
+	// Manifest bytes (per-shred entry, and the full all-stripped manifest of the hot case) come from
+	// the bind: they are a function of the shred set alone.
+	auto &hot_manifest = bind_data.hot_manifest;
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
@@ -2147,7 +2153,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			const std::string *manifest_ptr = nullptr;
 			if (!stripped_lanes.Empty()) {
 				manifest.clear();
-				JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
+				JsonoAppendShredManifest(manifest, bind_data.write_model, stripped_lanes);
 				manifest_ptr = &manifest;
 			}
 			writer.WriteRow(row, builder, manifest_ptr);
@@ -2207,7 +2213,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		const std::string *manifest_ptr = nullptr;
 		if (stripped_count > 0) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
+			JsonoAppendShredManifest(manifest, bind_data.write_model, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, builder, manifest_ptr);

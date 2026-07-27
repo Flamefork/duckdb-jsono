@@ -45,10 +45,12 @@ struct GroupMergeBindData : public FunctionData {
 	// type: they drive the direct fold plan and Finalize's native lane/residual write (plus its
 	// manifest entries), so the shreds "stick" across the aggregation with no reshred.
 	vector<std::pair<string, LogicalType>> shreds;
-	// Derived (not part of Equals): fold plan per shred plus the array-shred index filter for the
-	// per-chunk array composition pass.
+	// Derived (not part of Equals): fold plan per shred, the array-shred index filter for the
+	// per-chunk array composition pass, and the write-side tables Finalize emits each group's
+	// manifest and spill bits from.
 	vector<GroupMergeShredPlan> shred_plan;
 	vector<idx_t> array_shred_filter;
+	JsonoShredWriteModel write_model;
 	// Carried into Update/Combine so the accumulator's residual/lane growth is accounted; re-captured on
 	// plan round-trips because this bind_data has no serialize callback (deserialize re-runs the bind).
 	BufferManager &buffer_manager;
@@ -71,6 +73,7 @@ struct GroupMergeBindData : public FunctionData {
 				array_shred_filter.push_back(f);
 			}
 		}
+		write_model = JsonoBuildShredWriteModel(shreds);
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
@@ -650,14 +653,8 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 	writer.Init(result);
 	jsono::JsonoSpillStamp stamp;
 	stamp.Init(result);
-	vector<string> shred_names;
-	shred_names.reserve(bind_data.shreds.size());
-	for (auto &shred : bind_data.shreds) {
-		shred_names.push_back(shred.first);
-	}
-	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
+	auto &spill_ranks = bind_data.write_model.spill_ranks;
 	vector<Vector *> lane_out(bind_data.shreds.size());
-	auto manifest_entries = JsonoBuildShredManifestEntries(bind_data.shreds);
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 		lane_out[f] = &jsono::JsonoShredVector(result, f);
 		lane_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
@@ -764,7 +761,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		writer.data[BODY_NUMS][rid] = WriteBlobInto(writer.Nums(), blob.nums.data(), blob.nums.size());
 		skips_buf.assign(blob.skips.data(), blob.skips.size());
 		if (!stripped_lanes.Empty()) {
-			JsonoAppendShredManifest(skips_buf, manifest_entries, stripped_lanes);
+			JsonoAppendShredManifest(skips_buf, bind_data.write_model, stripped_lanes);
 		}
 		writer.data[BODY_SKIPS][rid] = WriteBlobInto(writer.Skips(), skips_buf.data(), skips_buf.size());
 	}

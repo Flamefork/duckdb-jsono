@@ -104,12 +104,17 @@ struct JsonoShredManifestEntryBytes {
 	std::string compact;
 };
 
-// The manifest side of a shred set, built once per bind. `entries[f]` is lane f's entry bytes;
-// `shreds[f]` is the lane's PHYSICAL (encoded) field name and type, while the entry records the
-// lane's LOGICAL path, decoded from that name, because the manifest is a per-row statement about the
-// DOCUMENT while the encoding is a transport artifact of the TYPE. The reader's verification
-// (VerifyShredManifestEntries) compares those bytes against signatures it decodes from its own type
-// the same way, so both sides name the lane identically by construction.
+// Everything a per-row shred write reads that is a function of the shred SET alone, built once by
+// the bind that decided the set. None of it is cheap: building it decodes every lane name back to
+// its logical path and renders every lane type, so a per-chunk rebuild charges the whole shred set
+// to every batch of rows.
+//
+// `entries[f]`/`paths[f]` describe lane f. `shreds[f]` is the lane's PHYSICAL (encoded) field name
+// and type, while the entry records the lane's LOGICAL path, decoded from that name, because the
+// manifest is a per-row statement about the DOCUMENT while the encoding is a transport artifact of
+// the TYPE. The reader's verification (VerifyShredManifestEntries) compares those bytes against
+// signatures it decodes from its own type the same way, so both sides name the lane identically by
+// construction.
 //
 // `manifest_order` lists the lanes in the manifest's emission order, which is the logical-path order
 // and NOT the lane order (that follows the encoded name, and the two genuinely differ: `$.a-c` sorts
@@ -117,12 +122,19 @@ struct JsonoShredManifestEntryBytes {
 // this is a table and not a bare vector: the write loops reach lanes in their own order (field
 // order, document order, tree order), so ordering the manifest is a bind-time permutation walked per
 // row, never a per-row sort.
-struct JsonoShredManifestEntries {
+//
+// `spill_ranks[f]` is lane f's bit in the `$jsono$spill` bitmap (see JsonoSpillRanksOfNames). It is
+// the PHYSICAL name that ranks there, because every reader recomputes the ranks from the stored
+// type's field names — writer and readers must rank the same string or the bits mean different lanes
+// on each side.
+struct JsonoShredWriteModel {
 	vector<JsonoShredManifestEntryBytes> entries;
+	vector<string> paths;
 	vector<idx_t> manifest_order;
+	vector<idx_t> spill_ranks;
 };
 
-JsonoShredManifestEntries JsonoBuildShredManifestEntries(const vector<std::pair<string, LogicalType>> &shreds);
+JsonoShredWriteModel JsonoBuildShredWriteModel(const vector<std::pair<string, LogicalType>> &shreds);
 
 // The lanes one row strips, as membership only: a write loop marks lanes by LANE index as it reaches
 // them and the manifest walk supplies the order. Sized once per shred set, cleared per row.
@@ -150,10 +162,10 @@ struct JsonoStrippedLanes {
 	vector<const JsonoShredManifestEntryBytes *> selected;
 };
 
-void JsonoAppendShredManifest(std::string &manifest, const JsonoShredManifestEntries &table);
+void JsonoAppendShredManifest(std::string &manifest, const JsonoShredWriteModel &model);
 
 // Appends the entries of the marked lanes, in manifest order.
-void JsonoAppendShredManifest(std::string &manifest, const JsonoShredManifestEntries &table, JsonoStrippedLanes &lanes);
+void JsonoAppendShredManifest(std::string &manifest, const JsonoShredWriteModel &model, JsonoStrippedLanes &lanes);
 
 // Shred a plain JSONO `input` vector into the shredded `result` STRUCT (the six-BLOB residual
 // prefix followed by one shred column per `shreds` entry, in order). `shreds[i]` names a lane by

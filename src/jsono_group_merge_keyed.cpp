@@ -66,6 +66,16 @@ struct GroupMergeLWWBindData : public FunctionData {
 	// (empty for a plain input). Drives the direct fold plan; only when that path declines does
 	// Finalize reshred a plain result back into this type.
 	vector<std::pair<string, LogicalType>> shreds;
+	// Derived from `shreds` (not part of Equals): the direct fold's lane split — scalar lanes, list
+	// lanes, and the lanes the direct path can only serve by overlaying them back into the residual —
+	// plus the text-lane numbering and the write-side tables Finalize emits manifests and spill bits
+	// from. Update, Combine and Finalize all need them, and building them decodes every lane name, so
+	// they belong to the bind rather than to each call.
+	vector<ReconShred> scalar_shreds;
+	vector<ReconShred> list_shreds;
+	vector<idx_t> overlay_shreds;
+	vector<idx_t> scalar_text_indices;
+	JsonoShredWriteModel write_model;
 	// Carried into Update/Combine to account the LWW tree/lane growth; re-captured on plan round-trips
 	// (no serialize callback, so deserialize re-runs the bind).
 	BufferManager &buffer_manager;
@@ -74,9 +84,12 @@ struct GroupMergeLWWBindData : public FunctionData {
 	    : modifiers(modifiers), buffer_manager(buffer_manager) {
 	}
 
+	void BuildShredPlan();
+
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<GroupMergeLWWBindData>(modifiers, buffer_manager);
 		result->shreds = shreds;
+		result->BuildShredPlan();
 		return std::move(result);
 	}
 
@@ -1301,6 +1314,15 @@ void PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
 	std::sort(list_shreds.begin(), list_shreds.end(), by_manifest_path);
 }
 
+void GroupMergeLWWBindData::BuildShredPlan() {
+	scalar_shreds.clear();
+	list_shreds.clear();
+	overlay_shreds.clear();
+	PrepareDirectLWWShreddedInput(shreds, scalar_shreds, list_shreds, overlay_shreds);
+	scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
+	write_model = JsonoBuildShredWriteModel(shreds);
+}
+
 // The four manifest walkers below each run the same two-pointer advance (manifest and shreds are
 // both sorted by path, so one rising `shred_idx` matches each entry to its shred). A shared functor
 // helper was tried but regressed the keyed group_merge hot path ~6%: capturing the loop-carried
@@ -1469,11 +1491,10 @@ bool JsonoGroupMergeLWWUpdateDirectShreddedImpl(Vector inputs[], const GroupMerg
 	if (!IsShreddedJsonoType(inputs[0].GetType()) || bind_data.shreds.empty()) {
 		return false;
 	}
-	vector<ReconShred> scalar_shreds;
-	vector<ReconShred> list_shreds;
-	vector<idx_t> overlay_shreds;
-	PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, overlay_shreds);
-	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
+	auto &scalar_shreds = bind_data.scalar_shreds;
+	auto &list_shreds = bind_data.list_shreds;
+	auto &overlay_shreds = bind_data.overlay_shreds;
+	auto &scalar_text_indices = bind_data.scalar_text_indices;
 	auto scalar_text_count = LWWScalarTextLaneCount(scalar_text_indices);
 	if (!list_shreds.empty() && !overlay_shreds.empty()) {
 		return false;
@@ -1829,12 +1850,10 @@ LWWPathLookup FindLWWPathNode(LWWTreeNode &root, const vector<PathStep> &steps) 
 bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorFormat &state_fmt,
                                               GroupMergeLWWState *const *state_data,
                                               const GroupMergeLWWBindData &bind_data, idx_t count, idx_t offset) {
-	vector<ReconShred> scalar_shreds;
-	vector<ReconShred> list_shreds;
-	vector<idx_t> ignored_list_shreds;
-	PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, ignored_list_shreds);
-	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
-	if (!list_shreds.empty() && !ignored_list_shreds.empty()) {
+	auto &scalar_shreds = bind_data.scalar_shreds;
+	auto &list_shreds = bind_data.list_shreds;
+	auto &scalar_text_indices = bind_data.scalar_text_indices;
+	if (!list_shreds.empty() && !bind_data.overlay_shreds.empty()) {
 		return false;
 	}
 
@@ -1847,14 +1866,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	}
 	JsonoSpillStamp stamp;
 	stamp.Init(result);
-	vector<string> shred_names;
-	shred_names.reserve(bind_data.shreds.size());
-	for (auto &shred : bind_data.shreds) {
-		shred_names.push_back(shred.first);
-	}
-	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
-
-	auto manifest_entries = JsonoBuildShredManifestEntries(bind_data.shreds);
+	auto &spill_ranks = bind_data.write_model.spill_ranks;
 
 	JsonoBuilder builder;
 	vector<const vector<PathStep> *> scalar_strip_paths;
@@ -1958,7 +1970,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
+			JsonoAppendShredManifest(manifest, bind_data.write_model, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(rid, builder, manifest_ptr);
@@ -1987,6 +1999,7 @@ unique_ptr<FunctionData> JsonoGroupMergeLWWBind(ClientContext &context, Aggregat
 		for (auto &shred : layout.shreds) {
 			bind_data->shreds.emplace_back(shred.first, shred.second);
 		}
+		bind_data->BuildShredPlan();
 		function.arguments[0] = type;
 		function.return_type = type;
 	} else if (type.id() == LogicalTypeId::SQLNULL || IsJsonoType(type)) {
@@ -2101,11 +2114,9 @@ void JsonoGroupMergeLWWUpdate(Vector inputs[], AggregateInputData &aggr_input_da
 
 void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
 	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeLWWBindData>();
-	vector<ReconShred> scalar_shreds;
-	vector<ReconShred> list_shreds;
-	vector<idx_t> ignored_list_shreds;
-	PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, ignored_list_shreds);
-	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
+	auto &scalar_shreds = bind_data.scalar_shreds;
+	auto &list_shreds = bind_data.list_shreds;
+	auto &scalar_text_indices = bind_data.scalar_text_indices;
 
 	UnifiedVectorFormat source_fmt;
 	source.ToUnifiedFormat(count, source_fmt);
