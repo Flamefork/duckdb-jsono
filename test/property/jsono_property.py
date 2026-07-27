@@ -1882,10 +1882,16 @@ def test_setop_merge_reserved_fields_by_name(left_size: int, right_size: int, pr
 # these cannot agree with the implementation by sharing its bug:
 #
 #   (1) round-trip: the logical path a lane reports, fed back as a spec, names the same lane;
-#   (2) order preservation: sorting lane names IS sorting paths (the invariant the canonical shred
-#       order, the spill ranks, the two-pointer walkers and the merge fast path's binary searches
-#       against the residual's byte-sorted document keys all rest on) — checked against the paths'
-#       own order, computed here as plain lexicographic comparison of their key byte strings;
+#   (2) order preservation: sorting lane names IS sorting paths — checked against the paths' own
+#       order, computed here as plain lexicographic comparison of their key byte strings. This
+#       property is the anchor the rest of the project points at instead of keeping hand-written
+#       lists of what depends on it. Its one gap is stated rather than papered over: the alphabet
+#       below cannot contain 0x00, because a shred path reaches the extension as a spec field name
+#       and no SQL literal carries a raw NUL byte (the parser ends the string there). So the
+#       `00 -> 00 FF` escape — the only branch where the serialization's order is not simply its
+#       keys' order — is covered for DECODING, by the hand-built lanes in
+#       test/sql/jsono_lane_name_codec.test, and is unreachable for ordering through any public
+#       surface that sorts lanes. Reachable the day a NUL key can be named;
 #   (3) case distinctness: DuckDB compares STRUCT field names case-insensitively, so two paths
 #       differing only in case must still yield names that differ under that comparison — this is
 #       the defect the codec exists to make unrepresentable.

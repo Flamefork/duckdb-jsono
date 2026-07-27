@@ -103,15 +103,18 @@ The same bijection ends a second conflation — `gclid` and `$.gclid` are one pa
 so they are one lane, and how the public spec DSL spells a path no longer reaches
 the stored format. Declaring both spellings in one spec is refused.
 
-Two consequences fall out. **No JSON key is reserved**: a name drawn from
-`0-9a-v` can be neither the layout's `body` nor anything under the `$jsono$`
-prefix, so a key spelled like a layout field shreds like any other. And **the
-encoding is order-preserving** at both stages, so sorting lane names *is* sorting
-paths — which is what the canonical shred order, the spill ranks, the two-pointer
-walkers and the merge fast path's binary searches against the residual's
-byte-sorted document keys all rely on. A length-prefixed serialization would
+Two consequences fall out. **No JSON key is reserved by the format**: a name
+drawn from `0-9a-v` can be neither the layout's `body` nor anything under the
+`$jsono$` prefix, so a key spelled like a layout field shreds like any other.
+(The spec DSL has one reservation of its own, unrelated to the stored form: a
+leading `$` starts a `$.`-rooted path, so a key literally named `$foo` is
+declared as `$."$foo"`.) And **the encoding is order-preserving** at both stages,
+so sorting lane names *is* sorting paths. A length-prefixed serialization would
 break that (the length byte dominates), so this is the first invariant to
-re-check if the serialization is ever revisited.
+re-check if the serialization is ever revisited; the property is pinned by
+`test_lane_name_codec` in `test/property/jsono_property.py`, which is also the
+answer to "what depends on it" — every dependent at once, without a hand-written
+list of them to fall out of date.
 
 An object-array lane's element subfield names are encoded the same way (a
 subfield is a one-step path). The price is that the type text is unreadable;
@@ -361,19 +364,19 @@ walks the two in lockstep: each object element's present subfields are overlaid
 back onto its skeleton tail (residual-authoritative — the tail and any kept
 explicit-null subfield win), and every other element is emitted verbatim.
 
-The manifest lists the array's object-key path with its `LIST<STRUCT>` type
-string when at least one element's subfield was lifted, exactly as for a scalar
-shred — so a raw cast that drops or retypes the array shred is caught the same
-way (the skeleton elements are missing their lifted subfields and the residual
-alone cannot reproduce them).
+The manifest records the array's object-key path when at least one element's
+subfield was lifted, exactly as for a scalar shred — so a raw cast that drops or
+retypes the array shred is caught the same way (the skeleton elements are
+missing their lifted subfields and the residual alone cannot reproduce them).
+An object-array entry is the one kind that spells its element subfields out
+rather than naming a type; the entry's exact framing is in
+[Shred manifest](#shred-manifest-in-skips), which is where it is specified.
 
-The binary blob format is unchanged: a skeleton residual is an ordinary value
-and the manifest reuses the length-prefixed `(path, type)` framing (the
-`LIST<STRUCT>` type string is just longer). The shred `LIST<STRUCT>` is a
-DuckDB/Parquet column inside the `shreds` struct, not part of the blob, so no
-`version` bump is needed; an old reader lacking array-shred support rejects the
-unknown `LIST<STRUCT>` shred field at bind or fails loud on the manifest rather than
-silently dropping data.
+A skeleton residual is an ordinary value, and the shred `LIST<STRUCT>` is a
+DuckDB/Parquet column inside the `shreds` struct rather than part of the blob.
+An old reader lacking array-shred support rejects the unknown `LIST<STRUCT>`
+shred field at bind or fails loud on the manifest rather than silently dropping
+data.
 
 ### Scalar array shreds (`LIST<TYPE>`)
 
@@ -415,24 +418,31 @@ never confused: the former always pairs with a non-`NULL` shred slot, the latter
 always with a `NULL` one. A `VARCHAR[]` lane lifts (and so marks its slot
 non-`NULL`) only a real JSON string, like every lane — keeping that invariant exact.
 
-The manifest lists the array's object-key path with its `LIST<TYPE>` type string when
-at least one element was lifted, exactly as for the other shreds, so a raw cast that
-drops or retypes the scalar array shred is caught the same way (the placeholders are
-missing their values and the residual alone cannot reproduce them). The binary blob
-format is unchanged — `VAL_NULL` is an existing slot tag and the manifest reuses the
-same framing — so no `version` bump is needed; the shred `LIST<TYPE>` is a
-DuckDB/Parquet column inside the `shreds` struct.
+The manifest records the array's object-key path when at least one element was
+lifted, exactly as for the other shreds, so a raw cast that drops or retypes the
+scalar array shred is caught the same way (the placeholders are missing their values
+and the residual alone cannot reproduce them); a scalar-array lane carries its own
+type code, like every non-object-array lane. `VAL_NULL` is an existing slot tag, and
+the shred `LIST<TYPE>` is a DuckDB/Parquet column inside the `shreds` struct rather
+than part of the blob.
 
 ## Layout revisions
 
 Three things are versioned independently, because they fail in different ways
 and invalidate different data:
 
-| What | Where the version lives | Current |
-|------|-------------------------|---------|
-| The bytes **inside** the body blobs | `version` byte in `slots` | 4 |
-| The residual's **column** layout (the set, names and types of the body blobs) | the field name `body$<N>` | 1 |
-| The **shred** layout (reserved fields inside `shreds`, lane naming, lane shape, spill bit numbering, marker semantics) | the field name `shreds$<M>` | 2 |
+| What | Where the version lives | How to read the current one |
+|------|-------------------------|-----------------------------|
+| The bytes **inside** the body blobs | `version` byte in `slots` | `jsono_version(value)`, and [Compatibility policy](#compatibility-policy) |
+| The residual's **column** layout (the set, names and types of the body blobs) | the field name `body$<N>` | the value's own type |
+| The **shred** layout (reserved fields inside `shreds`, lane naming, lane shape, spill bit numbering, marker semantics) | the field name `shreds$<M>` | the value's own type |
+
+The current numbers are deliberately not restated here. Each already has one
+authority that a reader can query — the version byte through `jsono_version()`,
+the two layout revisions through the field names in any type printout — and a
+second copy of a number that changes is a copy that eventually disagrees with
+the first. Where a revision bump happened and what the closed form looked like
+is in [Revision history](#revision-history).
 
 The layout field name `jsono` is the **anchor** and never carries a revision.
 Recognition is anchor-first: a top-level STRUCT with exactly one field named
@@ -546,6 +556,18 @@ so a shredded revision-1 value is moved forward by reading it with a build from
 that range and re-ingesting through `jsono(value, shredding := …)`. A **plain**
 revision-1 value is unaffected — that is why the two stems version separately.
 
+The rename is worse than useless, and it is worth knowing exactly how. Before it,
+the value is refused loudly on every read and render, including the cast that
+stands in front of `COPY … TO … (FORMAT CSV)`. After it, the revision check
+passes and the lane names do not, so the value is not JSONO at all — and *that*
+verdict is silent, which means the CSV dump of raw blobs is written with no error.
+Recognition cannot close this: the type carries nothing that separates a renamed
+old value from any other hand-built struct with a non-lane field, and those must
+stay silent (a DuckLake inlined-data flush produces them on a legal write path).
+So the rename is not a step of the upgrade — it is the one move that turns a loud
+refusal into a quiet one. `jsono_layout_diagnose` is what tells you which side of
+it you are on.
+
 **Revision 0** is everything written before layout revisions existed: the
 unrevisioned field names `body` and `shreds`. Four shapes shipped under it.
 
@@ -657,7 +679,7 @@ strings and keys. That is delegated to Parquet column-dictionary encoding — se
 | field | type | value |
 |---|---|---|
 | `magic` | u32 | `'JSNO'` = `0x4F4E534A` |
-| `version` | u8 | `4` |
+| `version` | u8 | the current format version — see [Compatibility policy](#compatibility-policy) |
 | `flags` | u8 | bit0 = `SORTED_KEYS` |
 | `reserved` | u16 | `0` |
 

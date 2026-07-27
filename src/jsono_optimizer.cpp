@@ -3174,10 +3174,9 @@ void RejectForeignLayoutsInExpression(Expression &expr) {
 	// byte of it, so refusing it would silence the only tool a user has for diagnosing the very value
 	// being refused. jsono_layout_lanes is NOT exempt — it claims to enumerate lanes, which this build
 	// cannot do for a foreign naming, so it refuses in its own bind and never reaches this walk.
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-		if (expr.Cast<BoundFunctionExpression>().function.name == "jsono_layout_diagnose") {
-			return;
-		}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+	    expr.Cast<BoundFunctionExpression>().function.name == "jsono_layout_diagnose") {
+		return;
 	}
 	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
 		// Classify first, name the consumer only on the refusal: this runs on every child of every
