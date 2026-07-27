@@ -33,6 +33,27 @@ namespace {
 
 using namespace jsono;
 
+// Where one merged shred's lane sits in one input: the argument, and the field index inside that
+// input's `shreds` struct.
+struct LaneSource {
+	idx_t arg;
+	idx_t field;
+};
+
+// The fast path's per-input facts: which arguments carry lanes, where each merged shred's lane sits
+// in each of them, and whether the lane types agree. All of it is a function of the ARGUMENT TYPES,
+// which are fixed for a bound expression — but recognizing one type costs a decode of every lane
+// name it carries, so it is resolved once per expression rather than per chunk. The executor used to
+// re-recognize every input inside FastCopyShred, i.e. once per shred per input per chunk: quadratic
+// in the shred set, and each recognition decoding every lane name again.
+struct MergeInputPlan {
+	vector<bool> shredded;                      // per argument
+	vector<idx_t> plain_inputs;                 // arguments carrying a residual but no lanes (SQLNULL excluded)
+	vector<vector<LaneSource>> lane_sources;    // per merged shred, in argument order
+	bool lane_types_agree = true;               // a shred declared with one type by every input that has it
+	vector<const ExtraTypeInfo *> resolved_for; // the argument types this plan was resolved against
+};
+
 struct JsonoMergeLocalState : public FunctionLocalState {
 	JsonoBuilder builder;
 	std::vector<MergeChild> merge_children_a;
@@ -41,6 +62,7 @@ struct JsonoMergeLocalState : public FunctionLocalState {
 	// One per input column: manifest signatures survive across chunks so the per-lane name decode
 	// does not repeat on every call (see JsonoShredSignatures).
 	std::vector<JsonoShredSignatures> input_signatures;
+	MergeInputPlan input_plan;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -53,13 +75,16 @@ struct JsonoMergeLocalState : public FunctionLocalState {
 
 // A shred carried through a shred-aware merge: its two names (the PHYSICAL field `name` the lanes
 // are matched by across inputs, and the LOGICAL `steps` the residual is probed with), the result
-// struct child index it lands in, and its type. The merge folds the six-BLOB residuals (existing
+// struct field it lands in, and its type. The merge folds the six-BLOB residuals (existing
 // logic) and copies each union shred from the last input that declares it.
 struct MergeShred {
 	string name;
-	idx_t result_child_index;
+	// the field this shred occupies inside the RESULT's `shreds` struct, resolved by name at bind
+	// (the result type is a bind fact) so the per-chunk write never re-scans the field names
+	idx_t result_field_index;
 	LogicalType type;
 	vector<PathStep> steps;
+	ShredKind kind;
 };
 
 struct JsonoMergeBindData : public FunctionData {
@@ -68,9 +93,15 @@ struct JsonoMergeBindData : public FunctionData {
 	// plain input's top-level object keys against them (ObjectKeyInShredSet). Not the shred order:
 	// that is sorted by physical name, which for a `$.key` spelling of the same key differs.
 	vector<idx_t> top_level_shreds;
-	// The merged shred set's manifest entries, indexed by shred (== result_child_index). The fast
-	// path re-emits every row's skips with them, so they are a bind fact, not a per-chunk one.
+	// The merged shred set's manifest entries, indexed by shred. The fast path re-emits every row's
+	// skips with them, so they are a bind fact, not a per-chunk one.
 	JsonoShredWriteModel write_model;
+	// Whether the fast path's SHAPE preconditions hold: no array shred, every path step an object
+	// key, and no shred path prefixing another. A function of the merged shred set alone — the one
+	// remaining precondition (the inputs must declare each lane with one type) is per-input and
+	// lives in MergeInputPlan.
+	bool fast_shape_viable = true;
+	bool has_nested_shred = false;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<JsonoMergeBindData>(*this);
@@ -88,6 +119,21 @@ struct JsonoMergeBindData : public FunctionData {
 		return true;
 	}
 };
+
+// True if two object-key shred paths overlap structurally: they agree on the full length of the
+// shorter one, so one is a prefix of (or equal to) the other (e.g. `a` and `$.a.a`, or `a` and
+// `$.a`). Such a pair cannot be two independent lanes — one names a scalar leaf, the other lives
+// under it — so only the actual merge (the reshred fallback) can decide which structure wins.
+// Sibling paths (`$.a.b` vs `$.a.c`) diverge before the shorter ends and do not conflict.
+bool ShredPathsStructurallyConflict(const vector<PathStep> &a, const vector<PathStep> &b) {
+	idx_t common = std::min(a.size(), b.size());
+	for (idx_t i = 0; i < common; i++) {
+		if (a[i].key != b[i].key) {
+			return false;
+		}
+	}
+	return true;
+}
 
 unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunction &bound_function,
                                              vector<unique_ptr<Expression>> &arguments) {
@@ -144,13 +190,11 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 		return std::move(bind_data);
 	}
 	// Canonical shred order (sorted by physical name) so the merged type is a pure function of the
-	// shred set, not of argument order: the executor writes shreds by result_child_index, so the index
-	// order and the type's shred order must agree.
+	// shred set, not of argument order: the type lists its lanes in that same order.
 	std::sort(shreds.begin(), shreds.end(), [](const MergeShred &a, const MergeShred &b) { return a.name < b.name; });
 	vector<JsonoLaneSpec> lanes;
-	idx_t next = 0; // shred-relative index inside the result's `.shreds` struct
 	for (auto &shred : shreds) {
-		shred.result_child_index = next++;
+		shred.kind = ClassifyShredKind(shred.type);
 		lanes.push_back(JsonoLaneSpec {shred.steps, shred.type});
 	}
 	for (idx_t k = 0; k < shreds.size(); k++) {
@@ -167,6 +211,39 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 	}
 	bind_data->write_model = JsonoBuildShredWriteModel(manifest_shreds);
 	bound_function.return_type = JsonoShreddedStructType(lanes);
+	auto &result_shreds_type = JsonoShredsStructType(bound_function.return_type);
+	for (auto &shred : shreds) {
+		shred.result_field_index = JsonoFindShredsFieldIndex(result_shreds_type, shred.name);
+	}
+	// The fast path's shape preconditions. An array shred merges multiple subfield lanes per element
+	// over a per-element tail, and a non-Key step (only reachable through an array path) has no lane
+	// the read overlay re-inserts — neither can ride the lane copy-through. A nested shred whose path
+	// prefixes (or equals) another's is structurally contradictory: only the reshred fallback can
+	// resolve which structure wins. Two distinct top-level keys never prefix each other, so that pass
+	// only matters once a nested shred is present.
+	for (auto &shred : shreds) {
+		if (shred.kind == ShredKind::Array) {
+			bind_data->fast_shape_viable = false;
+		}
+		for (auto &step : shred.steps) {
+			if (step.kind != PathStepKind::Key) {
+				bind_data->fast_shape_viable = false;
+			}
+		}
+		if (shred.steps.size() > 1) {
+			bind_data->has_nested_shred = true;
+		}
+	}
+	if (bind_data->has_nested_shred) {
+		for (idx_t a = 0; a < shreds.size() && bind_data->fast_shape_viable; a++) {
+			for (idx_t b = a + 1; b < shreds.size(); b++) {
+				if (ShredPathsStructurallyConflict(shreds[a].steps, shreds[b].steps)) {
+					bind_data->fast_shape_viable = false;
+					break;
+				}
+			}
+		}
+	}
 	return std::move(bind_data);
 }
 
@@ -310,19 +387,55 @@ bool ResidualConflictsWithScalarArrayShredPath(const JsonoView &view, const vect
 	return cursor.pos >= view.Slots() || SlotTag(view.SlotAt(cursor.pos)) != tag::ARR_START;
 }
 
-// True if two object-key shred paths overlap structurally: they agree on the full length of the
-// shorter one, so one is a prefix of (or equal to) the other (e.g. `a` and `$.a.a`, or `a` and
-// `$.a`). Such a pair cannot be two independent lanes — one names a scalar leaf, the other lives
-// under it — so only the actual merge (the reshred fallback) can decide which structure wins.
-// Sibling paths (`$.a.b` vs `$.a.c`) diverge before the shorter ends and do not conflict.
-bool ShredPathsStructurallyConflict(const vector<PathStep> &a, const vector<PathStep> &b) {
-	idx_t common = std::min(a.size(), b.size());
-	for (idx_t i = 0; i < common; i++) {
-		if (a[i].key != b[i].key) {
-			return false;
+// Resolve `plan` against the argument types unless it already is. A bound expression's argument
+// types never change between chunks, so this rebuilds exactly once — keying it on the type's
+// ExtraTypeInfo (the same key JsonoShredSignatures uses) keeps that a checked fact rather than an
+// assumption.
+const MergeInputPlan &ResolveInputPlan(DataChunk &args, const vector<MergeShred> &shreds, MergeInputPlan &plan) {
+	idx_t ncols = args.ColumnCount();
+	bool resolved = plan.resolved_for.size() == ncols;
+	for (idx_t i = 0; i < ncols && resolved; i++) {
+		resolved = plan.resolved_for[i] == args.data[i].GetType().AuxInfo().get();
+	}
+	if (resolved) {
+		return plan;
+	}
+	plan.shredded.assign(ncols, false);
+	plan.plain_inputs.clear();
+	plan.lane_sources.assign(shreds.size(), vector<LaneSource>());
+	plan.lane_types_agree = true;
+	plan.resolved_for.resize(ncols);
+	for (idx_t i = 0; i < ncols; i++) {
+		auto &type = args.data[i].GetType();
+		plan.resolved_for[i] = type.AuxInfo().get();
+		JsonoLayoutType layout;
+		if (!TryParseJsonoLayoutType(type, layout) || layout.kind != JsonoLayoutKind::Shredded) {
+			// A SQLNULL argument carries neither a residual nor lanes; every other input here is plain
+			// JSONO and folds its whole value into the residual.
+			if (type.id() != LogicalTypeId::SQLNULL) {
+				plan.plain_inputs.push_back(i);
+			}
+			continue;
+		}
+		plan.shredded[i] = true;
+		auto &shreds_type = JsonoShredsStructType(type);
+		for (auto &lane : layout.shreds) {
+			for (idx_t k = 0; k < shreds.size(); k++) {
+				if (shreds[k].name != lane.first) {
+					continue;
+				}
+				plan.lane_sources[k].push_back(LaneSource {i, JsonoFindShredsFieldIndex(shreds_type, lane.first)});
+				// A shred name declared with different types across inputs has incompatible lane
+				// layouts, so the per-row lane copy cannot stage its candidates together. The reshred
+				// fallback coerces every input to the merged (last-declared) type instead.
+				if (shreds[k].type != lane.second) {
+					plan.lane_types_agree = false;
+				}
+				break;
+			}
 		}
 	}
-	return true;
+	return plan;
 }
 
 // Fill the result shred lane by selecting, PER ROW, the winning input's lane value. Every input
@@ -333,22 +446,12 @@ bool ShredPathsStructurallyConflict(const vector<PathStep> &a, const vector<Path
 // scan diverts them — so a NULL lane slot on a kept row always means the key is absent from that
 // input. All candidate lanes share the shred's type (the fast path bails a name declared with mixed
 // types), so they stage side by side for one gather.
-void FastCopyShred(DataChunk &args, idx_t ncols, idx_t count, MergeMode mode, const MergeShred &shred, Vector &dst,
+void FastCopyShred(DataChunk &args, idx_t count, MergeMode mode, const vector<LaneSource> &sources, Vector &dst,
                    const ValidityMask &result_validity) {
 	vector<Vector *> lanes;
-	for (idx_t i = 0; i < ncols; i++) {
-		auto &t = args.data[i].GetType();
-		if (!IsShreddedJsonoType(t)) {
-			continue; // only shredded inputs declare shreds to copy from
-		}
-		JsonoLayoutType layout;
-		TryParseJsonoLayoutType(t, layout);
-		for (idx_t c = 0; c < layout.shreds.size(); c++) {
-			if (layout.shreds[c].first == shred.name) {
-				args.data[i].Flatten(count);
-				lanes.push_back(&JsonoShredVector(args.data[i], c));
-			}
-		}
+	for (auto &source : sources) {
+		args.data[source.arg].Flatten(count);
+		lanes.push_back(&JsonoShredFieldVector(args.data[source.arg], source.field));
 	}
 	dst.SetVectorType(VectorType::FLAT_VECTOR);
 	if (lanes.empty()) {
@@ -446,79 +549,18 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 
 	// Fast path: fold the raw residuals and copy shred lanes through verbatim, skipping the
 	// per-row reconstruct+reshred. Both shredded AND plain inputs ride it: a plain input folds
-	// its whole value into the residual and declares no lanes (FastCopyShred skips it). Every
+	// its whole value into the residual and declares no lanes (FastCopyShred copies from none). Every
 	// shred is an object-key lane (top-level `K` or nested `$.p.q`) the read overlay re-inserts
 	// at its path; a scalar-array shred copies through with its residual skeleton. LIST<STRUCT>
 	// array shreds still fall back because each element merges multiple subfield lanes over a
 	// per-element tail. The per-row gate diverts to the fallback whenever an input could make the
 	// lane copy-through wrong (a non-object replace, a key/path naming a lane).
-	bool fast_viable = true;
-	vector<idx_t> plain_inputs;
-	for (idx_t i = 0; i < ncols; i++) {
-		auto &t = args.data[i].GetType();
-		if (t.id() != LogicalTypeId::SQLNULL && !IsShreddedJsonoType(t)) {
-			plain_inputs.push_back(i);
-		}
-	}
-	// Each shred's object-key path was decoded once at bind (top-level shreds are a single Key step).
-	// An array shred with element objects, or any non-Key step (only reachable through an array path),
-	// disqualifies the fast path.
-	vector<ShredKind> shred_kinds(bind_data.shreds.size());
-	bool has_nested_shred = false;
-	for (idx_t k = 0; k < bind_data.shreds.size() && fast_viable; k++) {
-		auto &shred = bind_data.shreds[k];
-		shred_kinds[k] = ClassifyShredKind(shred.type);
-		if (shred_kinds[k] == ShredKind::Array) {
-			fast_viable = false;
-			break;
-		}
-		for (auto &step : shred.steps) {
-			if (step.kind != PathStepKind::Key) {
-				fast_viable = false;
-				break;
-			}
-		}
-		// A nested path is the one that needs the per-row descent below; a single-step shred, however
-		// its name is spelled, is covered by ObjectKeyInShredSet and the top-level key probe.
-		if (shred.steps.size() > 1) {
-			has_nested_shred = true;
-		}
-	}
-	// A nested shred whose path prefixes (or equals) another shred's path is structurally
-	// contradictory — only the reshred fallback can resolve which wins. Two distinct top-level
-	// keys never prefix each other, so this only matters once a nested shred is present.
-	if (fast_viable && has_nested_shred) {
-		for (idx_t a = 0; a < bind_data.shreds.size() && fast_viable; a++) {
-			for (idx_t b = a + 1; b < bind_data.shreds.size(); b++) {
-				if (ShredPathsStructurallyConflict(bind_data.shreds[a].steps, bind_data.shreds[b].steps)) {
-					fast_viable = false;
-					break;
-				}
-			}
-		}
-	}
-	// A shred name declared with different types across inputs has incompatible lane layouts, so the
-	// per-row lane copy cannot stage its candidates together. The reshred fallback coerces every input
-	// to the merged (last-declared) type instead.
-	for (idx_t i = 0; i < ncols && fast_viable; i++) {
-		auto &t = args.data[i].GetType();
-		if (!IsShreddedJsonoType(t)) {
-			continue;
-		}
-		JsonoLayoutType layout;
-		TryParseJsonoLayoutType(t, layout);
-		for (auto &layout_shred : layout.shreds) {
-			for (auto &merge_shred : bind_data.shreds) {
-				if (merge_shred.name == layout_shred.first && merge_shred.type != layout_shred.second) {
-					fast_viable = false;
-					break;
-				}
-			}
-			if (!fast_viable) {
-				break;
-			}
-		}
-	}
+	//
+	// Both halves of the viability question are answers about TYPES: the shape of the merged shred
+	// set (bind) and the inputs' lane layouts (the plan, resolved once per expression).
+	auto &plan = ResolveInputPlan(args, bind_data.shreds, lstate.input_plan);
+	bool fast_viable = bind_data.fast_shape_viable && plan.lane_types_agree;
+	auto &plain_inputs = plan.plain_inputs;
 
 	auto run_reshred_fallback = [&](const vector<Vector *> &fallback_args, idx_t fallback_count,
 	                                Vector &fallback_result) {
@@ -526,7 +568,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		vector<JsonoRowReader> inputs(ncols);
 		for (idx_t i = 0; i < ncols; i++) {
 			auto &input = *fallback_args[i];
-			if (IsShreddedJsonoType(input.GetType())) {
+			if (plan.shredded[i]) {
 				// The reconstruction verifies the shredded input's manifest itself; its plain
 				// output never carries one.
 				auto plain = make_uniq<Vector>(JsonoType(), fallback_count);
@@ -563,7 +605,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		// raw input's residual): a top-level key present, a nested path resolving to a present value or
 		// breaking its object skeleton, or a scalar-array path holding anything but its array skeleton.
 		auto residual_hits_shred = [&](const JsonoView &view, idx_t k) -> bool {
-			if (shred_kinds[k] == ShredKind::ScalarArray) {
+			if (bind_data.shreds[k].kind == ShredKind::ScalarArray) {
 				return ResidualConflictsWithScalarArrayShredPath(view, bind_data.shreds[k].steps);
 			}
 			if (bind_data.shreds[k].steps.size() == 1) {
@@ -587,30 +629,21 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			vector<UnifiedVectorFormat> lane_fmt;
 		};
 		vector<ShreddedProbeInput> probe_inputs;
-		for (idx_t i = 0; i < ncols; i++) {
-			auto &t = args.data[i].GetType();
-			if (!IsShreddedJsonoType(t)) {
-				continue;
-			}
-			JsonoLayoutType layout;
-			TryParseJsonoLayoutType(t, layout);
-			ShreddedProbeInput pin;
-			pin.arg = i;
-			for (idx_t c = 0; c < layout.shreds.size(); c++) {
-				for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
-					if (bind_data.shreds[k].name == layout.shreds[c].first) {
-						UnifiedVectorFormat fmt;
-						JsonoShredVector(args.data[i], c).ToUnifiedFormat(count, fmt);
-						if (!fmt.validity.AllValid()) {
-							pin.shred_ks.push_back(k);
-							pin.lane_fmt.push_back(std::move(fmt));
-						}
-						break;
-					}
+		vector<idx_t> probe_of_arg(ncols, DConstants::INVALID_INDEX);
+		for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
+			for (auto &source : plan.lane_sources[k]) {
+				UnifiedVectorFormat fmt;
+				JsonoShredFieldVector(args.data[source.arg], source.field).ToUnifiedFormat(count, fmt);
+				if (fmt.validity.AllValid()) {
+					continue;
 				}
-			}
-			if (!pin.shred_ks.empty()) {
-				probe_inputs.push_back(std::move(pin));
+				if (probe_of_arg[source.arg] == DConstants::INVALID_INDEX) {
+					probe_of_arg[source.arg] = probe_inputs.size();
+					probe_inputs.push_back(ShreddedProbeInput {source.arg, {}, {}});
+				}
+				auto &pin = probe_inputs[probe_of_arg[source.arg]];
+				pin.shred_ks.push_back(k);
+				pin.lane_fmt.push_back(std::move(fmt));
 			}
 		}
 		for (idx_t row = 0; row < count; row++) {
@@ -664,7 +697,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 					row_conflict = true;
 					break;
 				}
-				if (has_nested_shred) {
+				if (bind_data.has_nested_shred) {
 					for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
 						if (bind_data.shreds[k].steps.size() > 1 &&
 						    ResidualConflictsWithShredPath(pview, bind_data.shreds[k].steps)) {
@@ -746,9 +779,9 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 					JsonoSetRowMarkerNull(result, row);
 				}
 			}
-			for (auto &shred : bind_data.shreds) {
-				FastCopyShred(args, ncols, count, mode, shred, JsonoShredVector(result, shred.result_child_index),
-				              result_validity);
+			for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
+				FastCopyShred(args, count, mode, plan.lane_sources[k],
+				              JsonoShredFieldVector(result, bind_data.shreds[k].result_field_index), result_validity);
 			}
 			// The folded residual was rebuilt without the inputs' manifests, but a copied shred
 			// that carries a value has no copy in the residual (the no-conflict gate above) —
@@ -756,7 +789,8 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// silently. Re-emit each row's skips with the manifest of its non-NULL shreds.
 			vector<UnifiedVectorFormat> shred_fmt(bind_data.shreds.size());
 			for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
-				JsonoShredVector(result, bind_data.shreds[k].result_child_index).ToUnifiedFormat(count, shred_fmt[k]);
+				JsonoShredFieldVector(result, bind_data.shreds[k].result_field_index)
+				    .ToUnifiedFormat(count, shred_fmt[k]);
 			}
 			auto fr_skips = FlatVector::GetData<string_t>(*fr_blobs[BODY_SKIPS]);
 			auto &fr_skips_validity = FlatVector::Validity(*fr_blobs[BODY_SKIPS]);
