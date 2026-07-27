@@ -117,6 +117,22 @@ SELECT jsono_storage_type('"$.""$jsono$set""" VARCHAR')
 ----
 true
 
+# The DSL's one reservation, spelled out because it is the only place a user has to know it: a
+# leading `$` opens a `$.`-rooted path, so a key that literally starts with `$` is a quoted step
+# under the root. The bare quoted form is NOT the same path -- it names a key whose bytes include
+# the quotes -- so documenting one spelling and pinning the difference is the whole contract.
+query II
+SELECT [l.path FOR l IN jsono_layout_lanes(jsono('{"$foo":"v"}', shredding := {'$."$foo"':'VARCHAR'}))],
+       jsono('{"$foo":"v"}', shredding := {'$."$foo"':'VARCHAR'}) ->> '$."$foo"';
+----
+[$.$foo]	v
+
+query I
+SELECT [l.path FOR l IN jsono_layout_lanes(jsono('{"$foo":"v"}', shredding := {'"$foo"':'VARCHAR'}))];
+----
+['$."\\"$foo\\""']
+
+
 query I
 SELECT jsono_storage_type('"$.""$jsono$spill$0""" VARCHAR')
      = typeof(jsono('{"$jsono$spill$0":"x"}', shredding := {'$."$jsono$spill$0"':'VARCHAR'}));

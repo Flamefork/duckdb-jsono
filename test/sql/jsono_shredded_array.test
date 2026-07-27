@@ -247,3 +247,40 @@ query II
 SELECT s ->> '$.products[0].sku', s ->> '$.products[9].category' FROM arr_reads;
 ----
 S1	NULL
+
+# --- An object-array lane through jsono_merge_patch (the reshred fallback) ---
+#
+# An array shred makes the merge fast path decline, so the merge runs through JsonoShredFromLayout —
+# the entry point that DECODES the element subfield names out of the layout type instead of parsing
+# them out of spec text. Nothing else in the suite reaches it: the array tests never merge, and the
+# merge tests only use scalar-array lanes.
+query II
+SELECT to_json(m)::VARCHAR, m ->> '$.items[0].sku'
+FROM (SELECT jsono_merge_patch(
+        jsono('{"items":[{"id":1,"sku":"S1"}],"k":"a"}', shredding := {'$.items':'STRUCT(id BIGINT, sku VARCHAR)[]'}),
+        jsono('{"k":"b"}', shredding := {'k':'VARCHAR'})) AS m);
+----
+{"items":[{"id":1,"sku":"S1"}],"k":"b"}	S1
+
+# Two inputs whose element subfields differ only in CASE. Rendering the element struct as type text
+# would fold `id` and `ID` into one subfield on the way through the parser; decoding the lane's own
+# names cannot, because the two are different encoded names by construction.
+query II
+SELECT to_json(m)::VARCHAR, m ->> '$.items[0].ID'
+FROM (SELECT jsono_merge_patch(
+        jsono('{"items":[{"id":1}]}',  shredding := {'$.items':'STRUCT(id BIGINT)[]'}),
+        jsono('{"items":[{"ID":2}]}',  shredding := {'$.items':'STRUCT(ID BIGINT)[]'})) AS m);
+----
+{"items":[{"ID":2}]}	2
+
+# Both inputs name the same lane (`$.items`), so the later one's element struct wins it whole. What
+# matters is WHICH struct: the merged type carries the encoded `ID` (`9520000`) and not the encoded
+# `id` (`d5i0000`), so the winner was decoded from the layout rather than re-parsed from type text --
+# where the two spellings fold into one subfield.
+query II
+SELECT typeof(m) LIKE '%d5q6arbj0000 STRUCT("9520000" BIGINT)[]%', typeof(m) LIKE '%d5i0000%'
+FROM (SELECT jsono_merge_patch(
+  jsono('{"items":[{"id":1}]}', shredding := {'$.items':'STRUCT(id BIGINT)[]'}),
+  jsono('{"items":[{"ID":2}]}', shredding := {'$.items':'STRUCT(ID BIGINT)[]'})) AS m);
+----
+true	false

@@ -201,3 +201,41 @@ statement error
 SELECT to_json(v) FROM forged_zero_subfields;
 ----
 object-array manifest entry declares no subfields
+
+# --- The manifest's emission order is a fact about every WRITER, not just the constructor ---
+#
+# Four producers emit a shred manifest, and all four walk the same bind-time permutation
+# (JsonoShredWriteModel::manifest_order) rather than their own lane loop. Pinned only for the
+# constructor, a producer that emitted its manifest in FIELD order would pass the whole suite: every
+# verifying reader is order-independent, and the one consumer that is not (the keyed group_merge
+# walkers) had no divergent-order case either. The `$.a-c` / `$.a.b` pair is what tells the two
+# orders apart, so each producer is read here WITHOUT a sort.
+
+statement ok
+CREATE TABLE manifest_order_src AS
+SELECT jsono('{"a-c":"x","a":{"b":"y"},"r":1}', shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}) AS v;
+
+# jsono_merge_patch's shred-aware fast path re-emits every row's skips from the merged shred set.
+query I
+SELECT [m.path FOR m IN jsono_shred_manifest(jsono_merge_patch(v, jsono('{"r":2}')))] FROM manifest_order_src;
+----
+[$.a-c, $.a.b]
+
+# jsono_group_merge's direct shredded finalize writes the group's manifest natively.
+query I
+SELECT [m.path FOR m IN jsono_shred_manifest(jsono_group_merge(v))] FROM manifest_order_src;
+----
+[$.a-c, $.a.b]
+
+# The keyed (LWW) finalize is a separate writer again.
+query I
+SELECT [m.path FOR m IN jsono_shred_manifest(jsono_group_merge_max(v, 1))] FROM manifest_order_src;
+----
+[$.a-c, $.a.b]
+
+# Reshredding an already-shredded value (ApplyReshredShredded) carries the manifest over.
+query I
+SELECT [m.path FOR m IN jsono_shred_manifest(jsono(v, shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}))]
+FROM manifest_order_src;
+----
+[$.a-c, $.a.b]

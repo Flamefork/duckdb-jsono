@@ -230,3 +230,36 @@ ORDER BY doc;
 ----
 {"GCLID":"from_ym"}	NULL	from_ym
 {"gclid":"from_adjust"}	from_adjust	NULL
+
+# --- An object-array lane's element subfields are named by the same codec, one level down ---
+#
+# CombineStructTypes recurses into element structs, so an unencoded subfield name collapses
+# case-insensitively exactly like a lane name would. Recognition therefore refuses an element struct
+# whose subfields are not encoded keys (ShredSubfieldNamesAreCanonical). Without that gate the type
+# is called current and the first reader to want the subfield's KEY dies mid-read with an internal
+# error — on a value whose type recognition had just said it was fine.
+query I
+WITH v AS (SELECT jsono('{"items":[{"n":1}]}', shredding := {'$.items': 'STRUCT(n BIGINT)[]'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    "d5q6arbj0000" := [{'n': 1::BIGINT}]))))
+FROM v;
+----
+not jsono: array shred 'd5q6arbj0000' has an element subfield whose name is not the base32hex encoding of a single object key
+
+# The same struct with the subfield spelled the way the codec spells it IS a lane, so the refusal
+# above is about the naming and not about hand-built structs in general.
+query I
+WITH v AS (SELECT jsono('{"items":[{"n":1}]}', shredding := {'$.items': 'STRUCT(n BIGINT)[]'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    "d5q6arbj0000" := [{'do000': 1::BIGINT}]))))
+FROM v;
+----
+jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)

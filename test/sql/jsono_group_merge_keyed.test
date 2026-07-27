@@ -471,3 +471,57 @@ SELECT to_json(jsono_group_merge_max(j, ts)), jsono_group_merge_max(j, ts) IS NU
 FROM (VALUES (jsono('{"a":null}'), 1)) t(j, ts);
 ----
 {}	false
+
+# --- The manifest order and the lane order diverge, and the direct LWW fold walks both ---
+#
+# PrepareDirectLWWShreddedInput sorts its scalar/list shred vectors by manifest path because the
+# type lists lanes by ENCODED name (structural path order) while a row's manifest is emitted in
+# logical-path TEXT order. Four walkers then merge-join a row's manifest entries against those
+# vectors with a single rising index. Every other keyed case in this file uses a shred set where the
+# two orders coincide ({'a','b'}, single lanes), so dropping that sort would leave the suite green:
+# the walker would step past `$.a-c` (`.` = 0x2E > `-` = 0x2D), consume `$.a.b` in its place, and the
+# key would vanish from the result — no error, no NULL, because a lane's value is cut OUT of the
+# residual.
+
+statement ok
+CREATE TABLE lww_divergent AS SELECT * FROM (VALUES
+  (jsono('{"a-c":"old","a":{"b":"bold"},"r":1}', shredding := {'$."a-c"':'VARCHAR','$.a.b':'VARCHAR'}), 1),
+  (jsono('{"a-c":"new","a":{"b":"bnew"}}',       shredding := {'$."a-c"':'VARCHAR','$.a.b':'VARCHAR'}), 2)
+) v(j, ts);
+
+# Both lanes survive the fold, each carrying its own path's winner.
+query II
+SELECT to_json(jsono_group_merge_max(j, ts))::VARCHAR, to_json(jsono_group_merge_min(j, ts))::VARCHAR
+FROM lww_divergent;
+----
+{"a":{"b":"bnew"},"a-c":"new","r":1}	{"a":{"b":"bold"},"a-c":"old","r":1}
+
+# The lanes are still lanes afterwards, and each reads back under its own path.
+query II
+SELECT jsono_group_merge_max(j, ts) ->> '$."a-c"', jsono_group_merge_max(j, ts) ->> '$.a.b'
+FROM lww_divergent;
+----
+new	bnew
+
+# The same divergence with a scalar-array lane, which rides the separately sorted list_shreds vector
+# and DirectListShredManifestRowComplete.
+statement ok
+CREATE TABLE lww_divergent_list AS SELECT * FROM (VALUES
+  (jsono('{"a-c":[1,2],"a":{"b":"bold"},"r":1}', shredding := {'$."a-c"':'BIGINT[]','$.a.b':'VARCHAR'}), 1),
+  (jsono('{"a-c":[3],"a":{"b":"bnew"}}',         shredding := {'$."a-c"':'BIGINT[]','$.a.b':'VARCHAR'}), 2)
+) v(j, ts);
+
+query II
+SELECT to_json(jsono_group_merge_max(j, ts))::VARCHAR, to_json(jsono_group_merge_min(j, ts))::VARCHAR
+FROM lww_divergent_list;
+----
+{"a":{"b":"bnew"},"a-c":[3],"r":1}	{"a":{"b":"bold"},"a-c":[1,2],"r":1}
+
+# The window form runs the same fold through the aggregate's Copy() path, which must reproduce the
+# derived shred plan (an empty plan folds no lanes at all).
+query I
+SELECT DISTINCT to_json(jsono_group_merge_max(j, ts)
+                        OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING))::VARCHAR
+FROM lww_divergent;
+----
+{"a":{"b":"bnew"},"a-c":"new","r":1}

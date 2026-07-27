@@ -454,3 +454,31 @@ query I
 SELECT jsono_layout_diagnose(v) LIKE 'not jsono:%' FROM shreds_rev1_renamed;
 ----
 true
+
+# --- The trap this leaves open, pinned so it cannot be discovered twice ---
+#
+# A user who hits the refusal above and follows "rebuild the layout struct in SQL" by renaming
+# `shreds$<old>` to this revision's name gets a value that is no longer JSONO at all: the lane names
+# are still the closed revision's. The VARCHAR-cast refusal only fires for Foreign, so from here a
+# CSV dump of raw blobs is written with NO error. That silence is not fixable by recognition: the
+# type carries no evidence separating a renamed old value from any other hand-built struct with a
+# non-lane field, and that struct must stay silent (see the layout-grammar cases in jsono_shred.test,
+# jsono_spill_semantics.test and jsono_lane_name_codec.test, which pin exactly that). The upgrade path
+# is the old build, not a rename.
+statement ok
+CREATE TABLE renamed_revision AS
+SELECT struct_pack("jsono" := struct_pack(
+    "body$1"   := v.jsono."body$1",
+    "shreds$2" := struct_pack(
+        "$jsono$set"     := v.jsono."shreds$2"."$jsono$set",
+        "$jsono$spill$0" := v.jsono."shreds$2"."$jsono$spill$0",
+        "gclid"          := 'kept'))) AS j
+FROM (SELECT jsono('{"gclid":"kept","r":1}', shredding := {'gclid':'VARCHAR'}) AS v);
+
+# Silent: not JSONO, so no refusal stands in front of a render. jsono_layout_diagnose is the one
+# tool that says so, which is why it answers about types nothing else will touch.
+query II
+SELECT jsono_layout_diagnose(j) LIKE 'not jsono: field ''gclid'' is not a shred lane%', j ->> 'gclid'
+FROM renamed_revision;
+----
+true	NULL
