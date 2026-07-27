@@ -15,7 +15,7 @@ jsono: plain, body revision 1
 query I
 SELECT jsono_layout_diagnose(jsono('{"a":1,"b":2}', shredding := {'a':'BIGINT'}));
 ----
-jsono: shredded, body revision 1, shreds revision 1, 1 shreds, 1 spill column(s)
+jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
 
 # Ordinary values: the reason names the first rule that failed, from the outside in.
 query I
@@ -34,22 +34,22 @@ query I
 WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
-  "shreds$1" := struct_pack(a := c.jsono."shreds$1".a, b := c.jsono."shreds$1".b))))
+  "shreds$2" := struct_pack(c4000 := c.jsono."shreds$2".c4000, c8000 := c.jsono."shreds$2".c8000))))
 FROM v;
 ----
-not jsono: 'shreds$1' has no '$jsono$set' marker field
+not jsono: 'shreds$2' has no '$jsono$set' marker field
 
 query I
 WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
-  "shreds$1" := struct_pack(
-    "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
-    "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0",
-    a := {'weird': 1}))))
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    c4000 := {'weird': 1}))))
 FROM v;
 ----
-not jsono: shred 'a' is STRUCT(weird INTEGER), which is not a shred value type or LIST of one
+not jsono: shred 'c4000' is STRUCT(weird INTEGER), which is not a shred value type or LIST of one
 
 # A foreign revision is DIAGNOSED, not refused. Every other consumer of such a value throws
 # (RejectForeignLayoutsInExpression), so exempting this one is what keeps a diagnostic available for
@@ -58,7 +58,7 @@ query I
 WITH v AS (SELECT jsono('{"a":1}') AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))) FROM v;
 ----
-foreign: layout revision body=0, this build reads body=1 shreds=1
+foreign: layout revision body=0, this build reads body=1 shreds=2
 
 # The exemption is narrow: any OTHER consumer of the same foreign value still fails loud, and the
 # refusal quotes the same revision phrase the diagnosis does (JsonoDescribeForeignLayout).
@@ -66,7 +66,7 @@ statement error
 WITH v AS (SELECT jsono('{"a":1}') AS c)
 SELECT to_json(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))) FROM v;
 ----
-JSONO value carries layout revision body=0, this build reads body=1 shreds=1
+JSONO value carries layout revision body=0, this build reads body=1 shreds=2
 
 # The reordered-reserved-fields shape a set-op merge produces IS recognised (it is read by name), so
 # it diagnoses as ordinary shredded jsono rather than as a broken struct.
@@ -74,11 +74,52 @@ query I
 WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
-  "shreds$1" := struct_pack(
-    a := c.jsono."shreds$1".a,
-    "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
-    "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0",
-    b := c.jsono."shreds$1".b))))
+  "shreds$2" := struct_pack(
+    c4000 := c.jsono."shreds$2".c4000,
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    c8000 := c.jsono."shreds$2".c8000))))
 FROM v;
 ----
-jsono: shredded, body revision 1, shreds revision 1, 2 shreds, 1 spill column(s)
+jsono: shredded, body revision 1, shreds revision 2, 2 shreds, 1 spill column(s)
+
+# The diagnosis is about the TYPE, so a NULL value has one like any other. Without SPECIAL_HANDLING
+# the executor short-circuits a NULL argument and the answer blanks out on exactly the all-NULL
+# column someone is trying to explain.
+query II
+SELECT jsono_layout_diagnose(NULL::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))),
+       jsono_layout_diagnose(NULL::BIGINT);
+----
+jsono: plain, body revision 1	not jsono: the value is BIGINT, not a named STRUCT
+
+# --- jsono_layout_lanes: the same question one level down, and the answer that makes an encoded lane
+# name affordable — the logical paths a shredded type carries, in the type's own field order.
+query I
+SELECT jsono_layout_lanes(jsono('{"URL":{"path":"/x"},"a.b":1,"z":"s"}',
+                                shredding := {'$.URL.path':'VARCHAR','$."a.b"':'BIGINT','z':'VARCHAR'}));
+----
+[{'path': $.URL.path, 'type': VARCHAR}, {'path': '$."a.b"', 'type': BIGINT}, {'path': $.z, 'type': VARCHAR}]
+
+# Every reported path re-declares the lane it came from: the answer is spec DSL, not just prose.
+query I
+SELECT jsono_storage_type('"$.URL.path" VARCHAR, "$.""a.b""" BIGINT, "$.z" VARCHAR')
+     = typeof(jsono('{"URL":{"path":"/x"},"a.b":1,"z":"s"}',
+                    shredding := {'$.URL.path':'VARCHAR','$."a.b"':'BIGINT','z':'VARCHAR'}));
+----
+true
+
+# An object-array lane reports its element subfields by their JSON keys, not by the encoded one-step
+# paths the stored type carries — pasting the answer back into a spec must rebuild the same lane.
+query I
+SELECT jsono_layout_lanes(jsono('{"items":[{"n":1}]}', shredding := {'items':'STRUCT(n BIGINT)[]'}));
+----
+[{'path': $.items, 'type': 'STRUCT(n BIGINT)[]'}]
+
+# A plain value has no lanes, and so does a value that is not JSONO at all: "which lanes" has an
+# honest empty answer, while "is this JSONO" is jsono_layout_diagnose's question.
+query III
+SELECT jsono_layout_lanes(jsono('{"a":1}')),
+       jsono_layout_lanes(42),
+       jsono_layout_lanes(NULL::BIGINT);
+----
+[]	[]	[]

@@ -44,11 +44,17 @@ FROM (SELECT jsono(jsono('{"a":"text","present":9}'),
 ----
 [{"path":"$.a","type":"BIGINT","lane_rate":0.0,"divert_rate":1.0},{"path":"$.absent","type":"BIGINT","lane_rate":0.0,"divert_rate":0.0},{"path":"$.present","type":"BIGINT","lane_rate":1.0,"divert_rate":0.0}]
 
-# Duplicate spec paths ('$.x' and 'x' address the same key): the trie shares one node with two
-# scalar leaves, both read the same located cursor — unlike the text writer, no two-pass fallback.
+# Duplicate spec paths ('$.x' and 'x' address the same key) are refused: they resolve to one lane
+# name, so they cannot both be fields of one STRUCT. The one lane the surviving spelling declares
+# still reads and round-trips through the one-pass writer.
+statement error
+SELECT jsono(jsono('{"x":42}'), shredding := {'$.x':'BIGINT','x':'BIGINT'});
+----
+name the same shred path
+
 query II
 SELECT j->>'$.x', to_json(j)
-FROM (SELECT jsono(jsono('{"x":42}'), shredding := {'$.x':'BIGINT','x':'BIGINT'}) AS j);
+FROM (SELECT jsono(jsono('{"x":42}'), shredding := {'$.x':'BIGINT'}) AS j);
 ----
 42	{"x":42}
 

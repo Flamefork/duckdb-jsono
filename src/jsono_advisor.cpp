@@ -210,10 +210,11 @@ SubfieldStat &GetSubfieldStat(std::map<string, SubfieldStat> &subfields, const s
 
 // Name a top-level key in the candidate map (and so in the emitted spec). The common case is the
 // bare name; a key the spec parser would misread as a JSONPath (`$`-leading, see ParseShredSpecPath)
-// or reject as a reserved layout name (`body`) is spelled through its quoted `$.`-rooted path form,
-// which names the same top-level key.
+// is spelled through its quoted `$.`-rooted path form, which names the same top-level key. That is
+// the DSL's own reservation, and the only one left: no key is reserved by the format, since a lane
+// is named by the encoding of its path rather than by the path itself.
 string TopLevelSpecName(nonstd::string_view key) {
-	if (key[0] != '$' && key != "body") {
+	if (key[0] != '$') {
 		return string(key.data(), key.size());
 	}
 	string path = "$";
@@ -743,12 +744,13 @@ idx_t ShredStatsFootprint(const ShredStatsState &state) {
 	return state.counters->capacity() * sizeof(ShredStatCounters);
 }
 
-// One shred of the input type, in both its names: `lane_name` is the STRUCT field — the canonical
-// spill ranks are derived from it, and it is what the `path` output column reports today (a lane
-// name still being the path spelled as text) — while `steps` is the logical path used to detect a
-// diverted value (lane NULL but the path is still present in the residual).
+// One shred of the input type, in both its names: `lane_name` is the STRUCT field, which the
+// canonical spill ranks are derived from, while `path` (the logical text the `path` output column
+// reports) and `steps` (used to detect a diverted value — lane NULL but the path still present in
+// the residual) are its decoded path. Reporting the lane name would print base32hex at the user.
 struct ShredStatDescriptor {
 	string lane_name;
+	string path;
 	string type_name;
 	ShredKind kind;
 	vector<PathStep> steps;
@@ -828,7 +830,10 @@ unique_ptr<FunctionData> JsonoShredStatsBind(ClientContext &context, AggregateFu
 	for (auto &shred : layout.shreds) {
 		ShredStatDescriptor descriptor;
 		descriptor.lane_name = shred.first;
-		descriptor.type_name = shred.second.ToString();
+		descriptor.path = JsonoLaneLogicalPath(shred.first);
+		// Logical, like `path`: an object-array lane's element subfields are encoded one-step paths in
+		// the stored type, and the stats row is read by a human deciding on a shredding spec.
+		descriptor.type_name = JsonoLaneLogicalType(shred.second).ToString();
 		descriptor.kind = ClassifyShredKind(shred.second);
 		descriptor.steps = ShredNamePath(shred.first, "jsono_shred_stats shred");
 		bind_data->shreds.push_back(std::move(descriptor));
@@ -1044,7 +1049,7 @@ void JsonoShredStatsFinalize(Vector &states, AggregateInputData &aggr_input_data
 		for (idx_t f = 0; f < nshreds; f++) {
 			auto idx = start + f;
 			auto &counters = (*state.counters)[f];
-			path_data[idx] = StringVector::AddString(*child[0], bind_data.shreds[f].lane_name);
+			path_data[idx] = StringVector::AddString(*child[0], bind_data.shreds[f].path);
 			type_data[idx] = StringVector::AddString(*child[1], bind_data.shreds[f].type_name);
 			lane_data[idx] = double(counters.lane_present) / denom;
 			divert_data[idx] = double(counters.divert) / denom;

@@ -1,0 +1,199 @@
+# name: test/sql/jsono_lane_name_codec.test
+# description: A shred lane's STRUCT field name is the path's structure, not its text: each key's raw bytes with 0x00 escaped as `00 FF` and terminated by `00 00`, the concatenation encoded as unpadded lowercase base32hex (alphabet 0-9a-v). The codec lives in the lane-name boundary of src/include/jsono_path.hpp. This file pins the vectors that give it its two reasons to exist: the encoded alphabet has no upper case, so two spellings of one JSON key can no longer collapse into one lane; and the doubled terminator keeps 0x00 always in a pair, so a key starting with 0xFF is decoded unambiguously.
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+# --- Encode: a lane name is the encoded path -----------------------------------------------------
+# A simple key. The lane is the last field of `shreds`, so matching the tail pins the name exactly
+# without restating the six-blob body or the layout revision.
+query I
+SELECT jsono_storage_type('gclid VARCHAR') LIKE '%, cthmoqb40000 VARCHAR)))';
+----
+true
+
+# The other spelling of the same key encodes to an unrelated name. It is quoted in the type string
+# only because it starts with a digit — the alphabet spans 0-9a-v, so a leading digit is ordinary.
+query I
+SELECT jsono_storage_type('GCLID VARCHAR') LIKE '%, "8t1koia40000" VARCHAR)))';
+----
+true
+
+# The defect itself: DuckDB compares STRUCT field names case-insensitively over ASCII A-Z, so with
+# the path spelled verbatim these two types were case-equal and a type merge collapsed the two lanes
+# into one. Lower-casing both is exactly that comparison, and it must now separate them.
+query I
+SELECT lower(jsono_storage_type('gclid VARCHAR')) = lower(jsono_storage_type('GCLID VARCHAR'));
+----
+false
+
+query I
+SELECT jsono_storage_type('clientID VARCHAR') LIKE '%, cdm6ipbeeh4k8000 VARCHAR)))';
+----
+true
+
+# A nested path: two keys, each terminated, concatenated in path order.
+query I
+SELECT jsono_storage_type('"$.URL.fragment" VARCHAR') LIKE '%, al94o000cpp62prdcln78000 VARCHAR)))';
+----
+true
+
+# One key that contains a dot is a different path, so it is a different name. The quoting question
+# ("is the dot nesting or a literal?") is answered once, at spec parse, and never again inside the
+# format.
+query I
+SELECT jsono_storage_type('"URL.fragment" VARCHAR') LIKE '%, al94obj6e9gmerb5dpq0000 VARCHAR)))';
+----
+true
+
+query I
+SELECT jsono_storage_type('"$.URL.fragment" VARCHAR') = jsono_storage_type('"URL.fragment" VARCHAR');
+----
+false
+
+# A `$`-leading literal key. It needs quoting in the spec DSL (a bare `$` opens a JSONPath there),
+# but the name it produces carries no quoting rules and cannot collide with `$jsono$...`: the
+# alphabet has no `$`.
+query I
+SELECT jsono_storage_type('"$.""$x""" VARCHAR') LIKE '%, "4hs0000" VARCHAR)))';
+----
+true
+
+# The empty key encodes to the bare terminator — representable, unlike under a text name.
+query I
+SELECT jsono_storage_type('"$.""""" VARCHAR') LIKE '%, "0000" VARCHAR)))';
+----
+true
+
+# The constructor and the DDL helper encode identically — one boundary, one result.
+query I
+SELECT typeof(jsono('{"gclid":"x"}', shredding := {'gclid': 'VARCHAR'})) = jsono_storage_type('gclid VARCHAR');
+----
+true
+
+# Ordering is preserved by construction (both stages are order-preserving), so the canonical field
+# order of a shred set is the order of its paths: `URL`->`path` precedes `a` as a path (0x55 < 0x61)
+# and precedes it as a name. The general claim over random and adversarial paths belongs to the
+# property harness; this pins one concrete pair.
+query I
+SELECT jsono_storage_type('a VARCHAR, "$.URL.path" VARCHAR')
+  LIKE '%, al94o000e1gn8q0000 VARCHAR, c4000 VARCHAR)))';
+----
+true
+
+# --- Decode: names whose paths SQL cannot spell ---------------------------------------------------
+# A key made of a single 0x00 byte. No SQL identifier can carry it, but its encoded name is plain
+# ASCII, so the lane is expressible as a hand-built layout and must be recognized. `03vg000` decodes
+# to the one-step path [0x00] (`00 FF` escape, then the `00 00` terminator).
+query I
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    "03vg000" := c.jsono."shreds$2".c4000))))
+FROM v;
+----
+jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
+
+# Why the terminator is doubled. `c4001vr20000` is the path [`a`, 0xFF `b`] and `c40fuog000` is the
+# single key `a` 0x00 `b`. With a single-0x00 terminator both serialize to `61 00 FF 62 00` — one
+# name for two paths, i.e. the same misfiling the codec exists to remove. Doubled, they are
+# `61 00 00 FF 62 00 00` and `61 00 FF 62 00 00`, so one struct can carry both lanes at once.
+query I
+WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := {'a': 'VARCHAR', 'b': 'VARCHAR'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    "c4001vr20000" := c.jsono."shreds$2".c4000,
+    "c40fuog000" := c.jsono."shreds$2".c8000))))
+FROM v;
+----
+jsono: shredded, body revision 1, shreds revision 2, 2 shreds, 1 spill column(s)
+
+# --- Non-canonical names stay a silent NotJsono ---------------------------------------------------
+# `c400` is `c4000` with its last character cut: it decodes to the bytes `61 00`, a key `a` whose
+# terminator is truncated. Canonicity is `Encode(Decode(name)) == name`, so the name is not a lane
+# name and the struct is not JSONO — silently, the way recognition treats every unknown struct.
+query I
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    "c400" := c.jsono."shreds$2".c4000)))) LIKE 'not jsono:%'
+FROM v;
+----
+true
+
+# Upper case is rejected rather than folded. `C4000` decodes to the same bytes as `c4000`, so
+# accepting it would hand one lane two spellings — which is where case collisions came from.
+query I
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    "C4000" := c.jsono."shreds$2".c4000)))) LIKE 'not jsono:%'
+FROM v;
+----
+true
+
+# A lane spelled the way the closed `shreds$1` revision spelled it (the path as text) is not a
+# canonical name either, so a hand-assembled mixture of the two forms is not read as JSONO.
+query I
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    gclid := c.jsono."shreds$2".c4000)))) LIKE 'not jsono:%'
+FROM v;
+----
+true
+
+# --- The incident itself, end to end --------------------------------------------------------------
+# The production channel: two sources spelling one key differently (adjust.events writes `gclid`,
+# Yandex.Metrica writes `GCLID`), each shredding its own spelling, read together through
+# union_by_name. This is the one channel a cast cannot police — MultiFileColumnMapper merges the
+# per-file schemas by name and moves values by index-based child shuffling, with name matching
+# hardcoded case-insensitive, so no plan walk or cast-registry hook can reach it. Under text lane
+# names the two collapsed into one lane: `->> 'GCLID'` threw and `->> 'gclid'` silently answered with
+# the Metrica row's value. Encoded, the names share no prefix at all, so both lanes survive the merge.
+
+statement ok
+COPY (SELECT jsono('{"gclid":"from_adjust"}', shredding := {'gclid':'VARCHAR'}) AS v)
+TO '__TEST_DIR__/lane_case_low.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT jsono('{"GCLID":"from_ym"}', shredding := {'GCLID':'VARCHAR'}) AS v)
+TO '__TEST_DIR__/lane_case_up.parquet' (FORMAT parquet);
+
+# Both lanes live in the merged type — the collapse is what made the type carry only one.
+query I
+SELECT typeof(v) LIKE '%"shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, cthmoqb40000 VARCHAR, "8t1koia40000" VARCHAR)%'
+FROM read_parquet(['__TEST_DIR__/lane_case_low.parquet', '__TEST_DIR__/lane_case_up.parquet'], union_by_name := true)
+LIMIT 1;
+----
+true
+
+# Each row answers under its OWN spelling and NULL under the other, and reconstructs to its own
+# document. The silent half of the defect is the `gclid` column on the Metrica row: it read
+# `from_ym` before, which no error would ever have surfaced.
+query III
+SELECT to_json(v)::VARCHAR AS doc, v ->> 'gclid' AS low, v ->> 'GCLID' AS up
+FROM read_parquet(['__TEST_DIR__/lane_case_low.parquet', '__TEST_DIR__/lane_case_up.parquet'], union_by_name := true)
+ORDER BY doc;
+----
+{"GCLID":"from_ym"}	NULL	from_ym
+{"gclid":"from_adjust"}	from_adjust	NULL

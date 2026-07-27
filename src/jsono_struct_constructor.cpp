@@ -1417,6 +1417,10 @@ bool TryBuildAutoShredLaneType(const JsonoStructPlan &plan, const LogicalType &s
 		return true;
 	}
 	case StructValueStrategy::Struct: {
+		// Only reachable as the element of a list lane (a bare STRUCT is neither a scalar nor a list
+		// shred, so CollectAutoShreds drops it), and an object-array lane names its element subfields
+		// by the same codec one level down — a subfield is a one-step path. The source struct is cast
+		// into this type positionally, so the rename costs nothing on the write side.
 		auto &source_children = StructType::GetChildTypes(source_type);
 		child_list_t<LogicalType> lane_children;
 		for (idx_t i = 0; i < source_children.size(); i++) {
@@ -1424,7 +1428,8 @@ bool TryBuildAutoShredLaneType(const JsonoStructPlan &plan, const LogicalType &s
 			if (!TryBuildAutoShredLaneType(plan.children[i], source_children[i].second, child_lane)) {
 				return false;
 			}
-			lane_children.emplace_back(source_children[i].first, std::move(child_lane));
+			lane_children.emplace_back(JsonoEncodeLaneName(LiteralKeyPath(source_children[i].first)),
+			                           std::move(child_lane));
 		}
 		lane_type = LogicalType::STRUCT(std::move(lane_children));
 		return true;
@@ -1440,30 +1445,31 @@ bool TryBuildAutoShredLaneType(const JsonoStructPlan &plan, const LogicalType &s
 }
 
 struct AutoShredCandidate {
-	string name;
+	vector<PathStep> path;
+	string lane_name;
 	LogicalType type;
 	vector<idx_t> fields;
 };
 
 // Type-driven auto-shred: lift shred-eligible scalar fields into typed shreds. `fields` records the
-// source STRUCT route while the path is generated, so the one-pass writer never has to interpret
-// its own JSONPath string. `depth` is the 1-based key depth of the children being scanned (initial
-// call depth 1). The walk descends nested structs while depth < JSONO_AUTO_SHRED_MAX_DEPTH, so
-// leaves at depth 1..N are lifted and a leaf strictly deeper stays in the residual. The schema is
-// the only signal available at bind (the return type is a pure function of the input type, no
-// per-row inference), so depth is a fixed cap — see JSONO_AUTO_SHRED_MAX_DEPTH.
-void CollectAutoShreds(const LogicalType &struct_type, const JsonoStructPlan &struct_plan, const string &path_prefix,
+// source STRUCT route alongside the path, so the one-pass writer never has to interpret a path
+// string. `depth` is the 1-based key depth of the children being scanned (initial call depth 1).
+// The walk descends nested structs while depth < JSONO_AUTO_SHRED_MAX_DEPTH, so leaves at depth 1..N
+// are lifted and a leaf strictly deeper stays in the residual. The schema is the only signal
+// available at bind (the return type is a pure function of the input type, no per-row inference), so
+// depth is a fixed cap — see JSONO_AUTO_SHRED_MAX_DEPTH.
+//
+// No field name is excluded. A lane is named by the ENCODING of its path (see the lane-name boundary
+// in jsono_path.hpp), which is drawn from `0-9a-v` and can therefore collide with neither the
+// residual field `body` nor the reserved `$jsono$…` names, and two distinct paths always encode to
+// two distinct names — so a struct key spelled like a layout field, and a literal key spelled like a
+// nested path (`a.b` beside `a` → `b`), are ordinary lanes rather than cases to drop.
+void CollectAutoShreds(const LogicalType &struct_type, const JsonoStructPlan &struct_plan, vector<PathStep> &path,
                        idx_t depth, vector<idx_t> &fields, vector<AutoShredCandidate> &shreds) {
 	auto &children = StructType::GetChildTypes(struct_type);
 	for (idx_t field = 0; field < children.size(); field++) {
 		auto &child = children[field];
 		auto &child_plan = struct_plan.children[field];
-		// A top-level field named 'body' or the reserved shred-set marker is a name the shred-name
-		// validation rejects, so it stays in the residual instead of becoming a shred (auto-shred must
-		// not error on field names). Only depth-1 names are affected: a nested `$.URL.body` lane is safe.
-		if (depth == 1 && (child.first == "body" || child.first == JsonoShredSetName())) {
-			continue;
-		}
 		// An embedded jsono value is a subtree the constructor copies whole, not an object to walk: its
 		// layout fields are storage, not document paths (and the body blobs promote to VARCHAR lanes),
 		// so descending would lift `$.<field>.jsono.body.slots` and friends into shreds of paths the
@@ -1472,54 +1478,20 @@ void CollectAutoShreds(const LogicalType &struct_type, const JsonoStructPlan &st
 			continue;
 		}
 		fields.push_back(field);
+		path.push_back(PathStep {PathStepKind::Key, child.first, 0});
 		LogicalType shred_type;
 		// A scalar leaf, or a regular array shred — fixed-shape objects (LIST<STRUCT<scalars>>) lifting
 		// their element subfields, or scalars (LIST<UBIGINT>, LIST<VARCHAR>, …) lifting each whole
-		// element — into a parallel typed list shred, leaving a skeleton array in the residual. Lifted
-		// at depth 1 by bare name, deeper under its `$.parent.child` path.
+		// element — into a parallel typed list shred, leaving a skeleton array in the residual.
 		if (TryBuildAutoShredLaneType(child_plan, child.second, shred_type) &&
 		    (IsShredValueType(shred_type) || IsShredListType(shred_type))) {
-			if (depth == 1) {
-				shreds.push_back({child.first, shred_type, fields});
-			} else {
-				string path = path_prefix;
-				AppendJsonPathKey(path, nonstd::string_view(child.first.data(), child.first.size()));
-				shreds.push_back({std::move(path), shred_type, fields});
-			}
-			fields.pop_back();
-			continue;
-		}
-		if (depth < JSONO_AUTO_SHRED_MAX_DEPTH && child.second.id() == LogicalTypeId::STRUCT) {
-			string path = depth == 1 ? "$" : path_prefix;
-			AppendJsonPathKey(path, nonstd::string_view(child.first.data(), child.first.size()));
+			shreds.push_back({path, JsonoEncodeLaneName(path), shred_type, fields});
+		} else if (depth < JSONO_AUTO_SHRED_MAX_DEPTH && child.second.id() == LogicalTypeId::STRUCT) {
 			CollectAutoShreds(child.second, child_plan, path, depth + 1, fields, shreds);
 		}
+		path.pop_back();
 		fields.pop_back();
 	}
-}
-
-// A literal top-level key spelled as a JSON path ('$.a.b') and a nested scalar lifted to that same
-// path resolve to one shred field name. A shredded STRUCT cannot carry duplicate child names:
-// struct_extract would bind one child and leave the other value reachable only via to_json, not ->>.
-// Drop every colliding shred back to the residual, where the plain emit keeps both values losslessly
-// and path resolution stays correct. Mirrors the 'body' guard: auto-shred must not error or corrupt.
-void DropCollidingAutoShreds(vector<AutoShredCandidate> &shreds) {
-	vector<bool> colliding(shreds.size(), false);
-	for (idx_t i = 0; i < shreds.size(); i++) {
-		for (idx_t j = i + 1; j < shreds.size(); j++) {
-			if (shreds[i].name == shreds[j].name) {
-				colliding[i] = true;
-				colliding[j] = true;
-			}
-		}
-	}
-	vector<AutoShredCandidate> kept;
-	for (idx_t i = 0; i < shreds.size(); i++) {
-		if (!colliding[i]) {
-			kept.push_back(std::move(shreds[i]));
-		}
-	}
-	shreds = std::move(kept);
 }
 
 void AddStructShredPlanPath(JsonoStructShredPlan &root, const JsonoStructPlan &plan, const vector<idx_t> &fields,
@@ -1568,33 +1540,27 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 	// since a jsono value is physically a STRUCT too.
 	if (bind_data->plan.strategy == StructValueStrategy::Struct) {
 		vector<idx_t> fields;
-		CollectAutoShreds(input_type, bind_data->plan, string(), 1, fields, auto_shreds);
-		DropCollidingAutoShreds(auto_shreds);
+		vector<PathStep> path;
+		CollectAutoShreds(input_type, bind_data->plan, path, 1, fields, auto_shreds);
 	}
 	if (!auto_shreds.empty()) {
-		// Canonical shred order (sorted by name) so the shredded type is a pure function of the shred
-		// set, not of struct field order: the executor writes shreds by index, so the field write order
-		// (bind_data->shreds) and the type's shred order must agree.
+		// Canonical shred order (sorted by lane name) so the shredded type is a pure function of the
+		// shred set, not of struct field order: the executor writes shreds by index, so the field write
+		// order (bind_data->shreds) and the type's shred order must agree.
 		std::sort(auto_shreds.begin(), auto_shreds.end(),
-		          [](const AutoShredCandidate &a, const AutoShredCandidate &b) { return a.name < b.name; });
-		child_list_t<LogicalType> shred_types;
+		          [](const AutoShredCandidate &a, const AutoShredCandidate &b) { return a.lane_name < b.lane_name; });
+		vector<JsonoLaneSpec> lanes;
 		for (auto &shred : auto_shreds) {
-			bind_data->shreds.emplace_back(shred.name, shred.type);
+			bind_data->shreds.emplace_back(shred.lane_name, shred.type);
 			bind_data->shred_fields.push_back(std::move(shred.fields));
-			shred_types.emplace_back(shred.name, shred.type);
+			lanes.push_back(JsonoLaneSpec {std::move(shred.path), shred.type});
 		}
-		bound_function.return_type = JsonoShreddedStructType(shred_types);
+		bound_function.return_type = JsonoShreddedStructType(lanes);
 
 		bind_data->one_pass_shred = true;
 		for (idx_t f = 0; f < bind_data->shreds.size(); f++) {
 			auto &shred = bind_data->shreds[f];
 			auto &fields = bind_data->shred_fields[f];
-			// A literal top-level '$...'-named field still addresses a JSON path in the public
-			// shred contract. Only generated nested paths have an unambiguous typed source route.
-			if (fields.size() == 1 && !shred.first.empty() && shred.first[0] == '$') {
-				bind_data->one_pass_shred = false;
-				break;
-			}
 			if (fields.size() > 1) {
 				bind_data->nested_shreds = true;
 				// Nested list skeletons need element-row ancestry, which is a separate access
@@ -1669,6 +1635,21 @@ Vector &PrepareListShredLaneSource(Vector &source, const LogicalType &lane_type,
 		return source;
 	}
 	casted_source = make_uniq<Vector>(lane_type, count);
+	auto &lane_element = ListType::GetChildType(lane_type);
+	if (lane_element.id() == LogicalTypeId::STRUCT) {
+		// An object-array lane names its element subfields by the lane-name codec, so they never match
+		// the source struct's JSON keys — and DuckDB's STRUCT cast matches BY NAME (a disjoint pair is
+		// refused outright). Route through an unnamed element struct, which both halves cast
+		// positionally: the first step converts the subfield types, the second only relabels them.
+		child_list_t<LogicalType> unnamed;
+		for (auto &sub : StructType::GetChildTypes(lane_element)) {
+			unnamed.emplace_back(string(), sub.second);
+		}
+		Vector positional(LogicalType::LIST(LogicalType::STRUCT(std::move(unnamed))), count);
+		VectorOperations::DefaultCast(source, positional, count);
+		VectorOperations::DefaultCast(positional, *casted_source, count);
+		return *casted_source;
+	}
 	VectorOperations::DefaultCast(source, *casted_source, count);
 	return *casted_source;
 }
@@ -1881,10 +1862,7 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 		}
 	}
 
-	vector<JsonoShredManifestEntryBytes> manifest_entries(shred_count);
-	for (idx_t f = 0; f < shred_count; f++) {
-		manifest_entries[f] = JsonoShredManifestEntry(shreds[f].first, shreds[f].second);
-	}
+	auto manifest_entries = JsonoShredManifestEntries(shreds);
 
 	JsonoBodyWriter writer;
 	writer.Init(result);
@@ -1951,7 +1929,6 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 		builder.Reset();
 		EmitNestedStructShredResidual(input_data, row, bind_data.shred_plan, sources, stripped, stripped_fields, lstate,
 		                              builder);
-		std::sort(stripped_fields.begin(), stripped_fields.end());
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_fields.empty()) {
 			manifest.clear();
@@ -2059,11 +2036,8 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	}
 
 	// Manifest bytes: per-shred entry once, plus the full all-stripped manifest (the hot case).
-	vector<JsonoShredManifestEntryBytes> manifest_entries(shred_count);
+	auto manifest_entries = JsonoShredManifestEntries(shreds);
 	std::string hot_manifest;
-	for (idx_t f = 0; f < shred_count; f++) {
-		manifest_entries[f] = JsonoShredManifestEntry(shreds[f].first, shreds[f].second);
-	}
 	JsonoAppendShredManifest(hot_manifest, manifest_entries);
 
 	JsonoBodyWriter writer;
@@ -2168,7 +2142,6 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 				}
 			}
 			builder.EmitObjectEnd();
-			std::sort(stripped_fields.begin(), stripped_fields.end());
 			const std::string *manifest_ptr = nullptr;
 			if (!stripped_fields.empty()) {
 				manifest.clear();

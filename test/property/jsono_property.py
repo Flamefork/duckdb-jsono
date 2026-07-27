@@ -1713,13 +1713,23 @@ LANE_MUTATIONS = [
 ]
 
 
+# The lane names below are the base32hex encodings of $.arr, $.items and $.k (see the lane-name
+# boundary in src/include/jsono_path.hpp); a hand-built layout has to spell them the way the writer
+# does, since a non-canonical name is not a lane at all.
+ARR_LANE = "c5p74000"
+ITEMS_LANE = "d5q6arbj0000"
+K_LANE = "dc000"
+ITEMS_SUBFIELD = "do000"
+ITEMS_ELEMENT_SQL = f"STRUCT({ITEMS_SUBFIELD} BIGINT)"
+
+
 def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
     j = f"jsono({doc_sql}, shredding := {{'$.arr':'BIGINT[]', k:'BIGINT', '$.items':'STRUCT(n BIGINT)[]'}})"
-    marker = f'({j})."jsono"."shreds$1"."$jsono$set"'
-    spill = f'({j})."jsono"."shreds$1"."$jsono$spill$0"'
-    arr = f'({j})."jsono"."shreds$1"."$.arr"'
-    items = f'({j})."jsono"."shreds$1"."$.items"'
-    k_value = f'({j})."jsono"."shreds$1"."k"'
+    marker = f'({j})."jsono"."shreds$2"."$jsono$set"'
+    spill = f'({j})."jsono"."shreds$2"."$jsono$spill$0"'
+    arr = f'({j})."jsono"."shreds$2".{ARR_LANE}'
+    items = f'({j})."jsono"."shreds$2".{ITEMS_LANE}'
+    k_value = f'({j})."jsono"."shreds$2".{K_LANE}'
     if mutation == "arr_truncate":
         arr = f"list_slice({arr}, 1, greatest(len({arr}) - 1, 0))"
     elif mutation == "arr_extend":
@@ -1729,9 +1739,14 @@ def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
     elif mutation == "obj_arr_truncate":
         items = f"list_slice({items}, 1, greatest(len({items}) - 1, 0))"
     elif mutation == "obj_arr_extend":
-        items = f"list_append(coalesce({items}, []::STRUCT(n BIGINT)[]), {{'n': 99}}::STRUCT(n BIGINT))"
+        # The element literal carries the ENCODED subfield name: DuckDB casts a named struct by name,
+        # so a `{'n': …}` literal has no member in common with the lane's element type.
+        items = (
+            f"list_append(coalesce({items}, []::{ITEMS_ELEMENT_SQL}[]), "
+            f"{{'{ITEMS_SUBFIELD}': 99}}::{ITEMS_ELEMENT_SQL})"
+        )
     elif mutation == "obj_arr_null":
-        items = "NULL::STRUCT(n BIGINT)[]"
+        items = f"NULL::{ITEMS_ELEMENT_SQL}[]"
     elif mutation == "scalar_swap":
         k_value = f"coalesce({k_value}, 0) + 7"
     elif mutation == "scalar_null":
@@ -1746,11 +1761,11 @@ def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
         marker = f"{marker} + 1"
     return (
         f'struct_pack("jsono" := struct_pack("body$1" := ({j})."jsono"."body$1", '
-        f'"shreds$1" := struct_pack("$jsono$set" := {marker}, '
+        f'"shreds$2" := struct_pack("$jsono$set" := {marker}, '
         f'"$jsono$spill$0" := {spill}, '
-        f'"$.arr" := {arr}, '
-        f'"$.items" := {items}, '
-        f'"k" := {k_value})))'
+        f'{ARR_LANE} := {arr}, '
+        f'{ITEMS_LANE} := {items}, '
+        f'{K_LANE} := {k_value})))'
     )
 
 
@@ -1861,6 +1876,81 @@ def test_setop_merge_reserved_fields_by_name(left_size: int, right_size: int, pr
         ), f"jsono_entries refused the merged type: {direction} -> {entries.message!r}"
 
 
+# A shred lane's STRUCT field name is the base32hex encoding of its path's structure, not the path
+# spelled as text (docs/jsono_format.md -> "Lane names"). Three properties define it, and all three
+# are checked through the extension's own surface only — no second copy of the codec lives here, so
+# these cannot agree with the implementation by sharing its bug:
+#
+#   (1) round-trip: the logical path a lane reports, fed back as a spec, names the same lane;
+#   (2) order preservation: sorting lane names IS sorting paths (the invariant the canonical shred
+#       order, the spill ranks, the two-pointer walkers and the merge fast path's binary searches
+#       against the residual's byte-sorted document keys all rest on) — checked against the paths'
+#       own order, computed here as plain lexicographic comparison of their key byte strings;
+#   (3) case distinctness: DuckDB compares STRUCT field names case-insensitively, so two paths
+#       differing only in case must still yield names that differ under that comparison — this is
+#       the defect the codec exists to make unrepresentable.
+lane_key_chars = "aAbB.$-_0 \"\\\u00e9"
+lane_keys = st.text(alphabet=lane_key_chars, min_size=0, max_size=4)
+lane_paths = st.lists(lane_keys, min_size=1, max_size=3)
+
+
+def lane_spec_path(keys: list[str]) -> str:
+    # Every step quoted, whether or not it needs to be: this is INPUT to the spec DSL, and quoting
+    # unconditionally keeps the harness from restating AppendJsonPathKey's rule (which the round-trip
+    # property below reads back from the extension instead).
+    steps = "".join('."' + key.replace("\\", "\\\\").replace('"', '\\"') + '"' for key in keys)
+    return "$" + steps
+
+
+def lane_type_sql(spec: dict[str, str]) -> str:
+    entries = ", ".join(f"{sql_literal(path)}: {sql_literal(stype)}" for path, stype in spec.items())
+    return f"typeof(jsono(NULL::VARCHAR, shredding := {{{entries}}}))"
+
+
+@settings(PROPERTY_SETTINGS)
+@example(keys=["gclid"], other=["GCLID"])
+@example(keys=["a"], other=["URL", "path"])
+@example(keys=["URL", "fragment"], other=["URL.fragment"])
+@example(keys=["aB"], other=["aB#c"])
+@example(keys=[""], other=["$x"])
+@given(keys=lane_paths, other=lane_paths)
+def test_lane_name_codec(keys: list[str], other: list[str]) -> None:
+    spec_path = lane_spec_path(keys)
+    declared = SESSION.value(lane_type_sql({spec_path: "VARCHAR"}))
+    assert declared is not None, f"lane spec unreadable: {keys!r}"
+
+    # (1) The logical path the lane reports must re-declare the identical lane.
+    reported = SESSION.value(
+        f"list_extract(jsono_layout_lanes(jsono(NULL::VARCHAR, "
+        f"shredding := {{{sql_literal(spec_path)}: 'VARCHAR'}})), 1).path"
+    )
+    assert reported is not None, f"lane not reported: {keys!r}"
+    redeclared = SESSION.value(lane_type_sql({reported: "VARCHAR"}))
+    assert redeclared == declared, f"path round-trip lost the lane: {keys!r} -> {reported!r}"
+
+    if keys == other:
+        return
+
+    # (3) Case distinctness, which needs two SEPARATE specs: DuckDB rejects a struct literal whose
+    # keys are case-equal, so the colliding pair cannot even be written as one spec.
+    other_declared = SESSION.value(lane_type_sql({lane_spec_path(other): "VARCHAR"}))
+    assert other_declared is not None, f"lane spec unreadable: {other!r}"
+    assert declared.lower() != other_declared.lower(), f"lane names collapse case-insensitively: {keys!r} vs {other!r}"
+
+    # (2) Ordering. Both lanes in one spec, with different lane TYPES so the reported order says
+    # which path won without the harness having to know either name.
+    if lane_spec_path(other).lower() == spec_path.lower():
+        return
+    first_type = SESSION.value(
+        f"list_extract(jsono_layout_lanes(jsono(NULL::VARCHAR, shredding := "
+        f"{{{sql_literal(spec_path)}: 'VARCHAR', {sql_literal(lane_spec_path(other))}: 'BIGINT'}})), 1).type"
+    )
+    assert first_type in ("VARCHAR", "BIGINT"), f"lane pair not reported: {keys!r} vs {other!r} -> {first_type!r}"
+    keys_first = [key.encode("utf-8") for key in keys] < [key.encode("utf-8") for key in other]
+    expected = "VARCHAR" if keys_first else "BIGINT"
+    assert first_type == expected, f"lane order diverges from path order: {keys!r} vs {other!r} -> {first_type!r}"
+
+
 PROPERTIES = [
     test_round_trip_idempotent,
     test_value_parity,
@@ -1889,6 +1979,7 @@ PROPERTIES = [
     test_fuzz_manifest_no_crash,
     test_fuzz_shredded_lanes_no_lie,
     test_setop_merge_reserved_fields_by_name,
+    test_lane_name_codec,
 ]
 
 

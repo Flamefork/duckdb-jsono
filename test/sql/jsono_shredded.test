@@ -18,11 +18,11 @@ CREATE TABLE shred AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         "body$1" := jsono('{"kind":"commit","did":"d1","extra":"e1"}')."jsono"."body$1",
-        "shreds$1" := struct_pack(
+        "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
-            "$.did"  := 'd1',
-            "$.kind" := 'commit'))
+            chkm8000  := 'd1',
+            ddkmsp0000 := 'commit'))
 ) AS j;
 
 # bare ->> on a shred path resolves transparently
@@ -73,10 +73,10 @@ CREATE TABLE shred_sentinel AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         "body$1" := jsono('{"kind":"commit","did":"d1"}')."jsono"."body$1",
-        "shreds$1" := struct_pack(
+        "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
-            "$.kind" := 'SENTINEL'))
+            ddkmsp0000 := 'SENTINEL'))
 ) AS j;
 
 query I
@@ -180,11 +180,11 @@ CREATE TABLE shred_typed AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         "body$1" := jsono('{"n":5,"s":"blob_s"}')."jsono"."body$1",
-        "shreds$1" := struct_pack(
+        "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
-            "$.n" := 999::BIGINT,
-            "$.s" := 'shred_s'))
+            do000 := 999::BIGINT,
+            ec000 := 'shred_s'))
 ) AS j;
 
 # typed BIGINT shred read through the ->> text contract returns the shred value
@@ -213,10 +213,10 @@ CREATE TABLE typed_het AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         "body$1" := jsono('{"n":"hello"}')."jsono"."body$1",
-        "shreds$1" := struct_pack(
+        "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 1::BIGINT,
-            "$.n" := NULL::BIGINT))
+            do000 := NULL::BIGINT))
 ) AS j;
 
 query I

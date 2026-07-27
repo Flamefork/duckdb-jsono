@@ -60,7 +60,7 @@ Inspect:
 ## Quick Start
 
 > [!NOTE]
-> JSONO is a format, not a SQL type. A JSONO value is this extension's pre-parsed binary representation of a JSON document — physically a nested `STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))`, with no registered type name. There is no `JSONO` to name in a `CAST` or a column definition. Instead: build a value with `jsono(...)` / `try_jsono(...)`, declare storage columns with `jsono_storage_type()`, and let the functions, the `->` / `->>` operators, and `to_json` recognise that `STRUCT` shape structurally — a value read back from Parquet or DuckLake works with no cast. `.body$1` (and, on a shredded value, the shred fields in its sibling `shreds$1` struct) are physical storage details, not a public access API. The `$N` suffixes are layout revisions: a value written under a revision this build does not read is refused loudly rather than silently misread — see [jsono_format.md](docs/jsono_format.md#layout-revisions).
+> JSONO is a format, not a SQL type. A JSONO value is this extension's pre-parsed binary representation of a JSON document — physically a nested `STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))`, with no registered type name. There is no `JSONO` to name in a `CAST` or a column definition. Instead: build a value with `jsono(...)` / `try_jsono(...)`, declare storage columns with `jsono_storage_type()`, and let the functions, the `->` / `->>` operators, and `to_json` recognise that `STRUCT` shape structurally — a value read back from Parquet or DuckLake works with no cast. `.body$1` (and, on a shredded value, the shred fields in its sibling `shreds$2` struct) are physical storage details, not a public access API — a shred field's name is the encoded form of its path, and `jsono_layout_lanes(value)` is how you read the lane set. The `$N` suffixes are layout revisions: a value written under a revision this build does not read is refused loudly rather than silently misread — see [jsono_format.md](docs/jsono_format.md#layout-revisions).
 
 Build and load the extension first (see [Installation](#installation)), then:
 
@@ -180,7 +180,7 @@ A `MAP` builds an object whose keys are per-row data: keys render as text (as in
 
 The document root need not be an object: `jsono(MAP {...})`, `jsono([1, 2, 3])` and `jsono(array_value(1, 2))` build object/array documents, and the matching casts let you `INSERT` a `MAP`, a `LIST` or an `ARRAY` straight into a JSONO column. A `VARCHAR` root is the text parser by contract, so scalar roots are not constructible — wrap them in a list or an object.
 
-Because the input `STRUCT` already carries its field names and types, `jsono(struct)` shreds automatically — there is no `shredding` argument to pass. Every top-level field whose type is a scalar shred type (`BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`, or `VARCHAR`) is lifted into a typed shred column named by the field, exactly as the [`shredding`](#jsonovalue-shredding) constructor does for text. Narrow numeric fields are promoted to their shred type and lifted as well: `TINYINT`/`SMALLINT`/`INTEGER` and the unsigned `UTINYINT`/`USMALLINT`/`UINTEGER` become `BIGINT` shreds, and `FLOAT` becomes a `DOUBLE` shred, so `to_json` output is unchanged. The string-rendered types (`TIMESTAMP`, `DATE`, `UUID`, `ENUM`, `BLOB`, … — the string row of the table above) become `VARCHAR` shreds carrying exactly the text the document holds. Top-level `LIST<TYPE>` (and `ARRAY<TYPE>`) fields also become scalar-array shreds when `TYPE` is (or promotes to) one of those scalar shred types, and top-level `LIST<STRUCT<...>>` fields become array shreds when the struct children are (or promote to) supported scalar shred types. Nested `STRUCT` levels are eligible, with shred leaves named by JSONPath-style paths such as `$.parent.child` and `$.URL.query_params.utm_source`. Auto-shred descends nested structs up to a fixed depth cap set deliberately high (far above realistic analytical nesting); the cap exists only to keep a pathologically deep value's whole-value reconstruct from going super-linear, not to limit real use — a scalar leaf strictly past it, unsupported lists, `HUGEINT`/`UHUGEINT`/`VARINT`, `DECIMAL`, `MAP`, `NULL`, and `JSON` subtrees stay in the residual (and a deeper leaf can still be lifted explicitly with `shredding := {...}`). Shredding lifts named top-level object fields, which only a `STRUCT` root has, so `MAP`, `LIST`, `ARRAY` and `jsono` roots construct plain JSONO. An embedded `jsono` field is a document, not a struct to walk, so it stays in the residual whole.
+Because the input `STRUCT` already carries its field names and types, `jsono(struct)` shreds automatically — there is no `shredding` argument to pass. Every top-level field whose type is a scalar shred type (`BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`, or `VARCHAR`) is lifted into a typed shred column for that field, exactly as the [`shredding`](#jsonovalue-shredding) constructor does for text. Narrow numeric fields are promoted to their shred type and lifted as well: `TINYINT`/`SMALLINT`/`INTEGER` and the unsigned `UTINYINT`/`USMALLINT`/`UINTEGER` become `BIGINT` shreds, and `FLOAT` becomes a `DOUBLE` shred, so `to_json` output is unchanged. The string-rendered types (`TIMESTAMP`, `DATE`, `UUID`, `ENUM`, `BLOB`, … — the string row of the table above) become `VARCHAR` shreds carrying exactly the text the document holds. Top-level `LIST<TYPE>` (and `ARRAY<TYPE>`) fields also become scalar-array shreds when `TYPE` is (or promotes to) one of those scalar shred types, and top-level `LIST<STRUCT<...>>` fields become array shreds when the struct children are (or promote to) supported scalar shred types. Nested `STRUCT` levels are eligible, with shred leaves lifted under JSONPath-style paths such as `$.parent.child` and `$.URL.query_params.utm_source`. Auto-shred descends nested structs up to a fixed depth cap set deliberately high (far above realistic analytical nesting); the cap exists only to keep a pathologically deep value's whole-value reconstruct from going super-linear, not to limit real use — a scalar leaf strictly past it, unsupported lists, `HUGEINT`/`UHUGEINT`/`VARINT`, `DECIMAL`, `MAP`, `NULL`, and `JSON` subtrees stay in the residual (and a deeper leaf can still be lifted explicitly with `shredding := {...}`). Shredding lifts named top-level object fields, which only a `STRUCT` root has, so `MAP`, `LIST`, `ARRAY` and `jsono` roots construct plain JSONO. An embedded `jsono` field is a document, not a struct to walk, so it stays in the residual whole.
 
 ```sql
 SELECT typeof(jsono({'kind': 'commit', 'time_us': 1700::BIGINT}));
@@ -344,7 +344,7 @@ SELECT to_json(jsono('{"kind":"commit","time_us":1700,"extra":"e1"}',
 -- {"extra":"e1","kind":"commit","time_us":1700}
 ```
 
-Transparent reads over a shredded value go through the bundled `json` extension (present in every standard DuckDB distribution) and the extension's query optimizer. The shredded shape — the `jsono` layout wrapping the `body$1` blobs and the named `shreds$1` columns — survives a plain Parquet round-trip and reads back transparently; the scalar shred leaves keep projection and filter pushdown.
+Transparent reads over a shredded value go through the bundled `json` extension (present in every standard DuckDB distribution) and the extension's query optimizer. The shredded shape — the `jsono` layout wrapping the `body$1` blobs and the `shreds$2` columns — survives a plain Parquet round-trip and reads back transparently; the scalar shred leaves keep projection and filter pushdown.
 
 Two things decide whether a filter actually **prunes** Parquet row groups (skips them on the per-row-group min/max statistics) rather than scanning the whole file:
 
@@ -377,10 +377,10 @@ The safety net for the raw struct cast (no extension optimizer: another process,
 
 #### Is my read pushed down?
 
-Whether a read hits a shred lane (fast, and row-group-prunable) or rebuilds the document is visible in the plan: run `EXPLAIN <your query>` (or `EXPLAIN ANALYZE` for timings) and read the `physical_plan`. If the only jsono touch over a shredded column is a read of its `.shreds$1."<path>"` column, the read is pushed down; if any of the residual/reconstruct tokens below appear, it is not.
+Whether a read hits a shred lane (fast, and row-group-prunable) or rebuilds the document is visible in the plan: run `EXPLAIN <your query>` (or `EXPLAIN ANALYZE` for timings) and read the `physical_plan`. If the only jsono touch over a shredded column is a read of its `.shreds$2.<lane>` column, the read is pushed down; if any of the residual/reconstruct tokens below appear, it is not.
 
 - **Pushed** — reads a typed shred column, prunable on its min/max statistics:
-  - a bare `.shreds$1."<path>"` — a total shred, `COALESCE`-free. A projection shows it as a scan projection column (`ep.jsono.shreds$1."<path>"`); a filter or aggregate shows it as a `struct_extract_at(...shreds$1."<path>"...)`.
+  - a bare `.shreds$2.<lane>` — a total shred, `COALESCE`-free. A projection shows it as a scan projection column (`ep.jsono.shreds$2.<lane>`); a filter or aggregate shows it as a `struct_extract_at(...shreds$2.<lane>...)`. `<lane>` is the encoded path, so match it against `jsono_layout_lanes` rather than reading it as text.
   - `COALESCE(struct_extract_at(...shreds...), jsono_extract_string(...))` — partial: the lane is still read (and prunable), with a per-row residual fallback kept for diverted rows. `jsono_shred_stats`' `divert_rate` shows how often that fallback fires.
 - **Residual** — parses the six body blobs per row, not prunable:
   - `jsono_extract_string` / `jsono_extract` — a single extract on a path that has no shred.
@@ -678,6 +678,7 @@ jsono_storage_type()              -> VARCHAR    -- DDL of the physical STRUCT ba
 jsono_shred_manifest(value)       -> STRUCT[]   -- paths stripped into shred columns, with their types
 jsono_version()                   -> INTEGER    -- current JSONO binary format version
 jsono_layout_diagnose(value)      -> VARCHAR    -- whether the extension sees the value's TYPE as JSONO, and why not
+jsono_layout_lanes(value)         -> STRUCT[]   -- the shred lanes of the value's TYPE, as logical paths
 ```
 
 `jsono_type` and `jsono_keys` inspect the shape of unknown JSON before extracting it with `jsono_transform`. The optional `path` is a constant JSONPath (same grammar as `jsono_transform`, without wildcards) that points at a nested position; a missing path yields `NULL`.
@@ -715,7 +716,7 @@ SELECT jsono_storage_type();
 
 ```sql
 SELECT jsono_shred_manifest(jsono('{"a":"x","b":1}', shredding := {'a':'VARCHAR','b':'BIGINT'}));
--- [{'path': a, 'type': VARCHAR}, {'path': b, 'type': BIGINT}]
+-- [{'path': $.a, 'type': VARCHAR}, {'path': $.b, 'type': BIGINT}]
 ```
 
 `jsono_layout_diagnose` answers whether this build recognises the argument's **type** as a JSONO value, and if not, which rule failed. It is a question about the type, answered at bind — the value's bytes are never read, and a `NULL` value diagnoses the same as any other.
@@ -724,12 +725,23 @@ It exists for one specific failure mode. A value carrying the current layout rev
 
 ```sql
 SELECT jsono_layout_diagnose(jsono('{"a":1,"b":2}', shredding := {'a':'BIGINT'}));
--- jsono: shredded, body revision 1, shreds revision 1, 1 shreds, 1 spill column(s)
+-- jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
 SELECT jsono_layout_diagnose({'a': 1});
 -- not jsono: the value's single field is named 'a', not the layout anchor 'jsono'
 ```
 
 A value of a foreign layout revision is *diagnosed* rather than refused here, even though every other consumer of it throws — a diagnostic that fails on the value you are diagnosing is no diagnostic.
+
+`jsono_layout_lanes` lists the shred lanes of the argument's **type** as `LIST<STRUCT(path VARCHAR, type VARCHAR)>`, in the type's own field order. Like `jsono_layout_diagnose` it is answered at bind and reads no bytes, so it works on a `NULL` value and on a type the grammar refused (which has no lanes, and answers the empty list).
+
+Reading the lane set off the type text does not work: a lane's `STRUCT` field name is the base32hex encoding of its path, not the path spelled out (see [docs/jsono_format.md](docs/jsono_format.md#lane-names) — it is what keeps two spellings of one key, `gclid` and `GCLID`, from collapsing into one lane under DuckDB's case-insensitive field matching). This function is how you read a shredded schema instead, and its answers are spec DSL: paste one back into `jsono(value, shredding := {...})` or `jsono_storage_type(...)` and you get the same lane.
+
+```sql
+SELECT jsono_layout_lanes(jsono('{"URL":{"path":"/x"},"n":1}', shredding := {'$.URL.path':'VARCHAR','n':'BIGINT'}));
+-- [{'path': $.URL.path, 'type': VARCHAR}, {'path': $.n, 'type': BIGINT}]
+SELECT jsono_layout_lanes(jsono('{"a":1}'));
+-- []
+```
 
 These helpers are primarily used by the JSONO workflows and tests. Treat their exact surface as less stable than `jsono_transform`, `jsono`, and `to_json`.
 

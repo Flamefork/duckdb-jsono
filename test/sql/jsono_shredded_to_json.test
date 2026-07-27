@@ -80,9 +80,15 @@ WHERE to_json(j) NOT IN ('{"a":1,"b":2}'::JSON, '{"a":3,"b":4}'::JSON);
 ----
 0
 
-# Equivalent path spellings collapse to one logical reconstructed path.
+# Equivalent path spellings are one lane, so declaring both is refused — they would be two fields of
+# one STRUCT under one name. The single lane reconstructs to the same document either way.
+statement error
+SELECT to_json(jsono('{"a":7,"tail":8}', shredding := {'a': 'BIGINT', '$.a': 'BIGINT'}));
+----
+name the same shred path
+
 query I
-SELECT to_json(jsono('{"a":7,"tail":8}', shredding := {'a': 'BIGINT', '$.a': 'BIGINT'}))
+SELECT to_json(jsono('{"a":7,"tail":8}', shredding := {'$.a': 'BIGINT'}))
      = to_json(jsono('{"a":7,"tail":8}'));
 ----
 true

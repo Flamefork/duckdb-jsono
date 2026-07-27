@@ -36,7 +36,7 @@ handles far better.
 
 For fast columnar reads of hot paths, a JSONO value can be stored *shredded*:
 the `jsono` layout field carries the residual `body$1` plus a sibling
-`shreds$1` STRUCT — a reserved shred-set marker followed by one typed *shred*
+`shreds$2` STRUCT — a reserved shred-set marker followed by one typed *shred*
 per chosen path
 (produced by `jsono(value, shredding := spec)`).
 
@@ -45,12 +45,12 @@ STRUCT(
   jsono STRUCT(
     "body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB,
                     lengths BLOB, nums BLOB),
-    "shreds$1" STRUCT(         -- shred layout, revision 1
+    "shreds$2" STRUCT(         -- shred layout, revision 2
       "$jsono$set" BIGINT,       -- shred-set marker (see below)
       "$jsono$spill$0" BIGINT,   -- spill bitmap column(s): "$jsono$spill$1", … for sets past 63 shreds
-      "<path1>" <type1>,         -- scalar shred: the bare typed lane
-      "<path2>" <type2>,
-      "<arrpath>" <list_type>,  -- array shred: a bare LIST
+      "<lane1>" <type1>,         -- scalar shred: the bare typed lane
+      "<lane2>" <type2>,
+      "<arrlane>" <list_type>,  -- array shred: a bare LIST
       …
     )
   )
@@ -61,13 +61,65 @@ Shredding does **not** change the binary slot format. The six `body` blobs are
 an ordinary JSONO value — the *residual* — so everything else in this spec
 applies to them unchanged, including `version`. A plain (unshredded) value has
 **no** `shreds` field (`STRUCT(jsono STRUCT("body$1" …))`); shredded-ness is
-exactly the presence of `shreds$1`. Each scalar *shred* is the value at its canonical path
-(`$.kind`, `$.commit.operation`, …) materialized as a plain typed DuckDB column
-(`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`) with the path as the field
-name. Nested shred paths are allowed. No JSON key is reserved: a JSON key named
-`body` can still be shredded through its `$.`-prefixed path form (`$.body`),
-which lands inside `shreds$1` and cannot collide with the layout's `body$1` (the
-`$jsono$` name prefix is reserved for the layout's own fields).
+exactly the presence of `shreds$2`. Each scalar *shred* is the value at its
+canonical path (`$.kind`, `$.commit.operation`, …) materialized as a plain typed
+DuckDB column (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`). Nested shred
+paths are allowed.
+
+### Lane names
+
+A lane's STRUCT field name is **not** its path as text. It is the path's
+*structure*, serialized and encoded:
+
+1. **Serialize the steps.** Every step of a lane path is an object key (a lane
+   lifts keys, never array positions). Each key contributes its raw bytes with
+   `00` escaped as `00 FF`, terminated by `00 00`; keys concatenate in path
+   order.
+2. **Encode.** Those bytes as unpadded lowercase base32hex (RFC 4648 alphabet
+   `0-9a-v`).
+
+| Path | Lane name |
+|------|-----------|
+| `gclid` | `cthmoqb40000` |
+| `GCLID` | `8t1koia40000` |
+| `$.URL.fragment` (two keys) | `al94o000cpp62prdcln78000` |
+| `URL.fragment` (one key with a dot) | `al94obj6e9gmerb5dpq0000` |
+
+The doubled terminator is load-bearing: it keeps `00` always in a *pair* (`00 FF`
+= escaped NUL, `00 00` = end of key), so a decoder decides on the single byte
+after a `00` and never depends on what the next key starts with. With a single
+`00` terminator, `61 00 FF 62 00` would be both `[a, \xFFb]` and `[a\x00b]`.
+
+Why the encoding exists: DuckDB compares STRUCT field names **case-insensitively**
+over ASCII `A-Z`. A lane named by its path verbatim therefore collapses with
+another spelling of the same key — two sources writing `gclid` and `GCLID` merge
+into one lane, and the by-name cast then moves one key's values into the other's,
+loud on the dropped spelling and silently wrong on the surviving one. The encoded
+alphabet has no upper case at all, so distinct paths can never produce names that
+differ only in case: the collapse is unrepresentable rather than guarded against.
+The same bijection ends a second conflation — `gclid` and `$.gclid` are one path,
+so they are one lane, and how the public spec DSL spells a path no longer reaches
+the stored format. Declaring both spellings in one spec is refused.
+
+Two consequences fall out. **No JSON key is reserved**: a name drawn from
+`0-9a-v` can be neither the layout's `body` nor anything under the `$jsono$`
+prefix, so a key spelled like a layout field shreds like any other. And **the
+encoding is order-preserving** at both stages, so sorting lane names *is* sorting
+paths — which is what the canonical shred order, the spill ranks, the two-pointer
+walkers and the merge fast path's binary searches against the residual's
+byte-sorted document keys all rely on. A length-prefixed serialization would
+break that (the length byte dominates), so this is the first invariant to
+re-check if the serialization is ever revisited.
+
+An object-array lane's element subfield names are encoded the same way (a
+subfield is a one-step path). The price is that the type text is unreadable;
+`jsono_layout_lanes(value)` answers "which paths are shredded here" in logical
+form, and is the intended way to read a shredded schema.
+
+A name that is not canonical — anything `Encode(Decode(name)) == name` rejects:
+a bad character, an invalid length, a truncated escape, an upper-case digit —
+makes the struct silently *not JSONO*, the way recognition treats every unknown
+struct. `jsono_layout_diagnose(value)` explains which name failed and why.
 
 The single layout name (`jsono` for both plain and shredded) and the nested
 `shreds` struct are both deliberate. DuckDB reconciles struct types by field
@@ -233,6 +285,16 @@ carry (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`, and their `[]`
 scalar-array forms). Type code `0` keeps the full type string for complex shred
 types.
 
+An entry's path is the lane's **logical** path in the project's one text form
+(`$.`-always, quoted per key where a bare step would mis-parse) — never the
+lane's encoded field name. The manifest is a per-row statement about the
+*document*, while the encoding is a transport artifact of a DuckDB limitation at
+the *type* level; keeping the two apart is what lets the naming codec change
+without rewriting a single stored row. Readers decode their own type's lane names
+once per reader init and compare bytes from there. For the same reason an
+object-array entry's type string carries the element subfields' JSON keys, not
+their encoded names.
+
 Both forms are self-describing — each entry carries its path and type inline — so
 a reader needs no external shred list to decode them. (Earlier revisions also
 defined layout-hash-keyed `indexed` and `bitset` tails that referenced the
@@ -240,7 +302,9 @@ reader's own shred list; they were removed because they never beat the compact
 form on disk — their per-row bit-packing trades zstd-friendly repetition for high
 entropy, so Parquet + zstd compress the compact form smaller.)
 
-Entries are sorted by canonical shred order (path order) and list only the paths
+Entries are sorted by logical path, which is **not** the type's field order
+(that follows the encoded name, and the two genuinely differ: `$.a-c` sorts before
+`$.a.b` as text while the nested path sorts first structurally), and list only the paths
 actually stripped from this row (a value kept in the residual by the lossless
 gate is not listed). A plain value writes no manifest — its `skips` blob ends at
 the checkpoints, which reads as zero entries.
@@ -358,7 +422,7 @@ and invalidate different data:
 |------|-------------------------|---------|
 | The bytes **inside** the body blobs | `version` byte in `slots` | 4 |
 | The residual's **column** layout (the set, names and types of the body blobs) | the field name `body$<N>` | 1 |
-| The **shred** layout (reserved fields inside `shreds`, lane shape, spill bit numbering, marker semantics) | the field name `shreds$<M>` | 1 |
+| The **shred** layout (reserved fields inside `shreds`, lane naming, lane shape, spill bit numbering, marker semantics) | the field name `shreds$<M>` | 2 |
 
 The layout field name `jsono` is the **anchor** and never carries a revision.
 Recognition is anchor-first: a top-level STRUCT with exactly one field named
@@ -376,7 +440,7 @@ A layout struct carrying **more than one** revisioned stem of a kind (`body` and
 `body$1` side by side, say) is a *mixture* of revisions and is refused the same
 way. That is what a multi-file scan produces: `read_parquet(…, union_by_name :=
 true)` merges the per-file schemas by name, so an old file beside a current one
-yields `body$1, shreds$1, body, shreds` in whichever order the files were
+yields `body$1, shreds$2, body, shreds` in whichever order the files were
 listed. Nothing can be done to such a scan as a whole (there is no single
 revision to upgrade from) — upgrade the old files separately and `UNION ALL` the
 results. The refusal names a *foreign* revision rather than whichever sorted
@@ -425,8 +489,8 @@ Two boundaries are known and not caught:
 
 **Bump `body$N`** when a body blob column is added, removed, renamed or
 retyped. **Bump `shreds$M`** when the reserved field set inside `shreds`, the
-lane shape, the canonical rank numbering, the marker semantics or the spill bit
-encoding change — including purely *semantic* changes the type cannot show.
+lane naming (the path → field-name codec), the lane shape, the canonical rank
+numbering, the marker semantics or the spill bit encoding change — including purely *semantic* changes the type cannot show.
 Neither is bumped by the user's shred set or by the ⌈N/63⌉ spill column count:
 those are data under a fixed layout.
 
@@ -455,6 +519,23 @@ live in git, in the build that wrote them and in the golden bytes of
 bytes: which commit range wrote which shape, and what it takes to move it
 forward.
 
+**Shreds revision 1** (`bf99fb2`…`9d9f91c`) named a lane by its **path spelled as
+text** — `gclid`, `$.commit.operation` — rather than by the encoding of the path.
+Nothing else about it differs from revision 2: same reserved fields, same lane
+shape, same spill numbering, same marker. That naming is the defect it was closed
+for: DuckDB matches STRUCT field names case-insensitively, so two spellings of one
+JSON key (`gclid` / `GCLID`) collapsed into one lane on a type merge and the
+by-name cast then misfiled one key's values into the other's. The manifest of such
+a value additionally stored the lane's *physical* name, so `gclid` appears there
+where revision 2 writes `$.gclid`.
+
+Renaming the field to `shreds$2` is **not** an upgrade: every lane inside it must
+be re-spelled as the encoded path (see [Lane names](#lane-names)) and every row's
+manifest rewritten. Both are per-row work no rebuild of the layout struct can do,
+so a shredded revision-1 value is moved forward by reading it with a build from
+that range and re-ingesting through `jsono(value, shredding := …)`. A **plain**
+revision-1 value is unaffected — that is why the two stems version separately.
+
 **Revision 0** is everything written before layout revisions existed: the
 unrevisioned field names `body` and `shreds`. Four shapes shipped under it.
 
@@ -468,24 +549,26 @@ unrevisioned field names `body` and `shreds`. Four shapes shipped under it.
 Stored files overwhelmingly carry 0.d: it lived from `cc7d8cb` until revisions
 landed in `bf99fb2`.
 
-**0.d, 0.c and 0.b upgrade in place, in SQL.** Nothing inside the blobs changed
-across them, so the whole migration is a rebuild of the layout struct under the
-current field names:
+**0.d, 0.c and 0.b upgrade in place, in SQL — plain values only.** Nothing inside
+the blobs changed across them, so for a plain value the whole migration is a
+rebuild of the layout struct under the current field names:
 
 ```sql
 -- The extension optimizer refuses struct_extract over a foreign value — which is
 -- exactly the read this rebuild needs — so it is off for this one statement.
 SET disabled_optimizers='extension';
 CREATE TABLE upgraded AS
-SELECT {'jsono': {'body$1': v.jsono.body,           -- a plain value stops here
-                  'shreds$1': v.jsono.shreds}} AS v
+SELECT {'jsono': {'body$1': v.jsono.body}} AS v
 FROM old;
 RESET disabled_optimizers;
 ```
 
-For 0.c and 0.b the inner struct is rebuilt the same way one level deeper, with
-the spill columns respelled `"$jsono$spill$0"`, `"$jsono$spill$1"`, …. Read the
-result back with the optimizer on: a value that reads is a value that upgraded.
+A **shredded** revision-0 value carries text lane names and physical-name manifest
+entries, so it needs the same per-row work as shreds revision 1 above: read it
+with a build from its range and re-ingest. (Renaming the struct fields alone
+leaves a lane set the grammar does not accept, so the result reads as "not JSONO"
+rather than as data — loud, but not an upgrade.) Read the result back with the
+optimizer on: a value that reads is a value that upgraded.
 
 **0.a needs the build that wrote it.** Its per-row divert information lived in
 the `complete` flags, which the current lane shape does not have, and the

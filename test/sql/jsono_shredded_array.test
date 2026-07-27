@@ -25,7 +25,7 @@ SELECT to_json(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
 
 # The shred column is a real typed LIST<STRUCT>, queryable directly.
 query II
-SELECT (j."jsono"."shreds$1"."$.products")[1].name, (j."jsono"."shreds$1"."$.products")[2].id
+SELECT (j."jsono"."shreds$2".e1p6up3lcdq76000)[1].dpgmqp8000, (j."jsono"."shreds$2".e1p6up3lcdq76000)[2].d5i0000
 FROM (SELECT jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}) AS j);
 ----
@@ -189,7 +189,7 @@ SELECT to_json(jsono({'kind': 'order', 'products': [{'id': 1::UBIGINT, 'name': '
 
 # The array shred column is the typed list, queryable directly (bare field name).
 query II
-SELECT (j."jsono"."shreds$1"."products")[1].name, (j."jsono"."shreds$1"."products")[2].id
+SELECT (j."jsono"."shreds$2".e1p6up3lcdq76000)[1].dpgmqp8000, (j."jsono"."shreds$2".e1p6up3lcdq76000)[2].d5i0000
 FROM (SELECT jsono({'products': [{'id': 1::UBIGINT, 'name': 'a'}, {'id': 2::UBIGINT, 'name': 'b'}]}) AS j);
 ----
 a	2

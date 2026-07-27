@@ -241,10 +241,9 @@ statement ok
 CREATE TABLE case_out AS SELECT CASE WHEN true THEN sa.e ELSE sb.e END AS e FROM shred_a AS sa, shred_b AS sb;
 
 query I
-SELECT t LIKE '%a VARCHAR%' AND t LIKE '%b VARCHAR%'
-FROM (SELECT (SELECT column_type FROM (DESCRIBE case_out)) AS t);
+SELECT list_sort(jsono_layout_lanes(e)) FROM case_out;
 ----
-true
+[{'path': $.a, 'type': VARCHAR}, {'path': $.b, 'type': VARCHAR}]
 
 # COALESCE likewise — reads correctly and normalizes.
 query I
@@ -256,10 +255,9 @@ statement ok
 CREATE TABLE coalesce_out AS SELECT COALESCE(sa.e, sb.e) AS e FROM shred_a AS sa, shred_b AS sb;
 
 query I
-SELECT t LIKE '%a VARCHAR%' AND t LIKE '%b VARCHAR%'
-FROM (SELECT (SELECT column_type FROM (DESCRIBE coalesce_out)) AS t);
+SELECT list_sort(jsono_layout_lanes(e)) FROM coalesce_out;
 ----
-true
+[{'path': $.a, 'type': VARCHAR}, {'path': $.b, 'type': VARCHAR}]
 
 # Reshredding makes CASE/COALESCE dedup honest: the same value shredded two ways collapses under
 # DISTINCT (before normalization the two encodings compared unequal and both survived).

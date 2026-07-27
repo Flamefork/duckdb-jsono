@@ -105,24 +105,28 @@ SELECT to_json(e)::VARCHAR FROM probe_shred ORDER BY 1;
 {"a":1,"event_name":"page_view"}
 {"x":"y"}
 
-# Reserved shred names are rejected by the same check the constructor uses (a single source of truth),
-# so jsono_storage_type can only emit a type the constructor can actually produce. Without it, a shred
-# named '$jsono$set' duplicated the marker field (an unusable type) and 'body' declared a column the
-# value path rejects.
-statement error
-SELECT jsono_storage_type('"$jsono$set" VARCHAR');
+# No JSON key is reserved any more. A lane is named by the base32hex encoding of its path, drawn from
+# `0-9a-v`, so it can be neither the word `body` (the residual field) nor anything under the reserved
+# `$jsono$` prefix — the collision the two former bans guarded against is unrepresentable, and a
+# document key spelled like a layout field shreds like any other. (A `$`-leading key still needs its
+# quoted `$.`-rooted spelling — that is the spec DSL's own reservation, not the format's.) Both sides
+# still agree, which is the point of the shared parse.
+query I
+SELECT jsono_storage_type('"$.""$jsono$set""" VARCHAR')
+     = typeof(jsono('{"$jsono$set":"x"}', shredding := {'$."$jsono$set"':'VARCHAR'}));
 ----
-reserved
+true
 
-statement error
-SELECT jsono_storage_type('"$jsono$spill$0" VARCHAR');
+query I
+SELECT jsono_storage_type('"$.""$jsono$spill$0""" VARCHAR')
+     = typeof(jsono('{"$jsono$spill$0":"x"}', shredding := {'$."$jsono$spill$0"':'VARCHAR'}));
 ----
-reserved
+true
 
-statement error
-SELECT jsono_storage_type('body BIGINT');
+query I
+SELECT jsono_storage_type('body BIGINT') = typeof(jsono('{"body":1}', shredding := {'body':'BIGINT'}));
 ----
-cannot be named 'body'
+true
 
 # Unsupported shred types are rejected here, not only later by the constructor.
 statement error
@@ -135,11 +139,24 @@ SELECT jsono_storage_type('a JSON');
 ----
 unsupported shred type
 
-# The path form '$.body' is a different field name and stays allowed (matches the constructor).
+# `body` and `$.body` are two spellings of ONE path, so they now name one lane: the DDL helper and the
+# constructor agree whichever spelling either is given.
 query I
 SELECT jsono_storage_type('"$.body" BIGINT') = typeof(jsono('{"body":1}', shredding := {'$.body':'BIGINT'}));
 ----
 true
+
+query I
+SELECT jsono_storage_type('"$.body" BIGINT') = jsono_storage_type('body BIGINT');
+----
+true
+
+# Two columns resolving to one path cannot both be fields of one STRUCT, so the DDL helper refuses
+# loudly rather than emit a type it cannot build.
+statement error
+SELECT jsono_storage_type('body BIGINT, "$.body" BIGINT');
+----
+name the same shred path
 
 # Every shred path must be an object-key chain, matching the constructor: an array-index step is
 # rejected whether the shred type is an array or a scalar.
@@ -186,7 +203,7 @@ FROM (VALUES (NULL::VARCHAR), (NULL::VARCHAR), (NULL::VARCHAR)) t(s);
 # value->SQL->value round-trip narrows lanes the same way; see docs/jsono_format.md "Layout
 # revisions"), so the answer is to declare storage columns with jsono_storage_type().
 statement ok
-CREATE TABLE hand_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a INTEGER))));
+CREATE TABLE hand_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 INTEGER))));
 
 statement ok
 INSERT INTO hand_declared SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'});
@@ -198,14 +215,14 @@ NULL	NULL
 
 # The same bytes read back in full once the column type matches what the constructor produces.
 query I
-SELECT to_json(v::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT))))
+SELECT to_json(v::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
 FROM hand_declared;
 ----
 {"a":1,"b":"x"}
 
 # Declared with the type the helper emits for the same shred set, the INSERT reads back as written.
 statement ok
-CREATE TABLE helper_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT))));
+CREATE TABLE helper_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))));
 
 
 statement ok

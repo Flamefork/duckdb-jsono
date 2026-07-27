@@ -14,12 +14,13 @@ FROM range(3000) tt(i);
 statement ok
 PRAGMA explain_output='physical_only';
 
-# PUSHED (projection): a total scalar shred lane is pushed into the scan as a bare `.shreds."<path>"`
-# column read — no COALESCE, no extract function, no reconstruct.
+# PUSHED (projection): a total scalar shred lane is pushed into the scan as a bare `.shreds.<lane>`
+# column read — no COALESCE, no extract function, no reconstruct. `al94o000e1gn8q0000` is the lane of
+# $.URL.path: a lane name is the encoded path, so that is how the plan spells it.
 query II
 EXPLAIN SELECT ep ->> '$.URL.path' FROM tot;
 ----
-physical_plan	<REGEX>:.*shreds.*URL.*path.*
+physical_plan	<REGEX>:.*shreds.*al94o000e1gn8q0000.*
 
 query II
 EXPLAIN SELECT ep ->> '$.URL.path' FROM tot;

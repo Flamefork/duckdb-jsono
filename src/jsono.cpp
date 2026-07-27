@@ -79,12 +79,67 @@ void JsonoLayoutDiagnoseExecute(DataChunk &args, ExpressionState &state, Vector 
 	result.SetValue(0, Value(info.diagnosis));
 }
 
+// jsono_layout_lanes(value) -> the shred lanes of `value`'s type as (logical path, type), ordered
+// as the type carries them. A lane's STRUCT field name is the base32hex encoding of its path (see
+// the lane-name boundary in jsono_path.hpp), so reading the schema by eye no longer answers "which
+// paths are shredded here" — this does, and it is the reason that trade is affordable. Like
+// jsono_layout_diagnose it is a question about the TYPE, answered at bind, reading no bytes; a type
+// with no lanes (plain, or not JSONO at all) yields an empty list rather than an error, since
+// "which lanes" has an honest empty answer and jsono_layout_diagnose owns "is this JSONO".
+struct JsonoLayoutLanesBindData : public FunctionData {
+	explicit JsonoLayoutLanesBindData(Value lanes_p) : lanes(std::move(lanes_p)) {
+	}
+	Value lanes;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<JsonoLayoutLanesBindData>(lanes);
+	}
+	bool Equals(const FunctionData &other) const override {
+		return lanes == other.Cast<JsonoLayoutLanesBindData>().lanes;
+	}
+};
+
+LogicalType JsonoLayoutLanesResultType() {
+	child_list_t<LogicalType> lane;
+	lane.emplace_back("path", LogicalType::VARCHAR);
+	lane.emplace_back("type", LogicalType::VARCHAR);
+	return LogicalType::LIST(LogicalType::STRUCT(std::move(lane)));
+}
+
+unique_ptr<FunctionData> JsonoLayoutLanesBind(ClientContext &context, ScalarFunction &bound_function,
+                                              vector<unique_ptr<Expression>> &arguments) {
+	(void)context;
+	(void)bound_function;
+	JsonoLayoutType layout;
+	vector<Value> lanes;
+	if (TryParseJsonoLayoutType(arguments[0]->return_type, layout)) {
+		for (auto &shred : layout.shreds) {
+			child_list_t<Value> lane;
+			lane.emplace_back("path", Value(JsonoLaneLogicalPath(shred.first)));
+			// The lane type is reported logically too: an object-array lane's element subfields are
+			// encoded one-step paths in the stored type, and printing those would both hide the JSON
+			// keys and break pasting the answer back into a shredding spec.
+			lane.emplace_back("type", Value(JsonoLaneLogicalType(shred.second).ToString()));
+			lanes.push_back(Value::STRUCT(std::move(lane)));
+		}
+	}
+	auto element_type = ListType::GetChildType(JsonoLayoutLanesResultType());
+	return make_uniq<JsonoLayoutLanesBindData>(Value::LIST(element_type, std::move(lanes)));
+}
+
+void JsonoLayoutLanesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)args;
+	auto &info = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoLayoutLanesBindData>();
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	result.SetValue(0, info.lanes);
+}
+
 // jsono_storage_type(shreds) -> the shredded storage type's DDL: the 6-BLOB residual plus the
 // given shred columns, so a schema can declare a shredded jsono column from a readable shred spec
-// (e.g. 'event_name VARCHAR, n BIGINT'). The shred DDL is parsed into (name, type) and re-emitted
-// through JsonoShreddedStructType, so the declared column is byte-identical to a value built from
-// the same shreds. Shred specs are rejected by the same validation the constructor uses, so a declared
-// column always matches some value the constructor can produce.
+// (e.g. 'event_name VARCHAR, n BIGINT'). The column names are the public spec DSL's paths, parsed
+// and re-emitted through JsonoShreddedStructType, so the declared column is byte-identical to a
+// value built from the same shreds. Shred specs go through the same parse the constructor uses, so
+// a declared column always matches some value the constructor can produce.
 void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	// Parser::ParseColumnList parses the DDL but leaves binder-resolved type aliases (UBIGINT and the
 	// other unsigned ints, nested ones included) as unresolved USER types; bind each shred type so a
@@ -92,20 +147,39 @@ void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, 
 	auto binder = Binder::CreateBinder(state.GetContext());
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t shreds) {
 		auto columns = Parser::ParseColumnList(shreds.GetString());
-		child_list_t<LogicalType> shred_types;
+		vector<JsonoLaneSpec> lanes;
+		vector<string> lane_names;
+		vector<string> spec_names;
 		for (auto &col : columns.Logical()) {
 			auto type = col.Type();
 			binder->BindLogicalType(type);
-			JsonoValidateShredField(col.Name(), type);
-			shred_types.emplace_back(col.Name(), type);
+			auto lane = JsonoParseShredSpecField(col.Name(), type);
+			auto lane_name = JsonoEncodeLaneName(lane.path);
+			for (idx_t i = 0; i < lane_names.size(); i++) {
+				if (lane_names[i] == lane_name) {
+					// Two DDL columns naming one path would be two fields of one name — impossible in a
+					// STRUCT. The spellings differ (DuckDB already rejects a literal duplicate), so name both.
+					throw BinderException("jsono_storage_type: columns '%s' and '%s' name the same shred path",
+					                      spec_names[i], col.Name());
+				}
+			}
+			lane_names.push_back(std::move(lane_name));
+			spec_names.push_back(col.Name());
+			lanes.push_back(std::move(lane));
 		}
-		// Canonical shred order (sorted by name) so the DDL matches a value built from the same shreds
-		// regardless of the order they are written in here vs the shredding spec.
-		std::sort(shred_types.begin(), shred_types.end(),
-		          [](const std::pair<string, LogicalType> &a, const std::pair<string, LogicalType> &b) {
-			          return a.first < b.first;
-		          });
-		return StringVector::AddString(result, JsonoShreddedStructType(shred_types).ToString());
+		// Canonical shred order (sorted by encoded lane name) so the DDL matches a value built from the
+		// same shreds regardless of the order they are written in here vs the shredding spec.
+		vector<idx_t> order(lanes.size());
+		for (idx_t i = 0; i < order.size(); i++) {
+			order[i] = i;
+		}
+		std::sort(order.begin(), order.end(), [&](idx_t a, idx_t b) { return lane_names[a] < lane_names[b]; });
+		vector<JsonoLaneSpec> sorted;
+		sorted.reserve(lanes.size());
+		for (auto i : order) {
+			sorted.push_back(std::move(lanes[i]));
+		}
+		return StringVector::AddString(result, JsonoShreddedStructType(sorted).ToString());
 	});
 }
 
@@ -162,10 +236,11 @@ bool TryReadRevisionedName(const string &name, const char *stem, idx_t &revision
 	return TryReadCanonicalIndex(name.substr(stem_size + 1), revision);
 }
 // Reserved name of the shred-set marker, the field every writer emits first inside `shreds`. It is a BIGINT hash of the
-// shred set (paths + types) — schema identity across files, and the mandatory shared member that lets
-// a by-name struct cast bind between any two shred sets (even disjoint ones). The `$jsono$` prefix
-// cannot occur in a shred path (the shred-spec parsers reject the reserved prefix), so no shred can
-// collide with either reserved field.
+// shred set (lane names + types) — schema identity across files, and the mandatory shared member that lets
+// a by-name struct cast bind between any two shred sets (even disjoint ones). A lane name is drawn
+// from the base32hex alphabet `0-9a-v` (see the lane-name boundary in jsono_path.hpp), so it can
+// start with neither `$` nor anything else outside that alphabet: no shred can collide with a
+// reserved field, structurally rather than by a check.
 constexpr const char *JSONO_SHRED_SET = "$jsono$set";
 // Reserved name stem of the per-row spill bitmap columns, the fields every writer emits right after the marker inside
 // `shreds`: "$jsono$spill$0", "$jsono$spill$1", … (see JsonoShredSpillName in jsono.hpp for the bit
@@ -187,12 +262,6 @@ bool TryParseSpillColumnName(const string &name, idx_t &column) {
 	}
 	return TryReadCanonicalIndex(name.substr(stem_size + 1), column);
 }
-// The reserved layout-field namespace inside `shreds`: every non-shred member is named under it.
-constexpr const char *JSONO_RESERVED_PREFIX = "$jsono$";
-
-bool HasJsonoReservedPrefix(const string &name) {
-	return name.compare(0, strlen(JSONO_RESERVED_PREFIX), JSONO_RESERVED_PREFIX) == 0;
-}
 
 // A scalar shred field is its bare value type; an array shred field is a LIST as-is. Either way the
 // field type IS the shred's logical value type. Returns false when `type` is neither.
@@ -202,6 +271,24 @@ bool UnwrapShredFieldType(const LogicalType &type, LogicalType &value_type) {
 		return true;
 	}
 	return false;
+}
+
+// An object-array lane's element STRUCT names its subfields by the same codec one level down (a
+// subfield is a one-step path), so the grammar must gate them too: CombineStructTypes recurses into
+// element structs, and an unencoded subfield name would collapse case-insensitively exactly like a
+// lane name. A non-canonical subfield is a hand-built or foreign struct, not a lane any writer
+// emitted, and every reader that decodes one would throw mid-read.
+bool ShredSubfieldNamesAreCanonical(const LogicalType &type) {
+	if (!IsShredArrayType(type)) {
+		return true;
+	}
+	for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(type))) {
+		vector<PathStep> steps;
+		if (!JsonoTryDecodeLaneName(sub.first, steps) || steps.size() != 1) {
+			return false;
+		}
+	}
+	return true;
 }
 
 // The anchor's shape requirement: a named STRUCT of nothing but BLOBs. Revision-neutral — every
@@ -241,7 +328,7 @@ JsonoLayoutMatch RejectNotJsono(string *reason, const char *format, ARGS... args
 // field name `jsono` plus a field 0 named `body` or `body$<digits>` whose type is a STRUCT of pure
 // BLOBs; it is narrow enough that no user struct hits it by accident and permanent, so a value
 // written under a DIFFERENT revision is classified Foreign rather than silently passed over. Past
-// the anchor the current grammar is: the six-BLOB body struct at `body$1`, optionally a `shreds$1`
+// the anchor the current grammar is: the six-BLOB body struct at `body$1`, optionally a `shreds$2`
 // STRUCT sibling holding the shred-set marker, the spill bitmap columns and one field per shred.
 // The single, unrevisioned layout name (`jsono` for
 // plain and shredded) is deliberate: DuckDB reconciles set-operation branch types by field name
@@ -269,7 +356,7 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 	}
 	// Read every revisioned stem, not just the leading pair. Two stems of the same kind mean the type
 	// is a MIXTURE of revisions — a multi-file scan (`union_by_name`) merges per-file schemas by name,
-	// so an old file beside a current one yields `body$1, shreds$1, body, shreds` in whichever order
+	// so an old file beside a current one yields `body$1, shreds$2, body, shreds` in whichever order
 	// the files were listed. Without this the classification depended on that order: an old file first
 	// was refused, a current file first passed the anchor, failed the grammar and went silently
 	// NotJsono — the whole scan, current rows included, then read as NULL through core json. Naming a
@@ -391,24 +478,27 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 			spill_seen[column] = true;
 			continue;
 		}
-		// A lane name that is not a non-empty pure object-key chain (an array-index or root '$' path)
-		// cannot be a shred: no writer produces one, and every reconstruct-based reader would throw on
-		// it. A reserved-prefix name cannot be one either. Rejecting them here keeps such a raw-cast /
-		// stored struct from being recognized as JSONO.
-		if (HasJsonoReservedPrefix(shred_fields[i].first)) {
-			return RejectNotJsono(reason, "field '%s' uses the reserved '%s' namespace but is not a layout field",
-			                      shred_fields[i].first, JSONO_RESERVED_PREFIX);
-		}
-		if (!ShredNameIsObjectKeyPath(shred_fields[i].first)) {
+		// Everything left is a lane, and a lane is named by the encoding of its path: a name that does
+		// not decode canonically is one no writer could have minted, so the struct is a raw-cast or
+		// hand-built value rather than a JSONO one. Canonicity subsumes the old object-key-path check
+		// (a decode yields nothing but a non-empty chain of keys) and the old reserved-prefix check
+		// (the alphabet `0-9a-v` cannot spell `$jsono$…`).
+		if (!JsonoLaneNameIsCanonical(shred_fields[i].first)) {
 			return RejectNotJsono(reason,
-			                      "field '%s' is not a shred path: a shred is named by a non-empty object-key "
-			                      "path (array-index and root '$' paths cannot be shredded)",
+			                      "field '%s' is not a shred lane: a lane is named by the base32hex encoding of "
+			                      "its object-key path, and this name does not decode canonically",
 			                      shred_fields[i].first);
 		}
 		LogicalType value_type;
 		if (!UnwrapShredFieldType(shred_fields[i].second, value_type)) {
 			return RejectNotJsono(reason, "shred '%s' is %s, which is not a shred value type or LIST of one",
 			                      shred_fields[i].first, shred_fields[i].second.ToString());
+		}
+		if (!ShredSubfieldNamesAreCanonical(value_type)) {
+			return RejectNotJsono(reason,
+			                      "array shred '%s' has an element subfield whose name is not the base32hex "
+			                      "encoding of a single object key",
+			                      shred_fields[i].first);
 		}
 		shreds.emplace_back(shred_fields[i].first, value_type);
 	}
@@ -589,25 +679,12 @@ idx_t JsonoFindShredsFieldIndex(const LogicalType &shreds_type, const string &na
 	return DConstants::INVALID_INDEX;
 }
 
-void JsonoValidateShredFieldName(const string &name) {
-	if (name == JSONO_BODY_STEM) {
-		// The residual field beside the `shreds` struct is named after this stem. A bare 'body' shred name
-		// is rejected for clarity and to keep the DDL path consistent with the constructor; the path form
-		// '$.body' is a different name and is fine.
-		throw BinderException("jsono shred: a shred cannot be named 'body' (the residual field); "
-		                      "shred the JSON key through its path form '$.body'");
-	}
-	if (HasJsonoReservedPrefix(name)) {
-		throw BinderException("jsono shred: '%s' collides with the reserved '%s' layout field namespace", name,
-		                      JSONO_RESERVED_PREFIX);
-	}
-	if (!ShredNameIsObjectKeyPath(name)) {
-		throw BinderException("jsono shred: shred path '%s' must be a non-empty object-key path "
-		                      "(array-index and root '$' paths cannot be shredded)",
-		                      name);
-	}
-}
-
+// The canonical rank of each name: its position in the byte-wise sorted list. The names are the
+// ENCODED lane names, and sorting them IS sorting the lanes' paths — both stages of the codec are
+// order-preserving (see the lane-name boundary in jsono_path.hpp). That equality is a property of
+// THAT serialization, not of encoding in general: re-verify it first if the codec ever changes,
+// because the spill bit numbering, the type's canonical field order and the sort-merges against the
+// residual's byte-sorted document keys all rest on it.
 vector<idx_t> JsonoSpillRanksOfNames(const vector<string> &names) {
 	vector<idx_t> order(names.size());
 	for (idx_t i = 0; i < names.size(); i++) {
@@ -639,7 +716,7 @@ uint64_t JsonoLayoutHashOf(const LogicalType &type) {
 	return jsono::HashShredManifestSignatures(signatures);
 }
 
-LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds) {
+LogicalType JsonoShreddedStructType(const vector<JsonoLaneSpec> &shreds) {
 	// `shreds` STRUCT: the marker, the ⌈N/63⌉ spill bitmap columns, then one field per shred — a
 	// scalar shred is its bare value type, an array shred (LIST) is kept as-is. The marker
 	// (JsonoShredSetName) is the canonical layout hash of the shred set (its uint64 bits
@@ -657,8 +734,9 @@ LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds) {
 	for (idx_t column = 0; column < JsonoSpillColumnCount(shreds.size()); column++) {
 		shred_children.emplace_back(SpillColumnName(column), LogicalType::BIGINT);
 	}
+	// The one place a lane's physical field name is minted.
 	for (auto &shred : shreds) {
-		shred_children.push_back(shred);
+		shred_children.emplace_back(JsonoEncodeLaneName(shred.path), shred.type);
 	}
 	child_list_t<LogicalType> layout_children;
 	layout_children.emplace_back(JsonoBodyName(), JsonoBodyStructType());
@@ -700,10 +778,25 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 	}
 	{
 		// ANY, and no jsono check in the bind: the whole point is answering for a value the grammar
-		// REFUSED, which a JSONO-typed parameter could never receive.
+		// REFUSED, which a JSONO-typed parameter could never receive. SPECIAL_HANDLING because the
+		// answer is about the TYPE and reads no bytes: a NULL value has a type like any other, and
+		// letting the executor short-circuit it would blank the diagnostic exactly on the all-NULL
+		// column someone is trying to explain.
 		ScalarFunctionSet set("jsono_layout_diagnose");
-		set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::VARCHAR, JsonoLayoutDiagnoseExecute,
-		                               JsonoLayoutDiagnoseBind));
+		ScalarFunction diagnose({LogicalType::ANY}, LogicalType::VARCHAR, JsonoLayoutDiagnoseExecute,
+		                        JsonoLayoutDiagnoseBind);
+		diagnose.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		set.AddFunction(std::move(diagnose));
+		loader.RegisterFunction(set);
+	}
+	{
+		// ANY and SPECIAL_HANDLING for the same reasons as jsono_layout_diagnose: the answer is about
+		// the type, and a type the grammar refused — or a NULL value — must still be answerable.
+		ScalarFunctionSet set("jsono_layout_lanes");
+		ScalarFunction lanes({LogicalType::ANY}, JsonoLayoutLanesResultType(), JsonoLayoutLanesExecute,
+		                     JsonoLayoutLanesBind);
+		lanes.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		set.AddFunction(std::move(lanes));
 		loader.RegisterFunction(set);
 	}
 }

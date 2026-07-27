@@ -141,11 +141,11 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 	// shred set, not of argument order: the executor writes shreds by result_child_index, so the index
 	// order and the type's shred order must agree.
 	std::sort(shreds.begin(), shreds.end(), [](const MergeShred &a, const MergeShred &b) { return a.name < b.name; });
-	child_list_t<LogicalType> shred_types;
+	vector<JsonoLaneSpec> lanes;
 	idx_t next = 0; // shred-relative index inside the result's `.shreds` struct
 	for (auto &shred : shreds) {
 		shred.result_child_index = next++;
-		shred_types.emplace_back(shred.name, shred.type);
+		lanes.push_back(JsonoLaneSpec {shred.steps, shred.type});
 	}
 	for (idx_t k = 0; k < shreds.size(); k++) {
 		if (shreds[k].steps.size() == 1) {
@@ -154,7 +154,7 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 	}
 	std::sort(bind_data->top_level_shreds.begin(), bind_data->top_level_shreds.end(),
 	          [&](idx_t a, idx_t b) { return shreds[a].steps[0].key < shreds[b].steps[0].key; });
-	bound_function.return_type = JsonoShreddedStructType(shred_types);
+	bound_function.return_type = JsonoShreddedStructType(lanes);
 	return std::move(bind_data);
 }
 
@@ -732,13 +732,14 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// that carries a value has no copy in the residual (the no-conflict gate above) —
 			// exactly what the manifest must record, or a later raw narrowing cast would lose it
 			// silently. Re-emit each row's skips with the manifest of its non-NULL shreds.
-			vector<JsonoShredManifestEntryBytes> manifest_entries(bind_data.shreds.size());
+			vector<std::pair<string, LogicalType>> manifest_shreds;
 			vector<UnifiedVectorFormat> shred_fmt(bind_data.shreds.size());
 			for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
 				auto &shred = bind_data.shreds[k];
-				manifest_entries[k] = JsonoShredManifestEntry(shred.name, shred.type);
+				manifest_shreds.emplace_back(shred.name, shred.type);
 				JsonoShredVector(result, shred.result_child_index).ToUnifiedFormat(count, shred_fmt[k]);
 			}
+			auto manifest_entries = JsonoShredManifestEntries(manifest_shreds);
 			auto fr_skips = FlatVector::GetData<string_t>(*fr_blobs[BODY_SKIPS]);
 			auto &fr_skips_validity = FlatVector::Validity(*fr_blobs[BODY_SKIPS]);
 			auto &r_skips = writer.Skips();

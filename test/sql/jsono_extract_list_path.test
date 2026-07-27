@@ -130,8 +130,9 @@ EXPLAIN select json_extract_string(e, list_value('$.clientID', '$.counterUserIDH
 ----
 physical_plan	<!REGEX>:.*jsono_overlay.*
 
-# The scan prunes to the individual shred lanes instead of reading the whole value.
+# The scan prunes to the individual shred lanes instead of reading the whole value. `cdm6ipbeeh4k8000`
+# is the lane of `$.clientID` — a lane name is the encoded path, so the plan names it that way.
 query II
 EXPLAIN select json_extract_string(e, list_value('$.clientID', '$.counterUserIDHash')) from docs;
 ----
-physical_plan	<REGEX>:.*shreds.*clientID.*
+physical_plan	<REGEX>:.*shreds.*cdm6ipbeeh4k8000.*

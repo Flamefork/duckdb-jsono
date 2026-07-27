@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "jsono_path.hpp"
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -32,7 +34,7 @@ class ClientContext;
 
 // A jsono value is physically a nested STRUCT with exactly one layout field, named "jsono" for
 // both plain and shredded values. Inside the layout field live a `body$1` STRUCT of six BLOBs (the
-// binary JSONO body, see JsonoBodyStructType) and, for shredded values, a `shreds$1` STRUCT holding
+// binary JSONO body, see JsonoBodyStructType) and, for shredded values, a `shreds$2` STRUCT holding
 // a reserved `$jsono$set` marker (the shred-set hash), the reserved `$jsono$spill$0`, `$jsono$spill$1`,
 // … bitmap columns (per-row spilled-shred bits) plus one field per shred — a scalar shred is a bare
 // typed lane, an array shred is a LIST. The `$<N>` suffixes are the layout revisions (see
@@ -74,15 +76,52 @@ LogicalType JsonoRawStructType();
 // identical for plain and shredded.
 LogicalType JsonoBodyStructType();
 
+// One lane of a shred set as its producers hold it: the LOGICAL object-key path it lifts and the
+// lane's value type. The physical STRUCT field name is derived from the path, never spelled by the
+// caller — see JsonoShreddedStructType.
+struct JsonoLaneSpec {
+	vector<PathStep> path;
+	LogicalType type;
+};
+
 // The physical STRUCT of a shredded JSONO value: STRUCT("jsono" STRUCT("body$1" STRUCT(6 BLOB),
-// "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT [, "$jsono$spill$1" …], <shred fields>))).
+// "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT [, "$jsono$spill$1" …], <shred fields>))).
 // One shred field per `shreds` entry — a scalar shred is its bare value type, an array shred is the
 // LIST as-is. This is the single source of truth for the shredded shape: the constructor and
 // `jsono_storage_type` both build it here, so a column declared from the same shreds is
-// byte-identical to the value's type. Shred field order follows `shreds`; callers pass them in
-// canonical (name-sorted) order so the type is a pure function of the shred set, and they write
-// shreds in that same order (shreds are written by index, so field and value order must agree).
-LogicalType JsonoShreddedStructType(const child_list_t<LogicalType> &shreds);
+// byte-identical to the value's type.
+//
+// It is also the ONE place a lane's physical field name is minted (JsonoEncodeLaneName over the
+// logical path). Taking paths rather than names is what makes that true: a producer holding an
+// already-encoded name (a merged layout, the optimizer's canonical order) must decode it to get
+// here, so no caller can smuggle a hand-spelled name into the type.
+//
+// Shred field order follows `shreds`; callers pass them in canonical (encoded-name-sorted) order so
+// the type is a pure function of the shred set, and they write shreds in that same order (shreds
+// are written by index, so field and value order must agree). Sorting is deliberately NOT done here
+// — it would silently desync a caller's own shred write order from the type's field order.
+LogicalType JsonoShreddedStructType(const vector<JsonoLaneSpec> &shreds);
+
+// A lane's type as the shred manifest spells it: identical to the stored type except that an
+// object-array lane's element subfield names are decoded back to the JSON keys they encode. The
+// manifest is a per-row statement about the DOCUMENT, so neither half of an entry may carry the
+// encoding — otherwise a future codec change would rewrite the bytes of every stored row, which is
+// exactly what keeping the manifest logical buys. Writer and reader both build their side through
+// this, so the comparison stays a byte compare.
+inline LogicalType JsonoLaneLogicalType(const LogicalType &lane_type) {
+	if (lane_type.id() != LogicalTypeId::LIST) {
+		return lane_type;
+	}
+	auto &element = ListType::GetChildType(lane_type);
+	if (element.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(element)) {
+		return lane_type;
+	}
+	child_list_t<LogicalType> children;
+	for (auto &sub : StructType::GetChildTypes(element)) {
+		children.emplace_back(ShredNamePath(sub.first, "jsono lane subfield")[0].key, sub.second);
+	}
+	return LogicalType::LIST(LogicalType::STRUCT(std::move(children)));
+}
 
 // The top-level field name of every layout (plain and shredded): "jsono". The permanent anchor —
 // it never carries a revision, so a value of ANY revision stays recognizable as JSONO.
@@ -92,7 +131,7 @@ string JsonoLayoutName();
 string JsonoBodyName();
 
 // The revisioned name of the nested STRUCT (sibling of the residual) that holds the shred set:
-// "shreds$1". Shredded-ness is exactly the presence of this field.
+// "shreds$2". Shredded-ness is exactly the presence of this field.
 string JsonoShredsName();
 
 // The reserved name of the shred-set marker, the field every writer emits first inside `shreds`. A BIGINT carrying the
@@ -164,16 +203,8 @@ inline idx_t JsonoSpillColumnCount(idx_t shred_count) {
 	return (shred_count + JSONO_SPILL_BITS - 1) / JSONO_SPILL_BITS;
 }
 
-// Throw a BinderException if `name` collides with a reserved layout field: the `body` stem (the
-// residual, rejected for consistency — a value-path shred cannot be named it either) or the reserved
-// `$jsono$` name prefix (the marker and the spill bitmap live there; reserving the whole prefix
-// keeps future layout fields collision-free). Shared by the shredding-spec constructor
-// (ParseShredSpec) and the DDL path (jsono_storage_type) so both reject the same names —
-// otherwise jsono_storage_type emits a type the constructor can never produce or insert into.
-void JsonoValidateShredFieldName(const string &name);
-
 // Canonical layout hash of a shredded jsono type: HashShredManifestSignatures over its shreds
-// (path + logical value type) in type order. Returns 0 for a plain / non-shredded type.
+// (encoded lane name + logical value type) in type order. Returns 0 for a plain / non-shredded type.
 // Writers stamp this into the shred-set marker; the optimizer recomputes it from the read type
 // to verify per-scan shred-set coverage before trusting the spill bitmap.
 uint64_t JsonoLayoutHashOf(const LogicalType &type);
@@ -188,18 +219,20 @@ vector<idx_t> JsonoSpillRanksOfNames(const vector<string> &names);
 enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 
 // The layout revisions this build reads and writes. They are carried in the layout field NAMES
-// (`body$1`, `shreds$1`) because a name is the only thing that survives Parquet and DuckLake, and
+// (`body$1`, `shreds$2`) because a name is the only thing that survives Parquet and DuckLake, and
 // they are split because they version independent things: `body$N` the residual's column layout
 // (the set, names and types of the body blobs), `shreds$M` the shred layout (the reserved fields
-// inside `shreds`, the lane shape, the spill bit numbering, the marker's meaning). Splitting them
+// inside `shreds`, how a lane's path becomes its field name, the lane shape, the spill bit
+// numbering, the marker's meaning). Splitting them
 // keeps a shred-layout change from invalidating plain values, which are the bulk of stored data.
 // Neither versions the bytes INSIDE the blobs — that is jsono::VERSION.
 //
 // Bump `body$N` when a body blob column is added, removed, renamed or retyped. Bump `shreds$M`
-// when the reserved field set inside `shreds`, the lane shape, the canonical rank numbering, the
-// marker semantics or the spill bit encoding change — INCLUDING purely semantic changes the type
-// cannot show, which is the case golden-byte tests exist to catch. Neither is bumped by the user's
-// shred set or by the ⌈N/63⌉ spill column count: those are data under a fixed layout.
+// when the reserved field set inside `shreds`, the LANE NAMING (the path → field-name codec), the
+// lane shape, the canonical rank numbering, the marker semantics or the spill bit encoding change —
+// INCLUDING purely semantic changes the type cannot show, which is the case golden-byte tests exist
+// to catch. Neither is bumped by the user's shred set or by the ⌈N/63⌉ spill column count: those are
+// data under a fixed layout.
 //
 // Closing a revision is a three-step commit: bump the name here; add a closed-revision fixture
 // (a struct literal over a live body) to test/sql/jsono_layout_revision.test asserting the loud
@@ -211,7 +244,7 @@ enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 // old files the way back (which commit to build, or the struct rebuild that upgrades in place),
 // not an archive.
 constexpr idx_t JSONO_BODY_REVISION = 1;
-constexpr idx_t JSONO_SHREDS_REVISION = 1;
+constexpr idx_t JSONO_SHREDS_REVISION = 2;
 
 // A parsed JSONO layout field: its shred (path, LOGICAL-value-type) columns (empty for plain; a
 // scalar shred's bare lane and an array shred's list are recorded by their value type) and the
@@ -271,7 +304,7 @@ string JsonoDescribeForeignLayout(const JsonoLayoutType &layout);
 void JsonoRejectForeignLayout(const LogicalType &type, const string &context);
 
 // Parse `type` as an ordinary JSONO value of the CURRENT revision: a top-level STRUCT with exactly
-// one valid `jsono` layout field (`body$1` only for plain, `body$1` + non-empty `shreds$1` for
+// one valid `jsono` layout field (`body$1` only for plain, `body$1` + non-empty `shreds$2` for
 // shredded). The single classifier the thin predicates (IsJsonoType / IsShreddedJsonoType) delegate
 // to; a foreign layout answers false here, so callers that must reject it loudly go through
 // JsonoRejectForeignLayout first.
@@ -283,7 +316,7 @@ bool TryParseJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out);
 bool IsJsonoType(const LogicalType &type);
 
 // True when `type` is a shredded JSONO struct: a `jsono` layout field carrying `body$1` plus a
-// non-empty `shreds$1`. Set operations over differently-shredded values reconcile into this same
+// non-empty `shreds$2`. Set operations over differently-shredded values reconcile into this same
 // shape (the shred union), so there is no separate merged classification.
 bool IsShreddedJsonoType(const LogicalType &type);
 
@@ -669,9 +702,13 @@ inline uint64_t HashShredManifestSignatures(const std::vector<std::pair<std::str
 }
 
 // The shred manifest is the tail of the skips blob, after the checkpoint sections. It is either a
-// full path/type entry list or a compact type-code entry list (see docs/jsono_format.md). Entries
-// follow canonical shred order. A plain value writes no manifest (the skips blob ends at the
-// checkpoints), which reads as zero entries.
+// full path/type entry list or a compact type-code entry list (see docs/jsono_format.md). An entry
+// records the lane's LOGICAL path (the `$.`-always text), not its encoded field name: the manifest
+// is a per-row statement about the DOCUMENT, while the encoding is a transport artifact of a DuckDB
+// limitation at the TYPE level. Entries are sorted by that logical path — which is NOT the type's
+// field order (that follows the encoded name), so writers order them explicitly; the two-pointer
+// walkers of keyed group_merge merge manifest against shreds under this order. A plain value writes
+// no manifest (the skips blob ends at the checkpoints), which reads as zero entries.
 // The manifest is the write-time record of which paths are NOT in the residual: a reader holding
 // fewer (or differently typed) shreds than the manifest lists cannot reproduce the value — that row
 // was narrowed by a raw struct cast — and must fail loud instead of silently dropping the value.

@@ -64,13 +64,7 @@ struct GroupMergeBindData : public FunctionData {
 		for (idx_t f = 0; f < shreds.size(); f++) {
 			auto &plan = shred_plan[f];
 			plan.kind = ClassifyShredKind(shreds[f].second);
-			auto &name = shreds[f].first;
-			plan.steps = ShredNamePath(name, "jsono_group_merge shred");
-			for (auto &step : plan.steps) {
-				if (step.kind != PathStepKind::Key) {
-					throw BinderException("jsono_group_merge: shred path '%s' is not an object-key path", name);
-				}
-			}
+			plan.steps = ShredNamePath(shreds[f].first, "jsono_group_merge shred");
 			if (plan.kind == ShredKind::Scalar) {
 				plan.prim = jsono::JsonoScalarPrimitiveFromType(shreds[f].second, "jsono_group_merge shred");
 			} else {
@@ -663,11 +657,10 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 	}
 	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
 	vector<Vector *> lane_out(bind_data.shreds.size());
-	vector<JsonoShredManifestEntryBytes> manifest_entries(bind_data.shreds.size());
+	auto manifest_entries = JsonoShredManifestEntries(bind_data.shreds);
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 		lane_out[f] = &jsono::JsonoShredVector(result, f);
 		lane_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
-		manifest_entries[f] = JsonoShredManifestEntry(bind_data.shreds[f].first, bind_data.shreds[f].second);
 	}
 	JsonoBuilder empty_builder;
 	std::string skips_buf;

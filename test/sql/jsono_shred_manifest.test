@@ -13,7 +13,9 @@ SELECT typeof(jsono_shred_manifest(jsono('{"a":1}')));
 STRUCT(path VARCHAR, "type" VARCHAR)[]
 
 # A shredded value lists every path the writer stripped into a shred column, with its shred type,
-# in canonical (sorted) manifest order. Unnest + sort for a deterministic comparison.
+# in canonical (sorted) manifest order. A manifest entry names the lane's LOGICAL path in the
+# project's one text form ($.-always) — not the lane's encoded STRUCT field name, because the
+# manifest is a statement about the document, not about the type. Unnest + sort for a deterministic comparison.
 query II
 SELECT m.path, m.type
 FROM (
@@ -23,9 +25,9 @@ FROM (
 )
 ORDER BY m.path;
 ----
-a	VARCHAR
-b	BIGINT
-c	BOOLEAN
+$.a	VARCHAR
+$.b	BIGINT
+$.c	BOOLEAN
 
 # A plain value (no shredding) stripped nothing: the manifest is an EMPTY list, not NULL.
 query I
@@ -72,7 +74,7 @@ FROM (
 )
 ORDER BY m.path;
 ----
-b	BIGINT
+$.b	BIGINT
 
 # jsono_shred_manifest reads the row's own claim and does NOT raise on a narrowed row: even a value
 # whose manifest lists more shreds than the inspected type carries reads its raw manifest tail. Here a
@@ -120,6 +122,6 @@ FROM (
 )
 ORDER BY m.path;
 ----
-a	VARCHAR
-b	BIGINT
-c	BOOLEAN
+$.a	VARCHAR
+$.b	BIGINT
+$.c	BOOLEAN

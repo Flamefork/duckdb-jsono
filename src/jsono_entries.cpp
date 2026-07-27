@@ -155,7 +155,8 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 			}
 			if (ClassifyShredKind(shred.type) == ShredKind::Array) {
 				for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(shred.type))) {
-					shred.subfield_keys.push_back(sub.first);
+					// An element field name is encoded like a lane name; the entry key is the JSON key.
+					shred.subfield_keys.push_back(ShredNamePath(sub.first, "jsono_entries")[0].key);
 				}
 			}
 			shreds.push_back(std::move(shred));

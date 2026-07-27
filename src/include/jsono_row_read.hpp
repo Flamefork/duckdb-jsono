@@ -29,17 +29,23 @@ enum class JsonoRowState : uint8_t { Null, Empty, Value };
 // manifest tail against the last verified tail.
 class ShredManifestVerifier {
 public:
-	// Signatures = the shreds the reading type carries, as (path, type-string) pairs.
+	// Signatures = the shreds the reading type carries, as (logical path, type-string) pairs. The
+	// manifest records a lane's path, not its encoded field name, so the names are decoded here —
+	// once per reader init, leaving VerifyShredManifestEntries a byte comparison and the tail
+	// memoization untouched.
 	void InitFromType(const LogicalType &type) {
 		JsonoLayoutType layout;
 		if (TryParseJsonoLayoutType(type, layout)) {
 			signatures_.reserve(layout.shreds.size());
 			for (auto &shred : layout.shreds) {
-				signatures_.emplace_back(shred.first, shred.second.ToString());
+				signatures_.emplace_back(JsonoLaneLogicalPath(shred.first),
+				                         JsonoLaneLogicalType(shred.second).ToString());
 			}
 		}
 	}
 
+	// Signatures supplied by the caller (__jsono_internal_checked_residual receives them as plan
+	// constants); the paths must be the same canonical logical form InitFromType decodes to.
 	void InitSignatures(std::vector<std::pair<std::string, std::string>> signatures) {
 		signatures_ = std::move(signatures);
 	}
@@ -101,13 +107,11 @@ inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathSt
                                       vector<PathStep> &steps_scratch) {
 	view.ReadShredManifest(manifest_scratch);
 	for (auto &entry : manifest_scratch) {
+		// A manifest path is the lane's logical path in the project's one text form (`$.`-always), so
+		// it parses back to steps with the shared grammar — no lane-name decoding on this path, which
+		// is what B.4 of plan 056 bought by keeping the manifest logical.
 		auto path = string(entry.path);
-		steps_scratch.clear();
-		if (!path.empty() && path[0] == '$') {
-			steps_scratch = ParseJsonoPath(path, "jsono shred manifest");
-		} else {
-			steps_scratch.push_back(PathStep {PathStepKind::Key, path, 0});
-		}
+		steps_scratch = ParseJsonoPath(path, "jsono shred manifest");
 		// A manifest path is an object-key chain by the shred writer's invariant. It covers the
 		// read when it equals the read path (the value itself was stripped) or extends it (a
 		// stripped leaf inside the read subtree). For a found scalar neither can hold; for a

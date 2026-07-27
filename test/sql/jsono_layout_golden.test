@@ -27,7 +27,7 @@ STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB,
 query I
 SELECT jsono_storage_type('a BIGINT, b VARCHAR');
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT, b VARCHAR)))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT, c8000 VARCHAR)))
 
 query I
 SELECT typeof(jsono('{"a":1}'));
@@ -37,7 +37,7 @@ STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB,
 query I
 SELECT typeof(jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT)))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT)))
 
 # The layout name is the permanent anchor: it must never gain a revision suffix, or a value of any
 # revision stops being recognizable as JSONO at all (which is what made an old layout read as a bare
@@ -69,56 +69,57 @@ SELECT body_hex(jsono('{"a":1,"b":"x"}'));
 # Clean scalar shred: `a` is stripped from the residual (its skips tail carries the shred manifest),
 # the marker is the clean layout hash and the spill column stays NULL on a clean row.
 query III
-SELECT body_hex(v), v.jsono."shreds$1"."$jsono$set", v.jsono."shreds$1"."$jsono$spill$0"
+SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
 FROM (SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}) AS v);
 ----
-4A534E4F040100000100000000000000010000000000004000000000000000800000000000000010|62|78|000000000000000000000000FFFFFFFF0100000001006102|01000000|	284599021030007636	NULL
+4A534E4F040100000100000000000000010000000000004000000000000000800000000000000010|62|78|000000000000000000000000FFFFFFFF010000000300242E6102|01000000|	-538597865238962405	NULL
 
 # Dirty row (a container at the shred path diverts into the residual): the lane is NULL, the whole
 # document stays in the residual, the marker is the clean hash with its lowest bit flipped and the
 # spill column carries the diverted shred's rank bit. Marker and mask are the semantics no type can
 # express — this row is the reason golden bytes exist.
 query IIII
-SELECT body_hex(v), v.jsono."shreds$1"."$jsono$set", v.jsono."shreds$1"."$jsono$spill$0",
-       v.jsono."shreds$1".a IS NULL
+SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0",
+       v.jsono."shreds$2".c4000 IS NULL
 FROM (SELECT jsono('{"a":{"n":1},"b":"x"}', shredding := {'a':'BIGINT'}) AS v);
 ----
-4A534E4F040100000200000000000000010000000000004001000001000000400100000100000000010000020000004000000000000000A0000000000000001000000000000000800000000000000010|61626E|78|000000000000000000000000|01000000|0100000000000000	284599021030007637	1	true
+4A534E4F040100000200000000000000010000000000004001000001000000400100000100000000010000020000004000000000000000A0000000000000001000000000000000800000000000000010|61626E|78|000000000000000000000000|01000000|0100000000000000	-538597865238962406	1	true
 
 # The dirty marker is exactly the clean marker with bit 0 flipped — the two-valued stamp every
 # totality proof reads as a plain min/max question.
 query I
-SELECT xor((SELECT v.jsono."shreds$1"."$jsono$set" FROM (SELECT jsono('{"a":{"n":1},"b":"x"}', shredding := {'a':'BIGINT'}) AS v)),
-           (SELECT v.jsono."shreds$1"."$jsono$set" FROM (SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}) AS v))) = 1;
+SELECT xor((SELECT v.jsono."shreds$2"."$jsono$set" FROM (SELECT jsono('{"a":{"n":1},"b":"x"}', shredding := {'a':'BIGINT'}) AS v)),
+           (SELECT v.jsono."shreds$2"."$jsono$set" FROM (SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}) AS v))) = 1;
 ----
 true
 
 # Nested lane: the residual keeps the object skeleton, the leaf is stripped.
 query III
-SELECT body_hex(v), v.jsono."shreds$1"."$jsono$set", v.jsono."shreds$1"."$jsono$spill$0"
+SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
 FROM (SELECT jsono('{"o":{"k":"v"}}', shredding := {'$.o.k':'VARCHAR'}) AS v);
 ----
-4A534E4F0401000001000000000000000100000000000040000000010000000000000000000000100000000000000010|6F||000000000000000000000000FFFFFFFF010000000500242E6F2E6B01||	7598230814825901478	NULL
+4A534E4F0401000001000000000000000100000000000040000000010000000000000000000000100000000000000010|6F||000000000000000000000000FFFFFFFF010000000500242E6F2E6B01||	-7243425711980707825	NULL
 
 # Scalar array lane: the residual keeps one VAL_NULL placeholder per lifted element; an array shred
 # is never bare-read, so it never sets a spill bit.
 query IIII
-SELECT body_hex(v), v.jsono."shreds$1"."$jsono$set", v.jsono."shreds$1"."$jsono$spill$0",
-       v.jsono."shreds$1"."$.p"::VARCHAR
+SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0",
+       v.jsono."shreds$2".e0000::VARCHAR
 FROM (SELECT jsono('{"p":[1,2]}', shredding := {'$.p':'BIGINT[]'}) AS v);
 ----
-4A534E4F040100000100000000000000010000000000004000000001000000200000000000000050000000000000005000000000000000300000000000000010|70||01000000000000000000000001000000040000000000000000000000000000000000000000000000FFFFFFFF010000000300242E7007||	965310507769059411	NULL	[1, 2]
+4A534E4F040100000100000000000000010000000000004000000001000000200000000000000050000000000000005000000000000000300000000000000010|70||01000000000000000000000001000000040000000000000000000000000000000000000000000000FFFFFFFF010000000300242E7007||	870299297690790912	NULL	[1, 2]
 
 # Spill bit NUMBERING, the one semantic the single-shred fixtures above cannot show: with several
 # shreds, bit `r` belongs to the shred of canonical rank `r` — shreds sorted by NAME, independent of
-# the order the shredding spec listed them or the order the keys appear in the document. Reversing
-# the numbering, or ranking by spec order, keeps every type identical and every single-shred fixture
+# the order the shredding spec listed them or the order the keys appear in the document. The name is
+# the encoded path, and the codec is order-preserving, so that is also path order. Reversing the
+# numbering, or ranking by spec order, keeps every type identical and every single-shred fixture
 # green; only this row goes red. The masks below are 1 = 'a' (rank 0), 2 = 'b' (rank 1), 4 = 'c'
 # (rank 2).
 query IIII
-SELECT d, j.jsono."shreds$1"."$jsono$spill$0" AS mask,
-       xor(j.jsono."shreds$1"."$jsono$set",
-           jsono('{"c":3,"b":2,"a":1}', shredding := {'c':'BIGINT','b':'BIGINT','a':'BIGINT'}).jsono."shreds$1"."$jsono$set") AS marker_flip,
+SELECT d, j.jsono."shreds$2"."$jsono$spill$0" AS mask,
+       xor(j.jsono."shreds$2"."$jsono$set",
+           jsono('{"c":3,"b":2,"a":1}', shredding := {'c':'BIGINT','b':'BIGINT','a':'BIGINT'}).jsono."shreds$2"."$jsono$set") AS marker_flip,
        to_json(j)::VARCHAR AS rt
 FROM (
   SELECT d, jsono(d, shredding := {'c':'BIGINT','b':'BIGINT','a':'BIGINT'}) AS j FROM (VALUES
@@ -136,7 +137,7 @@ FROM (
 
 # A SQL-NULL row nulls the whole value, marker and spill columns included.
 query III
-SELECT v IS NULL, v.jsono."shreds$1"."$jsono$set" IS NULL, v.jsono."shreds$1"."$jsono$spill$0" IS NULL
+SELECT v IS NULL, v.jsono."shreds$2"."$jsono$set" IS NULL, v.jsono."shreds$2"."$jsono$spill$0" IS NULL
 FROM (SELECT jsono(NULL::VARCHAR, shredding := {'a':'BIGINT'}) AS v);
 ----
 true	true	true

@@ -10,7 +10,7 @@ require json
 # (NULL shred = "value lives in the residual"), non-NULL shred fields are stripped and
 # manifest-covered. Mixed NULL masks per row exercise the partial-strip emit.
 query III
-SELECT j.jsono."shreds$1"."a", j.jsono."shreds$1"."k", to_json(j)::VARCHAR
+SELECT j.jsono."shreds$2".c4000, j.jsono."shreds$2".dc000, to_json(j)::VARCHAR
 FROM (
     SELECT jsono(struct_pack(a := a, k := k)) AS j
     FROM (VALUES ('x', 1::BIGINT), (NULL, 2::BIGINT), ('z', NULL::BIGINT)) v(a, k)
@@ -20,30 +20,33 @@ x	1	{"a":"x","k":1}
 z	NULL	{"a":"z","k":null}
 NULL	2	{"a":null,"k":2}
 
-# A field literally named like a JSONPath keeps the locate-and-strip semantics: the shred
-# name parses as the path $.x, which does not exist, so the shred is NULL and the value
-# stays in the residual under its literal key.
+# A field literally named like a JSONPath is an ordinary one-step path: a lane name is the encoding
+# of the path, so the key `$.x` and the nested path $.x cannot share a name and the lane holds the
+# literal key's value. (Under the text-named lanes this key minted the name `$.x`, which every reader
+# then re-parsed as the nested path — the shred was permanently NULL and the value never lifted.)
 query II
-SELECT j.jsono."shreds$1"."$.x" IS NULL, to_json(j)::VARCHAR FROM (SELECT jsono({'$.x': 'v', 'y': 1}) AS j);
+SELECT j.jsono."shreds$2"."4gn7g000", to_json(j)::VARCHAR FROM (SELECT jsono({'$.x': 'v', 'y': 1}) AS j);
 ----
-true	{"$.x":"v","y":1}
+v	{"$.x":"v","y":1}
 
 # A `$`-leading field name that is NOT a path (`$x`) is a literal top-level key, and its lane holds
 # the value. The lane name is decoded, never re-parsed as the shredding-spec DSL — the DSL reserves
 # a leading `$` for the path form (a literal `$x` must be written `$."$x"` there), so re-parsing a
 # minted lane name through it used to reject a lane the same bind had just put in the return type.
 query II
-SELECT j.jsono."shreds$1"."$x", to_json(j)::VARCHAR FROM (SELECT jsono({'$x': 'v', 'y': 1}) AS j);
+SELECT j.jsono."shreds$2"."4hs0000", to_json(j)::VARCHAR FROM (SELECT jsono({'$x': 'v', 'y': 1}) AS j);
 ----
 v	{"$x":"v","y":1}
 
-# Type-driven auto-shred descends nested structs: top-level scalars keep their bare name, scalars
-# inside a nested STRUCT are lifted under their $.parent.child JSON path. The shred set is a pure
-# function of the input type (known at bind), so the constructor's return type carries them.
+# Type-driven auto-shred descends nested structs: a top-level scalar lifts under its one-step path,
+# a scalar inside a nested STRUCT under its $.parent.child path. Every lane is named by the encoding
+# of that path — the type text is base32hex, and jsono_layout_lanes is how it is read back. The shred
+# set is a pure function of the input type (known at bind), so the constructor's return type carries
+# them, sorted by name, which the codec makes the same as sorted by path.
 query I
 SELECT typeof(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.commit.collection" VARCHAR, "$.commit.operation" VARCHAR, did VARCHAR, kind VARCHAR)))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, cdnmqrb9eg000orfdhm6aorkd5nms000 VARCHAR, cdnmqrb9eg000rrgclp62t39dtn0000 VARCHAR, chkm8000 VARCHAR, ddkmsp0000 VARCHAR)))
 
 # The walk descends nested structs up to a deliberately high cap (JSONO_AUTO_SHRED_MAX_DEPTH), well
 # above realistic nesting, so every scalar leaf here lifts: $.b.c, $.b.d.e, and $.b.d.f.g. The cap
@@ -52,7 +55,7 @@ STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB,
 query I
 SELECT typeof(jsono({'a': 1::BIGINT, 'b': {'c': 'x', 'd': {'e': 'deep', 'f': {'g': 'deeper'}}}}));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.b.c" VARCHAR, "$.b.d.e" VARCHAR, "$.b.d.f.g" VARCHAR, a BIGINT)))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT, c8000oo000 VARCHAR, c8000p0001ig000 VARCHAR, c8000p0001j000370000 VARCHAR)))
 
 # The nested shreds round-trip losslessly.
 query I
@@ -69,7 +72,7 @@ SELECT to_json(jsono({'did': 'd1', 'kind': 'k', 'commit': {'collection': 'coll',
 # A nested NULL scalar stays an explicit null in the residual (NULL shred = value-in-residual);
 # the typed nested shred captures the present value.
 query III
-SELECT j.jsono."shreds$1"."$.commit.collection", j.jsono."shreds$1"."$.commit.n", to_json(j)::VARCHAR
+SELECT j.jsono."shreds$2".cdnmqrb9eg000orfdhm6aorkd5nms000, j.jsono."shreds$2".cdnmqrb9eg000rg000, to_json(j)::VARCHAR
 FROM (
     SELECT jsono({'commit': {'collection': c, 'n': n}}) AS j
     FROM (VALUES ('post', 1::BIGINT), (NULL, NULL::BIGINT)) v(c, n)
@@ -97,17 +100,17 @@ SELECT j ->> '$.commit.collection' AS c, count(*) FROM nested_shred GROUP BY c O
 app.bsky.feed.like	1
 app.bsky.feed.post	2
 
-# Shred-name collision: a literal top-level key spelled as a JSON path ('$.commit.collection')
-# and a nested scalar lifted to that same path would both want one shred field name. A shredded
-# STRUCT cannot carry duplicate children (struct_extract would bind one and make the other value
-# unreachable via ->>), so both colliding shreds stay in the residual and the type is plain. The
-# residual keeps every value losslessly. (Astronomically rare: a JSON key literally spelled '$.a.b'.)
+# The former shred-name collision is gone: a literal top-level key spelled as a JSON path
+# ('$.commit.collection') and a nested scalar lifted to that same TEXT are two different PATHS, and a
+# lane is named by the path's structure, so they encode to two names and both lift. This is what the
+# codec removed structurally — the old build dropped both to the residual because one text name could
+# not carry two lanes.
 query I
-SELECT typeof(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested'}}));
+SELECT jsono_layout_lanes(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested'}}));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+[{'path': '$."$.commit.collection"', 'type': VARCHAR}, {'path': $.commit.collection, 'type': VARCHAR}]
 
-# Both colliding values round-trip through the residual.
+# Both values round-trip.
 query I
 SELECT to_json(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested'}}))::VARCHAR;
 ----
@@ -121,12 +124,11 @@ FROM (SELECT jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nes
 ----
 nested	flat
 
-# A non-colliding sibling next to the collision is still lifted normally: only the two colliding
-# names drop to the residual, the unambiguous nested scalar keeps its typed shred.
+# A sibling next to them lifts as well — three lanes, no name in common.
 query I
 SELECT typeof(jsono({'$.commit.collection': 'flat', 'commit': {'collection': 'nested', 'operation': 'create'}}));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.commit.operation" VARCHAR)))
+STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "4gn66rrddlkn8bj3dtm6opb3ehkmurg000" VARCHAR, cdnmqrb9eg000orfdhm6aorkd5nms000 VARCHAR, cdnmqrb9eg000rrgclp62t39dtn0000 VARCHAR)))
 
 # Type-driven auto-shred is always complete: a shred's type IS its field's type, so a present
 # value always fits and a NULL is only an absent field, never a residual diversion. A typed shred

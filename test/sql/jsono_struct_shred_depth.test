@@ -9,12 +9,12 @@ require json
 require parquet
 
 # Depth-3 scalar leaf is lifted into a lane ($.URL.query_params.utm_source), alongside depth-2 and
-# top-level leaves.
+# top-level leaves. A lane's STRUCT field name is the encoded path, so the lane set is read through
+# jsono_layout_lanes rather than off the type text.
 query I
-SELECT typeof(jsono({'URL':{'query_params':{'utm_source':'g','utm_medium':'c'},'path':'/x'},'kind':'view'}))
-       LIKE '%"$.URL.query_params.utm_source"%';
+SELECT jsono_layout_lanes(jsono({'URL':{'query_params':{'utm_source':'g','utm_medium':'c'},'path':'/x'},'kind':'view'}));
 ----
-true
+[{'path': $.URL.path, 'type': VARCHAR}, {'path': $.URL.query_params.utm_medium, 'type': VARCHAR}, {'path': $.URL.query_params.utm_source, 'type': VARCHAR}, {'path': $.kind, 'type': VARCHAR}]
 
 # The depth-3 leaf reads from its shred lane and round-trips byte-identical.
 query II
@@ -27,7 +27,7 @@ g	{"URL":{"query_params":{"utm_source":"g"}}}
 # Auto-shred descends nested structs up to a deliberately high cap (JSONO_AUTO_SHRED_MAX_DEPTH = 16),
 # far above realistic nesting, so a depth-4 leaf lifts too.
 query I
-SELECT typeof(jsono({'a':{'b':{'c':{'d':'x'}}}})) LIKE '%"$.a.b.c.d"%';
+SELECT list_contains(jsono_layout_lanes(jsono({'a':{'b':{'c':{'d':'x'}}}})), {'path': '$.a.b.c.d', 'type': 'VARCHAR'});
 ----
 true
 
@@ -36,8 +36,8 @@ true
 # one strictly deeper (17) stays in the residual.
 query II
 SELECT
-  typeof(jsono({'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x'}}}}}}}}}}}}}}}})) LIKE '%"$.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.l"%',
-  typeof(jsono({'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x'}}}}}}}}}}}}}}}}})) LIKE '%"$.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.l"%';
+  list_contains(jsono_layout_lanes(jsono({'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x'}}}}}}}}}}}}}}}})), {'path': '$.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.l', 'type': 'VARCHAR'}),
+  list_contains(jsono_layout_lanes(jsono({'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x','a':{'l':'x'}}}}}}}}}}}}}}}}})), {'path': '$.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.l', 'type': 'VARCHAR'});
 ----
 true	false
 
@@ -50,11 +50,11 @@ SELECT
 ----
 x	true
 
-# Only a depth-1 field named 'body'/'$jsono$set' collides with a layout name; a nested $.URL.body
-# is a safe lane.
+# No key collides with a layout name at any depth — a lane is named by the encoding of its path, so
+# a nested `body` is an ordinary lane just like a top-level one.
 query II
 SELECT
-  typeof(jsono({'URL':{'body':'z'}})) LIKE '%"$.URL.body"%',
+  list_contains(jsono_layout_lanes(jsono({'URL':{'body':'z'}})), {'path': '$.URL.body', 'type': 'VARCHAR'}),
   jsono({'URL':{'body':'z'}}) ->> '$.URL.body';
 ----
 true	z

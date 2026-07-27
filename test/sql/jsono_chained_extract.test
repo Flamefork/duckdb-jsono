@@ -57,9 +57,9 @@ FROM range(2000) tt(i);
 
 # The explicitly shredded nested leaf is a shred lane.
 query I
-SELECT typeof(ep) LIKE '%"$.URL.path"%' FROM t LIMIT 1;
+SELECT jsono_layout_lanes(ep) FROM t LIMIT 1;
 ----
-true
+[{'path': $.URL.path, 'type': VARCHAR}]
 
 # Every row: chained == JSONPath. Zero divergences.
 query I
@@ -88,7 +88,7 @@ PRAGMA explain_output='physical_only';
 query II
 EXPLAIN SELECT ep -> 'URL' ->> 'path' FROM tot;
 ----
-physical_plan	<REGEX>:.*shreds.*URL.*path.*
+physical_plan	<REGEX>:.*shreds.*al94o000e1gn8q0000.*
 
 query II
 EXPLAIN SELECT ep -> 'URL' ->> 'path' FROM tot;

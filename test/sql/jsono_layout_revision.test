@@ -21,8 +21,8 @@ CREATE TABLE src AS SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'})
 statement ok
 CREATE TABLE rev0_shredded AS
 SELECT {'jsono': {'body': v.jsono."body$1",
-                  'shreds': {'$jsono$set': v.jsono."shreds$1"."$jsono$set",
-                             'a': {'value': v.jsono."shreds$1".a, 'complete': true}}}} AS v
+                  'shreds': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
+                             'a': {'value': v.jsono."shreds$2".c4000, 'complete': true}}}} AS v
 FROM src;
 
 # Revision 0, plain: the body layout of that era happens to match this build's, which is exactly the
@@ -36,9 +36,9 @@ CREATE TABLE rev0_plain AS SELECT {'jsono': {'body': v.jsono."body$1"}} AS v FRO
 statement ok
 CREATE TABLE rev0_bare_spill AS
 SELECT {'jsono': {'body': v.jsono."body$1",
-                  'shreds': {'$jsono$set': v.jsono."shreds$1"."$jsono$set",
-                             '$jsono$spill': v.jsono."shreds$1"."$jsono$spill$0",
-                             'a': v.jsono."shreds$1".a}}} AS v
+                  'shreds': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
+                             '$jsono$spill': v.jsono."shreds$2"."$jsono$spill$0",
+                             'a': v.jsono."shreds$2".c4000}}} AS v
 FROM src;
 
 # A future revision: the same anchor, a revision this build does not know. Two of them, one per
@@ -47,17 +47,29 @@ FROM src;
 statement ok
 CREATE TABLE rev99 AS
 SELECT {'jsono': {'body$1': v.jsono."body$1",
-                  'shreds$99': {'$jsono$set': v.jsono."shreds$1"."$jsono$set",
-                                '$jsono$spill$0': v.jsono."shreds$1"."$jsono$spill$0",
-                                'a': v.jsono."shreds$1".a}}} AS v
+                  'shreds$99': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
+                                '$jsono$spill$0': v.jsono."shreds$2"."$jsono$spill$0",
+                                'a': v.jsono."shreds$2".c4000}}} AS v
 FROM src;
 
 statement ok
 CREATE TABLE body_rev2 AS
 SELECT {'jsono': {'body$2': v.jsono."body$1",
-                  'shreds$1': {'$jsono$set': v.jsono."shreds$1"."$jsono$set",
-                               '$jsono$spill$0': v.jsono."shreds$1"."$jsono$spill$0",
-                               'a': v.jsono."shreds$1".a}}} AS v
+                  'shreds$1': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
+                               '$jsono$spill$0': v.jsono."shreds$2"."$jsono$spill$0",
+                               'a': v.jsono."shreds$2".c4000}}} AS v
+FROM src;
+
+# Shreds revision 1, closed by plan 056: a current residual beside the shred layout that named a lane
+# by its path spelled as TEXT (`a`, `$.o.k`) rather than by the encoding of the path. The text name is
+# what DuckDB's case-insensitive STRUCT matching could collapse, so the shape is refused rather than
+# read — and the refusal is decided by the field NAME, before any lane name is looked at.
+statement ok
+CREATE TABLE shreds_rev1 AS
+SELECT {'jsono': {'body$1': v.jsono."body$1",
+                  'shreds$1': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
+                               '$jsono$spill$0': v.jsono."shreds$2"."$jsono$spill$0",
+                               'a': v.jsono."shreds$2".c4000}}} AS v
 FROM src;
 
 # --- Every reading path refuses, ours and core json's alike. Before this, the core-json paths
@@ -157,7 +169,7 @@ layout revision body=0,
 statement error
 SELECT jsono_validate(v) FROM rev0_plain;
 ----
-this build reads body=1 shreds=1
+this build reads body=1 shreds=2
 
 statement error
 SELECT v ->> 'a' FROM rev0_bare_spill;
@@ -173,6 +185,16 @@ statement error
 SELECT v ->> 'a' FROM body_rev2;
 ----
 layout revision body=2 shreds=1
+
+statement error
+SELECT v ->> 'a' FROM shreds_rev1;
+----
+layout revision body=1 shreds=1
+
+statement error
+SELECT to_json(v) FROM shreds_rev1;
+----
+layout revision body=1 shreds=1
 
 # --- Split revisions: a value whose residual is current and whose shreds are foreign is refused,
 # while a current plain value beside it keeps reading. This is the point of versioning `body$N` and
@@ -238,7 +260,7 @@ layout revision body=0 shreds=0
 
 # --- Mixed revisions in one scan are refused, not silently emptied, IN EITHER FILE ORDER.
 # union_by_name merges the per-file schemas by name before the extension sees anything, so the merged
-# layout carries both revisions' stems ("body$1", "shreds$1", "body", "shreds") ordered by which file
+# layout carries both revisions' stems ("body$1", "shreds$2", "body", "shreds") ordered by which file
 # came first. Reading only the leading stem made the classification order-dependent: the old file
 # first was refused, the current file first passed the anchor, failed the grammar and went silently
 # NotJsono — the whole scan, current rows included, then read as NULL through core json. A compat
@@ -362,35 +384,59 @@ cast to VARCHAR: JSONO value carries layout revision body=0,
 statement ok
 RESET disabled_optimizers;
 
-# --- The documented way forward (docs/jsono_format.md → "Revision history"). A revision-0 value
-# whose only difference is the field names — the shape stored files overwhelmingly carry — is moved
-# to the current revision by rebuilding the layout struct under the revisioned names, in SQL, with no
-# per-row work. It needs the optimizer off for that one statement: the rebuild reads the foreign
-# value with struct_extract, which is exactly what the plan walk refuses. Pinned because the doc
-# promises it — a tightening of the refusal that also closed this path would leave a user holding old
-# files with no way forward at all, and the suite would stay green. ---
+# --- The documented way forward (docs/jsono_format.md → "Revision history"). A PLAIN revision-0
+# value — whose only difference is the field name, and the shape stored files overwhelmingly carry —
+# is moved to the current revision by rebuilding the layout struct under the revisioned name, in SQL,
+# with no per-row work. It needs the optimizer off for that one statement: the rebuild reads the
+# foreign value with struct_extract, which is exactly what the plan walk refuses. Pinned because the
+# doc promises it — a tightening of the refusal that also closed this path would leave a user holding
+# old files with no way forward at all, and the suite would stay green.
+# A SHREDDED old value has no such path: its lanes are named by their path spelled as text, so a
+# rename of the struct fields alone leaves a lane set the grammar does not accept (asserted below).
+# That is the whole reason the doc sends shredded old data through a re-ingest. ---
 
 statement ok
 CREATE TABLE rev0_renameable AS
-SELECT {'jsono': {'body': v.jsono."body$1", 'shreds': v.jsono."shreds$1"}} AS v FROM src;
+SELECT {'jsono': {'body': jsono('{"a":1,"b":"x"}').jsono."body$1"}} AS v;
 
 statement error
 SELECT to_json(v) FROM rev0_renameable;
 ----
-layout revision body=0 shreds=0
+layout revision body=0,
 
 statement ok
 SET disabled_optimizers='extension';
 
 statement ok
 CREATE TABLE rev0_upgraded AS
-SELECT {'jsono': {'body$1': v.jsono.body, 'shreds$1': v.jsono.shreds}} AS v FROM rev0_renameable;
+SELECT {'jsono': {'body$1': v.jsono.body}} AS v FROM rev0_renameable;
 
 statement ok
 RESET disabled_optimizers;
 
-# The upgraded value is the original in every respect: same type, same document, same shred read.
-query III
-SELECT typeof(v) = jsono_storage_type('a BIGINT'), to_json(v), v ->> 'a' FROM rev0_upgraded;
+# The upgraded value is the original in every respect: same type, same document.
+query II
+SELECT typeof(v) = jsono_storage_type(), to_json(v) FROM rev0_upgraded;
 ----
-true	{"a":1,"b":"x"}	1
+true	{"a":1,"b":"x"}
+
+# Renaming a shredded old value's fields is NOT an upgrade: the text lane name is not a canonical
+# encoded name, so the result is not recognized as JSONO at all.
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TABLE shreds_rev1_renamed AS
+SELECT {'jsono': {'body$1': v.jsono."body$1",
+                  'shreds$2': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
+                               '$jsono$spill$0': v.jsono."shreds$2"."$jsono$spill$0",
+                               'a': v.jsono."shreds$2".c4000}}} AS v
+FROM src;
+
+statement ok
+RESET disabled_optimizers;
+
+query I
+SELECT jsono_layout_diagnose(v) LIKE 'not jsono:%' FROM shreds_rev1_renamed;
+----
+true

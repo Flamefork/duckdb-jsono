@@ -8,6 +8,7 @@
 #include "string_view.hpp"
 
 #include <cctype>
+#include <cstdint>
 #include <limits>
 #include <utility>
 
@@ -158,49 +159,6 @@ inline bool IsObjectKeyPath(const vector<PathStep> &steps) {
 	return !steps.empty();
 }
 
-// ===== The lane-name boundary =====
-//
-// A shred lane has two names: the LOGICAL path it lifts out of the document (a pure object-key
-// chain — what reconstruct, render and jsono_entries emit, and what a diagnostic prints) and the
-// PHYSICAL STRUCT field it occupies inside `shreds` (what the type carries, what the manifest and
-// the canonical spill ranks are keyed by). Today they are one string: the physical name IS the path
-// spelled as text. That conflation is the defect plan 056 fixes — it is why two spellings of one
-// path (`gclid` and `$.gclid`) mint two lanes, and why DuckDB's case-insensitive STRUCT field
-// matching collapses `gclid` and `GCLID` into one. Everything that crosses between the two names
-// goes through the two functions below; nothing else may split a lane name on `$.` or hand a
-// physical name to a path parser.
-
-// Whether a lane name is spelled in the `$.`-rooted JSONPath form rather than as a bare literal
-// top-level key. Only the `$.` prefix marks it: a literal top-level key may itself begin with `$`
-// (e.g. `$x`), and the reserved `$jsono$set` marker begins with `$` too, so a bare-`$` test would
-// misread both.
-inline bool LaneNameIsPathForm(const string &name) {
-	return name.size() >= 2 && name[0] == '$' && name[1] == '.';
-}
-
-// Decode a lane's physical name into the logical path it lifts. Throws on a name no writer could
-// have minted (a malformed `$.`-rooted path); every recognizable lane decodes, because layout
-// recognition already gated the name through ShredNameIsObjectKeyPath.
-inline vector<PathStep> ShredNamePath(const string &name, const char *function_name) {
-	if (LaneNameIsPathForm(name)) {
-		return ParseJsonoPath(name, function_name);
-	}
-	return LiteralKeyPath(name);
-}
-
-// The non-throwing form of the decode above, plus the lane-path check: whether `name` decodes to a
-// path a shred lane may carry. It is the structural gate in layout recognition, which runs over
-// arbitrary user structs and must classify them silently rather than fail the query.
-inline bool ShredNameIsObjectKeyPath(const string &name) {
-	vector<PathStep> steps;
-	try {
-		steps = ShredNamePath(name, "jsono shred");
-	} catch (const std::exception &) {
-		return false;
-	}
-	return IsObjectKeyPath(steps);
-}
-
 // Append `key` to a `$`-rooted JSONPath as one `.key` step, quoting it exactly when a bare step
 // would mis-parse: an empty key, or one carrying a character ParseJsonoPath treats as structural (a
 // bare `.foo` step spans only up to the next . [ ] ", and a backslash is an escape inside a quoted
@@ -283,6 +241,196 @@ inline bool TryStepsToJsonPath(const vector<PathStep> &steps, string &out) {
 	}
 	out = std::move(path);
 	return true;
+}
+
+// ===== The lane-name boundary =====
+//
+// A shred lane has two names. The LOGICAL path is the object-key chain it lifts out of the
+// document: what reconstruct, render, jsono_entries and every diagnostic emit, and what the per-row
+// shred manifest records. The PHYSICAL name is the STRUCT field the lane occupies inside `shreds`,
+// and it is NOT that path as text — it is the path's STRUCTURE, serialized and encoded.
+//
+// DuckDB matches STRUCT field names case-insensitively over ASCII A-Z, so a lane named by its path
+// verbatim collapses with another spelling of the same key: two sources writing `gclid` and `GCLID`
+// merge into one lane, and the by-name cast then moves one key's values into the other key's lane —
+// loud on the dropped spelling, silently wrong on the surviving one. The encoded alphabet has no
+// upper case at all, so distinct paths can never produce names differing only in case: the collapse
+// becomes unrepresentable rather than guarded against. The same bijection ends a second conflation —
+// `gclid` and `$.gclid` are one path and now encode to one name, so how the public spec DSL spells
+// a path stops leaking into the stored format.
+//
+// Two stages, both order-preserving, so sorting encoded names IS sorting paths:
+//
+//   1. serialize the steps — each key's raw bytes with 0x00 escaped as `00 FF`, then terminated by
+//      `00 00`; keys concatenate in path order;
+//   2. base32hex (RFC 4648, alphabet `0-9a-v`, lowercase, unpadded) over those bytes.
+//
+// The DOUBLED terminator is what makes stage 1 self-delimiting: 0x00 ALWAYS appears in a pair, so a
+// decoder that has read a 0x00 decides on the single byte after it and never depends on what the
+// next key starts with. A single-0x00 terminator is ambiguous the moment the next key starts with
+// 0xFF: `61 00 FF 62 00` would then be both [`a`, `\xFFb`] and [`a\x00b`]. Doubled, they are
+// `61 00 00 FF 62 00 00` and `61 00 FF 62 00 00` — distinct, which is why the pair is not optional.
+//
+// Order preservation is a property of THIS serialization, not of encoding in general (a
+// length-prefixed variant breaks it: `a` sorts before `URL`→`path` as a path but after it once the
+// length byte dominates). It is load-bearing for the two-pointer walkers, the sort-merges against
+// the residual's byte-sorted document keys, and the binary searches of the merge fast path, so it
+// is the first thing to re-verify if the serialization is ever revisited.
+
+// Encode the lane path `steps` as its STRUCT field name. Every step must be an object key: an
+// index or wildcard step has no lane to name (each step strips one object key from the residual),
+// and admitting one here would mint a name whose decode contradicts the lane invariant.
+inline string JsonoEncodeLaneName(const vector<PathStep> &steps) {
+	if (steps.empty()) {
+		throw InvalidInputException("jsono shred: a lane path must name at least one object key");
+	}
+	idx_t serialized_size = 0;
+	for (auto &step : steps) {
+		if (step.kind != PathStepKind::Key) {
+			throw InvalidInputException("jsono shred: a lane path may only contain object keys");
+		}
+		serialized_size += step.key.size() + 2;
+	}
+
+	string serialized;
+	serialized.reserve(serialized_size);
+	for (auto &step : steps) {
+		for (char c : step.key) {
+			serialized.push_back(c);
+			if (c == '\0') {
+				serialized.push_back(static_cast<char>(0xFF));
+			}
+		}
+		serialized.push_back('\0');
+		serialized.push_back('\0');
+	}
+
+	const char digits[] = "0123456789abcdefghijklmnopqrstuv";
+	string name;
+	name.reserve((serialized.size() * 8 + 4) / 5);
+	uint32_t buffer = 0;
+	uint32_t bits = 0;
+	for (char c : serialized) {
+		buffer = (buffer << 8) | static_cast<unsigned char>(c);
+		bits += 8;
+		while (bits >= 5) {
+			bits -= 5;
+			name.push_back(digits[(buffer >> bits) & 0x1F]);
+		}
+	}
+	if (bits > 0) {
+		name.push_back(digits[(buffer << (5 - bits)) & 0x1F]);
+	}
+	return name;
+}
+
+inline bool JsonoBase32HexDigit(char c, uint8_t &value) {
+	if (c >= '0' && c <= '9') {
+		value = static_cast<uint8_t>(c - '0');
+		return true;
+	}
+	// Upper case is rejected rather than folded: `C4000` decodes to the same bytes as `c4000`, so
+	// accepting it would hand one lane two spellings — the very aliasing this codec removes.
+	if (c >= 'a' && c <= 'v') {
+		value = static_cast<uint8_t>(c - 'a' + 10);
+		return true;
+	}
+	return false;
+}
+
+// Decode a lane name back to its path. Returns false — never throws — for any name that is not
+// canonical, i.e. any name `JsonoEncodeLaneName` would not have produced: layout recognition runs
+// this over arbitrary user structs and must classify them silently as "not JSONO" rather than fail
+// the query. `steps` is assigned only on success.
+inline bool JsonoTryDecodeLaneName(const string &name, vector<PathStep> &steps) {
+	if (name.empty()) {
+		return false;
+	}
+	string serialized;
+	serialized.reserve(name.size() * 5 / 8);
+	uint32_t buffer = 0;
+	uint32_t bits = 0;
+	for (char c : name) {
+		uint8_t digit;
+		if (!JsonoBase32HexDigit(c, digit)) {
+			return false;
+		}
+		buffer = (buffer << 5) | digit;
+		bits += 5;
+		if (bits >= 8) {
+			bits -= 8;
+			serialized.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+		}
+	}
+	// One test covers both base32 rules: a name whose length is not a valid unpadded base32 length
+	// leaves a whole character (>= 5 bits) decoding to nothing, and a name whose last character
+	// carries non-zero unused bits leaves them set. Either way the bytes have a shorter spelling,
+	// which is the one Encode writes, so this name is an alias and not canonical.
+	if (bits >= 5 || (buffer & ((1u << bits) - 1)) != 0) {
+		return false;
+	}
+
+	vector<PathStep> decoded;
+	string key;
+	idx_t i = 0;
+	while (i < serialized.size()) {
+		if (serialized[i] != '\0') {
+			key.push_back(serialized[i]);
+			i++;
+			continue;
+		}
+		if (i + 1 >= serialized.size()) {
+			return false;
+		}
+		auto partner = static_cast<unsigned char>(serialized[i + 1]);
+		i += 2;
+		if (partner == 0xFF) {
+			key.push_back('\0');
+			continue;
+		}
+		if (partner != 0x00) {
+			return false;
+		}
+		decoded.push_back(PathStep {PathStepKind::Key, std::move(key), 0});
+		key.clear();
+	}
+	if (!key.empty() || decoded.empty()) {
+		return false;
+	}
+	steps = std::move(decoded);
+	return true;
+}
+
+// Whether `name` is a name JsonoEncodeLaneName could have produced. The structural gate in layout
+// recognition, which runs over arbitrary user structs and must classify them silently rather than
+// fail the query. Canonicity subsumes the old object-key-path check: a decode yields nothing but a
+// non-empty chain of Key steps.
+inline bool JsonoLaneNameIsCanonical(const string &name) {
+	vector<PathStep> steps;
+	return JsonoTryDecodeLaneName(name, steps);
+}
+
+// Decode a lane's physical name into the logical path it lifts. Throws on a non-canonical name: no
+// writer mints one and layout recognition refuses a type carrying one, so reaching this is a broken
+// invariant rather than user input.
+inline vector<PathStep> ShredNamePath(const string &name, const char *function_name) {
+	vector<PathStep> steps;
+	if (!JsonoTryDecodeLaneName(name, steps)) {
+		throw InternalException("%s: shred lane name '%s' is not a canonical encoded path", function_name, name);
+	}
+	return steps;
+}
+
+// The lane's logical path in the project's one text form (`$.`-always, quoted per
+// AppendJsonPathKey): what the per-row shred manifest stores and what every message naming a lane
+// prints. The single producer of that text, so the manifest a writer emits and the signature a
+// reader verifies against are the same bytes by construction.
+inline string JsonoLaneLogicalPath(const string &name) {
+	string path;
+	if (!TryStepsToJsonPath(ShredNamePath(name, "jsono lane"), path)) {
+		throw InternalException("jsono lane: path of '%s' cannot be serialized", name);
+	}
+	return path;
 }
 
 // True unless `read` and the object-key path `key_path` provably diverge — i.e. on some

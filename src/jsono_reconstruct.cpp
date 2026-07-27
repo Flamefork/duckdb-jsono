@@ -279,11 +279,6 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		}
 		auto &name = layout.shreds[i].first;
 		vector<PathStep> steps = ShredNamePath(name, "jsono reconstruct");
-		for (auto &step : steps) {
-			if (step.kind != PathStepKind::Key) {
-				throw InvalidInputException("jsono reconstruct: shred path '%s' is not an object-key path", name);
-			}
-		}
 		if (IsShredArrayType(layout.shreds[i].second)) {
 			ArrayReconShred ars;
 			ars.child = i;
@@ -291,7 +286,9 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			ars.path = std::move(steps);
 			auto &element = ListType::GetChildType(layout.shreds[i].second);
 			for (auto &sub : StructType::GetChildTypes(element)) {
-				ars.subfields.push_back(ReconArraySubfield {sub.first, sub.second});
+				// The element field name is encoded like a lane name; the overlay emits the JSON key.
+				ars.subfields.push_back(
+				    ReconArraySubfield {ShredNamePath(sub.first, "jsono reconstruct")[0].key, sub.second});
 			}
 			array_shreds.push_back(std::move(ars));
 			continue;
@@ -305,13 +302,9 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			array_shreds.push_back(std::move(ars));
 			continue;
 		}
-		auto duplicate = std::find_if(shreds.begin(), shreds.end(),
-		                              [&](const ReconShred &shred) { return PathStepsEqual(shred.steps, steps); });
-		if (duplicate != shreds.end()) {
-			*duplicate = ReconShred {i, layout.shreds[i].second, std::move(steps)};
-		} else {
-			shreds.push_back(ReconShred {i, layout.shreds[i].second, std::move(steps)});
-		}
+		// No duplicate check: the lane name is a bijection on paths, so two lanes of one path are two
+		// STRUCT fields of one name — a type DuckDB cannot even build.
+		shreds.push_back(ReconShred {i, layout.shreds[i].second, std::move(steps)});
 	}
 	std::sort(shreds.begin(), shreds.end(), [](const ReconShred &a, const ReconShred &b) {
 		auto n = std::min(a.steps.size(), b.steps.size());
@@ -685,14 +678,16 @@ void RenderShreddedListsToJsonImpl(Vector &input, idx_t count, Vector &result) {
 			continue;
 		}
 		auto steps = ShredNamePath(layout.shreds[f].first, "__jsono_shredded_lists_to_json");
-		if (steps.size() != 1 || steps[0].kind != PathStepKind::Key) {
+		if (steps.size() != 1) {
 			throw InternalException("__jsono_shredded_lists_to_json requires top-level list shred paths");
 		}
 		DirectListJsonShred shred;
 		shred.key = std::move(steps[0].key);
 		if (IsShredArrayType(shred_type)) {
 			for (auto &field : StructType::GetChildTypes(ListType::GetChildType(shred_type))) {
-				shred.subfield_keys.push_back(field.first);
+				// Decoded: these keys are both emitted as JSON and sort-merged against the residual's
+				// byte-sorted document keys, so they must be the logical names.
+				shred.subfield_keys.push_back(ShredNamePath(field.first, "__jsono_shredded_lists_to_json")[0].key);
 			}
 			shred.sorted_subfields.resize(shred.subfield_keys.size());
 			for (idx_t field = 0; field < shred.sorted_subfields.size(); field++) {

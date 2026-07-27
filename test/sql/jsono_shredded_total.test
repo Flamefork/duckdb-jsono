@@ -26,7 +26,7 @@ physical_plan	<!REGEX>:.*COALESCE.*
 query II
 EXPLAIN SELECT MIN(CAST(j->>'$.x' AS BIGINT)) FROM total_t;
 ----
-physical_plan	<REGEX>:.*\$\.x.*
+physical_plan	<REGEX>:.*shreds.*f0000.*
 
 # A selective equality filter on the total shred is pushed into the scan as a struct_extract filter
 # (zone-map prunable), not a post-scan COALESCE evaluation.
@@ -249,12 +249,12 @@ statement ok
 CREATE TABLE bad_spill AS
 SELECT struct_pack(jsono := struct_pack(
   "body$1" := jsono('{"a":"oops"}')."jsono"."body$1",
-  "shreds$1" := struct_pack(
-    "$jsono$set" := jsono('{"a":"oops"}', shredding := {'a':'BIGINT'}).jsono."shreds$1"."$jsono$set",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := jsono('{"a":"oops"}', shredding := {'a':'BIGINT'}).jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := 32::BIGINT,
     a := NULL::BIGINT
   )
-))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, a BIGINT))) AS j;
+))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))) AS j;
 
 query I
 SELECT j ->> '$.a' FROM bad_spill;

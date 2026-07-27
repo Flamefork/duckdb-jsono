@@ -1,5 +1,6 @@
 #pragma once
 
+#include "jsono.hpp"
 #include "jsono_path.hpp"
 #include "jsono_scalar_write.hpp"
 
@@ -69,7 +70,12 @@ bool IsShredScalarArrayType(const LogicalType &type);
 // through the two-pass materialize-then-shred writer. The single owner of "is this a list shred".
 bool IsShredListType(const LogicalType &type);
 
-void JsonoValidateShredField(const string &path, const LogicalType &type);
+// Parse and validate one entry of the public shredding-spec DSL — a `$.`-rooted JSONPath or a bare
+// literal key, plus its shred type — into the lane it declares: the LOGICAL path, and the PHYSICAL
+// column type (an object-array lane's element subfield names encoded, since a subfield is a one-step
+// path). The single spec-side validator: the DDL helper (jsono_storage_type) and the constructor both
+// go through it, so a declared storage column always matches a value the constructor can produce.
+JsonoLaneSpec JsonoParseShredSpecField(const string &path, const LogicalType &type);
 
 // One array shred for the residual-skeleton emit: the object-key chain to the array, plus the
 // lifted-element primitive description. An object array (kind == Array) lifts element subfields into
@@ -91,21 +97,32 @@ struct JsonoArrayShredSpec {
 // never match (they cannot form the scalar-vs-nested overlap).
 bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b);
 
+// One lane's manifest entry, in both framings, plus its emission rank within the shred set.
 struct JsonoShredManifestEntryBytes {
 	std::string full;
 	std::string compact;
+	idx_t order = 0;
 };
 
-// One manifest entry's bytes. `path` is the lane name as the manifest records it — today the
-// PHYSICAL field name, which is the lane's path spelled as text; the reader's verification
-// (VerifyShredManifestEntries) compares it byte-for-byte against the reading type's field names,
-// so both sides must name the lane the same way.
-JsonoShredManifestEntryBytes JsonoShredManifestEntry(const string &path, const LogicalType &type);
+// The per-lane manifest entries of a shred set, indexed by lane. `shreds[f]` is the lane's PHYSICAL
+// (encoded) field name and type; the entry records the lane's LOGICAL path, decoded from that name,
+// because the manifest is a per-row statement about the DOCUMENT while the encoding is a transport
+// artifact of the TYPE. The reader's verification (VerifyShredManifestEntries) compares those bytes
+// against signatures it decodes from its own type the same way, so both sides name the lane
+// identically by construction.
+//
+// The entries also carry the manifest's emission order, which is the logical-path order and NOT the
+// lane order (that follows the encoded name, and the two genuinely differ: `$.a-c` sorts before
+// `$.a.b` as text, while the nested path sorts first structurally). JsonoAppendShredManifest owns
+// applying it, so no writer has to remember.
+vector<JsonoShredManifestEntryBytes> JsonoShredManifestEntries(const vector<std::pair<string, LogicalType>> &shreds);
 
 void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries);
 
+// `entry_indices` selects the lanes stripped from this row; it is sorted into manifest order in
+// place, so callers may collect it in whatever order their write loop runs.
 void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries,
-                              const vector<idx_t> &entry_indices);
+                              vector<idx_t> &entry_indices);
 
 // Shred a plain JSONO `input` vector into the shredded `result` STRUCT (the six-BLOB residual
 // prefix followed by one shred column per `shreds` entry, in order). `shreds[i]` names a lane by
@@ -113,7 +130,7 @@ void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredMani
 // a group_merge accumulator's, the constructor's auto-shred set) and this must reproduce it
 // exactly, so the names are decoded to paths, not re-parsed as the public spec DSL. Reuses the
 // jsono_shred executor so the constructor and the shred function share strip and shred-write
-// semantics.
+// semantics. A name that is not a canonical lane name is a broken invariant, not user input.
 void JsonoShredFromLayout(Vector &input, idx_t count, const vector<std::pair<string, LogicalType>> &shreds,
                           Vector &result);
 

@@ -1267,22 +1267,17 @@ void MergeLWWListLane(GroupMergeLWWState &state, LWWListLane &lane, const LWWLis
 	}
 }
 
-bool PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> &bind_shreds,
+void PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> &bind_shreds,
                                    vector<ReconShred> &scalar_shreds, vector<ReconShred> &list_shreds,
                                    vector<idx_t> &overlay_shreds) {
 	for (idx_t i = 0; i < bind_shreds.size(); i++) {
 		auto &name = bind_shreds[i].first;
 		vector<PathStep> steps = ShredNamePath(name, "jsono_group_merge direct shredded update");
-		for (auto &step : steps) {
-			if (step.kind != PathStepKind::Key) {
-				return false;
-			}
-		}
 		auto &type = bind_shreds[i].second;
 		if (IsShredListType(type)) {
 			if (IsShredScalarArrayType(type) && steps.size() == 1) {
 				ReconShred shred {i, type, std::move(steps)};
-				shred.manifest_path = name;
+				shred.manifest_path = JsonoLaneLogicalPath(name);
 				list_shreds.push_back(std::move(shred));
 				continue;
 			}
@@ -1290,10 +1285,20 @@ bool PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
 			continue;
 		}
 		ReconShred shred {i, type, std::move(steps)};
-		shred.manifest_path = name;
+		shred.manifest_path = JsonoLaneLogicalPath(name);
 		scalar_shreds.push_back(std::move(shred));
 	}
-	return true;
+	// The four walkers below merge a row's manifest entries against these vectors with a single
+	// rising index, so both sequences must be in the SAME order — the manifest's, which is by logical
+	// path. That is NOT the shred order these were collected in (the type lists lanes by encoded
+	// name, and the two orders genuinely differ: `$.a-c` sorts before `$.a.b` as text while the
+	// nested path sorts first structurally), and a set-op merged type is not even canonically
+	// ordered, so sort explicitly rather than inherit the field order.
+	auto by_manifest_path = [](const ReconShred &a, const ReconShred &b) {
+		return a.manifest_path < b.manifest_path;
+	};
+	std::sort(scalar_shreds.begin(), scalar_shreds.end(), by_manifest_path);
+	std::sort(list_shreds.begin(), list_shreds.end(), by_manifest_path);
 }
 
 // The four manifest walkers below each run the same two-pointer advance (manifest and shreds are
@@ -1467,9 +1472,7 @@ bool JsonoGroupMergeLWWUpdateDirectShreddedImpl(Vector inputs[], const GroupMerg
 	vector<ReconShred> scalar_shreds;
 	vector<ReconShred> list_shreds;
 	vector<idx_t> overlay_shreds;
-	if (!PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, overlay_shreds)) {
-		return false;
-	}
+	PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, overlay_shreds);
 	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
 	auto scalar_text_count = LWWScalarTextLaneCount(scalar_text_indices);
 	if (!list_shreds.empty() && !overlay_shreds.empty()) {
@@ -1829,9 +1832,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	vector<ReconShred> scalar_shreds;
 	vector<ReconShred> list_shreds;
 	vector<idx_t> ignored_list_shreds;
-	if (!PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, ignored_list_shreds)) {
-		return false;
-	}
+	PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, ignored_list_shreds);
 	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
 	if (!list_shreds.empty() && !ignored_list_shreds.empty()) {
 		return false;
@@ -1853,10 +1854,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	}
 	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
 
-	vector<JsonoShredManifestEntryBytes> manifest_entries(bind_data.shreds.size());
-	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
-		manifest_entries[f] = JsonoShredManifestEntry(bind_data.shreds[f].first, bind_data.shreds[f].second);
-	}
+	auto manifest_entries = JsonoShredManifestEntries(bind_data.shreds);
 
 	JsonoBuilder builder;
 	vector<const vector<PathStep> *> scalar_strip_paths;
@@ -1958,7 +1956,6 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		stamp.StampRow(rid);
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_shred_indices.empty()) {
-			std::sort(stripped_shred_indices.begin(), stripped_shred_indices.end());
 			manifest.clear();
 			JsonoAppendShredManifest(manifest, manifest_entries, stripped_shred_indices);
 			manifest_ptr = &manifest;
@@ -2106,9 +2103,7 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 	vector<ReconShred> scalar_shreds;
 	vector<ReconShred> list_shreds;
 	vector<idx_t> ignored_list_shreds;
-	if (!PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, ignored_list_shreds)) {
-		list_shreds.clear();
-	}
+	PrepareDirectLWWShreddedInput(bind_data.shreds, scalar_shreds, list_shreds, ignored_list_shreds);
 	auto scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
 
 	UnifiedVectorFormat source_fmt;

@@ -232,12 +232,13 @@ SELECT jsono('{"a":[7]}', shredding := {'$[0]':'BIGINT'});
 ----
 invalid path
 
-# Layout recognition enforces the same rule on stored/cast structs: a lane name that is not an
-# object-key chain keeps the struct from being recognized as JSONO (no writer produces such a lane),
-# so jsono functions refuse it at bind instead of reading a read-copy lane. The same layout with an
-# object-key lane is recognized and binds.
+# Layout recognition enforces the same rule on stored/cast structs, and the codec makes it
+# structural: an index step has no encoding, so a lane naming one cannot be spelled at all. What
+# reaches recognition is simply a name that decodes to nothing — `$.arr[0]` is not base32hex — and
+# such a struct is not recognized as JSONO, so jsono functions refuse it at bind instead of reading
+# a read-copy lane. The same layout with the encoded object-key lane is recognized and binds.
 statement ok
-CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.arr[0]" BIGINT))));
+CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.arr[0]" BIGINT))));
 
 statement error
 SELECT jsono_array_length(x) FROM bad_lane_layout;
@@ -245,7 +246,7 @@ SELECT jsono_array_length(x) FROM bad_lane_layout;
 must be JSONO
 
 statement ok
-CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.arr" BIGINT))));
+CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c5p74000 BIGINT))));
 
 query I
 SELECT count(*) FROM (SELECT jsono_array_length(x) FROM good_lane_layout);
@@ -258,14 +259,14 @@ DROP TABLE bad_lane_layout;
 statement ok
 DROP TABLE good_lane_layout;
 
-# No JSON key is reserved by the storage layout: keys that collide with layout names (body,
-# shreds, "jsono") or old flat field names shred and read back correctly — 'body' through its
-# path form (a bare 'body' shred name would duplicate the layout's residual field; see below).
+# No JSON key is reserved by the storage layout, and now not even by its spelling: a lane is named
+# by the base32hex encoding of its path, which can be neither a layout field name nor anything under
+# the `$jsono$` prefix, so 'body' shreds bare like any other key.
 query IIIIII
 SELECT to_json(j), j ->> 'jsono_slots', j ->> 'jsono_slots_extra', j ->> 'body', j ->> 'shreds', j ->> 'jsono'
 FROM (
   SELECT jsono('{"jsono_slots":"v1","jsono_slots_extra":"v2","body":"v3","shreds":"v4","jsono":"v5"}',
-               shredding := {'jsono_slots':'VARCHAR','$.body':'VARCHAR','shreds':'VARCHAR'}) AS j
+               shredding := {'jsono_slots':'VARCHAR','body':'VARCHAR','shreds':'VARCHAR'}) AS j
 );
 ----
 {"body":"v3","jsono":"v5","jsono_slots":"v1","jsono_slots_extra":"v2","shreds":"v4"}	v1	v2	v3	v4	v5
@@ -331,7 +332,7 @@ SELECT to_json(jsono({'name': 'x', 'k': 'y'}));
 statement error
 SELECT to_json(jsono_residual(jsono({'name': 'x', 'k': 'y'})));
 ----
-row was shredded with shred 'k VARCHAR'
+row was shredded with shred '$.k VARCHAR'
 
 # Casting a shredded value to the plain jsono STRUCT is LOSSLESS: it reconstructs the full
 # document (overlay the shreds back onto the residual), it does not expose the stripped
@@ -360,25 +361,26 @@ SELECT to_json(params) FROM plain_store;
 ----
 {"a":"x","b":5,"c":"y"}
 
-# A shred cannot be named 'body' (it would duplicate the layout's residual field); the path form
-# is a different field name and works. jsono({...}) auto-shred keeps a 'body' field in the
-# residual silently for the same reason.
-statement error
-SELECT jsono('{"body":"x"}', shredding := {'body':'VARCHAR'});
-----
-shred the JSON key through its path form
-
+# The key 'body' is an ordinary key: its lane is named by the encoding of the path, which cannot be
+# the residual's field name, so the two spellings that used to be one ban and one workaround are now
+# one lane, and jsono({...}) auto-shred lifts it like any other field.
 query II
-SELECT to_json(jsono('{"body":"x","a":"y"}', shredding := {'$.body':'VARCHAR'})),
-       jsono('{"body":"x","a":"y"}', shredding := {'$.body':'VARCHAR'}) ->> 'body';
+SELECT to_json(jsono('{"body":"x","a":"y"}', shredding := {'body':'VARCHAR'})),
+       jsono('{"body":"x","a":"y"}', shredding := {'body':'VARCHAR'}) ->> 'body';
 ----
 {"a":"y","body":"x"}	x
 
+query I
+SELECT jsono('{"body":"x","a":"y"}', shredding := {'body':'VARCHAR'})
+     = jsono('{"body":"x","a":"y"}', shredding := {'$.body':'VARCHAR'});
+----
+true
+
 query II
-SELECT typeof(jsono({'body': 'x', 'a': 'y'})) LIKE '%body VARCHAR%',
+SELECT typeof(jsono({'body': 'x', 'a': 'y'})) LIKE '%c9nm8u8000 VARCHAR%',
        to_json(jsono({'body': 'x', 'a': 'y'}));
 ----
-false	{"a":"y","body":"x"}
+true	{"a":"y","body":"x"}
 
 # Reshredding to a smaller or retyped shred set is lossless: dropped shreds fold back into the
 # residual (single-pass partial overlay), a retyped shred returns and re-extracts at its new type,
@@ -391,7 +393,7 @@ SELECT to_json(jsono(jsono('{"a":"1","b":"2","c":"3","d":4}', shredding := {'a':
 
 query II
 SELECT to_json(jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})),
-       jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})."jsono"."shreds$1"."a";
+       jsono(jsono('{"a":7,"b":"x"}', shredding := {'a':'VARCHAR'}), shredding := {'a':'BIGINT'})."jsono"."shreds$2".c4000;
 ----
 {"a":7,"b":"x"}	7
 
@@ -411,17 +413,18 @@ SELECT to_json(jsono(jsono('{"p":{"q":"deep"},"r":"top"}', shredding := {'$.p.q'
 ----
 {"p":{"q":"deep"},"r":"top"}
 
-# Two spec entries naming the same key path ('a' and '$.a'): both shreds fill and the key
-# strips once (the duplicate-path fallback keeps the per-row locate-and-strip semantics).
-query III
-SELECT to_json(j), j."jsono"."shreds$1"."a", j."jsono"."shreds$1"."$.a"
-FROM (SELECT jsono('{"a":"v","z":1}', shredding := {'a':'VARCHAR', '$.a':'VARCHAR'}) AS j);
+# Two spec entries naming the same key path ('a' and '$.a') are now one lane, so they cannot both be
+# fields of one STRUCT and the spec is refused. The old behaviour (two lanes, both filled, the key
+# stripped once) existed only because the spelling leaked into the field name; with the name derived
+# from the path there is nothing left to distinguish the two entries by.
+statement error
+SELECT jsono('{"a":"v","z":1}', shredding := {'a':'VARCHAR', '$.a':'VARCHAR'});
 ----
-{"a":"v","z":1}	v	v
+name the same shred path
 
 # A UBIGINT shred strips values past int64 range and plain non-negative integers alike.
 query III
-SELECT to_json(j), j."jsono"."shreds$1"."big", j."jsono"."shreds$1"."small"
+SELECT to_json(j), j."jsono"."shreds$2".c9kme000, j."jsono"."shreds$2".edmm2r3c0000
 FROM (SELECT jsono('{"big":18446744073709551615,"small":7}', shredding := {'big':'UBIGINT','small':'UBIGINT'}) AS j);
 ----
 {"big":18446744073709551615,"small":7}	18446744073709551615	7

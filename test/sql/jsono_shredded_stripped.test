@@ -23,13 +23,13 @@ res AS (
 SELECT struct_pack(
     "jsono" := struct_pack(
         "body$1" := res.body,
-        "shreds$1" := struct_pack(
+        "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
-            "$.commit.collection" := orig ->> '$.commit.collection',
-            "$.commit.operation"  := orig ->> '$.commit.operation',
-            "$.did"               := orig ->> '$.did',
-            "$.kind"              := orig ->> '$.kind'))
+            cdnmqrb9eg000orfdhm6aorkd5nms000 := orig ->> '$.commit.collection',
+            cdnmqrb9eg000rrgclp62t39dtn0000  := orig ->> '$.commit.operation',
+            chkm8000               := orig ->> '$.did',
+            ddkmsp0000              := orig ->> '$.kind'))
 ) AS j
 FROM res;
 
@@ -86,10 +86,10 @@ CREATE TABLE ov_conflict AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         "body$1" := jsono('{"k":"RESIDUAL","c":"z"}')."jsono"."body$1",
-        "shreds$1" := struct_pack(
+        "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
-            "$.k" := 'SHRED'))
+            dc000 := 'SHRED'))
 ) AS j;
 
 query I
@@ -130,11 +130,11 @@ CREATE TABLE ov_null AS
 SELECT struct_pack(
     "jsono" := struct_pack(
         "body$1" := jsono('{"b":null,"c":"z"}')."jsono"."body$1",
-        "shreds$1" := struct_pack(
+        "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
-            "$.a" := 'x',
-            "$.b" := NULL::VARCHAR))
+            c4000 := 'x',
+            c8000 := NULL::VARCHAR))
 ) AS j;
 
 query I

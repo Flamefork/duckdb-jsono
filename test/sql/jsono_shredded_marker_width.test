@@ -9,8 +9,8 @@ require json
 # A canonical shredded value carries the marker and the spill bitmap as BIGINT, the first two fields
 # inside `shreds`.
 query II
-SELECT typeof(jsono({'event_name':'pv','goals':'buy'}).jsono."shreds$1"."$jsono$set"),
-       typeof(jsono({'event_name':'pv','goals':'buy'}).jsono."shreds$1"."$jsono$spill$0");
+SELECT typeof(jsono({'event_name':'pv','goals':'buy'}).jsono."shreds$2"."$jsono$set"),
+       typeof(jsono({'event_name':'pv','goals':'buy'}).jsono."shreds$2"."$jsono$spill$0");
 ----
 BIGINT	BIGINT
 
@@ -25,13 +25,13 @@ WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT
   struct_pack(jsono := struct_pack(
     "body$1" := c.jsono."body$1",
-    "shreds$1" := struct_pack(
-      "$jsono$set" := c.jsono."shreds$1"."$jsono$set"::HUGEINT,
-      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0"::INTEGER,
-      event_name := c.jsono."shreds$1".event_name,
-      goals := c.jsono."shreds$1".goals
+    "shreds$2" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set"::HUGEINT,
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0"::INTEGER,
+      clr6arjkbtn62rb50000 := c.jsono."shreds$2".clr6arjkbtn62rb50000,
+      ctnm2r3j0000 := c.jsono."shreds$2".ctnm2r3j0000
     )
-  ))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
+  ))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, clr6arjkbtn62rb50000 VARCHAR, ctnm2r3j0000 VARCHAR))) AS r
 FROM v;
 
 # The reserved fields were recognized by name, so this round-trips.
@@ -62,13 +62,13 @@ WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT to_json(
   struct_pack(jsono := struct_pack(
     "body$1" := c.jsono."body$1",
-    "shreds$1" := struct_pack(
-      "$jsono$set" := c.jsono."shreds$1"."$jsono$set"::HUGEINT,
-      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0"::HUGEINT,
-      event_name := c.jsono."shreds$1".event_name,
-      goals := c.jsono."shreds$1".goals
+    "shreds$2" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set"::HUGEINT,
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0"::HUGEINT,
+      clr6arjkbtn62rb50000 := c.jsono."shreds$2".clr6arjkbtn62rb50000,
+      ctnm2r3j0000 := c.jsono."shreds$2".ctnm2r3j0000
     )
-  ))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR)))
+  ))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, clr6arjkbtn62rb50000 VARCHAR)))
 )
 FROM v;
 ----
@@ -84,11 +84,11 @@ CREATE TABLE spill_deg AS
 WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT struct_pack(jsono := struct_pack(
     "body$1" := c.jsono."body$1",
-    "shreds$1" := struct_pack(
-      "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
-      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0"::INTEGER,
-      event_name := c.jsono."shreds$1".event_name,
-      goals := c.jsono."shreds$1".goals
+    "shreds$2" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0"::INTEGER,
+      clr6arjkbtn62rb50000 := c.jsono."shreds$2".clr6arjkbtn62rb50000,
+      ctnm2r3j0000 := c.jsono."shreds$2".ctnm2r3j0000
     )
   )) AS r
 FROM v;
@@ -112,13 +112,13 @@ WITH v AS (SELECT jsono({'event_name':'pv','goals':'buy'}) AS c)
 SELECT
   struct_pack(jsono := struct_pack(
     "body$1" := c.jsono."body$1",
-    "shreds$1" := struct_pack(
-      "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
-      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0"::INTEGER,
-      event_name := c.jsono."shreds$1".event_name,
-      goals := c.jsono."shreds$1".goals
+    "shreds$2" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0"::INTEGER,
+      clr6arjkbtn62rb50000 := c.jsono."shreds$2".clr6arjkbtn62rb50000,
+      ctnm2r3j0000 := c.jsono."shreds$2".ctnm2r3j0000
     )
-  ))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$1" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, event_name VARCHAR, goals VARCHAR))) AS r
+  ))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, clr6arjkbtn62rb50000 VARCHAR, ctnm2r3j0000 VARCHAR))) AS r
 FROM v;
 
 query I
@@ -137,11 +137,11 @@ WITH v AS (SELECT jsono({'a':'x','b':'y'}) AS c),
 reord AS (
   SELECT struct_pack(jsono := struct_pack(
     "body$1" := c.jsono."body$1",
-    "shreds$1" := struct_pack(
-      a := c.jsono."shreds$1".a,
-      "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
-      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0",
-      b := c.jsono."shreds$1".b
+    "shreds$2" := struct_pack(
+      c4000 := c.jsono."shreds$2".c4000,
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+      c8000 := c.jsono."shreds$2".c8000
     )
   )) AS r
   FROM v
@@ -156,11 +156,11 @@ WITH v AS (SELECT jsono({'a':'x','b':'y'}) AS c),
 reord AS (
   SELECT struct_pack(jsono := struct_pack(
     "body$1" := c.jsono."body$1",
-    "shreds$1" := struct_pack(
-      "$jsono$spill$0" := c.jsono."shreds$1"."$jsono$spill$0",
-      "$jsono$set" := c.jsono."shreds$1"."$jsono$set",
-      a := c.jsono."shreds$1".a,
-      b := c.jsono."shreds$1".b
+    "shreds$2" := struct_pack(
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+      c4000 := c.jsono."shreds$2".c4000,
+      c8000 := c.jsono."shreds$2".c8000
     )
   )) AS r
   FROM v
