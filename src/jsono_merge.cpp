@@ -38,6 +38,9 @@ struct JsonoMergeLocalState : public FunctionLocalState {
 	std::vector<MergeChild> merge_children_a;
 	std::vector<MergeChild> merge_children_b;
 	std::vector<MergePlanEntry> merge_plan;
+	// One per input column: manifest signatures survive across chunks so the per-lane name decode
+	// does not repeat on every call (see JsonoShredSignatures).
+	std::vector<JsonoShredSignatures> input_signatures;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -401,9 +404,19 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	// input carries none, so any manifest entry on it fails loud). jsono_overlay is exempt: it
 	// is the optimizer's reconstruction primitive and its residual argument legitimately
 	// carries a manifest already verified by __jsono_internal_checked_residual.
-	auto init_input = [&](JsonoRowReader &reader, Vector &input, idx_t row_count) {
+	if (lstate.input_signatures.size() < ncols) {
+		lstate.input_signatures.resize(ncols);
+	}
+	// `cache` is the per-input signature cache when the reader reads that input's own declared type
+	// (the fast path, where it is hit on every chunk after the first); the reshred fallback passes
+	// none, because there the same slot would alternate between an input's type and its reconstructed
+	// plain type and never hit.
+	auto init_input = [&](JsonoRowReader &reader, Vector &input, idx_t row_count,
+	                      optional_ptr<JsonoShredSignatures> cache) {
 		if (mode == MergeMode::Overlay) {
 			reader.InitTrusted(input, row_count);
+		} else if (cache) {
+			reader.Init(input, row_count, *cache);
 		} else {
 			reader.Init(input, row_count);
 		}
@@ -413,7 +426,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		// Plain merge: fold straight into the result.
 		vector<JsonoRowReader> inputs(ncols);
 		for (idx_t i = 0; i < ncols; i++) {
-			init_input(inputs[i], args.data[i], count);
+			init_input(inputs[i], args.data[i], count, &lstate.input_signatures[i]);
 		}
 		RunResidualFold(mode, inputs, ncols, count, result, lstate);
 		if (args.AllConstant()) {
@@ -509,10 +522,10 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				// output never carries one.
 				auto plain = make_uniq<Vector>(JsonoType(), fallback_count);
 				JsonoReconstructToPlain(input, fallback_count, *plain);
-				init_input(inputs[i], *plain, fallback_count);
+				init_input(inputs[i], *plain, fallback_count, nullptr);
 				reconstructed.push_back(std::move(plain));
 			} else {
-				init_input(inputs[i], input, fallback_count);
+				init_input(inputs[i], input, fallback_count, nullptr);
 			}
 		}
 		Vector fold_out(JsonoType(), fallback_count);
@@ -528,7 +541,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	if (fast_viable) {
 		vector<JsonoRowReader> raw(ncols);
 		for (idx_t i = 0; i < ncols; i++) {
-			init_input(raw[i], args.data[i], count);
+			init_input(raw[i], args.data[i], count, &lstate.input_signatures[i]);
 		}
 		Vector fast_residual(JsonoType(), count);
 		RunResidualFold(mode, raw, ncols, count, fast_residual, lstate);

@@ -2716,9 +2716,13 @@ unique_ptr<Expression> MakeReshredExpression(ClientContext &context, unique_ptr<
 	} else {
 		child_list_t<Value> spec_fields;
 		for (auto &shred : shreds) {
-			// The spec DSL is logical: hand it the lane's path, not its encoded name, or the parse
-			// would read the name as a literal key and mint a lane for a path nothing has.
-			spec_fields.emplace_back(JsonoLaneLogicalPath(shred.first), Value(shred.second.ToString()));
+			// The spec DSL is logical on BOTH halves: the lane's path rather than its encoded name,
+			// or the parse would read the name as a literal key and mint a lane for a path nothing
+			// has — and the lane's logical type, because an object-array lane's type carries encoded
+			// element-subfield names, which the spec would otherwise encode a second time and rebuild
+			// a type that no longer equals the target.
+			spec_fields.emplace_back(JsonoLaneLogicalPath(shred.first),
+			                         Value(JsonoLaneLogicalType(shred.second).ToString()));
 		}
 		auto spec = make_uniq<BoundConstantExpression>(Value::STRUCT(std::move(spec_fields)));
 		spec->SetAlias("shredding");

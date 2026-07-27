@@ -27,27 +27,70 @@ enum class JsonoRowState : uint8_t { Null, Empty, Value };
 // Vectors are overwhelmingly manifest-homogeneous — the rows of one column chunk were shredded
 // with the same spec — so after the first row a verification is one byte-compare of the row's
 // manifest tail against the last verified tail.
+// The (logical path, type-string) pairs of a reading type's shreds. Building them decodes every lane
+// name out of its base32 form and renders every lane type — O(lanes) with an allocation per lane —
+// which must not repeat on each chunk: a wide shredded merge inits a reader per input per chunk, and
+// paying there cost 25-30% on merge_patch when the codec landed. An operator therefore keeps one of
+// these per input in its local state, across chunks.
+//
+// Identity is the type's ExtraTypeInfo pointer: an expression's argument type is fixed for the
+// operator's lifetime, so this hits on every chunk after the first, and a miss only rebuilds.
+class JsonoShredSignatures {
+public:
+	const std::vector<std::pair<std::string, std::string>> &For(const LogicalType &type) {
+		auto info = type.AuxInfo();
+		if (!built_ || info.get() != cached_info_) {
+			signatures_.clear();
+			JsonoLayoutType layout;
+			if (TryParseJsonoLayoutType(type, layout)) {
+				signatures_.reserve(layout.shreds.size());
+				for (auto &shred : layout.shreds) {
+					signatures_.emplace_back(JsonoLaneLogicalPath(shred.first),
+					                         JsonoLaneLogicalType(shred.second).ToString());
+				}
+			}
+			cached_info_ = info.get();
+			built_ = true;
+		}
+		return signatures_;
+	}
+
+private:
+	std::vector<std::pair<std::string, std::string>> signatures_;
+	const ExtraTypeInfo *cached_info_ = nullptr;
+	bool built_ = false;
+};
+
 class ShredManifestVerifier {
 public:
 	// Signatures = the shreds the reading type carries, as (logical path, type-string) pairs. The
 	// manifest records a lane's path, not its encoded field name, so the names are decoded here —
 	// once per reader init, leaving VerifyShredManifestEntries a byte comparison and the tail
-	// memoization untouched.
+	// memoization untouched. Operators on a hot path pass a JsonoShredSignatures instead, so the
+	// decode happens once rather than per chunk.
 	void InitFromType(const LogicalType &type) {
+		owned_signatures_.clear();
 		JsonoLayoutType layout;
 		if (TryParseJsonoLayoutType(type, layout)) {
-			signatures_.reserve(layout.shreds.size());
+			owned_signatures_.reserve(layout.shreds.size());
 			for (auto &shred : layout.shreds) {
-				signatures_.emplace_back(JsonoLaneLogicalPath(shred.first),
-				                         JsonoLaneLogicalType(shred.second).ToString());
+				owned_signatures_.emplace_back(JsonoLaneLogicalPath(shred.first),
+				                               JsonoLaneLogicalType(shred.second).ToString());
 			}
 		}
+		signatures_ = &owned_signatures_;
+	}
+
+	// Signatures owned by a longer-lived cache; the reference must outlive the reader.
+	void InitSignaturesRef(const std::vector<std::pair<std::string, std::string>> &signatures) {
+		signatures_ = &signatures;
 	}
 
 	// Signatures supplied by the caller (__jsono_internal_checked_residual receives them as plan
 	// constants); the paths must be the same canonical logical form InitFromType decodes to.
 	void InitSignatures(std::vector<std::pair<std::string, std::string>> signatures) {
-		signatures_ = std::move(signatures);
+		owned_signatures_ = std::move(signatures);
+		signatures_ = &owned_signatures_;
 	}
 
 	// The hot path is a row without a manifest (a plain residual, the overwhelming majority):
@@ -80,7 +123,8 @@ private:
 		verified_ = false;
 		tail_.assign(tail.data(), tail.size());
 		ParseShredManifestBytes(tail_.data(), tail_.size(), entries_);
-		VerifyShredManifestEntries(entries_, signatures_);
+		static const std::vector<std::pair<std::string, std::string>> no_signatures;
+		VerifyShredManifestEntries(entries_, signatures_ ? *signatures_ : no_signatures);
 		verified_ = true;
 	}
 
@@ -88,7 +132,8 @@ private:
 		return tail.size() == tail_.size() && std::memcmp(tail.data(), tail_.data(), tail.size()) == 0;
 	}
 
-	std::vector<std::pair<std::string, std::string>> signatures_;
+	const std::vector<std::pair<std::string, std::string>> *signatures_ = nullptr;
+	std::vector<std::pair<std::string, std::string>> owned_signatures_;
 	std::string tail_;
 	std::vector<ShredManifestEntry> entries_;
 	bool verified_ = false;
@@ -153,6 +198,14 @@ public:
 	void Init(Vector &input, idx_t count) {
 		InitJsonoVectorData(input, count, data_);
 		verifier_.InitFromType(input.GetType());
+		verify_on_read_ = true;
+	}
+
+	// Same policy, but with the signatures kept in an operator-lifetime cache so the per-lane decode
+	// happens once instead of on every chunk. `cache` must outlive this reader.
+	void Init(Vector &input, idx_t count, JsonoShredSignatures &cache) {
+		InitJsonoVectorData(input, count, data_);
+		verifier_.InitSignaturesRef(cache.For(input.GetType()));
 		verify_on_read_ = true;
 	}
 

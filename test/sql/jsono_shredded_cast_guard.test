@@ -390,3 +390,19 @@ statement error
 SELECT to_json(jsono({'wrap': p})) FROM plain_narrowed;
 ----
 narrowed by a raw struct cast
+
+# Cast normalization into a target whose shred is an object array: the lane's TYPE carries encoded
+# element-subfield names, so the reshred spec must be handed the decoded (logical) type. Feeding it
+# the encoded one re-encodes the subfields and the rebuilt type stops matching the target.
+statement ok
+CREATE TABLE array_shredded AS
+SELECT jsono('{"items":[{"id":1}],"o":"x"}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v;
+
+statement ok
+INSERT INTO array_shredded SELECT jsono('{"items":[{"id":2},{"id":3}],"o":"y"}');
+
+query I
+SELECT v::json::varchar FROM array_shredded ORDER BY 1;
+----
+{"items":[{"id":1}],"o":"x"}
+{"items":[{"id":2},{"id":3}],"o":"y"}
