@@ -131,20 +131,12 @@ struct JsonoStructBindData : public FunctionData {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		// A copy that loses its shreds would take the plain path yet still allocate the shredded
-		// return type, leaving the shred children uninitialized.
-		auto copy = make_uniq<JsonoStructBindData>(plan);
-		copy->shreds = shreds;
-		copy->one_pass_shred = one_pass_shred;
-		copy->nested_shreds = nested_shreds;
-		copy->shred_fields = shred_fields;
-		copy->shred_plan = shred_plan;
-		copy->nested_residual_plan = nested_residual_plan;
-		copy->residual_fields = residual_fields;
-		copy->residual_plan = residual_plan;
-		copy->write_model = write_model;
-		copy->hot_manifest = hot_manifest;
-		return std::move(copy);
+		// Copy every member, by copy-construction rather than by listing them: a copy that lost its
+		// shreds would take the plain path yet still allocate the shredded return type, leaving the
+		// shred children uninitialized, and a copy that lost the derived write tables would emit an
+		// empty manifest. A hand-written list makes a new member's absence silent; this makes it
+		// impossible.
+		return make_uniq<JsonoStructBindData>(*this);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
@@ -1435,8 +1427,7 @@ bool TryBuildAutoShredLaneType(const JsonoStructPlan &plan, const LogicalType &s
 			if (!TryBuildAutoShredLaneType(plan.children[i], source_children[i].second, child_lane)) {
 				return false;
 			}
-			lane_children.emplace_back(JsonoEncodeLaneName(LiteralKeyPath(source_children[i].first)),
-			                           std::move(child_lane));
+			lane_children.emplace_back(JsonoEncodeLaneSubfieldName(source_children[i].first), std::move(child_lane));
 		}
 		lane_type = LogicalType::STRUCT(std::move(lane_children));
 		return true;

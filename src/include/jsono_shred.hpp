@@ -47,6 +47,13 @@ ShredKind ClassifyShredKind(const LogicalType &type);
 // normalization can reshred a branch to the merged shred set without a catalog lookup.
 ScalarFunction JsonoShredFromJsonoFunction();
 
+// __jsono_internal_reshred(value, target): the same reshred, but declaring its lanes by TYPE — the
+// second argument is a NULL constant of the target shredded type, and only its type is read. The
+// optimizer uses this instead of the public spec form because a spec is text: rendering a lane type
+// back to a string and re-parsing it collapses an object-array element's `id` and `ID` into one
+// subfield, undoing exactly what the lane-name codec guarantees.
+ScalarFunction JsonoReshredFunction();
+
 // True if `type` is a scalar a shred value can hold losslessly (VARCHAR/BIGINT/UBIGINT/
 // DOUBLE/BOOLEAN). The struct constructor lifts only such top-level fields into shreds;
 // every other field (other scalars, nested objects/arrays) stays in the residual tape.
@@ -91,17 +98,22 @@ struct JsonoArrayShredSpec {
 };
 
 // True if two shred paths overlap structurally: every step they share is the same object key, so
-// one is a prefix of (or equal to) the other (e.g. `a` and `$.a.a`, or `a` and `$.a`). Such a pair
-// is a sparse multi-shape layout (one row populates at most one lane), not an error — but the
-// whole-value to_json overlay cannot pack both into one patch tree (a node would be both a leaf and
-// a group), so that reader falls back to the independent-overlay reconstruct. Index/wildcard steps
-// never match (they cannot form the scalar-vs-nested overlap).
+// one is a prefix of (or equal to) the other (e.g. `a` and `$.a.a`). Such a pair is a sparse
+// multi-shape layout (one row populates at most one lane), not an error — but the whole-value
+// to_json overlay cannot pack both into one patch tree (a node would be both a leaf and a group),
+// so that reader falls back to the independent-overlay reconstruct. Index/wildcard steps never
+// match (they cannot form the scalar-vs-nested overlap).
+//
+// jsono_merge.cpp's ShredPathsStructurallyConflict tests the same shape and reaches the opposite
+// verdict — there it disqualifies the lane copy-through fast path rather than declaring the set
+// invalid, because merging two inputs must decide which structure survives, while reading one value
+// only has to render what is already there.
 bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b);
 
-// One lane's manifest entry, in both framings.
+// One lane's manifest entry, ready to append: the length-prefixed logical path, the type code, and
+// for an object-array lane its element subfield list.
 struct JsonoShredManifestEntryBytes {
-	std::string full;
-	std::string compact;
+	std::string bytes;
 };
 
 // Everything a per-row shred write reads that is a function of the shred SET alone, built once by
@@ -109,12 +121,13 @@ struct JsonoShredManifestEntryBytes {
 // its logical path and renders every lane type, so a per-chunk rebuild charges the whole shred set
 // to every batch of rows.
 //
-// `entries[f]`/`paths[f]` describe lane f. `shreds[f]` is the lane's PHYSICAL (encoded) field name
-// and type, while the entry records the lane's LOGICAL path, decoded from that name, because the
-// manifest is a per-row statement about the DOCUMENT while the encoding is a transport artifact of
-// the TYPE. The reader's verification (VerifyShredManifestEntries) compares those bytes against
-// signatures it decodes from its own type the same way, so both sides name the lane identically by
-// construction.
+// All four vectors are indexed by lane, in the order of the `shreds` the model was built from — the
+// (PHYSICAL name, type) pairs the stored type carries. `entries[f]` is lane f's manifest record and
+// `paths[f]` its logical path text, both decoded from that physical name, because the manifest is a
+// per-row statement about the DOCUMENT while the encoding is a transport artifact of the TYPE.
+// `paths[f]` is also what a carry-over probe matches an input row's manifest against. The reader's
+// verification (VerifyShredManifestEntries) compares those bytes against signatures it decodes from
+// its own type the same way, so both sides name the lane identically by construction.
 //
 // `manifest_order` lists the lanes in the manifest's emission order, which is the logical-path order
 // and NOT the lane order (that follows the encoded name, and the two genuinely differ: `$.a-c` sorts
@@ -123,7 +136,7 @@ struct JsonoShredManifestEntryBytes {
 // order, document order, tree order), so ordering the manifest is a bind-time permutation walked per
 // row, never a per-row sort.
 //
-// `spill_ranks[f]` is lane f's bit in the `$jsono$spill` bitmap (see JsonoSpillRanksOfNames). It is
+// `spill_ranks[f]` is lane f's bit in the `$jsono$spill` bitmap (see JsonoCanonicalRanks). It is
 // the PHYSICAL name that ranks there, because every reader recomputes the ranks from the stored
 // type's field names — writer and readers must rank the same string or the bits mean different lanes
 // on each side.
@@ -138,6 +151,11 @@ JsonoShredWriteModel JsonoBuildShredWriteModel(const vector<std::pair<string, Lo
 
 // The lanes one row strips, as membership only: a write loop marks lanes by LANE index as it reaches
 // them and the manifest walk supplies the order. Sized once per shred set, cleared per row.
+//
+// The trade this makes: a per-row sort of the stripped lanes (O(k log k) in what the row actually
+// stripped) becomes a per-row walk of the whole set (O(lanes), plus the clear). It pays whenever a
+// row strips a decent share of the lanes — the common case, since a shred set is chosen for the
+// document — and loses only on a wide set over a sparse document, where it is still linear.
 struct JsonoStrippedLanes {
 	void Init(idx_t lane_count) {
 		marks.assign(lane_count, 0);

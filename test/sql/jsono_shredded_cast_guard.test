@@ -392,8 +392,8 @@ SELECT to_json(jsono({'wrap': p})) FROM plain_narrowed;
 narrowed by a raw struct cast
 
 # Cast normalization into a target whose shred is an object array: the lane's TYPE carries encoded
-# element-subfield names, so the reshred spec must be handed the decoded (logical) type. Feeding it
-# the encoded one re-encodes the subfields and the rebuilt type stops matching the target.
+# element-subfield names, so the reshred must be handed the type itself rather than a rendering of
+# it — the injected expression declares its lanes structurally for exactly this reason.
 statement ok
 CREATE TABLE array_shredded AS
 SELECT jsono('{"items":[{"id":1}],"o":"x"}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v;
@@ -406,3 +406,161 @@ SELECT v::json::varchar FROM array_shredded ORDER BY 1;
 ----
 {"items":[{"id":1}],"o":"x"}
 {"items":[{"id":2},{"id":3}],"o":"y"}
+
+# Two object-array lanes for one path whose element subfields differ ONLY in case. The codec keeps
+# them apart in the stored type (the encoded alphabet has no upper case), and the set-op merge keeps
+# both — but the reshred that coerces each branch to the merged type must not round-trip that type
+# through text: DuckDB's type parser folds `id` and `ID` into one subfield, and the bind then fails
+# on a type it cannot build. This is the read side of the same guarantee the lane names carry.
+query I
+SELECT to_json(v) FROM (
+  SELECT jsono('{"items":[{"id":1}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v
+  UNION ALL
+  SELECT jsono('{"items":[{"ID":2}]}', shredding := {'$.items': 'STRUCT(ID BIGINT)[]'})
+) ORDER BY 1;
+----
+{"items":[{"ID":2}]}
+{"items":[{"id":1}]}
+
+# CASE reaches the same merged type through the binder rather than through set-op resolution.
+query I
+SELECT to_json(CASE WHEN i = 1
+                    THEN jsono('{"items":[{"id":1}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'})
+                    ELSE jsono('{"items":[{"ID":2}]}', shredding := {'$.items': 'STRUCT(ID BIGINT)[]'}) END)
+FROM (SELECT unnest([1, 2]) AS i) ORDER BY 1;
+----
+{"items":[{"ID":2}]}
+{"items":[{"id":1}]}
+
+# The merged type carries BOTH subfields, each under its own encoded name. Note what the logical
+# rendering below is: a type string DuckDB's own parser would collapse. That is exactly why the
+# reshred takes the type structurally — and it is the one case where the lanes answer cannot be
+# pasted back into a spec.
+query II
+SELECT l.path, l.type FROM (
+  SELECT unnest(jsono_layout_lanes(v)) AS l FROM (
+    SELECT jsono('{"items":[{"id":1}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v
+    UNION ALL
+    SELECT jsono('{"items":[{"ID":2}]}', shredding := {'$.items': 'STRUCT(ID BIGINT)[]'})
+  ) LIMIT 1
+);
+----
+$.items	STRUCT(id BIGINT, ID BIGINT)[]
+
+# --- An object-array lane's element struct may be WIDENED by name. This is what a multi-file scan
+# does: read_parquet(union_by_name := true) unions the element structs of two files and NULL-fills
+# the difference, and a NULL subfield means "not in the lane", which is where every reader already
+# falls back to the residual skeleton. The manifest spells the stripped subfields out one by one for
+# exactly this reason — as one rendered type string, "my subfield was dropped" and "another file's
+# subfield was added beside mine" were the same inequality. ---
+
+require parquet
+
+statement ok
+COPY (SELECT jsono('{"items":[{"id":1}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v)
+TO '__TEST_DIR__/arr_id.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT jsono('{"items":[{"name":"n"}]}', shredding := {'$.items': 'STRUCT(name VARCHAR)[]'}) AS v)
+TO '__TEST_DIR__/arr_name.parquet' (FORMAT PARQUET);
+
+query I
+SELECT to_json(v) FROM read_parquet(['__TEST_DIR__/arr_id.parquet', '__TEST_DIR__/arr_name.parquet'],
+                                    union_by_name := true) ORDER BY 1;
+----
+{"items":[{"id":1}]}
+{"items":[{"name":"n"}]}
+
+# The same scan where the two subfields differ only in case: the encoded names keep them apart in
+# the union, and each row still reads under the spelling it was written with.
+statement ok
+COPY (SELECT jsono('{"items":[{"ID":2}]}', shredding := {'$.items': 'STRUCT(ID BIGINT)[]'}) AS v)
+TO '__TEST_DIR__/arr_upper.parquet' (FORMAT PARQUET);
+
+query I
+SELECT to_json(v) FROM read_parquet(['__TEST_DIR__/arr_id.parquet', '__TEST_DIR__/arr_upper.parquet'],
+                                    union_by_name := true) ORDER BY 1;
+----
+{"items":[{"ID":2}]}
+{"items":[{"id":1}]}
+
+# Widening is accepted; NARROWING is still the loss the manifest exists to catch. A raw cast that
+# drops a subfield the row stripped fails loud, and so does one that retypes it.
+statement ok
+CREATE TABLE arr_narrow AS SELECT jsono('{}', shredding := {'$.items': 'STRUCT(name VARCHAR)[]'}) AS v WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO arr_narrow
+SELECT jsono('{"items":[{"id":7,"name":"n"}]}', shredding := {'$.items': 'STRUCT(id BIGINT, name VARCHAR)[]'});
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT to_json(v) FROM arr_narrow;
+----
+carries it as a different type
+
+statement ok
+CREATE TABLE arr_retyped AS SELECT jsono('{}', shredding := {'$.items': 'STRUCT(id VARCHAR)[]'}) AS v WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO arr_retyped SELECT jsono('{"items":[{"id":7}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'});
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT to_json(v) FROM arr_retyped;
+----
+carries it as a different type
+
+# The load-bearing line under the widening rule: a subfield that is NOT in the lane reads from the
+# residual skeleton. The document below carries both `id` and `name` in its element while only `id`
+# is shredded, so `name` sits in the skeleton — and it must still read through a widened union type,
+# where the lane gained a `name` column of NULLs. If a reader ever took a NULL subfield for "the key
+# is absent", this row is where it would lose data, and it is the row the relaxed check legalizes.
+statement ok
+COPY (SELECT jsono('{"items":[{"id":1,"name":"kept"}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v)
+TO '__TEST_DIR__/arr_residual.parquet' (FORMAT PARQUET);
+
+query II
+SELECT to_json(v), v ->> '$.items[0].name'
+FROM read_parquet(['__TEST_DIR__/arr_residual.parquet', '__TEST_DIR__/arr_name.parquet'],
+                  union_by_name := true)
+ORDER BY 1;
+----
+{"items":[{"id":1,"name":"kept"}]}	kept
+{"items":[{"name":"n"}]}	n
+
+# __jsono_internal_reshred is in the catalog so the injected expression re-binds by name after plan
+# deserialization, which also makes it callable by hand. A wrong argument must be a BINDER error:
+# an internal error aborts the caller's transaction over what is only a bad call.
+statement error
+SELECT __jsono_internal_reshred({'a': 1}, NULL);
+----
+the target must be a shredded jsono type
+
+# Both type-answering functions re-bind once a prepared parameter has a type, rather than answering
+# about UNKNOWN and freezing that answer into their bind data.
+statement ok
+PREPARE lanes_of AS SELECT jsono_layout_lanes($1);
+
+query I
+EXECUTE lanes_of(jsono('{"a":1}', shredding := {'a': 'BIGINT'}));
+----
+[{'path': $.a, 'type': BIGINT}]
+
+statement ok
+PREPARE diagnose_of AS SELECT jsono_layout_diagnose($1);
+
+query I
+EXECUTE diagnose_of(jsono('{"a":1}'));
+----
+jsono: plain, body revision 1

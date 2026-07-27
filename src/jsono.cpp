@@ -69,6 +69,11 @@ unique_ptr<FunctionData> JsonoLayoutDiagnoseBind(ClientContext &context, ScalarF
                                                  vector<unique_ptr<Expression>> &arguments) {
 	(void)context;
 	(void)bound_function;
+	if (arguments[0]->HasParameter()) {
+		// The diagnosis is a bind-time fact frozen into the bind data, so binding against an unresolved
+		// parameter would answer about UNKNOWN and keep answering that after the parameter arrives.
+		throw ParameterNotResolvedException();
+	}
 	return make_uniq<JsonoLayoutDiagnoseBindData>(JsonoExplainLayoutMatch(arguments[0]->return_type));
 }
 
@@ -83,9 +88,15 @@ void JsonoLayoutDiagnoseExecute(DataChunk &args, ExpressionState &state, Vector 
 // as the type carries them. A lane's STRUCT field name is the base32hex encoding of its path (see
 // the lane-name boundary in jsono_path.hpp), so reading the schema by eye no longer answers "which
 // paths are shredded here" — this does, and it is the reason that trade is affordable. Like
-// jsono_layout_diagnose it is a question about the TYPE, answered at bind, reading no bytes; a type
-// with no lanes (plain, or not JSONO at all) yields an empty list rather than an error, since
-// "which lanes" has an honest empty answer and jsono_layout_diagnose owns "is this JSONO".
+// jsono_layout_diagnose it is a question about the TYPE, answered at bind, reading no bytes.
+//
+// The empty list is reserved for the one type that honestly HAS no lanes: a plain JSONO value. A
+// foreign revision does have lanes — this build just cannot read their naming — and a non-JSONO
+// struct has no lanes to speak of, so answering `[]` for either would be the same silent substitution
+// the refusal machinery exists to prevent, and indistinguishable from a plain value. Both refuse at
+// bind, which is also why this function needs no exemption from the plan walk: it is already loud by
+// the time the walk would reach it. jsono_layout_diagnose stays the one never-throwing answer to
+// "what is this".
 struct JsonoLayoutLanesBindData : public FunctionData {
 	explicit JsonoLayoutLanesBindData(Value lanes_p) : lanes(std::move(lanes_p)) {
 	}
@@ -110,18 +121,28 @@ unique_ptr<FunctionData> JsonoLayoutLanesBind(ClientContext &context, ScalarFunc
                                               vector<unique_ptr<Expression>> &arguments) {
 	(void)context;
 	(void)bound_function;
+	if (arguments[0]->HasParameter()) {
+		// The answer is a bind-time fact about the argument's TYPE, so an unresolved parameter has to
+		// re-bind once it has one rather than be classified as "not JSONO".
+		throw ParameterNotResolvedException();
+	}
+	auto &argument_type = arguments[0]->return_type;
 	JsonoLayoutType layout;
+	string reason;
+	auto match = MatchJsonoLayoutType(argument_type, layout, &reason);
+	JsonoRejectForeignLayout(argument_type, "jsono_layout_lanes()");
+	if (match != JsonoLayoutMatch::Current) {
+		throw BinderException("jsono_layout_lanes(): argument is not a JSONO value: %s", reason);
+	}
 	vector<Value> lanes;
-	if (TryParseJsonoLayoutType(arguments[0]->return_type, layout)) {
-		for (auto &shred : layout.shreds) {
-			child_list_t<Value> lane;
-			lane.emplace_back("path", Value(JsonoLaneLogicalPath(shred.first)));
-			// The lane type is reported logically too: an object-array lane's element subfields are
-			// encoded one-step paths in the stored type, and printing those would both hide the JSON
-			// keys and break pasting the answer back into a shredding spec.
-			lane.emplace_back("type", Value(JsonoLaneLogicalType(shred.second).ToString()));
-			lanes.push_back(Value::STRUCT(std::move(lane)));
-		}
+	for (auto &shred : layout.shreds) {
+		child_list_t<Value> lane;
+		lane.emplace_back("path", Value(JsonoLaneLogicalPath(shred.first)));
+		// The lane type is reported logically too: an object-array lane's element subfields are
+		// encoded one-step paths in the stored type, and printing those would both hide the JSON
+		// keys and break pasting the answer back into a shredding spec.
+		lane.emplace_back("type", Value(JsonoLaneLogicalType(shred.second).ToString()));
+		lanes.push_back(Value::STRUCT(std::move(lane)));
 	}
 	auto element_type = ListType::GetChildType(JsonoLayoutLanesResultType());
 	return make_uniq<JsonoLayoutLanesBindData>(Value::LIST(element_type, std::move(lanes)));
@@ -679,13 +700,16 @@ idx_t JsonoFindShredsFieldIndex(const LogicalType &shreds_type, const string &na
 	return DConstants::INVALID_INDEX;
 }
 
-// The canonical rank of each name: its position in the byte-wise sorted list. The names are the
-// ENCODED lane names, and sorting them IS sorting the lanes' paths — both stages of the codec are
-// order-preserving (see the lane-name boundary in jsono_path.hpp). That equality is a property of
-// THAT serialization, not of encoding in general: re-verify it first if the codec ever changes,
-// because the spill bit numbering, the type's canonical field order and the sort-merges against the
-// residual's byte-sorted document keys all rest on it.
-vector<idx_t> JsonoSpillRanksOfNames(const vector<string> &names) {
+// The rank of each string: its position in the byte-wise sorted list. Which order that IS depends on
+// what the caller ranks, and the two framings of a lane genuinely differ. Ranked by ENCODED name it
+// is structural path order — both stages of the codec are order-preserving, so sorting names IS
+// sorting paths (see the lane-name boundary in jsono_path.hpp), and the spill bit numbering, the
+// type's canonical field order and the sort-merges against the residual's byte-sorted document keys
+// all rest on that. Ranked by logical path TEXT it is text order, which is what the manifest emits
+// in and is not the same permutation (`$.a-c` precedes `$.a.b` as text, follows it structurally).
+// The structural equality is a property of THAT serialization, not of encoding in general: re-verify
+// it first if the codec ever changes.
+vector<idx_t> JsonoCanonicalRanks(const vector<string> &names) {
 	vector<idx_t> order(names.size());
 	for (idx_t i = 0; i < names.size(); i++) {
 		order[i] = i;
@@ -703,17 +727,17 @@ uint64_t JsonoLayoutHashOf(const LogicalType &type) {
 	if (!TryParseJsonoLayoutType(type, layout) || layout.kind != JsonoLayoutKind::Shredded) {
 		return 0;
 	}
-	vector<std::pair<std::string, std::string>> signatures;
-	signatures.reserve(layout.shreds.size());
+	vector<std::pair<std::string, std::string>> lanes;
+	lanes.reserve(layout.shreds.size());
 	for (auto &shred : layout.shreds) {
-		signatures.emplace_back(shred.first, shred.second.ToString());
+		lanes.emplace_back(shred.first, shred.second.ToString());
 	}
-	// Canonicalize order: the marker identifies the shred SET (paths + types), not the field order. A
+	// Canonicalize order: the marker identifies the shred SET (names + types), not the field order. A
 	// set-operation merged type lists the left branch's shreds first then the right's unique ones
 	// (CombineStructTypes), so a writer stamping the canonical-order hash and a reader recomputing it
 	// over a reorder-cast result type would otherwise disagree and lose the schema-identity match.
-	std::sort(signatures.begin(), signatures.end());
-	return jsono::HashShredManifestSignatures(signatures);
+	std::sort(lanes.begin(), lanes.end());
+	return jsono::HashShredSetIdentity(lanes);
 }
 
 LogicalType JsonoShreddedStructType(const vector<JsonoLaneSpec> &shreds) {

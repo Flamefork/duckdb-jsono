@@ -542,7 +542,14 @@ inline Vector &JsonoShredVector(Vector &result, idx_t shred_index) {
 // the field names on every call, which is quadratic once a wide shred set is touched lane by lane.
 inline Vector &JsonoShredFieldVector(Vector &result, idx_t field_index) {
 	auto &entries = StructVector::GetEntries(JsonoShredsStructVector(result));
-	D_ASSERT(field_index < entries.size());
+	// Loud, not asserted: the index comes from JsonoFindShredsFieldIndex, which answers
+	// DConstants::INVALID_INDEX when the name is absent. That is unreachable while encode and decode
+	// stay inverse, but a release build with the check compiled out would read a wild pointer instead
+	// of naming the broken invariant, and this runs once per chunk, not per row.
+	if (field_index >= entries.size()) {
+		throw InternalException("JsonoShredFieldVector: shreds field index %llu out of range (%llu fields)",
+		                        (unsigned long long)field_index, (unsigned long long)entries.size());
+	}
 	return *entries[field_index];
 }
 

@@ -115,11 +115,21 @@ SELECT jsono_layout_lanes(jsono('{"items":[{"n":1}]}', shredding := {'items':'ST
 ----
 [{'path': $.items, 'type': 'STRUCT(n BIGINT)[]'}]
 
-# A plain value has no lanes, and so does a value that is not JSONO at all: "which lanes" has an
-# honest empty answer, while "is this JSONO" is jsono_layout_diagnose's question.
-query III
-SELECT jsono_layout_lanes(jsono('{"a":1}')),
-       jsono_layout_lanes(42),
-       jsono_layout_lanes(NULL::BIGINT);
+# The empty list belongs to the one type that honestly has no lanes: a plain JSONO value.
+query I
+SELECT jsono_layout_lanes(jsono('{"a":1}'));
 ----
-[]	[]	[]
+[]
+
+# A non-JSONO argument is a bind error, not an empty list. `[]` would be indistinguishable from the
+# plain answer above, i.e. a silent wrong answer to "which paths are shredded here";
+# jsono_layout_diagnose is the question that always answers.
+statement error
+SELECT jsono_layout_lanes(42);
+----
+not a JSONO value
+
+statement error
+SELECT jsono_layout_lanes(NULL::BIGINT);
+----
+not a JSONO value

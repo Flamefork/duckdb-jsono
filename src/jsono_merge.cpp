@@ -43,15 +43,17 @@ struct LaneSource {
 // The fast path's per-input facts: which arguments carry lanes, where each merged shred's lane sits
 // in each of them, and whether the lane types agree. All of it is a function of the ARGUMENT TYPES,
 // which are fixed for a bound expression — but recognizing one type costs a decode of every lane
-// name it carries, so it is resolved once per expression rather than per chunk. The executor used to
-// re-recognize every input inside FastCopyShred, i.e. once per shred per input per chunk: quadratic
-// in the shred set, and each recognition decoding every lane name again.
+// name it carries, so resolving it per shred per input per chunk is quadratic in the shred set.
+// Resolved once per expression instead.
 struct MergeInputPlan {
-	vector<bool> shredded;                      // per argument
-	vector<idx_t> plain_inputs;                 // arguments carrying a residual but no lanes (SQLNULL excluded)
-	vector<vector<LaneSource>> lane_sources;    // per merged shred, in argument order
-	bool lane_types_agree = true;               // a shred declared with one type by every input that has it
-	vector<const ExtraTypeInfo *> resolved_for; // the argument types this plan was resolved against
+	vector<bool> shredded;                   // per argument
+	vector<idx_t> plain_inputs;              // arguments carrying a residual but no lanes (SQLNULL excluded)
+	vector<vector<LaneSource>> lane_sources; // per merged shred, in argument order
+	bool lane_types_agree = true;            // a shred declared with one type by every input that has it
+	// The argument types this plan was resolved against, HELD (see JsonoShredSignatures for why a bare
+	// address would make a freed-and-reused one a false hit — here that would read lanes at another
+	// type's field indices).
+	vector<shared_ptr<ExtraTypeInfo>> resolved_for;
 };
 
 struct JsonoMergeLocalState : public FunctionLocalState {
@@ -89,9 +91,10 @@ struct MergeShred {
 
 struct JsonoMergeBindData : public FunctionData {
 	vector<MergeShred> shreds;
-	// Indices of the single-step shreds in LOGICAL key order, so the fast path can binary-search a
-	// plain input's top-level object keys against them (ObjectKeyInShredSet). Not the shred order:
-	// that is sorted by physical name, which for a `$.key` spelling of the same key differs.
+	// Indices of the single-step shreds, so the fast path can binary-search a plain input's top-level
+	// object keys against them (ObjectKeyInShredSet). They arrive in key order for free: the shreds
+	// are sorted by physical name, and for a one-step path that name encodes the key alone, so the
+	// encoding's order preservation makes this subsequence key-sorted already.
 	vector<idx_t> top_level_shreds;
 	// The merged shred set's manifest entries, indexed by shred. The fast path re-emits every row's
 	// skips with them, so they are a bind fact, not a per-chunk one.
@@ -121,10 +124,12 @@ struct JsonoMergeBindData : public FunctionData {
 };
 
 // True if two object-key shred paths overlap structurally: they agree on the full length of the
-// shorter one, so one is a prefix of (or equal to) the other (e.g. `a` and `$.a.a`, or `a` and
-// `$.a`). Such a pair cannot be two independent lanes — one names a scalar leaf, the other lives
-// under it — so only the actual merge (the reshred fallback) can decide which structure wins.
-// Sibling paths (`$.a.b` vs `$.a.c`) diverge before the shorter ends and do not conflict.
+// shorter one, so one is a prefix of (or equal to) the other (e.g. `a` and `$.a.a`). Such a pair
+// cannot be two independent lanes — one names a scalar leaf, the other lives under it — so only the
+// actual merge (the reshred fallback) can decide which structure wins. Sibling paths (`$.a.b` vs
+// `$.a.c`) diverge before the shorter ends and do not conflict. The same shape is legal for a single
+// value (see ShredPathsOverlap): rendering one value only has to show what is there, while merging
+// two must pick a winner.
 bool ShredPathsStructurallyConflict(const vector<PathStep> &a, const vector<PathStep> &b) {
 	idx_t common = std::min(a.size(), b.size());
 	for (idx_t i = 0; i < common; i++) {
@@ -202,8 +207,6 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 			bind_data->top_level_shreds.push_back(k);
 		}
 	}
-	std::sort(bind_data->top_level_shreds.begin(), bind_data->top_level_shreds.end(),
-	          [&](idx_t a, idx_t b) { return shreds[a].steps[0].key < shreds[b].steps[0].key; });
 	vector<std::pair<string, LogicalType>> manifest_shreds;
 	manifest_shreds.reserve(shreds.size());
 	for (auto &shred : shreds) {
@@ -388,14 +391,14 @@ bool ResidualConflictsWithScalarArrayShredPath(const JsonoView &view, const vect
 }
 
 // Resolve `plan` against the argument types unless it already is. A bound expression's argument
-// types never change between chunks, so this rebuilds exactly once — keying it on the type's
-// ExtraTypeInfo (the same key JsonoShredSignatures uses) keeps that a checked fact rather than an
-// assumption.
+// types never change between chunks, so this rebuilds exactly once; keying it on the type's
+// ExtraTypeInfo (the same key JsonoShredSignatures uses) means a plan is never reused across a type
+// it was not resolved against, rather than trusting the caller to notice.
 const MergeInputPlan &ResolveInputPlan(DataChunk &args, const vector<MergeShred> &shreds, MergeInputPlan &plan) {
 	idx_t ncols = args.ColumnCount();
 	bool resolved = plan.resolved_for.size() == ncols;
 	for (idx_t i = 0; i < ncols && resolved; i++) {
-		resolved = plan.resolved_for[i] == args.data[i].GetType().AuxInfo().get();
+		resolved = plan.resolved_for[i].get() == args.data[i].GetType().AuxInfo().get();
 	}
 	if (resolved) {
 		return plan;
@@ -407,7 +410,7 @@ const MergeInputPlan &ResolveInputPlan(DataChunk &args, const vector<MergeShred>
 	plan.resolved_for.resize(ncols);
 	for (idx_t i = 0; i < ncols; i++) {
 		auto &type = args.data[i].GetType();
-		plan.resolved_for[i] = type.AuxInfo().get();
+		plan.resolved_for[i] = type.GetAuxInfoShrPtr();
 		JsonoLayoutType layout;
 		if (!TryParseJsonoLayoutType(type, layout) || layout.kind != JsonoLayoutKind::Shredded) {
 			// A SQLNULL argument carries neither a residual nor lanes; every other input here is plain

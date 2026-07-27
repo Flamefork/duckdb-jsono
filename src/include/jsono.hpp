@@ -118,7 +118,7 @@ inline LogicalType JsonoLaneLogicalType(const LogicalType &lane_type) {
 	}
 	child_list_t<LogicalType> children;
 	for (auto &sub : StructType::GetChildTypes(element)) {
-		children.emplace_back(ShredNamePath(sub.first, "jsono lane subfield")[0].key, sub.second);
+		children.emplace_back(JsonoLaneSubfieldKey(sub.first, "jsono lane subfield"), sub.second);
 	}
 	return LogicalType::LIST(LogicalType::STRUCT(std::move(children)));
 }
@@ -213,7 +213,7 @@ uint64_t JsonoLayoutHashOf(const LogicalType &type);
 // byte-wise sorted name list. Field lists every constructor emits are already name-sorted, so
 // rank == index there; a set-op reorder-only cast permutes fields while the order-independent
 // set hash still matches, which is why the bit numbering must be permutation-invariant.
-vector<idx_t> JsonoSpillRanksOfNames(const vector<string> &names);
+vector<idx_t> JsonoCanonicalRanks(const vector<string> &names);
 
 // The classification of one JSONO layout field.
 enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
@@ -223,8 +223,8 @@ enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 // they are split because they version independent things: `body$N` the residual's column layout
 // (the set, names and types of the body blobs), `shreds$M` the shred layout (the reserved fields
 // inside `shreds`, how a lane's path becomes its field name, the lane shape, the spill bit
-// numbering, the marker's meaning). Splitting them
-// keeps a shred-layout change from invalidating plain values, which are the bulk of stored data.
+// numbering, the marker's meaning). Splitting them keeps a shred-layout change from invalidating
+// plain values, which are the bulk of stored data.
 // Neither versions the bytes INSIDE the blobs — that is jsono::VERSION.
 //
 // Bump `body$N` when a body blob column is added, removed, renamed or retyped. Bump `shreds$M`
@@ -233,6 +233,11 @@ enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 // INCLUDING purely semantic changes the type cannot show, which is the case golden-byte tests exist
 // to catch. Neither is bumped by the user's shred set or by the ⌈N/63⌉ spill column count: those are
 // data under a fixed layout.
+//
+// The per-row shred manifest lives INSIDE the skips blob, so its framing is versioned by
+// jsono::VERSION, not here. What a shred-layout change does to it — a lane's path spelled
+// differently, a different emission order — follows from the change that bumped `shreds$M` in the
+// first place, and golden bytes are what pin it either way.
 //
 // Closing a revision is a three-step commit: bump the name here; add a closed-revision fixture
 // (a struct literal over a live body) to test/sql/jsono_layout_revision.test asserting the loud
@@ -246,8 +251,9 @@ enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 constexpr idx_t JSONO_BODY_REVISION = 1;
 constexpr idx_t JSONO_SHREDS_REVISION = 2;
 
-// A parsed JSONO layout field: its shred (path, LOGICAL-value-type) columns (empty for plain; a
-// scalar shred's bare lane and an array shred's list are recorded by their value type) and the
+// A parsed JSONO layout field: its shred (PHYSICAL lane name, LOGICAL-value-type) columns — the
+// name as the type spells it, encoded, which ShredNamePath decodes to the lane's path — (empty for
+// plain; a scalar shred's bare lane and an array shred's list are recorded by their value type) and the
 // number of spill bitmap columns. The single grammar all predicates read against. Every writer
 // emits the shred-set marker, then the spill columns, then the shreds, contiguously in that order —
 // but a set-op merge of a narrow and a wide shred set (CombineStructTypes) can push a wide-only spill
@@ -293,7 +299,7 @@ JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &
 string JsonoExplainLayoutMatch(const LogicalType &type);
 
 // The revision phrase a foreign layout is described by ("layout revision body=0 shreds=0, this build
-// reads body=1 shreds=1"), shared by the refusal and the diagnosis so the two cannot describe the
+// reads body=1 shreds=2"), shared by the refusal and the diagnosis so the two cannot describe the
 // same value differently.
 string JsonoDescribeForeignLayout(const JsonoLayoutType &layout);
 
@@ -390,7 +396,7 @@ constexpr uint32_t MAGIC = 0x4F4E534A; // 'JSNO' little-endian
 // spans are stored only where a skip needs them — non-empty arrays and objects
 // with child_count > OBJECT_CHECKPOINT_STRIDE — addressed through a sorted sparse
 // container-id index.
-constexpr uint8_t VERSION = 0x04;
+constexpr uint8_t VERSION = 0x05;
 
 namespace flags {
 constexpr uint8_t SORTED_KEYS = 0x01;
@@ -643,13 +649,21 @@ struct JsonoCursor {
 
 // One shred-manifest entry: a path the shred writer stripped out of this row's residual (its value
 // lives only in the shred) and the shred type it was written as. The views point into the skips blob.
+//
+// An object-array lane records its element subfields SEPARATELY (`subfields`, the raw LV-framed
+// block; `type` is then empty) rather than as one rendered type string. That is what lets a reader
+// accept a lane whose element struct gained a subfield it does not know: the write-time claim is
+// "these subfields were stripped", and a subfield the reading type carries beyond them is simply a
+// column of NULLs whose values are still in the residual skeleton. With the type as one string the
+// two cases — a subfield ADDED beside mine, and my subfield DROPPED — are the same inequality, so
+// the reader had to refuse both, and `read_parquet(union_by_name := true)` over files with
+// different element subfields was unreadable.
 struct ShredManifestEntry {
 	nonstd::string_view path;
 	nonstd::string_view type;
+	nonstd::string_view subfields;
 };
 
-constexpr uint32_t SHRED_MANIFEST_COMPACT_TYPE_MARKER = 0xFFFFFFFFU;
-constexpr uint8_t SHRED_MANIFEST_TYPE_EXTENDED = 0;
 constexpr uint8_t SHRED_MANIFEST_TYPE_VARCHAR = 1;
 constexpr uint8_t SHRED_MANIFEST_TYPE_BIGINT = 2;
 constexpr uint8_t SHRED_MANIFEST_TYPE_UBIGINT = 3;
@@ -660,6 +674,9 @@ constexpr uint8_t SHRED_MANIFEST_TYPE_BIGINT_LIST = 7;
 constexpr uint8_t SHRED_MANIFEST_TYPE_UBIGINT_LIST = 8;
 constexpr uint8_t SHRED_MANIFEST_TYPE_DOUBLE_LIST = 9;
 constexpr uint8_t SHRED_MANIFEST_TYPE_BOOLEAN_LIST = 10;
+// An object-array lane (LIST<STRUCT<…>>). Its element subfields follow the code as their own
+// length-prefixed list, so this is the one code with no entry in the type-name table below.
+constexpr uint8_t SHRED_MANIFEST_TYPE_OBJECT_ARRAY = 11;
 
 struct ShredManifestCompactType {
 	uint8_t code;
@@ -667,7 +684,7 @@ struct ShredManifestCompactType {
 };
 
 // Codes are wire format (format-locked): they are written into the residual skips blob and must not
-// be renumbered. The EXTENDED sentinel (0) is not in this table — it is the out-of-band escape.
+// be renumbered. OBJECT_ARRAY (11) is not in this table — its type is its subfield list, not a name.
 static constexpr ShredManifestCompactType SHRED_MANIFEST_COMPACT_TYPES[] = {
     {SHRED_MANIFEST_TYPE_VARCHAR, nonstd::string_view("VARCHAR", 7)},
     {SHRED_MANIFEST_TYPE_BIGINT, nonstd::string_view("BIGINT", 6)},
@@ -681,7 +698,7 @@ static constexpr ShredManifestCompactType SHRED_MANIFEST_COMPACT_TYPES[] = {
     {SHRED_MANIFEST_TYPE_BOOLEAN_LIST, nonstd::string_view("BOOLEAN[]", 9)},
 };
 static_assert(sizeof(SHRED_MANIFEST_COMPACT_TYPES) / sizeof(SHRED_MANIFEST_COMPACT_TYPES[0]) == 10,
-              "compact shred manifest type table must cover all 10 non-EXTENDED codes");
+              "the manifest type-name table must cover every scalar and scalar-array code");
 
 inline nonstd::string_view ShredManifestCompactTypeName(uint8_t code) {
 	for (auto &entry : SHRED_MANIFEST_COMPACT_TYPES) {
@@ -689,20 +706,66 @@ inline nonstd::string_view ShredManifestCompactTypeName(uint8_t code) {
 			return entry.name;
 		}
 	}
-	throw InvalidInputException("malformed JSONO: unknown compact shred manifest type code");
+	throw InvalidInputException("malformed JSONO: unknown shred manifest type code");
 }
 
-inline uint64_t HashShredManifestSignatures(const std::vector<std::pair<std::string, std::string>> &signatures) {
-	uint64_t h = HashMix64(HASH_SEED ^ uint64_t(signatures.size()), HASH_PRIME);
-	for (auto &signature : signatures) {
-		h = HashKey(h, nonstd::string_view(signature.first.data(), signature.first.size()));
-		h = HashKey(h, nonstd::string_view(signature.second.data(), signature.second.size()));
+// One shred of a reading type, in the framing the manifest is verified against: the lane's logical
+// path plus either its type name (scalar and scalar-array lanes) or its element subfields as
+// (JSON key, type name) pairs sorted by key (object-array lanes). Built once per reader from the
+// reading type, compared per distinct manifest tail.
+struct JsonoShredSignature {
+	std::string path;
+	std::string type;
+	std::vector<std::pair<std::string, std::string>> subfields;
+};
+
+// The reading type's shreds in the framing the manifest is verified against. The one builder: every
+// reader — the per-chunk cache, the per-call verifier, and the plan constant the optimizer emits —
+// goes through it, so writer and reader always name a lane the same way. A type that is not current
+// shredded JSONO yields no signatures, which is the strictest reading: any manifest entry then fails.
+inline void JsonoBuildShredSignatures(const LogicalType &type, std::vector<JsonoShredSignature> &out) {
+	out.clear();
+	JsonoLayoutType layout;
+	if (!TryParseJsonoLayoutType(type, layout)) {
+		return;
+	}
+	out.reserve(layout.shreds.size());
+	for (auto &shred : layout.shreds) {
+		JsonoShredSignature signature;
+		signature.path = JsonoLaneLogicalPath(shred.first);
+		auto logical = JsonoLaneLogicalType(shred.second);
+		if (logical.id() == LogicalTypeId::LIST && ListType::GetChildType(logical).id() == LogicalTypeId::STRUCT) {
+			// An object-array lane is compared subfield by subfield, so it carries them rather than one
+			// rendered type. Ascending by key, matching the order the writer stores them in.
+			for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(logical))) {
+				signature.subfields.emplace_back(sub.first, sub.second.ToString());
+			}
+			std::sort(signature.subfields.begin(), signature.subfields.end(),
+			          [](const std::pair<std::string, std::string> &a, const std::pair<std::string, std::string> &b) {
+				          return a.first < b.first;
+			          });
+		} else {
+			signature.type = logical.ToString();
+		}
+		out.push_back(std::move(signature));
+	}
+}
+
+// The shred SET's identity hash, over (physical lane name, stored type) pairs — the stamp in the
+// `$jsono$set` marker, not anything the manifest reads. Its input is the type's own spelling, so it
+// answers "is this the same shred set" without decoding a single lane name.
+inline uint64_t HashShredSetIdentity(const std::vector<std::pair<std::string, std::string>> &lanes) {
+	uint64_t h = HashMix64(HASH_SEED ^ uint64_t(lanes.size()), HASH_PRIME);
+	for (auto &lane : lanes) {
+		h = HashKey(h, nonstd::string_view(lane.first.data(), lane.first.size()));
+		h = HashKey(h, nonstd::string_view(lane.second.data(), lane.second.size()));
 	}
 	return h;
 }
 
-// The shred manifest is the tail of the skips blob, after the checkpoint sections. It is either a
-// full path/type entry list or a compact type-code entry list (see docs/jsono_format.md). An entry
+// The shred manifest is the tail of the skips blob, after the checkpoint sections: an entry count
+// then one length-prefixed path and type code each, an object-array lane's entry continuing with its
+// element subfields (see docs/jsono_format.md). An entry
 // records the lane's LOGICAL path (the `$.`-always text), not its encoded field name: the manifest
 // is a per-row statement about the DOCUMENT, while the encoding is a transport artifact of a DuckDB
 // limitation at the TYPE level. Entries are sorted by that logical path — which is NOT the type's
@@ -737,6 +800,39 @@ inline size_t JsonoSkipsManifestOffset(const uint8_t *skips, size_t skips_size) 
 	return size_t(required);
 }
 
+// Walk an object-array entry's subfield block, calling `fn(key, type_code)` per subfield. The block
+// is `u16 count` then `u16 key_len, key bytes, u8 type_code` per subfield, keys ascending. Bounds
+// are re-checked here rather than assumed from the framing walk: this also runs over the raw slice
+// a caller kept, and a truncated read would otherwise walk off the blob.
+template <class FN>
+inline void WalkShredManifestSubfields(nonstd::string_view block, FN &&fn) {
+	size_t cursor = 0;
+	auto read = [&](void *dst, size_t bytes) {
+		if (bytes > block.size() - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest subfield list is truncated");
+		}
+		std::memcpy(dst, block.data() + cursor, bytes);
+		cursor += bytes;
+	};
+	uint16_t count;
+	read(&count, sizeof(count));
+	for (uint16_t i = 0; i < count; i++) {
+		uint16_t key_len;
+		read(&key_len, sizeof(key_len));
+		if (key_len > block.size() - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest subfield list is truncated");
+		}
+		auto key = nonstd::string_view(block.data() + cursor, key_len);
+		cursor += key_len;
+		uint8_t code;
+		read(&code, sizeof(code));
+		fn(key, code);
+	}
+	if (cursor != block.size()) {
+		throw InvalidInputException("malformed JSONO: shred manifest subfield list has trailing bytes");
+	}
+}
+
 // The shred-manifest framing walker, shared by the parse (ParseShredManifestBytes) and validate
 // (ValidateShredManifestBytes) paths via a sink — the same pattern as DecodeScalarSlot's decode/skip
 // twins. The walker owns how the tail's bytes frame into entries; the sink decides what to do with
@@ -761,35 +857,46 @@ inline void WalkShredManifestBytes(const char *data, size_t size, SINK &sink) {
 	};
 	uint32_t entry_count;
 	read_bytes(&entry_count, sizeof(entry_count));
-	bool compact_types = false;
-	if (entry_count == SHRED_MANIFEST_COMPACT_TYPE_MARKER) {
-		compact_types = true;
-		read_bytes(&entry_count, sizeof(entry_count));
-	}
+	auto read_lv = [&]() {
+		uint16_t len;
+		read_bytes(&len, sizeof(len));
+		if (len > size - cursor) {
+			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		}
+		auto value = nonstd::string_view(data + cursor, len);
+		cursor += len;
+		return value;
+	};
 	for (uint32_t i = 0; i < entry_count; i++) {
-		uint16_t path_len;
-		read_bytes(&path_len, sizeof(path_len));
-		if (path_len > size - cursor) {
-			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		auto path = read_lv();
+		uint8_t type_code;
+		read_bytes(&type_code, sizeof(type_code));
+		if (type_code != SHRED_MANIFEST_TYPE_OBJECT_ARRAY) {
+			sink.OnEntry(ShredManifestEntry {path, ShredManifestCompactTypeName(type_code), nonstd::string_view()});
+			continue;
 		}
-		auto path = nonstd::string_view(data + cursor, path_len);
-		cursor += path_len;
-		if (compact_types) {
-			uint8_t type_code;
-			read_bytes(&type_code, sizeof(type_code));
-			if (type_code != SHRED_MANIFEST_TYPE_EXTENDED) {
-				sink.OnEntry(ShredManifestEntry {path, ShredManifestCompactTypeName(type_code)});
-				continue;
-			}
+		// The subfield list is walked here for its bounds checks but handed on as ONE raw slice: the
+		// verify re-walks it only for a manifest tail it has not seen before (SameTail memoizes the
+		// rest), and the validate path must stay allocation-free.
+		auto block_start = cursor;
+		uint16_t subfield_count;
+		read_bytes(&subfield_count, sizeof(subfield_count));
+		if (subfield_count == 0) {
+			// A lane's element STRUCT is never empty (IsShredArrayType refuses one), so a zero count is
+			// not a lane a writer emitted. Rejected HERE rather than tolerated in the verify, because an
+			// entry claiming nothing was stripped is a claim the verify cannot fail: it would accept any
+			// reading type for this path, which is exactly the raw-cast loss the manifest exists to
+			// catch — a row whose subfields really were stripped would then read back short, silently.
+			throw InvalidInputException("malformed JSONO: object-array manifest entry declares no subfields");
 		}
-		uint16_t type_len;
-		read_bytes(&type_len, sizeof(type_len));
-		if (type_len > size - cursor) {
-			throw InvalidInputException("malformed JSONO: shred manifest is shorter than its declared entries");
+		for (uint16_t s = 0; s < subfield_count; s++) {
+			read_lv();
+			uint8_t subfield_code;
+			read_bytes(&subfield_code, sizeof(subfield_code));
+			ShredManifestCompactTypeName(subfield_code);
 		}
-		auto type = nonstd::string_view(data + cursor, type_len);
-		cursor += type_len;
-		sink.OnEntry(ShredManifestEntry {path, type});
+		auto subfields = nonstd::string_view(data + block_start, cursor - block_start);
+		sink.OnEntry(ShredManifestEntry {path, nonstd::string_view(), subfields});
 	}
 	if (cursor != size) {
 		throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
@@ -1297,28 +1404,76 @@ private:
 // reproduced and the read must fail loud. Extra shreds are fine (a widening cast NULL-fills them;
 // readers fall back to the residual). Callers go through the row-read layer
 // (jsono_row_read.hpp), which parses and memoizes the entries.
+// Render a manifest entry's type the way a human reads it: the type name for a scalar lane, the
+// element struct for an object-array one. Only ever called on the failure paths below.
+inline std::string DescribeShredManifestEntry(const ShredManifestEntry &entry) {
+	if (entry.subfields.empty()) {
+		return std::string(entry.type);
+	}
+	std::string described = "STRUCT(";
+	bool first = true;
+	WalkShredManifestSubfields(entry.subfields, [&](nonstd::string_view key, uint8_t code) {
+		if (!first) {
+			described += ", ";
+		}
+		first = false;
+		described += std::string(key);
+		described += ' ';
+		described += std::string(ShredManifestCompactTypeName(code));
+	});
+	described += ")[]";
+	return described;
+}
+
 inline void VerifyShredManifestEntries(const std::vector<ShredManifestEntry> &manifest,
-                                       const std::vector<std::pair<std::string, std::string>> &shred_signatures) {
+                                       const std::vector<JsonoShredSignature> &shred_signatures) {
 	for (auto &entry : manifest) {
 		bool found = false;
 		for (auto &shred : shred_signatures) {
-			if (entry.path == nonstd::string_view(shred.first.data(), shred.first.size())) {
-				if (entry.type != nonstd::string_view(shred.second.data(), shred.second.size())) {
-					throw InvalidInputException(
-					    "JSONO: row was shredded with shred '%s %s' but the column carries it as a different type; "
-					    "the shred value was converted by a raw struct cast and the original cannot be reproduced",
-					    std::string(entry.path).c_str(), std::string(entry.type).c_str());
-				}
-				found = true;
-				break;
+			if (entry.path != nonstd::string_view(shred.path.data(), shred.path.size())) {
+				continue;
 			}
+			bool same_type;
+			if (entry.subfields.empty()) {
+				same_type = entry.type == nonstd::string_view(shred.type.data(), shred.type.size());
+			} else {
+				// An object-array lane matches when every subfield the row STRIPPED is still carried,
+				// under the same name and type. A subfield the reading type carries beyond them is a
+				// widening — `read_parquet(union_by_name := true)` unions the element structs of two
+				// files and NULL-fills the difference — and a NULL subfield means exactly "not in the
+				// lane", which is where every reader already falls back to the residual skeleton. A
+				// subfield MISSING here is the real narrowing the manifest exists to catch.
+				same_type = !shred.subfields.empty();
+				WalkShredManifestSubfields(entry.subfields, [&](nonstd::string_view key, uint8_t code) {
+					if (!same_type) {
+						return;
+					}
+					auto type_name = ShredManifestCompactTypeName(code);
+					bool carried = false;
+					for (auto &subfield : shred.subfields) {
+						if (key == nonstd::string_view(subfield.first.data(), subfield.first.size())) {
+							carried = type_name == nonstd::string_view(subfield.second.data(), subfield.second.size());
+							break;
+						}
+					}
+					same_type = carried;
+				});
+			}
+			if (!same_type) {
+				throw InvalidInputException(
+				    "JSONO: row was shredded with shred '%s %s' but the column carries it as a different type; "
+				    "the shred value was converted by a raw struct cast and the original cannot be reproduced",
+				    std::string(entry.path).c_str(), DescribeShredManifestEntry(entry).c_str());
+			}
+			found = true;
+			break;
 		}
 		if (!found) {
 			throw InvalidInputException(
 			    "JSONO: row was shredded with shred '%s %s' but the column no longer carries that shred; the value "
 			    "was narrowed by a raw struct cast and cannot be read losslessly. Reshred through "
 			    "jsono(value, shredding := {...}) (the extension optimizer does this automatically)",
-			    std::string(entry.path).c_str(), std::string(entry.type).c_str());
+			    std::string(entry.path).c_str(), DescribeShredManifestEntry(entry).c_str());
 		}
 	}
 }

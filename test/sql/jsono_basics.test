@@ -44,7 +44,7 @@ SELECT
   jsono_validate({'jsono': {'body$1': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}),
   jsono_validate({
     'jsono': {'body$1': {
-      'slots': unhex('4A534E4F040100000000000000000000'),
+      'slots': unhex('4A534E4F050100000000000000000000'),
       'key_heap': ''::BLOB,
       'string_heap': ''::BLOB,
       'skips': ''::BLOB,
@@ -62,7 +62,7 @@ true	true	false	false
 # u32 length_count, u32 num_count); the "x" length lives in the lengths stream.
 query I
 SELECT jsono_validate({'jsono': {'body$1': {
-  'slots': unhex('4A534E4F0401000000000000000000200000000100000020000000000000008000000000000000'||'30'),
+  'slots': unhex('4A534E4F0501000000000000000000200000000100000020000000000000008000000000000000'||'30'),
   'key_heap': ''::BLOB,
   'string_heap': unhex('78'),
   'skips': unhex('020000000000000000000000'||'0000000001000000'||'040000000100000000000000000000000100000000000000'||'030000000100000000000000000000000100000000000000'),

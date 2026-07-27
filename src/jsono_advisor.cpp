@@ -886,7 +886,7 @@ void InitShredStatsLanes(Vector &input, idx_t count, const ShredStatsBindData &b
 	for (auto &shred : bind_data.shreds) {
 		names.push_back(shred.lane_name);
 	}
-	lanes.spill_ranks = JsonoSpillRanksOfNames(names);
+	lanes.spill_ranks = JsonoCanonicalRanks(names);
 }
 
 void AccumulateShredStatsRow(ShredStatsState &state, const ShredStatsBindData &bind_data, ShredStatsLanes &lanes,

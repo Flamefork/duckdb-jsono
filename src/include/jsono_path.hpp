@@ -6,6 +6,7 @@
 #include "duckdb/common/vector.hpp"
 
 #include "string_view.hpp"
+#include "utf8proc_wrapper.hpp"
 
 #include <cctype>
 #include <cstdint>
@@ -272,10 +273,10 @@ inline bool TryStepsToJsonPath(const vector<PathStep> &steps, string &out) {
 // `61 00 00 FF 62 00 00` and `61 00 FF 62 00 00` — distinct, which is why the pair is not optional.
 //
 // Order preservation is a property of THIS serialization, not of encoding in general (a
-// length-prefixed variant breaks it: `a` sorts before `URL`→`path` as a path but after it once the
-// length byte dominates). It is load-bearing for the two-pointer walkers, the sort-merges against
-// the residual's byte-sorted document keys, and the binary searches of the merge fast path, so it
-// is the first thing to re-verify if the serialization is ever revisited.
+// length-prefixed variant breaks it: `a` sorts AFTER `URL`→`path` as a path, because `a` > `U`, but
+// BEFORE it once the leading length byte dominates). It is load-bearing for the two-pointer walkers,
+// the sort-merges against the residual's byte-sorted document keys, and the binary searches of the
+// merge fast path, so it is the first thing to re-verify if the serialization is ever revisited.
 
 // Encode the lane path `steps` as its STRUCT field name. Every step must be an object key: an
 // index or wildcard step has no lane to name (each step strips one object key from the residual),
@@ -391,6 +392,15 @@ inline bool JsonoTryDecodeLaneName(const string &name, vector<PathStep> &steps) 
 		if (partner != 0x00) {
 			return false;
 		}
+		// A key a writer could not have produced is not a lane name either. Every path a lane carries
+		// came from a JSON key — yyjson validates the text, and a VARCHAR is valid by DuckDB's own
+		// contract — so bytes that are not UTF-8 mean a hand-built or foreign struct. Without this the
+		// grammar would accept a name every reader then dies on: the decoded path reaches Value(string),
+		// which validates, so `jsono_layout_lanes` and `to_json` would throw on a type recognition just
+		// called current. An embedded NUL is valid UTF-8 and stays supported.
+		if (!Utf8Proc::IsValid(key.data(), key.size())) {
+			return false;
+		}
 		decoded.push_back(PathStep {PathStepKind::Key, std::move(key), 0});
 		key.clear();
 	}
@@ -419,6 +429,26 @@ inline vector<PathStep> ShredNamePath(const string &name, const char *function_n
 		throw InternalException("%s: shred lane name '%s' is not a canonical encoded path", function_name, name);
 	}
 	return steps;
+}
+
+// An object-array lane's element STRUCT names its subfields by the same codec one level down: a
+// subfield is a one-step path. It has to, for the reason the lane names do — CombineStructTypes
+// recurses into element structs, so an unencoded subfield name would collapse case-insensitively
+// exactly like a lane name. These two are that rule's owners; nothing else spells the conversion.
+inline string JsonoEncodeLaneSubfieldName(const string &key) {
+	return JsonoEncodeLaneName(LiteralKeyPath(key));
+}
+
+// The JSON key a subfield's physical name spells. Throws on a name that is not one key: no writer
+// mints one, and layout recognition (ShredSubfieldNamesAreCanonical) refuses a type carrying one, so
+// reaching this is a broken invariant rather than user input.
+inline string JsonoLaneSubfieldKey(const string &name, const char *function_name) {
+	auto steps = ShredNamePath(name, function_name);
+	if (steps.size() != 1) {
+		throw InternalException("%s: lane subfield '%s' names a %llu-step path, not a single object key", function_name,
+		                        name, (unsigned long long)steps.size());
+	}
+	return std::move(steps[0].key);
 }
 
 // The lane's logical path in the project's one text form (`$.`-always, quoted per

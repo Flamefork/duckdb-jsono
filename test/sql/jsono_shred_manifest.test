@@ -29,6 +29,33 @@ $.a	VARCHAR
 $.b	BIGINT
 $.c	BOOLEAN
 
+# The manifest's EMISSION order is the logical-path text order, and it is not the lane order the
+# type carries: lanes sort by encoded name, which is structural path order, and the two genuinely
+# differ. `$.a-c` precedes `$.a.b` as text ('-' < '.') while the nested path precedes it
+# structurally, so this pair is the one that tells the two apart. Read WITHOUT a sort — sorting the
+# answer is what hid the permutation everywhere else in this file, and the permutation is a bind-time
+# fact the writer walks per row.
+query I
+SELECT [m.path FOR m IN jsono_shred_manifest(v)]
+FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}) AS v);
+----
+[$.a-c, $.a.b]
+
+# The same value's lanes, in the type's own order — the reverse permutation.
+query I
+SELECT [l.path FOR l IN jsono_layout_lanes(v)]
+FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}) AS v);
+----
+[$.a.b, $.a-c]
+
+# Both orders survive the round trip: whatever order the manifest is emitted in, every lane reads
+# back under its own path.
+query II
+SELECT v ->> '$."a-c"', v ->> '$.a.b'
+FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}) AS v);
+----
+x	y
+
 # A plain value (no shredding) stripped nothing: the manifest is an EMPTY list, not NULL.
 query I
 SELECT len(jsono_shred_manifest(jsono('{"a":1}')));
@@ -125,3 +152,52 @@ ORDER BY m.path;
 $.a	VARCHAR
 $.b	BIGINT
 $.c	BOOLEAN
+
+# A JSON key may hold ANY byte, including the 0x01 that used to separate a lane path from its type
+# in the plan constant carrying manifest signatures to the residual check. Joined, a key containing
+# that byte split at the wrong place and the check rejected an honest row ("the column no longer
+# carries that shred"). The signatures ride as a STRUCT per lane now, so no byte is a delimiter.
+# The key below is 0x01 followed by `x`; the shredding spec names it literally.
+query I
+SELECT to_json(v) FROM (
+  SELECT jsono('{"\u0001x":1,"b":2}', shredding := {'x': 'BIGINT'}) AS v
+);
+----
+{"\u0001x":1,"b":2}
+
+# A manifest entry that declares an object-array lane with ZERO subfields is malformed, and it must
+# be refused by the framing, not tolerated by the verify. Such an entry asserts nothing about what
+# was stripped, so the verify cannot fail it — it would accept ANY reading type for that path, which
+# is precisely the raw-cast loss the manifest exists to catch. No writer emits one (a lane's element
+# STRUCT is never empty), so a zero count is corruption or a hand-built blob.
+statement ok
+CREATE TABLE forged_zero_subfields AS
+SELECT {'jsono': {'body$1': {
+  'slots': v.jsono."body$1".slots,
+  'key_heap': v.jsono."body$1".key_heap,
+  'string_heap': v.jsono."body$1".string_heap,
+  -- the real tail is `$.items`, code 0x0B, two subfields; this rewrites it to code 0x0B, zero
+  'skips': unhex(replace(hex(v.jsono."body$1".skips),
+                         '010000000700242E6974656D730B020002004E4D010200696402',
+                         '010000000700242E6974656D730B0000')),
+  'lengths': v.jsono."body$1".lengths,
+  'nums': v.jsono."body$1".nums},
+  'shreds$2': v.jsono."shreds$2"}} AS v
+FROM (SELECT jsono('{"items":[{"id":1,"NM":"z"}]}',
+                   shredding := {'$.items': 'STRUCT(id BIGINT, NM VARCHAR)[]'}) AS v);
+
+# The rewrite landed (guards the fixture itself against a format change silently making it a no-op).
+query I
+SELECT hex(v.jsono."body$1".skips) LIKE '%0B0000' FROM forged_zero_subfields;
+----
+true
+
+query I
+SELECT jsono_validate(v) FROM forged_zero_subfields;
+----
+false
+
+statement error
+SELECT to_json(v) FROM forged_zero_subfields;
+----
+object-array manifest entry declares no subfields

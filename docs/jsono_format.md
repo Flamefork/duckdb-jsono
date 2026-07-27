@@ -75,8 +75,10 @@ A lane's STRUCT field name is **not** its path as text. It is the path's
    lifts keys, never array positions). Each key contributes its raw bytes with
    `00` escaped as `00 FF`, terminated by `00 00`; keys concatenate in path
    order.
-2. **Encode.** Those bytes as unpadded lowercase base32hex (RFC 4648 alphabet
-   `0-9a-v`).
+2. **Encode.** Those bytes as unpadded base32hex over `0-9a-v` — RFC 4648's
+   base32hex alphabet lowercased. The lower case is not cosmetic: it is what
+   keeps a name out of the case-folding that this encoding exists to escape, so
+   an upper-case digit is *rejected* on decode rather than folded.
 
 | Path | Lane name |
 |------|-----------|
@@ -116,10 +118,15 @@ subfield is a one-step path). The price is that the type text is unreadable;
 `jsono_layout_lanes(value)` answers "which paths are shredded here" in logical
 form, and is the intended way to read a shredded schema.
 
-A name that is not canonical — anything `Encode(Decode(name)) == name` rejects:
-a bad character, an invalid length, a truncated escape, an upper-case digit —
-makes the struct silently *not JSONO*, the way recognition treats every unknown
-struct. `jsono_layout_diagnose(value)` explains which name failed and why.
+A name is canonical when it is the one spelling its bytes have — `Encode(Decode(
+name)) == name` — *and* the path it spells is one a writer could have produced.
+The decoder enforces both: it refuses a bad character, an invalid length,
+non-zero padding bits, a truncated escape or an upper-case digit, and it refuses
+a key whose bytes are not valid UTF-8, since every lane path is a chain of JSON
+keys and no writer can mint a key the parser would not accept. (An embedded NUL
+*is* valid UTF-8 and stays supported.) A non-canonical name never decodes at all,
+so such a struct is silently *not JSONO*, the way recognition treats every
+unknown struct. `jsono_layout_diagnose(value)` explains which name failed and why.
 
 The single layout name (`jsono` for both plain and shredded) and the nested
 `shreds` struct are both deliberate. DuckDB reconciles struct types by field
@@ -266,24 +273,27 @@ with the shred type each was written as. After the checkpoint sections (see
 
 ```
 u32 entry_count
-per entry: u16 path_len, path bytes, u16 type_len, type bytes
-```
-
-Writers may use a compact type-code variant for common scalar and scalar-array
-shred types:
-
-```
-u32 marker = 0xffffffff
-u32 entry_count
 per entry: u16 path_len, path bytes, u8 type_code
-           [if type_code = 0: u16 type_len, type bytes]
+           [if type_code = 11: u16 subfield_count,
+              per subfield: u16 key_len, key bytes, u8 type_code]
 ```
 
-The compact form is semantically identical: the path remains stored exactly, and
-the type code expands to the same canonical type string a full manifest would
-carry (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`, and their `[]`
-scalar-array forms). Type code `0` keeps the full type string for complex shred
-types.
+Codes 1–10 are the scalar shred types and their scalar-array forms (`VARCHAR`,
+`BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`, then `VARCHAR[]` … `BOOLEAN[]`). Code
+11 is an object-array lane, and it is the only one whose entry continues: its
+element subfields follow as their own list, keys ascending, each with the code of
+its scalar type. The grammar admits no other shred type, so there is no escape
+code — a type without one is an internal error, not a string to fall back on.
+
+Spelling an object array's subfields out is what makes a *widened* element struct
+readable. The entry is the write-time claim "these subfields were stripped from
+this row"; a subfield the reading type carries beyond them is a column of NULLs
+whose values are still in the residual skeleton, which is where every reader
+already looks when a lane is NULL. Rendering the element struct as one type
+string instead made "my subfield was dropped" and "another file's subfield was
+added beside mine" the same inequality, so a reader had to refuse both — and
+`read_parquet(…, union_by_name := true)` over files whose elements carry
+different subfields unions those structs, so such a scan was unreadable.
 
 An entry's path is the lane's **logical** path in the project's one text form
 (`$.`-always, quoted per key where a bare step would mis-parse) — never the
@@ -292,11 +302,11 @@ lane's encoded field name. The manifest is a per-row statement about the
 the *type* level; keeping the two apart is what lets the naming codec change
 without rewriting a single stored row. Readers decode their own type's lane names
 once per reader init and compare bytes from there. For the same reason an
-object-array entry's type string carries the element subfields' JSON keys, not
-their encoded names.
+object-array entry's subfield list stores the elements' JSON keys, not their
+encoded names.
 
-Both forms are self-describing — each entry carries its path and type inline — so
-a reader needs no external shred list to decode them. (Earlier revisions also
+Entries are self-describing — each carries its path and type inline — so a reader
+needs no external shred list to decode them. (Earlier revisions also
 defined layout-hash-keyed `indexed` and `bitset` tails that referenced the
 reader's own shred list; they were removed because they never beat the compact
 form on disk — their per-row bit-packing trades zstd-friendly repetition for high
@@ -519,7 +529,7 @@ live in git, in the build that wrote them and in the golden bytes of
 bytes: which commit range wrote which shape, and what it takes to move it
 forward.
 
-**Shreds revision 1** (`bf99fb2`…`9d9f91c`) named a lane by its **path spelled as
+**Shreds revision 1** (`bf99fb2`…`172d892`) named a lane by its **path spelled as
 text** — `gclid`, `$.commit.operation` — rather than by the encoding of the path.
 Nothing else about it differs from revision 2: same reserved fields, same lane
 shape, same spill numbering, same marker. That naming is the defect it was closed
@@ -566,9 +576,11 @@ RESET disabled_optimizers;
 A **shredded** revision-0 value carries text lane names and physical-name manifest
 entries, so it needs the same per-row work as shreds revision 1 above: read it
 with a build from its range and re-ingest. (Renaming the struct fields alone
-leaves a lane set the grammar does not accept, so the result reads as "not JSONO"
-rather than as data — loud, but not an upgrade.) Read the result back with the
-optimizer on: a value that reads is a value that upgraded.
+leaves a lane set the grammar does not accept, and that verdict is *silent*: the
+value is simply not JSONO, so an extract reads NULL and `to_json` serializes the
+physical struct. Nothing announces the half-migration — check the result with
+`jsono_layout_diagnose`, not by watching for an error.) Read the result back with
+the optimizer on: a value that reads is a value that upgraded.
 
 **0.a needs the build that wrote it.** Its per-row divert information lived in
 the `complete` flags, which the current lane shape does not have, and the
@@ -582,7 +594,7 @@ why closed layouts are not restated in this document.
 ## Compatibility policy
 
 The on-disk binary format is versioned by the `version` byte in `slots`.
-Current `JSONO` files use `version = 4`:
+Current `JSONO` files use `version = 5`:
 
 - version 2 added the per-object `shape_hash` field to `ContainerSpan` (see
   [Navigation](#navigation-skips));
@@ -592,7 +604,12 @@ Current `JSONO` files use `version = 4`:
   (slots are pure tags), made `ContainerSpan`/`ObjectCursorCheckpoint` carry
   per-stream counts/deltas, and made span storage *sparse*: non-empty arrays
   and objects with `child_count > OBJECT_CHECKPOINT_STRIDE` store a span,
-  addressed through a sorted sparse container-id index.
+  addressed through a sorted sparse container-id index;
+- version 5 made the shred manifest one framing instead of two (the full and
+  compact forms collapsed into the type-code form, and its `0xffffffff` marker
+  is gone), and gave an object-array lane its own type code whose entry spells
+  the element subfields out one by one instead of rendering the element struct
+  as a type string.
 
 This extension is still experimental, so compatibility is intentionally strict:
 an incompatible change to slot tags, payload semantics, heap layout, navigation

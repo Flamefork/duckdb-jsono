@@ -101,22 +101,55 @@ FROM v;
 ----
 jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
 
-# Why the terminator is doubled. `c4001vr20000` is the path [`a`, 0xFF `b`] and `c40fuog000` is the
-# single key `a` 0x00 `b`. With a single-0x00 terminator both serialize to `61 00 FF 62 00` — one
-# name for two paths, i.e. the same misfiling the codec exists to remove. Doubled, they are
-# `61 00 00 FF 62 00 00` and `61 00 FF 62 00 00`, so one struct can carry both lanes at once.
+# Why the terminator is doubled, and why the escape survives a round trip. `c40fuog000` is the single
+# key `a` 0x00 `b` — serialized `61 00 FF 62 00 00`, the escape then the terminator. `c4001vr20000` is
+# the two-step path [`a`, 0xFF `b`] — `61 00 00 FF 62 00 00`. Under a single-0x00 terminator both
+# would be `61 00 FF 62 00`: one name for two paths, the exact misfiling this codec removes. The pair
+# is doubled, so they stay distinct names — and the decoder never has to look at what follows a
+# terminator to know it ended a key.
+#
+# A lane path is also a chain of JSON keys, so every key must be valid UTF-8: an embedded NUL is (it
+# is U+0000), a bare 0xFF is not. The first name is therefore a lane; the second decodes cleanly but
+# to a path no writer could mint, so recognition refuses it the same way it refuses any other name a
+# writer could not have produced.
 query I
-WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := {'a': 'VARCHAR', 'b': 'VARCHAR'}) AS c)
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    "c4001vr20000" := c.jsono."shreds$2".c4000,
-    "c40fuog000" := c.jsono."shreds$2".c8000))))
+    "c40fuog000" := c.jsono."shreds$2".c4000))))
 FROM v;
 ----
-jsono: shredded, body revision 1, shreds revision 2, 2 shreds, 1 spill column(s)
+jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
+
+# The NUL key reads back whole: `$.a<NUL>b`, escape decoded, terminator consumed.
+query I
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+SELECT hex(l.path)
+FROM (SELECT unnest(jsono_layout_lanes(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    "c40fuog000" := c.jsono."shreds$2".c4000))))) AS l FROM v);
+----
+242E610062
+
+# The 0xFF path is a clean decode of bytes no key may hold, so it is not a lane name. Silent, like
+# every other non-lane struct — and loud only if you ask what it is.
+query I
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+  "body$1" := c.jsono."body$1",
+  "shreds$2" := struct_pack(
+    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+    "c4001vr20000" := c.jsono."shreds$2".c4000))))
+FROM v;
+----
+not jsono: field 'c4001vr20000' is not a shred lane: a lane is named by the base32hex encoding of its object-key path, and this name does not decode canonically
 
 # --- Non-canonical names stay a silent NotJsono ---------------------------------------------------
 # `c400` is `c4000` with its last character cut: it decodes to the bytes `61 00`, a key `a` whose

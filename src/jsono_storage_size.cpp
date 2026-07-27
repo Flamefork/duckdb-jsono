@@ -198,8 +198,11 @@ void JsonoShredManifestExecute(DataChunk &args, ExpressionState &state, Vector &
 				auto child_row = start + i;
 				path_data[child_row] =
 				    StringVector::AddString(path_vector, entries[i].path.data(), entries[i].path.size());
-				type_data[child_row] =
-				    StringVector::AddString(type_vector, entries[i].type.data(), entries[i].type.size());
+				// An object-array entry stores its element subfields rather than a rendered type, so it
+				// is rendered here — introspection answers in the same type text the shredding spec
+				// takes, whichever framing the row happens to use.
+				auto described = DescribeShredManifestEntry(entries[i]);
+				type_data[child_row] = StringVector::AddString(type_vector, described.data(), described.size());
 			}
 		}
 		FinishListRow(result, row, start, length);

@@ -410,7 +410,7 @@ void InitSpillChecker(Vector &input, idx_t count, SpillChecker &checker) {
 	for (auto &shred : layout.shreds) {
 		names.push_back(shred.first);
 	}
-	auto ranks = JsonoSpillRanksOfNames(names);
+	auto ranks = JsonoCanonicalRanks(names);
 	checker.lanes.resize(layout.shreds.size());
 	for (idx_t f = 0; f < layout.shreds.size(); f++) {
 		auto &lane = checker.lanes[f];

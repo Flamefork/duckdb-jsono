@@ -4,11 +4,70 @@
 #include "jsono_path.hpp"
 
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 
 namespace duckdb {
+
+using jsono::JsonoShredSignature;
+
+// One lane's manifest signature as the plan carries it to __jsono_internal_checked_residual: what
+// JsonoBuildShredSignatures derives from a reading type, spelled as a value. A STRUCT of fields and
+// a nested list, not joined strings — a path and a JSON key may each contain any byte, so there is
+// no separator that needs no escaping, and the channel carries structure natively.
+inline LogicalType JsonoShredSignatureType() {
+	child_list_t<LogicalType> subfield;
+	subfield.emplace_back("key", LogicalType::VARCHAR);
+	subfield.emplace_back("type", LogicalType::VARCHAR);
+	child_list_t<LogicalType> signature;
+	signature.emplace_back("path", LogicalType::VARCHAR);
+	signature.emplace_back("type", LogicalType::VARCHAR);
+	signature.emplace_back("subfields", LogicalType::LIST(LogicalType::STRUCT(std::move(subfield))));
+	return LogicalType::STRUCT(std::move(signature));
+}
+
+// The signature list as a plan constant, and its inverse. The two live side by side so the shape the
+// optimizer writes and the shape the executor reads cannot drift apart.
+inline Value JsonoShredSignaturesToValue(const std::vector<JsonoShredSignature> &signatures) {
+	auto signature_type = JsonoShredSignatureType();
+	auto subfield_type = ListType::GetChildType(StructType::GetChildTypes(signature_type)[2].second);
+	std::vector<Value> values;
+	values.reserve(signatures.size());
+	for (auto &signature : signatures) {
+		std::vector<Value> subfields;
+		subfields.reserve(signature.subfields.size());
+		for (auto &subfield : signature.subfields) {
+			child_list_t<Value> pair;
+			pair.emplace_back("key", Value(subfield.first));
+			pair.emplace_back("type", Value(subfield.second));
+			subfields.push_back(Value::STRUCT(std::move(pair)));
+		}
+		child_list_t<Value> fields;
+		fields.emplace_back("path", Value(signature.path));
+		fields.emplace_back("type", Value(signature.type));
+		fields.emplace_back("subfields", Value::LIST(subfield_type, std::move(subfields)));
+		values.push_back(Value::STRUCT(std::move(fields)));
+	}
+	return Value::LIST(signature_type, std::move(values));
+}
+
+inline std::vector<JsonoShredSignature> JsonoShredSignaturesFromValue(const Value &value) {
+	std::vector<JsonoShredSignature> signatures;
+	for (auto &element : ListValue::GetChildren(value)) {
+		auto &fields = StructValue::GetChildren(element);
+		JsonoShredSignature signature;
+		signature.path = StringValue::Get(fields[0]);
+		signature.type = StringValue::Get(fields[1]);
+		for (auto &subfield : ListValue::GetChildren(fields[2])) {
+			auto &pair = StructValue::GetChildren(subfield);
+			signature.subfields.emplace_back(StringValue::Get(pair[0]), StringValue::Get(pair[1]));
+		}
+		signatures.push_back(std::move(signature));
+	}
+	return signatures;
+}
 
 class Expression;
 class ScalarFunction;

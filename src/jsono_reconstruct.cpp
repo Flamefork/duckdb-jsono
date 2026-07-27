@@ -101,8 +101,8 @@ struct ArrayReconShred {
 	UnifiedVectorFormat list_fmt; // list_entry_t + per-row validity (both kinds)
 	const list_entry_t *list_entries = nullptr;
 	// kind == Array: the element struct's subfields lifted into a LIST<STRUCT> column. `key` is the
-	// element's JSON key the overlay emits — decoded from the lane's element field name (today the
-	// two are one string); the physical access is the index into `sub_fmt`, never the name.
+	// element's JSON key the overlay emits, decoded from the subfield's physical field name (which is
+	// that key encoded, not the key itself); the physical access is the index into `sub_fmt`.
 	vector<ReconArraySubfield> subfields; // struct order
 	// Subfield indices in sorted-key order: the overlay patch object must emit keys ascending
 	// (the JSONO object invariant and the sorted-key two-pointer MergeTwoObjects both require it).
@@ -288,7 +288,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			for (auto &sub : StructType::GetChildTypes(element)) {
 				// The element field name is encoded like a lane name; the overlay emits the JSON key.
 				ars.subfields.push_back(
-				    ReconArraySubfield {ShredNamePath(sub.first, "jsono reconstruct")[0].key, sub.second});
+				    ReconArraySubfield {JsonoLaneSubfieldKey(sub.first, "jsono reconstruct"), sub.second});
 			}
 			array_shreds.push_back(std::move(ars));
 			continue;
@@ -687,7 +687,7 @@ void RenderShreddedListsToJsonImpl(Vector &input, idx_t count, Vector &result) {
 			for (auto &field : StructType::GetChildTypes(ListType::GetChildType(shred_type))) {
 				// Decoded: these keys are both emitted as JSON and sort-merged against the residual's
 				// byte-sorted document keys, so they must be the logical names.
-				shred.subfield_keys.push_back(ShredNamePath(field.first, "__jsono_shredded_lists_to_json")[0].key);
+				shred.subfield_keys.push_back(JsonoLaneSubfieldKey(field.first, "__jsono_shredded_lists_to_json"));
 			}
 			shred.sorted_subfields.resize(shred.subfield_keys.size());
 			for (idx_t field = 0; field < shred.sorted_subfields.size(); field++) {
@@ -735,7 +735,7 @@ void RenderShreddedListsToJsonImpl(Vector &input, idx_t count, Vector &result) {
 }
 
 // __jsono_internal_checked_residual(residual, shreds): pass the plain residual through after
-// verifying its shred manifest against `shreds`, the shred signatures ("path\x01type") of the
+// verifying its shred manifest against `shreds`, the shred signatures of the
 // shredded type the optimizer read the residual out of. The optimizer wraps every residual
 // reinterpret with this check, so a row narrowed by a raw struct cast (its manifest lists a
 // shred the type no longer carries) fails loud on every optimizer read path — extract fallback,
@@ -747,17 +747,7 @@ void JsonoCheckedResidualExecute(DataChunk &args, ExpressionState &state, Vector
 	if (shreds_value.GetVectorType() != VectorType::CONSTANT_VECTOR) {
 		throw InvalidInputException("__jsono_internal_checked_residual: shreds must be constant");
 	}
-	vector<std::pair<std::string, std::string>> shred_signatures;
-	auto shreds = ListValue::GetChildren(shreds_value.GetValue(0));
-	shred_signatures.reserve(shreds.size());
-	for (auto &shred : shreds) {
-		auto signature = StringValue::Get(shred);
-		auto sep = signature.find('\x01');
-		if (sep == string::npos) {
-			throw InvalidInputException("__jsono_internal_checked_residual: malformed shred signature");
-		}
-		shred_signatures.emplace_back(signature.substr(0, sep), signature.substr(sep + 1));
-	}
+	auto shred_signatures = JsonoShredSignaturesFromValue(shreds_value.GetValue(0));
 
 	JsonoRowReader reader;
 	reader.Init(args.data[0], count, std::move(shred_signatures));
@@ -800,7 +790,7 @@ void JsonoRenderShreddedListsToJson(Vector &input, idx_t count, Vector &result) 
 }
 
 ScalarFunction JsonoCheckedResidualFunction() {
-	ScalarFunction fun("__jsono_internal_checked_residual", {JsonoType(), LogicalType::LIST(LogicalType::VARCHAR)},
+	ScalarFunction fun("__jsono_internal_checked_residual", {JsonoType(), LogicalType::LIST(JsonoShredSignatureType())},
 	                   JsonoType(), JsonoCheckedResidualExecute);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;

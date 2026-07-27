@@ -61,9 +61,10 @@ SELECT {'jsono': {'body$2': v.jsono."body$1",
 FROM src;
 
 # Shreds revision 1, closed by plan 056: a current residual beside the shred layout that named a lane
-# by its path spelled as TEXT (`a`, `$.o.k`) rather than by the encoding of the path. The text name is
-# what DuckDB's case-insensitive STRUCT matching could collapse, so the shape is refused rather than
-# read — and the refusal is decided by the field NAME, before any lane name is looked at.
+# by its path spelled as TEXT (`a` for the top-level key below; a nested lane of that era read
+# `$.o.k`) rather than by the encoding of the path. The text name is what DuckDB's case-insensitive
+# STRUCT matching could collapse, so the shape is refused rather than read — and the refusal is
+# decided by the field NAME, before any lane name is looked at.
 statement ok
 CREATE TABLE shreds_rev1 AS
 SELECT {'jsono': {'body$1': v.jsono."body$1",
@@ -185,6 +186,19 @@ statement error
 SELECT v ->> 'a' FROM body_rev2;
 ----
 layout revision body=2 shreds=1
+
+# jsono_layout_lanes refuses a foreign revision too. Its answer would otherwise be `[]` — the same
+# answer a plain value gets — for a value that HAS lanes this build cannot name. Only
+# jsono_layout_diagnose, which answers what the value is rather than what is in it, survives.
+statement error
+SELECT jsono_layout_lanes(v) FROM rev99;
+----
+layout revision body=1 shreds=99
+
+query I
+SELECT jsono_layout_diagnose(v) FROM rev99;
+----
+foreign: layout revision body=1 shreds=99, this build reads body=1 shreds=2
 
 statement error
 SELECT v ->> 'a' FROM shreds_rev1;

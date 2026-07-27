@@ -1520,12 +1520,11 @@ vector<JsonoShred> CollectShreddedShreds(const LogicalType &shredded) {
 		vector<PathStep> steps = ShredNamePath(name, "__jsono_shredded_shred");
 		// The premise EmitShredRead's soft-residual fallback and the per-lane no-NULL totality proof
 		// both rest on: a lane in the type carries the values of ITS OWN path, so a path that IS a lane
-		// cannot have been narrowed away. That held only by convention while a lane was named by its
-		// path as text — DuckDB's case-insensitive STRUCT matching then merged `gclid` and `GCLID` into
-		// one lane holding the other key's values. The codec makes it structural; assert the bijection
-		// here, at the one bind-time gate the whole rewrite layer reads its lanes through, so a
-		// regression surfaces in the relassert build instead of as a silently misfiled value. No
-		// runtime gate: plan 056 part A weighs and rejects paying for one on every honest read.
+		// cannot have been narrowed away. The codec is what makes that structural rather than a
+		// convention — encode and decode are inverse, so a name cannot name one path and hold another.
+		// Assert the bijection here, at the one bind-time gate the whole rewrite layer reads its lanes
+		// through, so a codec regression surfaces in the relassert build instead of as a silently
+		// misfiled value. No runtime gate: every honest read would pay for it.
 		D_ASSERT(JsonoEncodeLaneName(steps) == name);
 		shreds.push_back(JsonoShred {i, layout.shreds[i].second, std::move(steps)});
 	}
@@ -1698,7 +1697,7 @@ void CollectSpillProvenPaths(const BaseStatistics &stats, const LogicalType &typ
 	for (auto &shred : layout.shreds) {
 		shred_names.push_back(shred.first);
 	}
-	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
+	auto spill_ranks = JsonoCanonicalRanks(shred_names);
 	for (idx_t k = 0; k < layout.shreds.size(); k++) {
 		if (IsShredListType(layout.shreds[k].second)) {
 			continue; // array shreds are always reconstructed, never bare-read
@@ -2004,18 +2003,18 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 						if (!per_shred[shred.child_index] || IsShredListType(shred.type)) {
 							continue;
 						}
-						auto &path = read_layout.shreds[shred.child_index].first;
+						auto &lane_name = read_layout.shreds[shred.child_index].first;
 						auto &read_type = read_layout.shreds[shred.child_index].second;
 						bool every_file = true;
 						for (idx_t file_idx = 0; file_idx < file_proven.size() && every_file; file_idx++) {
 							bool carried_same_type = false;
 							for (auto &file_shred : *file_shreds[file_idx]) {
-								if (file_shred.first == path) {
+								if (file_shred.first == lane_name) {
 									carried_same_type = file_shred.second == read_type;
 									break;
 								}
 							}
-							every_file = carried_same_type && file_proven[file_idx].count(path);
+							every_file = carried_same_type && file_proven[file_idx].count(lane_name);
 						}
 						if (every_file) {
 							per_shred[shred.child_index] = false;
@@ -2453,17 +2452,11 @@ private:
 		auto residual = BoundCastExpression::AddCastToType(context, std::move(outer), JsonoType());
 		JsonoLayoutType layout;
 		if (!soft && TryParseJsonoLayoutType(column.return_type, layout) && !layout.shreds.empty()) {
-			vector<Value> shred_signatures;
-			shred_signatures.reserve(layout.shreds.size());
-			for (auto &shred : layout.shreds) {
-				// The manifest records a lane's LOGICAL path, so the signature it is verified against
-				// must be that same text — decoded from the lane name exactly as ShredManifestVerifier
-				// does when it builds signatures from a type itself.
-				shred_signatures.push_back(
-				    Value(JsonoLaneLogicalPath(shred.first) + '\x01' + JsonoLaneLogicalType(shred.second).ToString()));
-			}
-			auto shreds =
-			    make_uniq<BoundConstantExpression>(Value::LIST(LogicalType::VARCHAR, std::move(shred_signatures)));
+			// The signatures the residual check verifies each row's manifest against, derived from the
+			// column's own type through the one builder every other reader uses.
+			std::vector<JsonoShredSignature> signatures;
+			jsono::JsonoBuildShredSignatures(column.return_type, signatures);
+			auto shreds = make_uniq<BoundConstantExpression>(JsonoShredSignaturesToValue(signatures));
 			vector<unique_ptr<Expression>> check_children;
 			check_children.push_back(std::move(residual));
 			check_children.push_back(std::move(shreds));
@@ -2714,27 +2707,22 @@ unique_ptr<Expression> MakeReshredExpression(ClientContext &context, unique_ptr<
 	if (shreds.empty()) {
 		result = BoundCastExpression::AddCastToType(context, std::move(column), JsonoType());
 	} else {
-		child_list_t<Value> spec_fields;
-		for (auto &shred : shreds) {
-			// The spec DSL is logical on BOTH halves: the lane's path rather than its encoded name,
-			// or the parse would read the name as a literal key and mint a lane for a path nothing
-			// has — and the lane's logical type, because an object-array lane's type carries encoded
-			// element-subfield names, which the spec would otherwise encode a second time and rebuild
-			// a type that no longer equals the target.
-			spec_fields.emplace_back(JsonoLaneLogicalPath(shred.first),
-			                         Value(JsonoLaneLogicalType(shred.second).ToString()));
-		}
-		auto spec = make_uniq<BoundConstantExpression>(Value::STRUCT(std::move(spec_fields)));
-		spec->SetAlias("shredding");
+		// The target rides in as a NULL constant OF the target type — the lanes are declared
+		// STRUCTURALLY, not as spec text. Text would be a lossy channel in both halves: a lane name
+		// re-read as a path spelling mints a lane for a path nothing has, and a rendered element struct
+		// comes back through DuckDB's type parser with `id` and `ID` folded into one subfield, which is
+		// the very collapse the lane-name codec exists to make unrepresentable. A bound constant carries
+		// its LogicalType through plan (de)serialization, so the re-bind decodes the same lanes.
+		auto target_constant = make_uniq<BoundConstantExpression>(Value(target));
 		vector<unique_ptr<Expression>> children;
 		children.push_back(std::move(column));
-		children.push_back(std::move(spec));
+		children.push_back(std::move(target_constant));
 		FunctionBinder function_binder(context);
-		result = function_binder.BindScalarFunction(JsonoShredFromJsonoFunction(), std::move(children));
+		result = function_binder.BindScalarFunction(JsonoReshredFunction(), std::move(children));
 		if (result->return_type != target) {
-			// Also the built-in `Encode ∘ Decode == id` self-test: the spec above was decoded from
-			// `target`'s lane names and the bind re-encodes it, so any drift in the codec — or in the
-			// canonical field order the two sides sort by — shows up as this type mismatch.
+			// The bind decoded `target`'s lane names and re-encoded them building its own return type,
+			// so this is also a `Encode ∘ Decode == id` self-test: codec drift, or drift in the canonical
+			// field order the two sides sort by, surfaces here.
 			throw InternalException("jsono cast normalization: reshred type mismatch");
 		}
 	}
@@ -3182,12 +3170,12 @@ string ForeignConsumerContext(const Expression &consumer) {
 // `disabled_optimizers=extension` this hook does not run at all and the core-json paths go quiet
 // again, the same trade JsonoRequireExtensionOptimizerForShredded already takes.
 void RejectForeignLayoutsInExpression(Expression &expr) {
-	// The consumers that must survive a foreign child: they answer questions ABOUT the type and
-	// never read a byte of the value, so refusing them would silence the only tools a user has for
-	// diagnosing the very value being refused.
+	// The one consumer that must survive a foreign child: it answers what the value IS, reading no
+	// byte of it, so refusing it would silence the only tool a user has for diagnosing the very value
+	// being refused. jsono_layout_lanes is NOT exempt — it claims to enumerate lanes, which this build
+	// cannot do for a foreign naming, so it refuses in its own bind and never reaches this walk.
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-		auto &name = expr.Cast<BoundFunctionExpression>().function.name;
-		if (name == "jsono_layout_diagnose" || name == "jsono_layout_lanes") {
+		if (expr.Cast<BoundFunctionExpression>().function.name == "jsono_layout_diagnose") {
 			return;
 		}
 	}

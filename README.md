@@ -184,7 +184,9 @@ Because the input `STRUCT` already carries its field names and types, `jsono(str
 
 ```sql
 SELECT typeof(jsono({'kind': 'commit', 'time_us': 1700::BIGINT}));
--- a shredded STRUCT: a `jsono` layout wrapping the body blobs plus shreds "kind" VARCHAR and "time_us" BIGINT
+-- a shredded STRUCT: a `jsono` layout wrapping the body blobs plus one lane per field, each named by
+-- the encoding of its path (`ddkmsp0000` VARCHAR for `kind`, `ehkmqpavelpg000` BIGINT for `time_us`).
+-- Read the paths back with jsono_layout_lanes(value).
 ```
 
 ### `to_json`
@@ -446,6 +448,8 @@ SELECT unnest(jsono_entries(jsono('{"a":1,"b":{"c":"x"}}'), key_style := 'dotted
 -- {'key': a, 'value': 1}
 -- {'key': b.c, 'value': x}
 ```
+
+A `'jsonpath'` key is a path the JSONO path grammar parses back to the same keys, so a key that a bare `.step` would mis-read is quoted and escaped — `{"a.b":1}` gives `$."a.b"` (one key, not two levels) and `{"a\\b":1}` gives `$."a\\b"`. `'dotted'` keys are display text and are not quoted.
 
 The named argument `array_style` selects where the walk stops at an array. The default `'indexed_elements'` recurses into arrays, giving each element an indexed key (`arr[0]`, `arr.0`, …). Pass `array_style := 'whole_json'` to stop at the array boundary and emit each array as a single leaf whose value is the whole array as JSON text:
 
@@ -714,6 +718,8 @@ SELECT jsono_storage_type();
 
 `jsono_shred_manifest` returns a `LIST<STRUCT(path VARCHAR, type VARCHAR)>` of the paths a shredded value stripped out of its residual into shred columns, each with the shred type it was written as, in canonical (sorted) order. A plain value returns an empty list (nothing was stripped); a SQL `NULL` returns `NULL`. It reads the row's own manifest claim and, unlike the other readers, does not raise on a narrowed row — pair it with `jsono_validate` to debug shredding, layout, or migration questions (which paths got lifted, did a cast drop one). A shred value that did not round-trip its declared type stays in the residual and is correctly absent from the manifest, so a short manifest is not "shredding did not happen".
 
+Its answers describe the *row*, not the type, and the two can order things differently. An object-array lane's element subfields are stored in the manifest sorted by key, so `jsono_shred_manifest` reports them that way, while `jsono_layout_lanes` reports the element struct in the type's own field order. Paste-back into a `shredding :=` spec wants the latter: the field order of the element struct is part of the type.
+
 ```sql
 SELECT jsono_shred_manifest(jsono('{"a":"x","b":1}', shredding := {'a':'VARCHAR','b':'BIGINT'}));
 -- [{'path': $.a, 'type': VARCHAR}, {'path': $.b, 'type': BIGINT}]
@@ -732,9 +738,9 @@ SELECT jsono_layout_diagnose({'a': 1});
 
 A value of a foreign layout revision is *diagnosed* rather than refused here, even though every other consumer of it throws — a diagnostic that fails on the value you are diagnosing is no diagnostic.
 
-`jsono_layout_lanes` lists the shred lanes of the argument's **type** as `LIST<STRUCT(path VARCHAR, type VARCHAR)>`, in the type's own field order. Like `jsono_layout_diagnose` it is answered at bind and reads no bytes, so it works on a `NULL` value and on a type the grammar refused (which has no lanes, and answers the empty list).
+`jsono_layout_lanes` lists the shred lanes of the argument's **type** as `LIST<STRUCT(path VARCHAR, type VARCHAR)>`, in the type's own field order. Like `jsono_layout_diagnose` it is answered at bind and reads no bytes. The empty list means one thing only — a plain JSONO value, which genuinely has no lanes; a foreign revision or a non-JSONO argument is a bind error, since answering `[]` there would be indistinguishable from the plain answer. `jsono_layout_diagnose` is the question that always answers.
 
-Reading the lane set off the type text does not work: a lane's `STRUCT` field name is the base32hex encoding of its path, not the path spelled out (see [docs/jsono_format.md](docs/jsono_format.md#lane-names) — it is what keeps two spellings of one key, `gclid` and `GCLID`, from collapsing into one lane under DuckDB's case-insensitive field matching). This function is how you read a shredded schema instead, and its answers are spec DSL: paste one back into `jsono(value, shredding := {...})` or `jsono_storage_type(...)` and you get the same lane.
+Reading the lane set off the type text does not work: a lane's `STRUCT` field name is the base32hex encoding of its path, not the path spelled out (see [docs/jsono_format.md](docs/jsono_format.md#lane-names) — it is what keeps two spellings of one key, `gclid` and `GCLID`, from collapsing into one lane under DuckDB's case-insensitive field matching). This function is how you read a shredded schema instead, and its answers are spec DSL: paste one back into `jsono(value, shredding := {...})` or `jsono_storage_type(...)` and you get the same lane. The one exception is an object-array lane whose element subfields differ only in case — a shape only a type merge produces — since DuckDB's type parser folds those two names into one.
 
 ```sql
 SELECT jsono_layout_lanes(jsono('{"URL":{"path":"/x"},"n":1}', shredding := {'$.URL.path':'VARCHAR','n':'BIGINT'}));
@@ -805,7 +811,7 @@ Use power-of-two values when comparing performance. The default is tuned for loc
 - `jsono_extract` / `->` / `jsono_extract_string` / `->>` require a constant path, do not support wildcard list extraction yet, and do not support negative array indexes.
 - Unsupported scalar types in `jsono_transform` fail at bind time.
 - JSON nested deeper than 1000 levels is rejected with an error (512 on macOS, whose worker-thread stacks are too small for the deeper recursion). Sanitizer builds lower the bound only where their fatter frames need it: 32 under AddressSanitizer (any platform) and under UndefinedBehaviorSanitizer on macOS; the UndefinedBehaviorSanitizer build on Linux keeps the full 1000.
-- The binary JSONO format is strict-versioned (current `version = 4`, reported by `jsono_version()`). Incompatible storage changes must bump `jsono::VERSION`. A present-but-unreadable header — wrong magic, a different format version, misaligned slots — fails loud on read rather than silently reading as SQL `NULL`; only an absent value (a slots blob too short to hold a header) reads as `NULL`, and `jsono_validate` reports a corrupt blob as `false`.
+- The binary JSONO format is strict-versioned (current `version = 5`, reported by `jsono_version()`). Incompatible storage changes must bump `jsono::VERSION`. A present-but-unreadable header — wrong magic, a different format version, misaligned slots — fails loud on read rather than silently reading as SQL `NULL`; only an absent value (a slots blob too short to hold a header) reads as `NULL`, and `jsono_validate` reports a corrupt blob as `false`.
 - Malformed input raises DuckDB errors unless `try_jsono` is used. `try_jsono` never raises: implementation-limit violations on otherwise valid JSON (nesting past the depth limit, an oversized key or string) also map to `NULL`, indistinguishable from malformed input — use the strict `jsono` when a limit overflow must surface instead of dropping the row.
 
 ## Known limitations

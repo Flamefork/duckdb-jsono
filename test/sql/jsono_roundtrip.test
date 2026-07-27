@@ -194,7 +194,7 @@ not a JSONO value
 # one) should fail, not crash.
 statement error
 SELECT to_json({'jsono': {'body$1': {
-  'slots': unhex('4A534E4F040100000000000000000020'),
+  'slots': unhex('4A534E4F050100000000000000000020'),
   'key_heap': ''::BLOB,
   'string_heap': ''::BLOB,
   'skips': ''::BLOB,
@@ -207,7 +207,7 @@ container span
 # to_json on a structurally valid header with truncated slot data should fail, not crash.
 statement error
 SELECT to_json({'jsono': {'body$1': {
-  'slots': unhex('4A534E4F040100000000000000000020'),
+  'slots': unhex('4A534E4F050100000000000000000020'),
   'key_heap': ''::BLOB,
   'string_heap': ''::BLOB,
   'skips': unhex('01000000000000000000000000000000010000000000000000000000000000000000000000000000'),
