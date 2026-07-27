@@ -28,6 +28,15 @@ SELECT j.jsono."shreds$1"."$.x" IS NULL, to_json(j)::VARCHAR FROM (SELECT jsono(
 ----
 true	{"$.x":"v","y":1}
 
+# A `$`-leading field name that is NOT a path (`$x`) is a literal top-level key, and its lane holds
+# the value. The lane name is decoded, never re-parsed as the shredding-spec DSL — the DSL reserves
+# a leading `$` for the path form (a literal `$x` must be written `$."$x"` there), so re-parsing a
+# minted lane name through it used to reject a lane the same bind had just put in the return type.
+query II
+SELECT j.jsono."shreds$1"."$x", to_json(j)::VARCHAR FROM (SELECT jsono({'$x': 'v', 'y': 1}) AS j);
+----
+v	{"$x":"v","y":1}
+
 # Type-driven auto-shred descends nested structs: top-level scalars keep their bare name, scalars
 # inside a nested STRUCT are lifted under their $.parent.child JSON path. The shred set is a pure
 # function of the input type (known at bind), so the constructor's return type carries them.

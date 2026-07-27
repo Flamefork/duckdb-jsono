@@ -46,14 +46,16 @@ enum class JsonoEntriesArrayStyle : uint8_t { IndexedElements, WholeJson };
 // (precomputed at bind). A top-level literal shred name `n` keys as `n` (dotted) or `$.n`
 // (jsonpath); a `$.`-prefixed path keys as itself (jsonpath) or without the prefix (dotted). A
 // scalar shred flattens to one entry at its key; an array shred (LIST<STRUCT>) expands each
-// element's lifted subfields into `<key>[i].<subfield>` leaves keyed by `subfield_names`, the key
+// element's lifted subfields into `<key>[i].<subfield>` leaves keyed by `subfield_keys`, the key
 // being the array's base path. The runtime value lanes and shred kinds come from InitShredLanes.
 struct EntriesShred {
 	idx_t child_index;
 	LogicalType type;
 	string key_jsonpath;
 	string key_dotted;
-	vector<string> subfield_names; // element-struct order; empty for a scalar shred
+	// The element subfields' JSON keys, decoded from the lane's element field names: they are emitted
+	// as key segments, so they are the logical names. The lane is addressed by index.
+	vector<string> subfield_keys; // element-struct order; empty for a scalar shred
 };
 
 struct JsonoEntriesBindData : public FunctionData {
@@ -153,7 +155,7 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 			}
 			if (ClassifyShredKind(shred.type) == ShredKind::Array) {
 				for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(shred.type))) {
-					shred.subfield_names.push_back(sub.first);
+					shred.subfield_keys.push_back(sub.first);
 				}
 			}
 			shreds.push_back(std::move(shred));
@@ -162,35 +164,12 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 	return make_uniq<JsonoEntriesBindData>(style, array_style, std::move(shreds));
 }
 
-// A bare JSONPath key segment is parseable only while it avoids the grammar's
-// delimiters; anything else (or an empty key) must be quoted.
-bool JsonPathKeyNeedsQuote(nonstd::string_view key) {
-	if (key.empty()) {
-		return true;
-	}
-	for (char c : key) {
-		if (c == '.' || c == '[' || c == ']' || c == '"') {
-			return true;
-		}
-	}
-	return false;
-}
-
+// The jsonpath style is the project's one logical path form (AppendJsonPathKey owns the quoting
+// rule, so a key emitted here re-parses to the step it came from). The dotted style is a separate
+// public contract — raw keys joined by dots, no quoting — and deliberately does not share it.
 void AppendKeySegment(std::string &path, nonstd::string_view key, JsonoEntriesKeyStyle style) {
 	if (style == JsonoEntriesKeyStyle::JsonPath) {
-		path.push_back('.');
-		if (JsonPathKeyNeedsQuote(key)) {
-			path.push_back('"');
-			for (char c : key) {
-				if (c == '"' || c == '\\') {
-					path.push_back('\\');
-				}
-				path.push_back(c);
-			}
-			path.push_back('"');
-		} else {
-			path.append(key.data(), key.size());
-		}
+		AppendJsonPathKey(path, key);
 		return;
 	}
 	if (!path.empty()) {
@@ -558,8 +537,8 @@ void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result
 							continue;
 						}
 						auto saved_key = path.size();
-						auto &sub_name = shreds[f].subfield_names[j];
-						AppendKeySegment(path, nonstd::string_view(sub_name.data(), sub_name.size()), style);
+						auto &sub_key = shreds[f].subfield_keys[j];
+						AppendKeySegment(path, nonstd::string_view(sub_key.data(), sub_key.size()), style);
 						auto value = FormatShredValue(sub_fmt, sub_idx, lane.sub_kind[j], shred_scratch);
 						sink.AppendText(nonstd::string_view(path.data(), path.size()), false, value);
 						path.resize(saved_key);

@@ -48,18 +48,23 @@ struct JsonoMergeLocalState : public FunctionLocalState {
 	}
 };
 
-// A shred carried through a shred-aware merge: its name, the result struct child index it
-// lands in, and its type. The merge folds the six-BLOB residuals (existing logic) and
-// copies each union shred from the last input that declares it. Shred keys are assumed
-// disjoint from residual keys (true when shreds are computed fields lifted into columns).
+// A shred carried through a shred-aware merge: its two names (the PHYSICAL field `name` the lanes
+// are matched by across inputs, and the LOGICAL `steps` the residual is probed with), the result
+// struct child index it lands in, and its type. The merge folds the six-BLOB residuals (existing
+// logic) and copies each union shred from the last input that declares it.
 struct MergeShred {
 	string name;
 	idx_t result_child_index;
 	LogicalType type;
+	vector<PathStep> steps;
 };
 
 struct JsonoMergeBindData : public FunctionData {
 	vector<MergeShred> shreds;
+	// Indices of the single-step shreds in LOGICAL key order, so the fast path can binary-search a
+	// plain input's top-level object keys against them (ObjectKeyInShredSet). Not the shred order:
+	// that is sorted by physical name, which for a `$.key` spelling of the same key differs.
+	vector<idx_t> top_level_shreds;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<JsonoMergeBindData>(*this);
@@ -113,7 +118,8 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 					}
 				}
 				if (!found) {
-					shreds.push_back(MergeShred {shred_name, 0, layout_shred.second});
+					shreds.push_back(MergeShred {shred_name, 0, layout_shred.second,
+					                             ShredNamePath(shred_name, bound_function.name.c_str())});
 				}
 			}
 			bound_function.arguments.push_back(type);
@@ -131,9 +137,9 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 		bound_function.return_type = JsonoType();
 		return std::move(bind_data);
 	}
-	// Canonical shred order (sorted by name) so the merged type is a pure function of the shred set,
-	// not of argument order: the executor writes shreds by result_child_index, so the index order and
-	// the type's shred order must agree.
+	// Canonical shred order (sorted by physical name) so the merged type is a pure function of the
+	// shred set, not of argument order: the executor writes shreds by result_child_index, so the index
+	// order and the type's shred order must agree.
 	std::sort(shreds.begin(), shreds.end(), [](const MergeShred &a, const MergeShred &b) { return a.name < b.name; });
 	child_list_t<LogicalType> shred_types;
 	idx_t next = 0; // shred-relative index inside the result's `.shreds` struct
@@ -141,6 +147,13 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 		shred.result_child_index = next++;
 		shred_types.emplace_back(shred.name, shred.type);
 	}
+	for (idx_t k = 0; k < shreds.size(); k++) {
+		if (shreds[k].steps.size() == 1) {
+			bind_data->top_level_shreds.push_back(k);
+		}
+	}
+	std::sort(bind_data->top_level_shreds.begin(), bind_data->top_level_shreds.end(),
+	          [&](idx_t a, idx_t b) { return shreds[a].steps[0].key < shreds[b].steps[0].key; });
 	bound_function.return_type = JsonoShreddedStructType(shred_types);
 	return std::move(bind_data);
 }
@@ -228,14 +241,16 @@ bool ResidualHasTopLevelKey(const JsonoView &view, const string &key) {
 	return SlotTag(ks) == tag::KEY && view.KeyAt(SlotPayload(ks)) == target;
 }
 
-// True if the object has any top-level key that matches a merged shred name. `shreds`
-// is sorted by name (bind canonicalizes it), so each of the object's (few) keys is
-// binary-searched. Used to gate the fast path against a PLAIN input whose top-level
-// key names a shred: a value there collides into the residual (also caught by the
-// per-row residual probe), but an RFC 7396 null at that key DELETES the lane and
-// leaves no trace in the folded residual — the lane copy-through would wrongly keep
-// it, so any such key forces the reshred fallback.
-bool ObjectKeyInShredSet(const JsonoView &view, const vector<MergeShred> &shreds) {
+// True if the object has any top-level key that a single-step shred lifts. The comparison is
+// against the shred's LOGICAL key — a document key and a lane name are different namespaces, and
+// only the path the lane means can collide with a key in the document. `top_level_shreds` indexes
+// the single-step shreds in key order (bind canonicalizes it), so each of the object's (few) keys
+// is binary-searched. Used to gate the fast path against a PLAIN input whose top-level key names a
+// shred: a value there collides into the residual (also caught by the per-row residual probe), but
+// an RFC 7396 null at that key DELETES the lane and leaves no trace in the folded residual — the
+// lane copy-through would wrongly keep it, so any such key forces the reshred fallback.
+bool ObjectKeyInShredSet(const JsonoView &view, const vector<MergeShred> &shreds,
+                         const vector<idx_t> &top_level_shreds) {
 	if (view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
 		return false;
 	}
@@ -246,17 +261,20 @@ bool ObjectKeyInShredSet(const JsonoView &view, const vector<MergeShred> &shreds
 			break;
 		}
 		auto key = view.KeyAt(SlotPayload(ks));
+		auto shred_key = [&](size_t i) {
+			return nonstd::string_view(shreds[top_level_shreds[i]].steps[0].key);
+		};
 		size_t lo = 0;
-		size_t hi = shreds.size();
+		size_t hi = top_level_shreds.size();
 		while (lo < hi) {
 			auto mid = lo + (hi - lo) / 2;
-			if (nonstd::string_view(shreds[mid].name) < key) {
+			if (shred_key(mid) < key) {
 				lo = mid + 1;
 			} else {
 				hi = mid;
 			}
 		}
-		if (lo < shreds.size() && nonstd::string_view(shreds[lo].name) == key) {
+		if (lo < top_level_shreds.size() && shred_key(lo) == key) {
 			return true;
 		}
 	}
@@ -420,12 +438,10 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			plain_inputs.push_back(i);
 		}
 	}
-	// Parse each shred's object-key path once (top-level shreds are a single Key step). An array
-	// shred with element objects, or any non-Key step (only reachable through an array path),
+	// Each shred's object-key path was decoded once at bind (top-level shreds are a single Key step).
+	// An array shred with element objects, or any non-Key step (only reachable through an array path),
 	// disqualifies the fast path.
-	vector<vector<PathStep>> shred_paths(bind_data.shreds.size());
 	vector<ShredKind> shred_kinds(bind_data.shreds.size());
-	bool has_jsonpath_shred = false;
 	bool has_nested_shred = false;
 	for (idx_t k = 0; k < bind_data.shreds.size() && fast_viable; k++) {
 		auto &shred = bind_data.shreds[k];
@@ -434,19 +450,15 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			fast_viable = false;
 			break;
 		}
-		shred_paths[k] = ShredNamePath(shred.name, "jsono merge fast path");
-		// The JSONPath form gates the per-row nested-shred probe below; a bare-literal top-level key
-		// is already covered there by ObjectKeyInShredSet.
-		if (shred.name.size() >= 2 && shred.name[0] == '$' && shred.name[1] == '.') {
-			has_jsonpath_shred = true;
-		}
-		for (auto &step : shred_paths[k]) {
+		for (auto &step : shred.steps) {
 			if (step.kind != PathStepKind::Key) {
 				fast_viable = false;
 				break;
 			}
 		}
-		if (shred_paths[k].size() > 1) {
+		// A nested path is the one that needs the per-row descent below; a single-step shred, however
+		// its name is spelled, is covered by ObjectKeyInShredSet and the top-level key probe.
+		if (shred.steps.size() > 1) {
 			has_nested_shred = true;
 		}
 	}
@@ -454,9 +466,9 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 	// contradictory — only the reshred fallback can resolve which wins. Two distinct top-level
 	// keys never prefix each other, so this only matters once a nested shred is present.
 	if (fast_viable && has_nested_shred) {
-		for (idx_t a = 0; a < shred_paths.size() && fast_viable; a++) {
-			for (idx_t b = a + 1; b < shred_paths.size(); b++) {
-				if (ShredPathsStructurallyConflict(shred_paths[a], shred_paths[b])) {
+		for (idx_t a = 0; a < bind_data.shreds.size() && fast_viable; a++) {
+			for (idx_t b = a + 1; b < bind_data.shreds.size(); b++) {
+				if (ShredPathsStructurallyConflict(bind_data.shreds[a].steps, bind_data.shreds[b].steps)) {
 					fast_viable = false;
 					break;
 				}
@@ -510,7 +522,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		for (auto &shred : bind_data.shreds) {
 			shred_specs.emplace_back(shred.name, shred.type);
 		}
-		JsonoShredFromSpec(fold_out, fallback_count, shred_specs, fallback_result);
+		JsonoShredFromLayout(fold_out, fallback_count, shred_specs, fallback_result);
 	};
 
 	if (fast_viable) {
@@ -530,12 +542,14 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		// breaking its object skeleton, or a scalar-array path holding anything but its array skeleton.
 		auto residual_hits_shred = [&](const JsonoView &view, idx_t k) -> bool {
 			if (shred_kinds[k] == ShredKind::ScalarArray) {
-				return ResidualConflictsWithScalarArrayShredPath(view, shred_paths[k]);
+				return ResidualConflictsWithScalarArrayShredPath(view, bind_data.shreds[k].steps);
 			}
-			if (shred_paths[k].size() == 1) {
-				return ResidualHasTopLevelKey(view, bind_data.shreds[k].name);
+			if (bind_data.shreds[k].steps.size() == 1) {
+				// The residual holds DOCUMENT keys, so a top-level shred is probed by the key it lifts,
+				// not by the field name its lane occupies.
+				return ResidualHasTopLevelKey(view, bind_data.shreds[k].steps[0].key);
 			}
-			return ResidualConflictsWithShredPath(view, shred_paths[k]);
+			return ResidualConflictsWithShredPath(view, bind_data.shreds[k].steps);
 		};
 		// A shredded input keeps a shred key in its OWN residual only for a present-null (explicit
 		// JSON null) or a diverted value — both cases the lane slot is NULL, so a valid lane means the
@@ -622,17 +636,16 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				// A plain input naming a shred also forces the fallback: a value there is caught by
 				// the residual probe above, but an RFC 7396 null-delete of a lane leaves no trace in
 				// the folded residual and the lane copy-through would wrongly keep it. ObjectKeyInShredSet
-				// covers the top-level shred names in one pass; a plain input touching a NESTED shred path
+				// covers the top-level shred keys in one pass; a plain input touching a NESTED shred path
 				// (its leaf or a non-object along it) needs the per-path descent.
-				if (ObjectKeyInShredSet(pview, bind_data.shreds)) {
+				if (ObjectKeyInShredSet(pview, bind_data.shreds, bind_data.top_level_shreds)) {
 					row_conflict = true;
 					break;
 				}
-				if (has_jsonpath_shred) {
+				if (has_nested_shred) {
 					for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
-						auto &name = bind_data.shreds[k].name;
-						if (name.size() >= 2 && name[0] == '$' && name[1] == '.' &&
-						    ResidualConflictsWithShredPath(pview, shred_paths[k])) {
+						if (bind_data.shreds[k].steps.size() > 1 &&
+						    ResidualConflictsWithShredPath(pview, bind_data.shreds[k].steps)) {
 							row_conflict = true;
 							break;
 						}

@@ -75,6 +75,7 @@ void JsonoValidateShredField(const string &path, const LogicalType &type);
 // lifted-element primitive description. An object array (kind == Array) lifts element subfields into
 // a LIST<STRUCT> column; a scalar array (kind == ScalarArray) lifts each whole element into a
 // LIST<element_type> column. The two carry disjoint extra fields; `kind` selects which is valid.
+// Both `path` and the subfield names are LOGICAL: the emit matches them against document keys.
 struct JsonoArrayShredSpec {
 	vector<PathStep> path;
 	ShredKind kind = ShredKind::Array;
@@ -95,6 +96,10 @@ struct JsonoShredManifestEntryBytes {
 	std::string compact;
 };
 
+// One manifest entry's bytes. `path` is the lane name as the manifest records it — today the
+// PHYSICAL field name, which is the lane's path spelled as text; the reader's verification
+// (VerifyShredManifestEntries) compares it byte-for-byte against the reading type's field names,
+// so both sides must name the lane the same way.
 JsonoShredManifestEntryBytes JsonoShredManifestEntry(const string &path, const LogicalType &type);
 
 void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries);
@@ -102,13 +107,14 @@ void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredMani
 void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries,
                               const vector<idx_t> &entry_indices);
 
-// Shred a plain JSONO `input` vector into the shredded `result` STRUCT (the six-BLOB
-// residual prefix followed by one shred column per `shreds` entry, in order). Each shred is
-// a top-level key named by `shreds[i].first` with type `shreds[i].second`; its value is
-// lifted from the document and (when losslessly captured) stripped from the residual.
-// Reuses the jsono_shred executor so the constructor and the shred function share strip
-// and shred-write semantics.
-void JsonoShredFromSpec(Vector &input, idx_t count, const vector<std::pair<string, LogicalType>> &shreds,
-                        Vector &result);
+// Shred a plain JSONO `input` vector into the shredded `result` STRUCT (the six-BLOB residual
+// prefix followed by one shred column per `shreds` entry, in order). `shreds[i]` names a lane by
+// its PHYSICAL field name and type — the caller already has the result layout (a merged shred set,
+// a group_merge accumulator's, the constructor's auto-shred set) and this must reproduce it
+// exactly, so the names are decoded to paths, not re-parsed as the public spec DSL. Reuses the
+// jsono_shred executor so the constructor and the shred function share strip and shred-write
+// semantics.
+void JsonoShredFromLayout(Vector &input, idx_t count, const vector<std::pair<string, LogicalType>> &shreds,
+                          Vector &result);
 
 } // namespace duckdb

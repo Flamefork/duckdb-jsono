@@ -208,34 +208,8 @@ SubfieldStat &GetSubfieldStat(std::map<string, SubfieldStat> &subfields, const s
 	return subfields[key];
 }
 
-// Append `key` as a `$`-rooted JSONPath step, quoting it when a bare `.key` step would be
-// mis-parsed (empty key, or a delimiter/quote/backslash inside it). Mirrors jsono_entries'
-// AppendKeySegment so a suggested nested path re-parses to the same steps.
-void AppendJsonPathStep(string &path, nonstd::string_view key) {
-	bool needs_quote = key.empty();
-	for (char c : key) {
-		if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
-			needs_quote = true;
-			break;
-		}
-	}
-	path.push_back('.');
-	if (!needs_quote) {
-		path.append(key.data(), key.size());
-		return;
-	}
-	path.push_back('"');
-	for (char c : key) {
-		if (c == '"' || c == '\\') {
-			path.push_back('\\');
-		}
-		path.push_back(c);
-	}
-	path.push_back('"');
-}
-
 // Name a top-level key in the candidate map (and so in the emitted spec). The common case is the
-// bare name; a key the spec parser would misread as a JSONPath (`$`-leading, see ParseShredPathSpec)
+// bare name; a key the spec parser would misread as a JSONPath (`$`-leading, see ParseShredSpecPath)
 // or reject as a reserved layout name (`body`) is spelled through its quoted `$.`-rooted path form,
 // which names the same top-level key.
 string TopLevelSpecName(nonstd::string_view key) {
@@ -243,7 +217,7 @@ string TopLevelSpecName(nonstd::string_view key) {
 		return string(key.data(), key.size());
 	}
 	string path = "$";
-	AppendJsonPathStep(path, key);
+	AppendJsonPathKey(path, key);
 	return path;
 }
 
@@ -363,7 +337,7 @@ void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, const string &
 			continue;
 		}
 		string path = base;
-		AppendJsonPathStep(path, child_key);
+		AppendJsonPathKey(path, child_key);
 		if (child_tag == tag::OBJ_START && depth < JSONO_AUTO_SHRED_MAX_DEPTH) {
 			// A nested object still within shred depth: record it as a nonrole occurrence of its own path
 			// (so a path that is a scalar in some rows and an object in others drops at min_fit = 1.0) and
@@ -417,7 +391,7 @@ void AccumulateDocument(const JsonoView &view, std::map<string, SuggestCandidate
 			// parent path — a key that is a scalar in some rows and an object in others drops at min_fit.
 			GetCandidate(paths, TopLevelSpecName(key)).nonrole_present++;
 			string base = "$";
-			AppendJsonPathStep(base, key);
+			AppendJsonPathKey(base, key);
 			WalkNestedObject(view, cursor, base, paths, 2);
 		} else if (value_tag == tag::ARR_START) {
 			ClassifyTopLevelArray(view, cursor, GetCandidate(paths, TopLevelSpecName(key)));
@@ -769,10 +743,12 @@ idx_t ShredStatsFootprint(const ShredStatsState &state) {
 	return state.counters->capacity() * sizeof(ShredStatCounters);
 }
 
-// One shred of the input type: its output path/type strings plus the residual path steps used to
-// detect a diverted value (lane NULL but the path is still present in the residual).
+// One shred of the input type, in both its names: `lane_name` is the STRUCT field — the canonical
+// spill ranks are derived from it, and it is what the `path` output column reports today (a lane
+// name still being the path spelled as text) — while `steps` is the logical path used to detect a
+// diverted value (lane NULL but the path is still present in the residual).
 struct ShredStatDescriptor {
-	string path;
+	string lane_name;
 	string type_name;
 	ShredKind kind;
 	vector<PathStep> steps;
@@ -798,7 +774,7 @@ struct ShredStatsBindData : public FunctionData {
 			return false;
 		}
 		for (idx_t i = 0; i < shreds.size(); i++) {
-			if (shreds[i].path != other.shreds[i].path || shreds[i].type_name != other.shreds[i].type_name) {
+			if (shreds[i].lane_name != other.shreds[i].lane_name || shreds[i].type_name != other.shreds[i].type_name) {
 				return false;
 			}
 		}
@@ -851,7 +827,7 @@ unique_ptr<FunctionData> JsonoShredStatsBind(ClientContext &context, AggregateFu
 	auto bind_data = make_uniq<ShredStatsBindData>(BufferManager::GetBufferManager(context));
 	for (auto &shred : layout.shreds) {
 		ShredStatDescriptor descriptor;
-		descriptor.path = shred.first;
+		descriptor.lane_name = shred.first;
 		descriptor.type_name = shred.second.ToString();
 		descriptor.kind = ClassifyShredKind(shred.second);
 		descriptor.steps = ShredNamePath(shred.first, "jsono_shred_stats shred");
@@ -903,7 +879,7 @@ void InitShredStatsLanes(Vector &input, idx_t count, const ShredStatsBindData &b
 	vector<string> names;
 	names.reserve(nshreds);
 	for (auto &shred : bind_data.shreds) {
-		names.push_back(shred.path);
+		names.push_back(shred.lane_name);
 	}
 	lanes.spill_ranks = JsonoSpillRanksOfNames(names);
 }
@@ -1068,7 +1044,7 @@ void JsonoShredStatsFinalize(Vector &states, AggregateInputData &aggr_input_data
 		for (idx_t f = 0; f < nshreds; f++) {
 			auto idx = start + f;
 			auto &counters = (*state.counters)[f];
-			path_data[idx] = StringVector::AddString(*child[0], bind_data.shreds[f].path);
+			path_data[idx] = StringVector::AddString(*child[0], bind_data.shreds[f].lane_name);
 			type_data[idx] = StringVector::AddString(*child[1], bind_data.shreds[f].type_name);
 			lane_data[idx] = double(counters.lane_present) / denom;
 			divert_data[idx] = double(counters.divert) / denom;

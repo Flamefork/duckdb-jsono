@@ -2211,7 +2211,7 @@ void FinalizeLWWPlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMe
 		builder.Reset();
 		if (!state.has_input) {
 			// Zero non-NULL inputs -> SQL NULL (DEFAULT_NULL_HANDLING). `out` is plain here (shreds
-			// empty, or the reshred-fallback's plain temp, where JsonoShredFromSpec carries the NULL
+			// empty, or the reshred-fallback's plain temp, where JsonoShredFromLayout carries the NULL
 			// row through into the shredded result).
 			writer.SetRowNull(rid);
 			continue;
@@ -2241,7 +2241,7 @@ void JsonoGroupMergeLWWFinalize(Vector &states, AggregateInputData &aggr_input_d
 	Vector plain(JsonoType(), count);
 	FinalizeLWWPlainGroups(plain, state_fmt, state_data, count, 0);
 	Vector shredded(result.GetType(), count);
-	JsonoShredFromSpec(plain, count, bind_data.shreds, shredded);
+	JsonoShredFromLayout(plain, count, bind_data.shreds, shredded);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	VectorOperations::Copy(shredded, result, count, 0, offset);
 }

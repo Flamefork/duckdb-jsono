@@ -1376,31 +1376,6 @@ void JsonoShredPatchExecute(DataChunk &args, ExpressionState &state, Vector &res
 	}
 }
 
-// Append `key` to a JSON path under `$`, quoting it when it carries a character ParseJsonoPath
-// would otherwise treat as structural (a bare `.foo` step only spans up to the next . [ ] ").
-void AppendShredPathStep(string &path, const string &key) {
-	bool needs_quote = key.empty();
-	for (char c : key) {
-		if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
-			needs_quote = true;
-			break;
-		}
-	}
-	path.push_back('.');
-	if (!needs_quote) {
-		path.append(key);
-		return;
-	}
-	path.push_back('"');
-	for (char c : key) {
-		if (c == '"' || c == '\\') {
-			path.push_back('\\');
-		}
-		path.push_back(c);
-	}
-	path.push_back('"');
-}
-
 // Auto-shred lanes derive from the constructor plan that defines the residual representation, so
 // adding a source type cannot update one representation without the other. The raw type only
 // distinguishes UBIGINT from the wider NumberText types and supplies LIST/ARRAY/STRUCT child types.
@@ -1508,7 +1483,7 @@ void CollectAutoShreds(const LogicalType &struct_type, const JsonoStructPlan &st
 				shreds.push_back({child.first, shred_type, fields});
 			} else {
 				string path = path_prefix;
-				AppendShredPathStep(path, child.first);
+				AppendJsonPathKey(path, nonstd::string_view(child.first.data(), child.first.size()));
 				shreds.push_back({std::move(path), shred_type, fields});
 			}
 			fields.pop_back();
@@ -1516,7 +1491,7 @@ void CollectAutoShreds(const LogicalType &struct_type, const JsonoStructPlan &st
 		}
 		if (depth < JSONO_AUTO_SHRED_MAX_DEPTH && child.second.id() == LogicalTypeId::STRUCT) {
 			string path = depth == 1 ? "$" : path_prefix;
-			AppendShredPathStep(path, child.first);
+			AppendJsonPathKey(path, nonstd::string_view(child.first.data(), child.first.size()));
 			CollectAutoShreds(child.second, child_plan, path, depth + 1, fields, shreds);
 		}
 		fields.pop_back();
@@ -1989,7 +1964,7 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 
 // One-pass shredded constructor: shred values copy from the typed input children, the residual
 // emits only the non-shred fields, and the manifest is written along the way — the two-pass path
-// (full plain emit, then per-row locate + strip + re-emit in JsonoShredFromSpec) is skipped
+// (full plain emit, then per-row locate + strip + re-emit in JsonoShredFromLayout) is skipped
 // entirely. Per row only the shred fields' NULL mask varies: every non-NULL shred field is
 // losslessly captured by construction (a VARCHAR field is a real JSON string, BIGINT/DOUBLE/
 // BOOLEAN/UBIGINT match their stored kind exactly) and is stripped from the residual; a NULL
@@ -2292,7 +2267,7 @@ void JsonoStructExecute(DataChunk &args, ExpressionState &state, Vector &result)
 	} else {
 		Vector plain(JsonoType(), count);
 		ExecuteStructConstructor(*input, count, plain, bind_data.plan, lstate);
-		JsonoShredFromSpec(plain, count, bind_data.shreds, result);
+		JsonoShredFromLayout(plain, count, bind_data.shreds, result);
 	}
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);

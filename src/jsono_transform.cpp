@@ -173,25 +173,9 @@ idx_t FindWildcardIndex(const vector<PathStep> &path) {
 }
 
 string LiteralKeyPathText(nonstd::string_view key) {
-	bool simple = !key.empty();
-	for (auto c : key) {
-		if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
-			simple = false;
-			break;
-		}
-	}
-	if (simple) {
-		return "$." + string(key);
-	}
-	string result = "$.\"";
-	for (auto c : key) {
-		if (c == '"' || c == '\\') {
-			result.push_back('\\');
-		}
-		result.push_back(c);
-	}
-	result.push_back('"');
-	return result;
+	string path = "$";
+	AppendJsonPathKey(path, key);
+	return path;
 }
 
 TransformField MakeField(nonstd::string_view name, JsonoScalarPrimitive primitive, TransformMode mode,

@@ -81,6 +81,14 @@ void EmitShredPatchObject(JsonoBuilder &builder, const vector<ReconShred> &shred
 }
 
 // ---- Array shred overlay (read side) ----
+
+// One subfield of an array shred's element struct, as the reconstruct overlay needs it: the JSON
+// key it is emitted under and its scalar type.
+struct ReconArraySubfield {
+	string key;
+	LogicalType type;
+};
+
 // A LIST<STRUCT> shred column holds, per row, one struct per element of the skeleton array, in
 // lockstep. Reconstruct rebuilds the array: each object element merges its present shred subfields
 // (residual-authoritative) back over its skeleton tail; a non-object/null element or a NULL shred
@@ -92,8 +100,10 @@ struct ArrayReconShred {
 	vector<PathStep> path;        // pure object-key chain to the array
 	UnifiedVectorFormat list_fmt; // list_entry_t + per-row validity (both kinds)
 	const list_entry_t *list_entries = nullptr;
-	// kind == Array: the element struct's subfields lifted into a LIST<STRUCT> column.
-	vector<std::pair<string, LogicalType>> subfields; // element subfield (name, scalar type), struct order
+	// kind == Array: the element struct's subfields lifted into a LIST<STRUCT> column. `key` is the
+	// element's JSON key the overlay emits — decoded from the lane's element field name (today the
+	// two are one string); the physical access is the index into `sub_fmt`, never the name.
+	vector<ReconArraySubfield> subfields; // struct order
 	// Subfield indices in sorted-key order: the overlay patch object must emit keys ascending
 	// (the JSONO object invariant and the sorted-key two-pointer MergeTwoObjects both require it).
 	vector<idx_t> sorted_subfields;
@@ -166,14 +176,14 @@ void OverlayArray(const JsonoView &view, JsonoCursor &cursor, JsonoBuilder &buil
 			for (auto j : shred.sorted_subfields) {
 				if (shred.sub_fmt[j].validity.RowIsValid(shred.sub_fmt[j].sel->get_index(child))) {
 					scratch.patch_builder.EmitKeySlot(
-					    nonstd::string_view(shred.subfields[j].first.data(), shred.subfields[j].first.size()));
+					    nonstd::string_view(shred.subfields[j].key.data(), shred.subfields[j].key.size()));
 				}
 			}
 			for (auto j : shred.sorted_subfields) {
 				auto sub_idx = shred.sub_fmt[j].sel->get_index(child);
 				if (shred.sub_fmt[j].validity.RowIsValid(sub_idx)) {
 					scratch.patch_builder.EmitObjectChildStart();
-					EmitReconShredScalar(scratch.patch_builder, shred.subfields[j].second, shred.sub_fmt[j], sub_idx);
+					EmitReconShredScalar(scratch.patch_builder, shred.subfields[j].type, shred.sub_fmt[j], sub_idx);
 				}
 			}
 			scratch.patch_builder.EmitObjectEnd();
@@ -267,7 +277,6 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		if (shred_filter && std::find(shred_filter->begin(), shred_filter->end(), i) == shred_filter->end()) {
 			continue;
 		}
-		// Shred field names ARE the clean path (no fingerprint suffix in the nested layout).
 		auto &name = layout.shreds[i].first;
 		vector<PathStep> steps = ShredNamePath(name, "jsono reconstruct");
 		for (auto &step : steps) {
@@ -282,7 +291,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			ars.path = std::move(steps);
 			auto &element = ListType::GetChildType(layout.shreds[i].second);
 			for (auto &sub : StructType::GetChildTypes(element)) {
-				ars.subfields.emplace_back(sub.first, sub.second);
+				ars.subfields.push_back(ReconArraySubfield {sub.first, sub.second});
 			}
 			array_shreds.push_back(std::move(ars));
 			continue;
@@ -359,7 +368,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			ars.sorted_subfields[j] = j;
 		}
 		std::sort(ars.sorted_subfields.begin(), ars.sorted_subfields.end(),
-		          [&](idx_t a, idx_t b) { return ars.subfields[a].first < ars.subfields[b].first; });
+		          [&](idx_t a, idx_t b) { return ars.subfields[a].key < ars.subfields[b].key; });
 	}
 	std::vector<const ArrayReconShred *> array_shred_ptrs;
 	for (auto &ars : array_shreds) {
@@ -481,7 +490,10 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 
 struct DirectListJsonShred {
 	string key;
-	vector<string> subfield_names;
+	// The element subfields' JSON keys, decoded from the lane's element field names: they are both
+	// emitted into the output and sort-merged against the residual's (byte-sorted) document keys, so
+	// they must be the logical names. The lane itself is addressed by index.
+	vector<string> subfield_keys;
 	vector<idx_t> sorted_subfields;
 	ShredLane lane;
 };
@@ -527,7 +539,7 @@ void AppendDirectObjectArrayElement(const JsonoView &view, JsonoCursor &cursor, 
 			cmp = -1;
 		} else if (residual_field < layout.key_count) {
 			auto field = shred.sorted_subfields[lane_field];
-			auto &lane_key = shred.subfield_names[field];
+			auto &lane_key = shred.subfield_keys[field];
 			cmp = CompareJsonoKeys(residual_key, nonstd::string_view(lane_key.data(), lane_key.size()));
 		}
 
@@ -546,7 +558,7 @@ void AppendDirectObjectArrayElement(const JsonoView &view, JsonoCursor &cursor, 
 		}
 
 		auto field = shred.sorted_subfields[lane_field++];
-		auto &lane_key = shred.subfield_names[field];
+		auto &lane_key = shred.subfield_keys[field];
 		AppendJsonString(nonstd::string_view(lane_key.data(), lane_key.size()), out);
 		out.push_back(':');
 		auto sub_idx = shred.lane.sub_fmt[field].sel->get_index(child);
@@ -680,14 +692,14 @@ void RenderShreddedListsToJsonImpl(Vector &input, idx_t count, Vector &result) {
 		shred.key = std::move(steps[0].key);
 		if (IsShredArrayType(shred_type)) {
 			for (auto &field : StructType::GetChildTypes(ListType::GetChildType(shred_type))) {
-				shred.subfield_names.push_back(field.first);
+				shred.subfield_keys.push_back(field.first);
 			}
-			shred.sorted_subfields.resize(shred.subfield_names.size());
+			shred.sorted_subfields.resize(shred.subfield_keys.size());
 			for (idx_t field = 0; field < shred.sorted_subfields.size(); field++) {
 				shred.sorted_subfields[field] = field;
 			}
 			std::sort(shred.sorted_subfields.begin(), shred.sorted_subfields.end(),
-			          [&](idx_t a, idx_t b) { return shred.subfield_names[a] < shred.subfield_names[b]; });
+			          [&](idx_t a, idx_t b) { return shred.subfield_keys[a] < shred.subfield_keys[b]; });
 		}
 		InitShredLane(JsonoShredVector(input, f), count, shred_type, shred.lane);
 		list_shreds.push_back(std::move(shred));

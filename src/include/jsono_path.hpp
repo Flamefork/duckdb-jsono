@@ -146,44 +146,88 @@ inline vector<PathStep> LiteralKeyPath(const string &name) {
 	return path;
 }
 
-// Resolve a shred lane name to its path steps. A lane name is either a bare literal top-level object
-// key or a `$.`-rooted JSONPath naming a nested key. Only the `$.` prefix marks the JSONPath form:
-// a literal top-level key may itself begin with `$` (e.g. `$x`), and the reserved `$jsono$set` marker
-// begins with `$` too, so a bare-`$` test would misparse both. New readers must resolve shred names
-// through this classifier; several older readers still inline the split. It agrees with them on
-// every constructible / recognizable name because a lane name is guaranteed to be a non-empty pure
-// object-key chain — enforced at spec parse (ParseShredPathSpec) and at structural layout
-// recognition (TryParseJsonoLayoutType, via ShredNameIsObjectKeyPath), so array-index and root `$`
-// lanes never exist.
-inline vector<PathStep> ShredNamePath(const string &name, const char *function_name) {
-	if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
-		return ParseJsonoPath(name, function_name);
-	}
-	return LiteralKeyPath(name);
-}
-
-// Whether a shred lane name resolves to a non-empty pure object-key chain — the only shape a shred
-// lane may carry (each step strips one object key from the residual; an array-index or root `$` lane
-// cannot be rebuilt by the object overlay). Non-throwing and mirroring ShredNamePath's split, so it
-// doubles as the structural gate in layout recognition: a stored / raw-cast type whose lane name is
-// an index or root path is simply not recognized as JSONO.
-inline bool ShredNameIsObjectKeyPath(const string &name) {
-	vector<PathStep> steps;
-	if (name.size() >= 2 && name[0] == '$' && name[1] == '.') {
-		try {
-			steps = ParseJsonoPath(name, "jsono shred");
-		} catch (const std::exception &) {
-			return false;
-		}
-	} else {
-		steps = LiteralKeyPath(name);
-	}
+// Whether `steps` is a path a shred lane may carry: a non-empty pure object-key chain. The residual
+// emit removes one object key per step, and only an object key can be re-filled by the object
+// overlay on reconstruction, so an array-index or root `$` lane could never be rebuilt.
+inline bool IsObjectKeyPath(const vector<PathStep> &steps) {
 	for (auto &step : steps) {
 		if (step.kind != PathStepKind::Key) {
 			return false;
 		}
 	}
 	return !steps.empty();
+}
+
+// ===== The lane-name boundary =====
+//
+// A shred lane has two names: the LOGICAL path it lifts out of the document (a pure object-key
+// chain — what reconstruct, render and jsono_entries emit, and what a diagnostic prints) and the
+// PHYSICAL STRUCT field it occupies inside `shreds` (what the type carries, what the manifest and
+// the canonical spill ranks are keyed by). Today they are one string: the physical name IS the path
+// spelled as text. That conflation is the defect plan 056 fixes — it is why two spellings of one
+// path (`gclid` and `$.gclid`) mint two lanes, and why DuckDB's case-insensitive STRUCT field
+// matching collapses `gclid` and `GCLID` into one. Everything that crosses between the two names
+// goes through the two functions below; nothing else may split a lane name on `$.` or hand a
+// physical name to a path parser.
+
+// Whether a lane name is spelled in the `$.`-rooted JSONPath form rather than as a bare literal
+// top-level key. Only the `$.` prefix marks it: a literal top-level key may itself begin with `$`
+// (e.g. `$x`), and the reserved `$jsono$set` marker begins with `$` too, so a bare-`$` test would
+// misread both.
+inline bool LaneNameIsPathForm(const string &name) {
+	return name.size() >= 2 && name[0] == '$' && name[1] == '.';
+}
+
+// Decode a lane's physical name into the logical path it lifts. Throws on a name no writer could
+// have minted (a malformed `$.`-rooted path); every recognizable lane decodes, because layout
+// recognition already gated the name through ShredNameIsObjectKeyPath.
+inline vector<PathStep> ShredNamePath(const string &name, const char *function_name) {
+	if (LaneNameIsPathForm(name)) {
+		return ParseJsonoPath(name, function_name);
+	}
+	return LiteralKeyPath(name);
+}
+
+// The non-throwing form of the decode above, plus the lane-path check: whether `name` decodes to a
+// path a shred lane may carry. It is the structural gate in layout recognition, which runs over
+// arbitrary user structs and must classify them silently rather than fail the query.
+inline bool ShredNameIsObjectKeyPath(const string &name) {
+	vector<PathStep> steps;
+	try {
+		steps = ShredNamePath(name, "jsono shred");
+	} catch (const std::exception &) {
+		return false;
+	}
+	return IsObjectKeyPath(steps);
+}
+
+// Append `key` to a `$`-rooted JSONPath as one `.key` step, quoting it exactly when a bare step
+// would mis-parse: an empty key, or one carrying a character ParseJsonoPath treats as structural (a
+// bare `.foo` step spans only up to the next . [ ] ", and a backslash is an escape inside a quoted
+// key). The single owner of the quoting rule — the serializer below, the shred-spec emitters of the
+// constructor and the advisor, and the jsono_entries key builder all call it, so a path this
+// project prints always re-parses to the steps it came from.
+inline void AppendJsonPathKey(string &path, nonstd::string_view key) {
+	bool needs_quote = key.empty();
+	for (char c : key) {
+		if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
+			needs_quote = true;
+			break;
+		}
+	}
+	path.push_back('.');
+	if (!needs_quote) {
+		path.append(key.data(), key.size());
+		return;
+	}
+	path.push_back('"');
+	for (char c : key) {
+		if (c == '"' || c == '\\') {
+			path.push_back('\\');
+		}
+		path.push_back(c);
+	}
+	path.push_back('"');
 }
 
 inline vector<PathStep> ArrayIndexPath(idx_t index) {
@@ -212,17 +256,12 @@ inline bool JsonoPathSpecEqual(const JsonoPathSpec &left, const JsonoPathSpec &r
 	return left.text == right.text && PathStepsEqual(left.steps, right.steps);
 }
 
-// True unless `read` and the object-key path `key_path` provably diverge — i.e. on some
-// shared-depth step both are object keys that differ. A wildcard or index at a shared step is
-// treated as a possible match (not provably disjoint), and one path being a prefix of the other
-// also shares a branch. Used to decide, conservatively, whether a read could touch a shredded
-// array path (read it, descend into it, or sit on a container subtree that holds it) — whose
-// lifted element values are stripped from the residual and so demand a reconstruct.
 // Serialize object-key / array-index steps back to a `$`-rooted JSONPath that ParseJsonoPath
-// round-trips (the inverse of ParseJsonoPath). A key is quoted when a bare `.key` step would
-// mis-parse (empty, or a delimiter/quote/backslash inside it), so a literal key carrying a dot
-// stays one step. Fails for a leading non-key step or any wildcard, which ParseJsonoPath cannot
-// root — the caller then declines rather than emit an unparseable path.
+// round-trips (the inverse of ParseJsonoPath). This is the project's single logical path form —
+// `$.`-always, quoting per AppendJsonPathKey — shared by the spec DSL the constructor and the
+// advisor emit and by every diagnostic that names a path. Fails for a leading non-key step or any
+// wildcard, which ParseJsonoPath cannot root — the caller then declines rather than emit an
+// unparseable path.
 inline bool TryStepsToJsonPath(const vector<PathStep> &steps, string &out) {
 	if (steps.empty() || steps[0].kind != PathStepKind::Key) {
 		return false;
@@ -230,29 +269,9 @@ inline bool TryStepsToJsonPath(const vector<PathStep> &steps, string &out) {
 	string path = "$";
 	for (auto &step : steps) {
 		switch (step.kind) {
-		case PathStepKind::Key: {
-			bool needs_quote = step.key.empty();
-			for (char c : step.key) {
-				if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
-					needs_quote = true;
-					break;
-				}
-			}
-			path.push_back('.');
-			if (!needs_quote) {
-				path.append(step.key);
-				break;
-			}
-			path.push_back('"');
-			for (char c : step.key) {
-				if (c == '"' || c == '\\') {
-					path.push_back('\\');
-				}
-				path.push_back(c);
-			}
-			path.push_back('"');
+		case PathStepKind::Key:
+			AppendJsonPathKey(path, nonstd::string_view(step.key.data(), step.key.size()));
 			break;
-		}
 		case PathStepKind::Index:
 			path.push_back('[');
 			path.append(std::to_string(step.index));
@@ -266,6 +285,12 @@ inline bool TryStepsToJsonPath(const vector<PathStep> &steps, string &out) {
 	return true;
 }
 
+// True unless `read` and the object-key path `key_path` provably diverge — i.e. on some
+// shared-depth step both are object keys that differ. A wildcard or index at a shared step is
+// treated as a possible match (not provably disjoint), and one path being a prefix of the other
+// also shares a branch. Used to decide, conservatively, whether a read could touch a shredded
+// array path (read it, descend into it, or sit on a container subtree that holds it) — whose
+// lifted element values are stripped from the residual and so demand a reconstruct.
 inline bool PathStepsMayShareBranch(const vector<PathStep> &read, const vector<PathStep> &key_path) {
 	idx_t shared = read.size() < key_path.size() ? read.size() : key_path.size();
 	for (idx_t i = 0; i < shared; i++) {
