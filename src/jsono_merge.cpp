@@ -752,13 +752,14 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				manifest_shreds.emplace_back(shred.name, shred.type);
 				JsonoShredVector(result, shred.result_child_index).ToUnifiedFormat(count, shred_fmt[k]);
 			}
-			auto manifest_entries = JsonoShredManifestEntries(manifest_shreds);
+			auto manifest_entries = JsonoBuildShredManifestEntries(manifest_shreds);
 			auto fr_skips = FlatVector::GetData<string_t>(*fr_blobs[BODY_SKIPS]);
 			auto &fr_skips_validity = FlatVector::Validity(*fr_blobs[BODY_SKIPS]);
 			auto &r_skips = writer.Skips();
 			auto skips_out = writer.data[BODY_SKIPS];
 			std::string skips_buf;
-			vector<idx_t> stripped_fields;
+			JsonoStrippedLanes stripped_lanes;
+			stripped_lanes.Init(bind_data.shreds.size());
 			for (idx_t row = 0; row < count; row++) {
 				if (!result_validity.RowIsValid(row) || !fr_skips_validity.RowIsValid(row)) {
 					FlatVector::SetNull(r_skips, row, true);
@@ -766,14 +767,14 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				}
 				skips_buf.clear();
 				skips_buf.append(fr_skips[row].GetData(), fr_skips[row].GetSize());
-				stripped_fields.clear();
+				stripped_lanes.Clear();
 				for (idx_t k = 0; k < bind_data.shreds.size(); k++) {
 					if (RowIsValid(shred_fmt[k], row)) {
-						stripped_fields.push_back(k);
+						stripped_lanes.Mark(k);
 					}
 				}
-				if (!stripped_fields.empty()) {
-					JsonoAppendShredManifest(skips_buf, manifest_entries, stripped_fields);
+				if (!stripped_lanes.Empty()) {
+					JsonoAppendShredManifest(skips_buf, manifest_entries, stripped_lanes);
 				}
 				skips_out[row] = WriteBlobInto(r_skips, skips_buf.data(), skips_buf.size());
 			}

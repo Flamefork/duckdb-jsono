@@ -1854,12 +1854,13 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	}
 	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
 
-	auto manifest_entries = JsonoShredManifestEntries(bind_data.shreds);
+	auto manifest_entries = JsonoBuildShredManifestEntries(bind_data.shreds);
 
 	JsonoBuilder builder;
 	vector<const vector<PathStep> *> scalar_strip_paths;
 	vector<idx_t> stripped_child_indices;
-	vector<idx_t> stripped_shred_indices;
+	JsonoStrippedLanes stripped_lanes;
+	stripped_lanes.Init(bind_data.shreds.size());
 	vector<idx_t> list_override_indices;
 	std::string manifest;
 	for (idx_t i = 0; i < count; i++) {
@@ -1875,7 +1876,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		builder.Reset();
 		scalar_strip_paths.clear();
 		stripped_child_indices.clear();
-		stripped_shred_indices.clear();
+		stripped_lanes.Clear();
 		list_override_indices.clear();
 		if (!state.has_input) {
 			// Zero non-NULL inputs -> SQL NULL (DEFAULT_NULL_HANDLING): null the body and the whole
@@ -1912,7 +1913,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 					if (found) {
 						scalar_strip_paths.push_back(&shred.steps);
 					}
-					stripped_shred_indices.push_back(shred.child);
+					stripped_lanes.Mark(shred.child);
 					continue;
 				}
 				if (!found) {
@@ -1921,7 +1922,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 				bool diverted = false;
 				if (WriteLWWScalarShredValue(*lookup.node, shred, *shred_out[shred.child], rid, diverted)) {
 					scalar_strip_paths.push_back(&shred.steps);
-					stripped_shred_indices.push_back(shred.child);
+					stripped_lanes.Mark(shred.child);
 				}
 				if (diverted) {
 					stamp.SetBit(spill_ranks[shred.child]);
@@ -1945,7 +1946,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 						stripped_child_indices.push_back(child_idx);
 					}
 					WriteLWWListLaneValue(*lane, shred, *shred_out[shred.child], rid);
-					stripped_shred_indices.push_back(shred.child);
+					stripped_lanes.Mark(shred.child);
 					list_override_indices.push_back(s);
 				}
 			}
@@ -1955,9 +1956,9 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		                                 list_override_indices, list_shreds, state.list_lanes, 0);
 		stamp.StampRow(rid);
 		const std::string *manifest_ptr = nullptr;
-		if (!stripped_shred_indices.empty()) {
+		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, manifest_entries, stripped_shred_indices);
+			JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(rid, builder, manifest_ptr);

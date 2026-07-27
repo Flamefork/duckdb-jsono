@@ -802,7 +802,7 @@ struct ShredTrieWalkState {
 	JsonoSpillStamp &stamp;
 	std::string &scratch;
 	std::vector<const std::vector<PathStep> *> &strip_paths;
-	vector<idx_t> &stripped_fields;
+	JsonoStrippedLanes &stripped_lanes;
 };
 
 struct ShredTrieWalkPolicy {
@@ -820,7 +820,7 @@ struct ShredTrieWalkPolicy {
 		}
 		if (strippable) {
 			state.strip_paths.push_back(&field.steps);
-			state.stripped_fields.push_back(field_index);
+			state.stripped_lanes.Mark(field_index);
 		}
 	}
 
@@ -858,13 +858,13 @@ vector<idx_t> ShredFieldSpillRanks(const vector<ShredField> &fields) {
 
 // The per-field manifest entries, through the one builder every writer shares — so the paths it
 // records are decoded from the lane names exactly as a reader decodes its own type's.
-vector<JsonoShredManifestEntryBytes> ShredFieldManifestEntries(const vector<ShredField> &fields) {
+JsonoShredManifestEntries ShredFieldManifestEntries(const vector<ShredField> &fields) {
 	vector<std::pair<string, LogicalType>> shreds;
 	shreds.reserve(fields.size());
 	for (auto &field : fields) {
 		shreds.emplace_back(field.lane_name, ShredFieldType(field));
 	}
-	return JsonoShredManifestEntries(shreds);
+	return JsonoBuildShredManifestEntries(shreds);
 }
 
 void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &fields, Vector &result,
@@ -931,7 +931,8 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 	}
 
 	std::string manifest;
-	vector<idx_t> stripped_fields;
+	JsonoStrippedLanes stripped_lanes;
+	stripped_lanes.Init(fields.size());
 
 	// The one-pass trie walk (trie != nullptr) reaches every scalar shred in one sorted-merge pass of
 	// the document, replacing the per-shred LocatePath loop. Its rank cache is sized to the bind-time
@@ -951,10 +952,10 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 		FlatVector::Validity(result).SetValid(row);
 		stamp.ResetRow();
 		lstate.strip_paths.clear();
-		stripped_fields.clear();
+		stripped_lanes.Clear();
 		if (trie) {
-			ShredTrieWalkState walk_state {fields,      shred_children,     spill_ranks,    stamp,
-			                               lstate.text, lstate.strip_paths, stripped_fields};
+			ShredTrieWalkState walk_state {fields,      shred_children,     spill_ranks,   stamp,
+			                               lstate.text, lstate.strip_paths, stripped_lanes};
 			JsonoTrieWalkContext<ShredTrieWalkPolicy> ctx {trie->nodes, lstate.jsono_rank_cache, walk_state};
 			JsonoTrieApplyNode<ShredTrieWalkPolicy>(ctx, 0, view, JsonoCursor(), row);
 		} else {
@@ -969,7 +970,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 					        ? WriteScalarArrayShred(field, view, location, *shred_children[f], row, lstate.text)
 					        : WriteArrayShred(field, view, location, *shred_children[f], row, lstate.text);
 					if (stripped) {
-						stripped_fields.push_back(f);
+						stripped_lanes.Mark(f);
 					}
 					continue;
 				}
@@ -980,7 +981,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 				}
 				if (strippable) {
 					lstate.strip_paths.push_back(&field.steps);
-					stripped_fields.push_back(f);
+					stripped_lanes.Mark(f);
 				}
 			}
 		}
@@ -993,9 +994,9 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const vector<ShredField> &
 			JsonoEmitObjectStrippingPaths(view, lstate.strip_paths, lstate.builder);
 		}
 		const std::string *manifest_ptr = nullptr;
-		if (!stripped_fields.empty()) {
+		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, manifest_entries, stripped_fields);
+			JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, lstate.builder, manifest_ptr);
@@ -1396,7 +1397,8 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 	JsonoVectorData input;
 	InitJsonoVectorData(input_vec, count, input);
 	std::string manifest;
-	vector<idx_t> stripped_fields;
+	JsonoStrippedLanes stripped_lanes;
+	stripped_lanes.Init(fields.size());
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
@@ -1427,7 +1429,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		stamp.ResetRow();
 		lstate.strip_paths.clear();
 		lstate.flat_strip_positions.clear();
-		stripped_fields.clear();
+		stripped_lanes.Clear();
 		for (idx_t f = 0; f < fields.size(); f++) {
 			if (bind_data.keep_src[f] != DConstants::INVALID_INDEX) {
 				// The kept shred's stripped-or-not state carries over from the input row (the manifest);
@@ -1453,7 +1455,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 					}
 				}
 				if (manifest_has_path(field_paths[f])) {
-					stripped_fields.push_back(f);
+					stripped_lanes.Mark(f);
 				}
 				continue;
 			}
@@ -1467,7 +1469,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			if (strippable) {
 				lstate.strip_paths.push_back(&field.steps);
 				lstate.flat_strip_positions.push_back(location.cursor.pos);
-				stripped_fields.push_back(f);
+				stripped_lanes.Mark(f);
 			}
 		}
 		stamp.StampRow(row);
@@ -1485,10 +1487,10 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			writer.data[BODY_LENGTHS][row] =
 			    WriteBlobInto(writer.Lengths(), blob.lengths.GetData(), blob.lengths.GetSize());
 			writer.data[BODY_NUMS][row] = WriteBlobInto(writer.Nums(), blob.nums.GetData(), blob.nums.GetSize());
-			if (reads_merged && !stripped_fields.empty()) {
+			if (reads_merged && !stripped_lanes.Empty()) {
 				manifest.clear();
 				manifest.append(blob.skips.GetData(), blob.skips.GetSize());
-				JsonoAppendShredManifest(manifest, manifest_entries, stripped_fields);
+				JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
 				writer.data[BODY_SKIPS][row] = WriteBlobInto(writer.Skips(), manifest.data(), manifest.size());
 			} else {
 				writer.data[BODY_SKIPS][row] =
@@ -1498,9 +1500,9 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		}
 
 		const std::string *manifest_ptr = nullptr;
-		if (!stripped_fields.empty()) {
+		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, manifest_entries, stripped_fields);
+			JsonoAppendShredManifest(manifest, manifest_entries, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		if (TryWriteFlatObjectStrippingPaths(view, lstate.strip_paths, lstate.flat_strip_positions,
@@ -1574,6 +1576,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	ctx.nodes = &bind_data.trie;
 	ctx.manifest_entries = &manifest_entries;
 	ctx.kinds.resize(fields.size());
+	ctx.stripped_lanes.Init(fields.size());
 	for (idx_t f = 0; f < fields.size(); f++) {
 		ctx.kinds[f] = fields[f].primitive;
 	}
@@ -1760,7 +1763,7 @@ void JsonoAppendShredManifestInternal(std::string &manifest, idx_t entry_count, 
 
 } // namespace
 
-vector<JsonoShredManifestEntryBytes> JsonoShredManifestEntries(const vector<std::pair<string, LogicalType>> &shreds) {
+JsonoShredManifestEntries JsonoBuildShredManifestEntries(const vector<std::pair<string, LogicalType>> &shreds) {
 	vector<string> paths;
 	paths.reserve(shreds.size());
 	for (auto &shred : shreds) {
@@ -1769,13 +1772,16 @@ vector<JsonoShredManifestEntryBytes> JsonoShredManifestEntries(const vector<std:
 	// The manifest's own order, which is the logical-path order — NOT the lane order the shred set is
 	// listed in (that follows the encoded name, and the two genuinely differ: `$.a-c` sorts before
 	// `$.a.b` as text while the nested path sorts first structurally). Reusing the rank helper keeps
-	// "rank == position in the byte-sorted list" spelled once.
+	// "rank == position in the byte-sorted list" spelled once; inverting the ranks turns it into the
+	// walk order every per-row write follows.
 	auto ranks = JsonoSpillRanksOfNames(paths);
-	vector<JsonoShredManifestEntryBytes> entries(shreds.size());
+	JsonoShredManifestEntries table;
+	table.entries.resize(shreds.size());
+	table.manifest_order.resize(shreds.size());
 	for (idx_t f = 0; f < shreds.size(); f++) {
 		auto type_name = JsonoLaneLogicalType(shreds[f].second).ToString();
-		auto &entry = entries[f];
-		entry.order = ranks[f];
+		auto &entry = table.entries[f];
+		table.manifest_order[ranks[f]] = f;
 		AppendManifestLV(entry.full, paths[f]);
 		AppendManifestLV(entry.full, type_name);
 		AppendManifestLV(entry.compact, paths[f]);
@@ -1785,32 +1791,26 @@ vector<JsonoShredManifestEntryBytes> JsonoShredManifestEntries(const vector<std:
 			AppendManifestLV(entry.compact, type_name);
 		}
 	}
-	return entries;
+	return table;
 }
 
-void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries) {
-	vector<idx_t> all(entries.size());
-	for (idx_t i = 0; i < all.size(); i++) {
-		all[i] = i;
-	}
-	JsonoAppendShredManifest(manifest, entries, all);
+void JsonoAppendShredManifest(std::string &manifest, const JsonoShredManifestEntries &table) {
+	JsonoAppendShredManifestInternal(
+	    manifest, table.manifest_order.size(),
+	    [&](idx_t i) -> const JsonoShredManifestEntryBytes & { return table.entries[table.manifest_order[i]]; });
 }
 
-void JsonoAppendShredManifest(std::string &manifest, const vector<JsonoShredManifestEntryBytes> &entries,
-                              vector<idx_t> &entry_indices) {
-	for (auto index : entry_indices) {
-		if (index >= entries.size()) {
-			throw InternalException("jsono shred: manifest entry index is out of bounds");
+void JsonoAppendShredManifest(std::string &manifest, const JsonoShredManifestEntries &table,
+                              JsonoStrippedLanes &lanes) {
+	lanes.selected.clear();
+	for (auto lane : table.manifest_order) {
+		if (lanes.marks[lane]) {
+			lanes.selected.push_back(&table.entries[lane]);
 		}
 	}
-	// Manifest order is owned here, once, rather than at each write loop: the loops collect stripped
-	// lanes in whatever order they visit them (field order, document order, tree order) and none of
-	// those is the manifest's.
-	std::sort(entry_indices.begin(), entry_indices.end(),
-	          [&](idx_t a, idx_t b) { return entries[a].order < entries[b].order; });
 	JsonoAppendShredManifestInternal(
-	    manifest, entry_indices.size(),
-	    [&](idx_t i) -> const JsonoShredManifestEntryBytes & { return entries[entry_indices[i]]; });
+	    manifest, lanes.selected.size(),
+	    [&](idx_t i) -> const JsonoShredManifestEntryBytes & { return *lanes.selected[i]; });
 }
 
 void JsonoShredFromLayout(Vector &input, idx_t count, const vector<std::pair<string, LogicalType>> &shreds,

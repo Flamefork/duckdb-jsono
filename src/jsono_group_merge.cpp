@@ -657,14 +657,15 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 	}
 	auto spill_ranks = JsonoSpillRanksOfNames(shred_names);
 	vector<Vector *> lane_out(bind_data.shreds.size());
-	auto manifest_entries = JsonoShredManifestEntries(bind_data.shreds);
+	auto manifest_entries = JsonoBuildShredManifestEntries(bind_data.shreds);
 	for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
 		lane_out[f] = &jsono::JsonoShredVector(result, f);
 		lane_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
 	}
 	JsonoBuilder empty_builder;
 	std::string skips_buf;
-	vector<idx_t> stripped_fields;
+	JsonoStrippedLanes stripped_lanes;
+	stripped_lanes.Init(bind_data.shreds.size());
 	for (idx_t i = 0; i < count; i++) {
 		auto rid = offset + i;
 		auto &state = *state_data[RowIndex(state_fmt, i)];
@@ -698,7 +699,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		bool residual_has_members = acc_parsed && acc_view.Slots() > 0 &&
 		                            SlotTag(acc_view.SlotAt(0)) == tag::OBJ_START &&
 		                            ContainerChildCount(SlotPayload(acc_view.SlotAt(0))) > 0;
-		stripped_fields.clear();
+		stripped_lanes.Clear();
 		stamp.ResetRow();
 		D_ASSERT(direct->lanes.size() == bind_data.shreds.size());
 		for (idx_t f = 0; f < bind_data.shreds.size(); f++) {
@@ -748,7 +749,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 					FlatVector::GetData<bool>(out)[rid] = lane.b;
 					break;
 				}
-				stripped_fields.push_back(f);
+				stripped_lanes.Mark(f);
 			} else {
 				FlatVector::SetNull(*lane_out[f], rid, true);
 			}
@@ -762,8 +763,8 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		writer.data[BODY_LENGTHS][rid] = WriteBlobInto(writer.Lengths(), blob.lengths.data(), blob.lengths.size());
 		writer.data[BODY_NUMS][rid] = WriteBlobInto(writer.Nums(), blob.nums.data(), blob.nums.size());
 		skips_buf.assign(blob.skips.data(), blob.skips.size());
-		if (!stripped_fields.empty()) {
-			JsonoAppendShredManifest(skips_buf, manifest_entries, stripped_fields);
+		if (!stripped_lanes.Empty()) {
+			JsonoAppendShredManifest(skips_buf, manifest_entries, stripped_lanes);
 		}
 		writer.data[BODY_SKIPS][rid] = WriteBlobInto(writer.Skips(), skips_buf.data(), skips_buf.size());
 	}
