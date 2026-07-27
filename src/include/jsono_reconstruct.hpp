@@ -53,16 +53,41 @@ inline Value JsonoShredSignaturesToValue(const std::vector<JsonoShredSignature> 
 	return Value::LIST(signature_type, std::move(values));
 }
 
+// Every string in the channel is required. __jsono_internal_checked_residual is in the catalog (the
+// re-bind after plan deserialization needs it there), which also puts it within reach of a
+// hand-written query, so a NULL here is a wrong argument and not a broken invariant: reading it
+// through StringValue::Get would raise an INTERNAL error and abort the caller's transaction over it.
+inline const std::string &JsonoRequiredSignatureString(const Value &value, const char *field) {
+	if (value.IsNull()) {
+		throw InvalidInputException("__jsono_internal_checked_residual: a shred signature's '%s' must not be NULL",
+		                            field);
+	}
+	return StringValue::Get(value);
+}
+
 inline std::vector<JsonoShredSignature> JsonoShredSignaturesFromValue(const Value &value) {
 	std::vector<JsonoShredSignature> signatures;
 	for (auto &element : ListValue::GetChildren(value)) {
+		if (element.IsNull()) {
+			throw InvalidInputException("__jsono_internal_checked_residual: a shred signature must not be NULL");
+		}
 		auto &fields = StructValue::GetChildren(element);
 		JsonoShredSignature signature;
-		signature.path = StringValue::Get(fields[0]);
-		signature.type = StringValue::Get(fields[1]);
+		signature.path = JsonoRequiredSignatureString(fields[0], "path");
+		signature.type = JsonoRequiredSignatureString(fields[1], "type");
+		if (fields[2].IsNull()) {
+			throw InvalidInputException("__jsono_internal_checked_residual: a shred signature's 'subfields' must not "
+			                            "be NULL; an object-array lane spells its element subfields out and every "
+			                            "other lane spells an empty list");
+		}
 		for (auto &subfield : ListValue::GetChildren(fields[2])) {
+			if (subfield.IsNull()) {
+				throw InvalidInputException(
+				    "__jsono_internal_checked_residual: an element subfield signature must not be NULL");
+			}
 			auto &pair = StructValue::GetChildren(subfield);
-			signature.subfields.emplace_back(StringValue::Get(pair[0]), StringValue::Get(pair[1]));
+			signature.subfields.emplace_back(JsonoRequiredSignatureString(pair[0], "subfields.key"),
+			                                 JsonoRequiredSignatureString(pair[1], "subfields.type"));
 		}
 		signatures.push_back(std::move(signature));
 	}

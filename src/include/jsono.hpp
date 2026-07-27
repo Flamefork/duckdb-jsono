@@ -11,6 +11,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 
 #include "string_view.hpp"
 
@@ -203,7 +204,7 @@ inline idx_t JsonoSpillColumnCount(idx_t shred_count) {
 	return (shred_count + JSONO_SPILL_BITS - 1) / JSONO_SPILL_BITS;
 }
 
-// Canonical layout hash of a shredded jsono type: HashShredManifestSignatures over its shreds
+// Canonical layout hash of a shredded jsono type: HashShredSetIdentity over its shreds
 // (encoded lane name + logical value type) in type order. Returns 0 for a plain / non-shredded type.
 // Writers stamp this into the shred-set marker; the optimizer recomputes it from the read type
 // to verify per-scan shred-set coverage before trusting the spill bitmap.
@@ -1405,7 +1406,12 @@ private:
 // readers fall back to the residual). Callers go through the row-read layer
 // (jsono_row_read.hpp), which parses and memoizes the entries.
 // Render a manifest entry's type the way a human reads it: the type name for a scalar lane, the
-// element struct for an object-array one. Only ever called on the failure paths below.
+// element struct for an object-array one. A subfield key is spelled through the same primitive
+// LogicalType::ToString() spells a STRUCT field with (KeywordHelper::WriteOptionallyQuoted via
+// SQLIdentifier), so this and jsono_layout_lanes answer with the same text for the same lane. Spelled
+// raw, a key holding a comma or a space rendered as a DIFFERENT valid type — one subfield reported as
+// two — which both misnames the lane in the narrowing errors below and breaks the round trip back
+// into a shredding spec that jsono_shred_manifest promises.
 inline std::string DescribeShredManifestEntry(const ShredManifestEntry &entry) {
 	if (entry.subfields.empty()) {
 		return std::string(entry.type);
@@ -1417,7 +1423,7 @@ inline std::string DescribeShredManifestEntry(const ShredManifestEntry &entry) {
 			described += ", ";
 		}
 		first = false;
-		described += std::string(key);
+		described += KeywordHelper::WriteOptionallyQuoted(std::string(key), '"');
 		described += ' ';
 		described += std::string(ShredManifestCompactTypeName(code));
 	});

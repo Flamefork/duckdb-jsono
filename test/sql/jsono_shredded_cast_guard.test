@@ -499,10 +499,14 @@ SELECT jsono('{"items":[{"id":7,"name":"n"}]}', shredding := {'$.items': 'STRUCT
 statement ok
 RESET disabled_optimizers;
 
+# The entry names the subfields the row actually stripped, so the message says which shape was
+# written -- and it must differ from the retyped case below. Matched on the same substring, the two
+# defects were one test: a reader that reported a DROPPED subfield as a RETYPED one, or the reverse,
+# stayed green.
 statement error
 SELECT to_json(v) FROM arr_narrow;
 ----
-carries it as a different type
+shred '$.items STRUCT(id BIGINT, "name" VARCHAR)[]' but the column carries it as a different type
 
 statement ok
 CREATE TABLE arr_retyped AS SELECT jsono('{}', shredding := {'$.items': 'STRUCT(id VARCHAR)[]'}) AS v WHERE false;
@@ -519,7 +523,7 @@ RESET disabled_optimizers;
 statement error
 SELECT to_json(v) FROM arr_retyped;
 ----
-carries it as a different type
+shred '$.items STRUCT(id BIGINT)[]' but the column carries it as a different type
 
 # The load-bearing line under the widening rule: a subfield that is NOT in the lane reads from the
 # residual skeleton. The document below carries both `id` and `name` in its element while only `id`
@@ -564,3 +568,35 @@ query I
 EXECUTE diagnose_of(jsono('{"a":1}'));
 ----
 jsono: plain, body revision 1
+
+# --- The manifest's own text form quotes a subfield key, like every other type text does ---
+#
+# jsono_shred_manifest promises "the same type text the shredding spec takes", and the narrowing
+# errors above quote the same rendering. A subfield key spelled raw turned a key holding a comma into
+# a DIFFERENT valid type -- one subfield reported as two -- so the introspection lied and the two
+# introspection functions disagreed about one lane.
+query II
+SELECT [m."type" FOR m IN jsono_shred_manifest(v)], [l."type" FOR l IN jsono_layout_lanes(v)]
+FROM (SELECT jsono('{"items":[{"x BIGINT, y":"s"}]}',
+                   shredding := {'$.items':'STRUCT("x BIGINT, y" VARCHAR)[]'}) AS v);
+----
+['STRUCT("x BIGINT, y" VARCHAR)[]']	['STRUCT("x BIGINT, y" VARCHAR)[]']
+
+# --- __jsono_internal_checked_residual answers a wrong argument as a wrong argument ---
+#
+# It is in the catalog so the optimizer-injected expression can re-bind after plan deserialization,
+# which also puts it within reach of a hand-written query. A NULL in the signature channel is a bad
+# argument, not a broken invariant: raised as INTERNAL it aborts the caller's transaction over it.
+statement error
+SELECT __jsono_internal_checked_residual(
+  jsono('{"a":1}'),
+  [{'path': NULL::VARCHAR, 'type': 'BIGINT', 'subfields': []::STRUCT(key VARCHAR, "type" VARCHAR)[]}]);
+----
+Invalid Input Error
+
+statement error
+SELECT __jsono_internal_checked_residual(
+  jsono('{"a":1}'),
+  [{'path': '$.a', 'type': 'BIGINT', 'subfields': [NULL::STRUCT(key VARCHAR, "type" VARCHAR)]}]);
+----
+Invalid Input Error
