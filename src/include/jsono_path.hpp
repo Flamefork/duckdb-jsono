@@ -274,9 +274,12 @@ inline bool TryStepsToJsonPath(const vector<PathStep> &steps, string &out) {
 //
 // Order preservation is a property of THIS serialization, not of encoding in general (a
 // length-prefixed variant breaks it: `a` sorts AFTER `URL`→`path` as a path, because `a` > `U`, but
-// BEFORE it once the leading length byte dominates). It is load-bearing for the two-pointer walkers,
-// the sort-merges against the residual's byte-sorted document keys, and the binary searches of the
-// merge fast path, so it is the first thing to re-verify if the serialization is ever revisited.
+// BEFORE it once the leading length byte dominates). It is the first thing to re-verify if the
+// serialization is ever revisited, and `test_lane_name_codec` in test/property/jsono_property.py is
+// what re-verifies it. No list of what depends on it is kept anywhere: such a list inverts a
+// dependency the compiler already tracks, and it goes stale the moment a client stops relying on the
+// property — which is exactly what happened to the list that used to stand here, within one arc,
+// when the keyed group_merge walkers started sorting by manifest path explicitly.
 
 // Encode the lane path `steps` as its STRUCT field name. Every step must be an object key: an
 // index or wildcard step has no lane to name (each step strips one object key from the residual),
@@ -289,6 +292,13 @@ inline string JsonoEncodeLaneName(const vector<PathStep> &steps) {
 	for (auto &step : steps) {
 		if (step.kind != PathStepKind::Key) {
 			throw InvalidInputException("jsono shred: a lane path may only contain object keys");
+		}
+		// The decoder refuses a key that is not valid UTF-8, so accepting one here would let Encode mint
+		// a name Decode calls non-canonical — and "canonical" is defined as "a name Encode could have
+		// produced". Refusing on both sides makes the two describe one language instead of two that
+		// happen to agree for every caller anyone has written.
+		if (!Utf8Proc::IsValid(step.key.data(), step.key.size())) {
+			throw InvalidInputException("jsono shred: a lane path key must be valid UTF-8");
 		}
 		serialized_size += step.key.size() + 2;
 	}

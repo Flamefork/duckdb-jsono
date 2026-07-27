@@ -66,6 +66,7 @@ public:
 	// memoization untouched. Operators on a hot path pass a JsonoShredSignatures instead, so the
 	// decode happens once rather than per chunk.
 	void InitFromType(const LogicalType &type) {
+		ResetMemo();
 		external_ = nullptr;
 		JsonoBuildShredSignatures(type, owned_);
 	}
@@ -74,12 +75,15 @@ public:
 	// valid until that cache is asked about a different type — JsonoShredSignatures::For rebuilds in
 	// place, so an operator holding this must re-init whenever it re-resolves its input.
 	void InitSignaturesRef(const std::vector<JsonoShredSignature> &signatures) {
+		ResetMemo();
+		owned_.clear();
 		external_ = &signatures;
 	}
 
 	// Signatures supplied by the caller (__jsono_internal_checked_residual receives them as plan
 	// constants); the paths must be the same canonical logical form InitFromType decodes to.
 	void InitSignatures(std::vector<JsonoShredSignature> signatures) {
+		ResetMemo();
 		external_ = nullptr;
 		owned_ = std::move(signatures);
 	}
@@ -110,6 +114,18 @@ public:
 	}
 
 private:
+	// Every Init begins here, so "initialized" means the same thing however it was reached. The
+	// memoization keys on the manifest tail ALONE — two rows with byte-equal tails skip re-verifying —
+	// which is sound only within one set of signatures. Leaving it across an Init would bless a row of
+	// the new input against the lanes of the old one, silently, in the mechanism that exists to fail
+	// loud. InitSignaturesRef documents re-init as a supported operation (JsonoShredSignatures::For
+	// rebuilds in place), so this is the contract that makes that safe rather than a guard.
+	void ResetMemo() {
+		tail_.clear();
+		entries_.clear();
+		verified_ = false;
+	}
+
 	// The signatures in force: an external cache when one was supplied, this reader's own otherwise.
 	// Held as "external or own" rather than as one pointer that may aim at a member, so copying or
 	// moving a reader cannot leave it verifying against the source's signatures. Before any Init the
@@ -151,8 +167,8 @@ inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathSt
 	view.ReadShredManifest(manifest_scratch);
 	for (auto &entry : manifest_scratch) {
 		// A manifest path is the lane's logical path in the project's one text form (`$.`-always), so
-		// it parses back to steps with the shared grammar — no lane-name decoding on this path, which
-		// is what B.4 of plan 056 bought by keeping the manifest logical.
+		// it parses back to steps with the shared grammar — keeping the manifest logical is what buys
+		// this path its freedom from lane-name decoding.
 		auto path = string(entry.path);
 		steps_scratch = ParseJsonoPath(path, "jsono shred manifest");
 		// A manifest path is an object-key chain by the shred writer's invariant. It covers the
@@ -194,6 +210,7 @@ public:
 	// Whole-document policy (the default): every manifest entry must name a shred `input`'s
 	// type carries (a plain type carries none, so any manifest fails loud as a narrowed row).
 	void Init(Vector &input, idx_t count) {
+		ResetPolicy();
 		InitJsonoVectorData(input, count, data_);
 		verifier_.InitFromType(input.GetType());
 		verify_on_read_ = true;
@@ -202,6 +219,7 @@ public:
 	// Same policy, but with the signatures kept in an operator-lifetime cache so the per-lane decode
 	// happens once instead of on every chunk. `cache` must outlive this reader.
 	void Init(Vector &input, idx_t count, JsonoShredSignatures &cache) {
+		ResetPolicy();
 		InitJsonoVectorData(input, count, data_);
 		verifier_.InitSignaturesRef(cache.For(input.GetType()));
 		verify_on_read_ = true;
@@ -210,6 +228,7 @@ public:
 	// Whole-document policy with caller-supplied signatures
 	// (__jsono_internal_checked_residual receives them as plan constants).
 	void Init(Vector &input, idx_t count, std::vector<JsonoShredSignature> signatures) {
+		ResetPolicy();
 		InitJsonoVectorData(input, count, data_);
 		verifier_.InitSignatures(std::move(signatures));
 		verify_on_read_ = true;
@@ -222,6 +241,7 @@ public:
 	// whole-container read — via CheckPathMiss / CheckContainerRead. Point reads also prefetch
 	// the row's streams (bulk walkers touch them densely anyway).
 	void InitPointRead(Vector &input, idx_t count) {
+		ResetPolicy();
 		InitJsonoVectorData(input, count, data_);
 		verify_on_read_ = false;
 		prefetch_ = true;
@@ -232,6 +252,7 @@ public:
 	// already verified upstream, and the overlay's job is precisely to refill those stripped
 	// paths from the shreds.
 	void InitTrusted(Vector &input, idx_t count) {
+		ResetPolicy();
 		InitJsonoVectorData(input, count, data_);
 		verify_on_read_ = false;
 	}
@@ -284,6 +305,16 @@ private:
 		std::string tail;
 		bool ok = false;
 	};
+
+	// Every Init begins here: a re-init is a new input, and both the policy flags and the cover memos
+	// (keyed by manifest tail plus a `steps` ADDRESS, which a new call site can reuse) describe the old
+	// one. Carrying either over would answer a question about the new input with the old input's proof.
+	void ResetPolicy() {
+		verify_on_read_ = true;
+		prefetch_ = false;
+		miss_memo_ = CoverMemo();
+		container_memo_ = CoverMemo();
+	}
 
 	JSONO_ALWAYS_INLINE JsonoRowState ParseAndVerify(const JsonoBlobRow &blob, JsonoView &view) {
 		view = MakeJsonoView(blob);

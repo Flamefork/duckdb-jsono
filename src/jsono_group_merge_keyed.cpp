@@ -87,10 +87,10 @@ struct GroupMergeLWWBindData : public FunctionData {
 	void BuildShredPlan();
 
 	unique_ptr<FunctionData> Copy() const override {
-		auto result = make_uniq<GroupMergeLWWBindData>(modifiers, buffer_manager);
-		result->shreds = shreds;
-		result->BuildShredPlan();
-		return std::move(result);
+		// Copy every member, by copy-construction rather than by listing them and rebuilding the derived
+		// tables: a hand-written list makes a new member's absence silent, and rebuilding hides it twice
+		// over by producing a plausible copy that is missing whatever the list forgot.
+		return make_uniq<GroupMergeLWWBindData>(*this);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
@@ -1872,7 +1872,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	vector<const vector<PathStep> *> scalar_strip_paths;
 	vector<idx_t> stripped_child_indices;
 	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(bind_data.shreds.size());
+	stripped_lanes.Init(bind_data.write_model);
 	vector<idx_t> list_override_indices;
 	std::string manifest;
 	for (idx_t i = 0; i < count; i++) {
@@ -1970,7 +1970,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, bind_data.write_model, stripped_lanes);
+			JsonoAppendShredManifest(manifest, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(rid, builder, manifest_ptr);

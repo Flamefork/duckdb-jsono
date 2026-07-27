@@ -1868,7 +1868,7 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 	auto &builder = lstate.builder;
 	vector<uint8_t> stripped(shred_count);
 	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(shred_count);
+	stripped_lanes.Init(bind_data.write_model);
 	std::string manifest;
 	for (idx_t row = 0; row < count; row++) {
 		if (ConstructorValueRowIsNull(input_data, row)) {
@@ -1931,7 +1931,7 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, bind_data.write_model, stripped_lanes);
+			JsonoAppendShredManifest(manifest, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, builder, manifest_ptr);
@@ -2054,7 +2054,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 
 	vector<uint8_t> stripped(shred_count);
 	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(shred_count);
+	stripped_lanes.Init(bind_data.write_model);
 	std::string manifest;
 	for (idx_t row = 0; row < count; row++) {
 		if (!parent_fmt.validity.RowIsValid(parent_fmt.sel->get_index(row))) {
@@ -2144,7 +2144,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			const std::string *manifest_ptr = nullptr;
 			if (!stripped_lanes.Empty()) {
 				manifest.clear();
-				JsonoAppendShredManifest(manifest, bind_data.write_model, stripped_lanes);
+				JsonoAppendShredManifest(manifest, stripped_lanes);
 				manifest_ptr = &manifest;
 			}
 			writer.WriteRow(row, builder, manifest_ptr);
@@ -2204,7 +2204,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		const std::string *manifest_ptr = nullptr;
 		if (stripped_count > 0) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, bind_data.write_model, stripped_lanes);
+			JsonoAppendShredManifest(manifest, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, builder, manifest_ptr);

@@ -82,11 +82,14 @@ struct JsonoMergeLocalState : public FunctionLocalState {
 struct MergeShred {
 	string name;
 	// the field this shred occupies inside the RESULT's `shreds` struct, resolved by name at bind
-	// (the result type is a bind fact) so the per-chunk write never re-scans the field names
-	idx_t result_field_index;
+	// (the result type is a bind fact) so the per-chunk write never re-scans the field names. Unset
+	// until the result type exists, and unset is INVALID_INDEX rather than 0: field 0 of `shreds` is
+	// the `$jsono$set` marker, so a zero default is not "not yet known" but a live wrong answer that
+	// walks straight past JsonoShredFieldVector's bounds check into the marker.
+	idx_t result_field_index = DConstants::INVALID_INDEX;
 	LogicalType type;
 	vector<PathStep> steps;
-	ShredKind kind;
+	ShredKind kind = ShredKind::Scalar;
 };
 
 struct JsonoMergeBindData : public FunctionData {
@@ -175,8 +178,11 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 					}
 				}
 				if (!found) {
-					shreds.push_back(MergeShred {shred_name, 0, layout_shred.second,
-					                             ShredNamePath(shred_name, bound_function.name.c_str())});
+					MergeShred merge_shred;
+					merge_shred.name = shred_name;
+					merge_shred.type = layout_shred.second;
+					merge_shred.steps = ShredNamePath(shred_name, bound_function.name.c_str());
+					shreds.push_back(std::move(merge_shred));
 				}
 			}
 			bound_function.arguments.push_back(type);
@@ -207,6 +213,13 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 			bind_data->top_level_shreds.push_back(k);
 		}
 	}
+	// ObjectKeyInShredSet binary-searches this subsequence by the LOGICAL key while the shreds it
+	// indexes are ordered by the PHYSICAL name; the two agree only because a one-step path encodes its
+	// key alone and both codec stages preserve order. Assert it where the subsequence is built, so a
+	// codec change surfaces in the relassert build rather than as a missed RFC 7396 null-delete on the
+	// fast path. No runtime gate: every honest bind would pay for it.
+	D_ASSERT(std::is_sorted(bind_data->top_level_shreds.begin(), bind_data->top_level_shreds.end(),
+	                        [&](idx_t a, idx_t b) { return shreds[a].steps[0].key < shreds[b].steps[0].key; }));
 	vector<std::pair<string, LogicalType>> manifest_shreds;
 	manifest_shreds.reserve(shreds.size());
 	for (auto &shred : shreds) {
@@ -217,6 +230,10 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 	auto &result_shreds_type = JsonoShredsStructType(bound_function.return_type);
 	for (auto &shred : shreds) {
 		shred.result_field_index = JsonoFindShredsFieldIndex(result_shreds_type, shred.name);
+		if (shred.result_field_index == DConstants::INVALID_INDEX) {
+			throw InternalException("%s: shred lane '%s' is missing from the result type built from these lanes",
+			                        bound_function.name, shred.name);
+		}
 	}
 	// The fast path's shape preconditions. An array shred merges multiple subfield lanes per element
 	// over a per-element tail, and a non-Key step (only reachable through an array path) has no lane
@@ -801,7 +818,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			auto skips_out = writer.data[BODY_SKIPS];
 			std::string skips_buf;
 			JsonoStrippedLanes stripped_lanes;
-			stripped_lanes.Init(bind_data.shreds.size());
+			stripped_lanes.Init(bind_data.write_model);
 			for (idx_t row = 0; row < count; row++) {
 				if (!result_validity.RowIsValid(row) || !fr_skips_validity.RowIsValid(row)) {
 					FlatVector::SetNull(r_skips, row, true);
@@ -816,7 +833,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 					}
 				}
 				if (!stripped_lanes.Empty()) {
-					JsonoAppendShredManifest(skips_buf, bind_data.write_model, stripped_lanes);
+					JsonoAppendShredManifest(skips_buf, stripped_lanes);
 				}
 				skips_out[row] = WriteBlobInto(r_skips, skips_buf.data(), skips_buf.size());
 			}

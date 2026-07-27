@@ -121,8 +121,10 @@ struct JsonoShredManifestEntryBytes {
 // its logical path and renders every lane type, so a per-chunk rebuild charges the whole shred set
 // to every batch of rows.
 //
-// All four vectors are indexed by lane, in the order of the `shreds` the model was built from — the
-// (PHYSICAL name, type) pairs the stored type carries. `entries[f]` is lane f's manifest record and
+// `entries`, `paths` and `spill_ranks` are indexed by lane, in the order of the `shreds` the model
+// was built from — the (PHYSICAL name, type) pairs the stored type carries. `manifest_order` is the
+// one that is NOT: it is indexed by position in the manifest and HOLDS lane indices (see below).
+// `entries[f]` is lane f's manifest record and
 // `paths[f]` its logical path text, both decoded from that physical name, because the manifest is a
 // per-row statement about the DOCUMENT while the encoding is a transport artifact of the TYPE.
 // `paths[f]` is also what a carry-over probe matches an input row's manifest against. The reader's
@@ -157,8 +159,13 @@ JsonoShredWriteModel JsonoBuildShredWriteModel(const vector<std::pair<string, Lo
 // row strips a decent share of the lanes — the common case, since a shred set is chosen for the
 // document — and loses only on a wide set over a sparse document, where it is still linear.
 struct JsonoStrippedLanes {
-	void Init(idx_t lane_count) {
-		marks.assign(lane_count, 0);
+	// Sized FROM the model it will be emitted against, and holding it: the marks are indexed by lane,
+	// so a set sized from anything else would mark the wrong lane. Passing the model here makes that
+	// agreement a property of construction instead of a check at the far end of the row write, where
+	// it could only fire after the mismatched Mark() had already run.
+	void Init(const JsonoShredWriteModel &model_p) {
+		model = &model_p;
+		marks.assign(model_p.entries.size(), 0);
 		any = false;
 	}
 	void Clear() {
@@ -174,6 +181,9 @@ struct JsonoStrippedLanes {
 		return !any;
 	}
 
+	// The model Init sized these against; the emitter reads it from here rather than being handed one
+	// separately, so there is no second model to disagree with.
+	const JsonoShredWriteModel *model = nullptr;
 	vector<uint8_t> marks;
 	bool any = false;
 	// Scratch for the manifest walk, held here so a per-row manifest write allocates nothing.
@@ -183,7 +193,7 @@ struct JsonoStrippedLanes {
 void JsonoAppendShredManifest(std::string &manifest, const JsonoShredWriteModel &model);
 
 // Appends the entries of the marked lanes, in manifest order.
-void JsonoAppendShredManifest(std::string &manifest, const JsonoShredWriteModel &model, JsonoStrippedLanes &lanes);
+void JsonoAppendShredManifest(std::string &manifest, JsonoStrippedLanes &lanes);
 
 // Shred a plain JSONO `input` vector into the shredded `result` STRUCT (the six-BLOB residual
 // prefix followed by one shred column per `shreds` entry, in order). `shreds[i]` names a lane by

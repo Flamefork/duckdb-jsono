@@ -77,10 +77,10 @@ struct GroupMergeBindData : public FunctionData {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		auto result = make_uniq<GroupMergeBindData>(merge_mode, buffer_manager);
-		result->shreds = shreds;
-		result->BuildShredPlan();
-		return std::move(result);
+		// Copy every member, by copy-construction rather than by listing them and rebuilding the derived
+		// tables: a hand-written list makes a new member's absence silent, and rebuilding hides it twice
+		// over by producing a plausible copy that is missing whatever the list forgot.
+		return make_uniq<GroupMergeBindData>(*this);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
@@ -662,7 +662,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 	JsonoBuilder empty_builder;
 	std::string skips_buf;
 	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(bind_data.shreds.size());
+	stripped_lanes.Init(bind_data.write_model);
 	for (idx_t i = 0; i < count; i++) {
 		auto rid = offset + i;
 		auto &state = *state_data[RowIndex(state_fmt, i)];
@@ -761,7 +761,7 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 		writer.data[BODY_NUMS][rid] = WriteBlobInto(writer.Nums(), blob.nums.data(), blob.nums.size());
 		skips_buf.assign(blob.skips.data(), blob.skips.size());
 		if (!stripped_lanes.Empty()) {
-			JsonoAppendShredManifest(skips_buf, bind_data.write_model, stripped_lanes);
+			JsonoAppendShredManifest(skips_buf, stripped_lanes);
 		}
 		writer.data[BODY_SKIPS][rid] = WriteBlobInto(writer.Skips(), skips_buf.data(), skips_buf.size());
 	}
