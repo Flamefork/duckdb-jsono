@@ -174,7 +174,8 @@ void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, 
 			for (idx_t i = 0; i < lane_names.size(); i++) {
 				if (lane_names[i] == lane_name) {
 					// Two spec entries naming one path would be two fields of one name — impossible in a
-					// STRUCT. The spellings differ (JSON keeps a byte-exact duplicate last-wins), so name both.
+					// STRUCT. Both spellings are named; a byte-exact duplicate reaches here too
+					// (JsonoShredSpecEntries keeps it: a spec is a declaration, not a last-wins document).
 					throw BinderException("jsono_storage_type: '%s' and '%s' name the same shred path", spec_names[i],
 					                      entry.first);
 				}

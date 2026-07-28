@@ -98,6 +98,8 @@ JsonoLaneSpec JsonoParseShredSpecField(const string &path, const LogicalType &ty
 //
 // Parses one spec into its (path, type-string) entries, spec-text errors prefixed with `fn_name`;
 // every consumer of the spec language goes through here, so the surfaces cannot drift apart.
+// Byte-exact duplicate keys are KEPT (unlike in a document, where last-wins is the JSON rule): a
+// spec is a declaration, and both entries must reach the callers' duplicate-path refusal.
 vector<std::pair<string, string>> JsonoShredSpecEntries(const Value &spec, const char *fn_name);
 
 // Parse one spec entry's type string as SQL type text, rewrapping a parse failure with the caller's

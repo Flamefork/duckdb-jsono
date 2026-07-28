@@ -191,6 +191,13 @@ SELECT jsono_storage_type(NULL) IS NULL;
 ----
 true
 
+# A byte-exact duplicate key refuses like the two-spellings duplicate (the spec is a declaration:
+# neither of two contradicting entries is "fresher").
+statement error
+SELECT jsono_storage_type('{"a": "BIGINT", "a": "VARCHAR"}');
+----
+'a' and 'a' name the same shred path
+
 # `body` and `$.body` are two spellings of ONE path, so they now name one lane: the DDL helper and the
 # constructor agree whichever spelling either is given.
 query I

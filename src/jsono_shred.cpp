@@ -1842,46 +1842,36 @@ vector<std::pair<string, string>> JsonoShredSpecEntries(const Value &spec, const
 		                      "e.g. '{\"$.kind\": \"VARCHAR\"}'",
 		                      fn_name);
 	}
-	// The spec is parsed by the same parser every jsono value goes through, then walked as a
-	// one-level object of string values — no second JSON reader to keep in agreement.
-	Vector spec_text(LogicalType::VARCHAR, 1);
-	spec_text.SetValue(0, spec);
-	Vector parsed(JsonoType(), 1);
-	try {
-		JsonoParseTextVector(spec_text, 1, parsed);
-	} catch (const InvalidInputException &error) {
-		throw BinderException("%s: shredding spec is not valid JSON: %s", fn_name, ErrorData(error).RawMessage());
+	// The spec is parsed by the same yyjson reader every jsono value goes through, but walked as a
+	// DOM rather than round-tripped through the value writer: the writer dedupes duplicate object
+	// keys last-wins — the DOCUMENT rule (RFC 8259; jsono values keep it, see
+	// jsono_dupkey_shredded.test) — which would swallow the second of two byte-equal spec entries
+	// before anything could refuse it. A spec is a DECLARATION: of two contradicting entries
+	// neither is "fresher", so both survive to the callers' duplicate-path checks, where a
+	// byte-exact duplicate refuses exactly like two spellings of one path.
+	auto text = StringValue::Get(spec);
+	jsono_dom::YyjsonAllocator parser;
+	yyjson_read_err err;
+	auto doc = jsono_dom::ReadJsonoDoc(string_t(text), parser.alc, err);
+	if (!doc) {
+		throw BinderException("%s: shredding spec is not valid JSON: %s", fn_name, err.msg);
 	}
-	JsonoRowReader reader;
-	reader.Init(parsed, 1);
-	JsonoBlobRow blob;
-	JsonoView view;
-	if (reader.Read(0, blob, view) != JsonoRowState::Value || view.Slots() == 0 ||
-	    SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+	auto root = yyjson_doc_get_root(doc);
+	if (!yyjson_is_obj(root)) {
 		throw BinderException("%s: shredding spec must be a JSON object mapping path to type, "
 		                      "e.g. '{\"$.kind\": \"VARCHAR\"}'",
 		                      fn_name);
 	}
 	vector<std::pair<string, string>> entries;
-	auto layout = ReadObjectLayout(view, 0);
-	JsonoCursor cursor;
-	cursor.pos = layout.value_start;
-	for (size_t i = 0; i < layout.key_count; i++) {
-		auto key_slot = view.SlotAt(layout.key_start + i);
-		if (SlotTag(key_slot) != tag::KEY) {
-			throw InvalidInputException("malformed JSONO: expected KEY slot");
-		}
-		auto key = view.KeyAt(SlotPayload(key_slot));
-		string path(key.data(), key.size());
-		auto value_tag = SlotTag(view.SlotAt(cursor.pos));
-		if (value_tag == tag::OBJ_START || value_tag == tag::ARR_START) {
+	yyjson_obj_iter iter = yyjson_obj_iter_with(root);
+	yyjson_val *key;
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		string path(yyjson_get_str(key), yyjson_get_len(key));
+		auto value = yyjson_obj_iter_get_val(key);
+		if (!yyjson_is_str(value)) {
 			throw BinderException("%s: type for '%s' must be a JSON string naming the shred type", fn_name, path);
 		}
-		auto scalar = DecodeScalarAt(view, cursor);
-		if (scalar.kind != JsonoScalarKind::String) {
-			throw BinderException("%s: type for '%s' must be a JSON string naming the shred type", fn_name, path);
-		}
-		entries.emplace_back(std::move(path), string(scalar.text.data(), scalar.text.size()));
+		entries.emplace_back(std::move(path), string(yyjson_get_str(value), yyjson_get_len(value)));
 	}
 	if (entries.empty()) {
 		throw BinderException("%s: empty shredding spec", fn_name);

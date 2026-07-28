@@ -266,6 +266,22 @@ SELECT jsono('{"a":1}', shredding := '{}');
 ----
 empty shredding spec
 
+# A BYTE-EXACT duplicate key refuses like the two-spellings duplicate: the spec is a declaration,
+# not a document. In a document last-wins is the JSON rule and jsono values keep it
+# (jsono_dupkey_shredded.test); of two contradicting declarations neither is "fresher", and specs
+# are emitted programmatically (jsono_suggest_shredding), so a duplicate key is a generator bug to
+# surface, not a preference to honor.
+statement error
+SELECT jsono('{"a":1}', shredding := '{"a": "BIGINT", "a": "VARCHAR"}');
+----
+name the same shred path
+
+# Values keep last-wins (the document rule) — only the spec refuses.
+query I
+SELECT to_json(jsono('{"a":1,"a":2}', shredding := '{"$.a": "BIGINT"}'));
+----
+{"a":2}
+
 # A shred path must be a non-empty object-key chain. An array-index step, a nested index, and the
 # root '$' are rejected at bind: otherwise the value would be lifted into a lane while ALSO staying
 # in the residual (a read-copy), and every reconstruct-based reader would throw on the non-key lane.
