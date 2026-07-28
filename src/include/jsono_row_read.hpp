@@ -200,11 +200,11 @@ inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathSt
 	}
 }
 
-// How a reader treats a row's shred manifest. One value per meaningful state — the two bools this
-// replaces (`verify_on_read_`, `prefetch_`) spanned four states of which only three meant anything,
-// and every policy consumer switches over this enum, so a fourth policy fails compilation
-// (-Werror=switch) at each place that must decide for it instead of inheriting a leftover bool
-// combination.
+// How a reader treats a row's shred manifest. One value per meaningful state — as two independent
+// flags (verify, prefetch) the state space had four combinations of which only three meant
+// anything — and every policy consumer switches over this enum, so a fourth policy fails
+// compilation (-Werror=switch) at each place that must decide for it instead of inheriting a
+// leftover flag combination.
 enum class ReadPolicy : uint8_t {
 	// Verify every manifested row whole-document (the default): each manifest entry must name a
 	// shred the input's type carries.
