@@ -54,7 +54,8 @@ SELECT (j::VARCHAR) IS NOT NULL FROM t;
 ----
 true
 
-# Recovery: drop the misnamed field and the column reads again.
+# Recovery by DROP works HERE because the misnamed lane was ADDED empty — it never held stripped
+# values (the data-carrying case is below, where a drop is refused by the shred manifest instead).
 statement ok
 ALTER TABLE t DROP COLUMN j.jsono."shreds$2"."$.b";
 
@@ -144,3 +145,57 @@ statement error
 INSERT INTO plain_target SELECT j FROM sub_bad;
 ----
 array shred 'd5q6arbj0000' has an element subfield
+
+# The typical typo is a RENAME of a DATA-CARRYING lane (values were stripped into it), and there
+# the recovery the refusal recommends FIRST is renaming BACK to the encoded name: it restores every
+# read in place.
+statement ok
+CREATE TABLE ren AS SELECT jsono('{"a":1,"b":"x"}', shredding := '{"$.a": "BIGINT", "$.b": "VARCHAR"}') AS j;
+
+statement ok
+ALTER TABLE ren RENAME COLUMN "j"."jsono"."shreds$2".c8000 TO "$.b";
+
+statement error
+SELECT j ->> 'a' FROM ren;
+----
+field '$.b' is not a shred lane
+
+statement ok
+ALTER TABLE ren RENAME COLUMN "j"."jsono"."shreds$2"."$.b" TO c8000;
+
+query I
+SELECT to_json(j)::VARCHAR FROM ren;
+----
+{"a":1,"b":"x"}
+
+# DROP of a data-carrying misnamed lane is NOT a recovery: the stripped values go with it, and the
+# shred manifest refuses the narrowed rows — correctly, since the read would silently lose '$.b'.
+statement ok
+CREATE TABLE dropped AS SELECT jsono('{"a":1,"b":"x"}', shredding := '{"$.a": "BIGINT", "$.b": "VARCHAR"}') AS j;
+
+statement ok
+ALTER TABLE dropped RENAME COLUMN "j"."jsono"."shreds$2".c8000 TO "$.b";
+
+statement ok
+ALTER TABLE dropped DROP COLUMN "j"."jsono"."shreds$2"."$.b";
+
+statement error
+SELECT to_json(j) FROM dropped;
+----
+no longer carries that shred
+
+# Dropping the ONLY lane leaves `shreds` with reserved fields and no shred — a shape that silently
+# stops being JSONO (a type-level miss, deliberately quiet): the diagnosis names it.
+statement ok
+CREATE TABLE lastlane AS SELECT jsono('{"a":1}', shredding := '{"$.a": "BIGINT"}') AS j;
+
+statement ok
+ALTER TABLE lastlane RENAME COLUMN "j"."jsono"."shreds$2".c4000 TO "$.a";
+
+statement ok
+ALTER TABLE lastlane DROP COLUMN "j"."jsono"."shreds$2"."$.a";
+
+query I
+SELECT jsono_layout_diagnose(j) FROM lastlane;
+----
+not jsono: 'shreds$2' carries only reserved layout fields and no shred

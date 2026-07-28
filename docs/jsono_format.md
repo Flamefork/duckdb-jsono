@@ -494,7 +494,9 @@ classes from there:
   the JSONO conversions (`jsono()`, a cast or `INSERT` into a JSONO column)
   that would grind the document into a rebuild of its raw layout fields.
   Passthrough (`SELECT *`, `COPY`), the raw `::VARCHAR` render and DDL stay
-  open, so the bytes can be moved and the offending field dropped
+  open, so the bytes can be moved and the field renamed back to its encoded
+  name — the recovery README's "Evolving the shred set" spells out; a DROP
+  recovers only a lane that held no stripped values
   (`test/sql/jsono_malformed_lane_read.test` pins both halves).
 
 Splitting `body$N` from `shreds$M` is what keeps a shred-layout change from

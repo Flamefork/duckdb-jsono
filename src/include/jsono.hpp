@@ -236,7 +236,8 @@ vector<idx_t> JsonoRanksInByteOrder(const vector<string> &names);
 // optimizer calls this where it declined a shredded rewrite, and the constructor/cast binds call it
 // beside their foreign-layout refusal; it is a no-op for every other type and throws the grammar's
 // own reason for this one. Passthrough (SELECT *, COPY), ::VARCHAR and DDL stay untouched, so
-// backup and recovery (DROP COLUMN) work.
+// backup and recovery work — RENAME back to the encoded name always, DROP only for a lane that
+// held no stripped values (README, "Evolving the shred set").
 void JsonoRejectMalformedAnchoredRead(const LogicalType &type);
 
 // The classification of one JSONO layout field.

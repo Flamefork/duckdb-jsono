@@ -612,10 +612,12 @@ void JsonoRejectMalformedAnchoredRead(const LogicalType &type) {
 	throw BinderException("jsono: this column carries the current jsono layout anchor, but %s. Reading it would "
 	                      "silently treat it as an ordinary struct: a JSON read answers NULL for every path, and a "
 	                      "JSONO conversion (jsono(), a cast, an INSERT into a JSONO column) rebuilds the document "
-	                      "out of the raw layout fields — so it is refused. The value bytes are intact: drop or "
-	                      "rename the offending field (ALTER TABLE ... DROP COLUMN) to recover, and declare lanes "
-	                      "with the encoded name jsono_storage_type(<spec>) prints. jsono_layout_diagnose(...) "
-	                      "gives this diagnosis in SQL",
+	                      "out of the raw layout fields — so it is refused. The value bytes are intact: RENAME the "
+	                      "field back to the encoded lane name jsono_storage_type(<spec>) prints (ALTER TABLE ... "
+	                      "RENAME COLUMN ...) and every read recovers in place. DROP COLUMN recovers only a lane "
+	                      "that held no stripped values — after a drop, rows whose values were stripped into it "
+	                      "are refused by the shred manifest. jsono_layout_diagnose(...) gives this diagnosis in "
+	                      "SQL",
 	                      reason);
 }
 
