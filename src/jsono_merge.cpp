@@ -819,7 +819,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			auto &r_skips = writer.Skips();
 			auto skips_out = writer.data[BODY_SKIPS];
 			std::string skips_buf;
-			JsonoStrippedLanes stripped_lanes(bind_data.write.model);
+			JsonoStrippedLanes stripped_lanes(bind_data.write.Model());
 			for (idx_t row = 0; row < count; row++) {
 				if (!result_validity.RowIsValid(row) || !fr_skips_validity.RowIsValid(row)) {
 					FlatVector::SetNull(r_skips, row, true);

@@ -1559,7 +1559,7 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 		}
 		bound_function.return_type = JsonoShreddedStructType(lanes);
 		bind_data->write = JsonoBuildShredWriteSet(bind_data->shreds);
-		JsonoAppendFullShredManifest(bind_data->hot_manifest, bind_data->write.model);
+		JsonoAppendFullShredManifest(bind_data->hot_manifest, bind_data->write.Model());
 
 		bind_data->one_pass_shred = true;
 		for (idx_t f = 0; f < bind_data->shreds.size(); f++) {
@@ -1871,7 +1871,7 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 	JsonoFillShredMarker(result, count);
 	auto &builder = lstate.builder;
 	vector<uint8_t> stripped(shred_count);
-	JsonoStrippedLanes stripped_lanes(bind_data.write.model);
+	JsonoStrippedLanes stripped_lanes(bind_data.write.Model());
 	std::string manifest;
 	for (idx_t row = 0; row < count; row++) {
 		if (ConstructorValueRowIsNull(input_data, row)) {
@@ -2056,7 +2056,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	string_t hot_blobs[BODY_BLOB_COUNT];
 
 	vector<uint8_t> stripped(shred_count);
-	JsonoStrippedLanes stripped_lanes(bind_data.write.model);
+	JsonoStrippedLanes stripped_lanes(bind_data.write.Model());
 	std::string manifest;
 	for (idx_t row = 0; row < count; row++) {
 		if (!parent_fmt.validity.RowIsValid(parent_fmt.sel->get_index(row))) {

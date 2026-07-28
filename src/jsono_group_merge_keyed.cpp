@@ -1872,12 +1872,12 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	}
 	JsonoSpillStamp stamp;
 	stamp.Init(result);
-	auto &spill_ranks = bind_data.write.model.spill_ranks;
+	auto &spill_ranks = bind_data.write.Model().spill_ranks;
 
 	JsonoBuilder builder;
 	vector<const vector<PathStep> *> scalar_strip_paths;
 	vector<idx_t> stripped_child_indices;
-	JsonoStrippedLanes stripped_lanes(bind_data.write.model);
+	JsonoStrippedLanes stripped_lanes(bind_data.write.Model());
 	vector<idx_t> list_override_indices;
 	std::string manifest;
 	for (idx_t i = 0; i < count; i++) {

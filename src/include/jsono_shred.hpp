@@ -243,16 +243,40 @@ struct ShredField {
 // A shred set compiled for writing: the lanes, plus the per-lane tables every per-row write reads.
 // Built once where the set is decided — a bind — because each table decodes every lane name and
 // allocates; rebuilding them per chunk charged the whole shred set to every batch of rows.
-struct ShredWriteSet {
-	vector<ShredField> fields;
-	JsonoShredWriteModel model;
-	// The non-scalar lanes' residual-skeleton specs (path + lifted-element description). The skeleton
-	// emit strips, per array element, exactly what the WriteArrayShred / WriteScalarArrayShred pass
-	// reports lifted (both gate on JsonoScalarFitsPrimitive), keeping the array as the position
-	// carrier. Empty — the common case — means the plain leaf-strip emit.
-	vector<JsonoArrayShredSpec> array_specs;
+// The compiled shred set for writing: the fields, the write model derived from them, and the
+// non-scalar lanes' residual-skeleton specs (path + lifted-element description — the skeleton emit
+// strips, per array element, exactly what the WriteArrayShred / WriteScalarArrayShred pass reports
+// lifted, both gating on JsonoScalarFitsPrimitive, keeping the array as the position carrier;
+// empty — the common case — means the plain leaf-strip emit).
+//
+// A set with lanes exists only through From(), which derives the model and the specs from the
+// fields in one step: there is no "fields set, tables stale" state to forget to rebuild, so the
+// marks-by-lane agreement JsonoStrippedLanes sizes against cannot be broken by a mutation between
+// filling the fields and building the tables. A default-constructed set IS the empty set (no
+// lanes, the empty model) — the state a ShredBindData holds until its bind resolves.
+class ShredWriteSet {
+public:
+	ShredWriteSet() = default;
 
-	void Build();
+	// `fields` arrive in FINAL order — ordering stays the caller's decision on purpose: the spec
+	// bind sorts canonically (FinalizeShredBindData), a layout-driven set reproduces the type's own
+	// lane order exactly.
+	static ShredWriteSet From(vector<ShredField> fields);
+
+	const vector<ShredField> &Fields() const {
+		return fields_;
+	}
+	const JsonoShredWriteModel &Model() const {
+		return model_;
+	}
+	const vector<JsonoArrayShredSpec> &ArraySpecs() const {
+		return array_specs_;
+	}
+
+private:
+	vector<ShredField> fields_;
+	JsonoShredWriteModel model_;
+	vector<JsonoArrayShredSpec> array_specs_;
 };
 
 // Compile a result layout's shred set for writing. `shreds[i]` names a lane by its PHYSICAL field
