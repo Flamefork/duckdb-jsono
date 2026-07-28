@@ -163,6 +163,34 @@ SELECT jsono_storage_type('{"$.products": "STRUCT(ID VARCHAR, id BIGINT)[]"}');
 ----
 Duplicate STRUCT type argument name
 
+# The removed DDL form ('"$.kind" VARCHAR') is refused as what it now is: not a JSON spec.
+statement error
+SELECT jsono_storage_type('"$.kind" VARCHAR');
+----
+shredding spec is not valid JSON
+
+statement error
+SELECT jsono_storage_type('{}');
+----
+empty shredding spec
+
+statement error
+SELECT jsono_storage_type('["a"]');
+----
+must be a JSON object mapping path to type
+
+# No STRUCT overload is left to fall into.
+statement error
+SELECT jsono_storage_type({'a': 'BIGINT'});
+----
+No function matches
+
+# A SQL NULL spec propagates NULL like any scalar function.
+query I
+SELECT jsono_storage_type(NULL) IS NULL;
+----
+true
+
 # `body` and `$.body` are two spellings of ONE path, so they now name one lane: the DDL helper and the
 # constructor agree whichever spelling either is given.
 query I

@@ -636,8 +636,9 @@ def test_fuzz_validish_blob_no_crash(text: str, mutation: str, reader: str) -> N
 
 
 # Shredding properties run on object documents whose top-level keys are plain identifiers
-# (shred paths are spec field names; quoting rules are not the property under test).
-shred_keys = st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=8).filter(lambda key: key != "body")
+# (shred paths are spec keys; quoting rules are not the property under test). No key is excluded:
+# `body` shreds like any other key (jsono_storage_type.test pins it).
+shred_keys = st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=8)
 shred_documents = st.dictionaries(shred_keys, json_scalars, min_size=1, max_size=6)
 shred_types = st.sampled_from(["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN"])
 
@@ -1371,6 +1372,10 @@ manifest_documents = st.sampled_from(
         ('{"a":"1","b":"2","c":3}', '\'{"a": "VARCHAR", "b": "VARCHAR"}\''),
         ('{"n":7,"o":{"x":1}}', '\'{"n": "BIGINT"}\''),
         (wide_object_text, '\'{"k00": "BIGINT", "k16": "VARCHAR"}\''),
+        # An object-array lane: its manifest entry continues past the type code (uint16 subfield
+        # count, then an LV key + code per subfield), a framing the scalar entries above never
+        # reach — truncations, huge counts and flipped tail bytes must hit it too.
+        ('{"items":[{"id":1,"NM":"z"}],"k":"v"}', '\'{"$.items": "STRUCT(id BIGINT, NM VARCHAR)[]"}\''),
     ]
 )
 

@@ -227,6 +227,45 @@ SELECT jsono('{"a":1}', shredding := '{"a": "STRUCT(("}');
 ----
 can not be converted to a DuckDB Type
 
+# The JSON spec carrier's own bind-time refusals: each wrong shape of the spec is a distinct,
+# explicit error. The carrier is the most-used declaration surface, so every arm of its grammar
+# is pinned — a STRUCT literal (the removed carrier), SQL NULL, non-JSON text, a JSON array,
+# a non-string type value, a nested object where a type string belongs, and an empty object.
+statement error
+SELECT jsono('{"a":1}', shredding := {'a': 'BIGINT'});
+----
+shredding spec must be a non-NULL JSON object
+
+statement error
+SELECT jsono('{"a":1}', shredding := NULL);
+----
+shredding spec must be a non-NULL JSON object
+
+statement error
+SELECT jsono('{"a":1}', shredding := '{not json');
+----
+shredding spec is not valid JSON
+
+statement error
+SELECT jsono('{"a":1}', shredding := '["a"]');
+----
+must be a JSON object mapping path to type
+
+statement error
+SELECT jsono('{"a":1}', shredding := '{"a": 1}');
+----
+type for 'a' must be a JSON string naming the shred type
+
+statement error
+SELECT jsono('{"a":1}', shredding := '{"a": {"b": "BIGINT"}}');
+----
+type for 'a' must be a JSON string naming the shred type
+
+statement error
+SELECT jsono('{"a":1}', shredding := '{}');
+----
+empty shredding spec
+
 # A shred path must be a non-empty object-key chain. An array-index step, a nested index, and the
 # root '$' are rejected at bind: otherwise the value would be lifted into a lane while ALSO staying
 # in the residual (a read-copy), and every reconstruct-based reader would throw on the non-key lane.

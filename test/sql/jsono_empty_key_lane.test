@@ -55,3 +55,55 @@ query I
 SELECT to_json(jsono_merge_patch(jsono('{"":1}', shredding := '{"": "BIGINT"}'), jsono('{"":9}')));
 ----
 {"":9}
+
+# An empty-key lane TOGETHER with a LIST lane. The render gate classifies the type in one loop that
+# BREAKS at the empty key (forcing the full reconstruct) — with the empty-key lane sorted first it
+# exits before ever seeing the list lane, so the route must not depend on the flags the loop never
+# set. Both list shapes ride the combination.
+query I
+SELECT to_json(jsono('{"":1,"tags":[1,2]}', shredding := '{"": "BIGINT", "$.tags": "BIGINT[]"}'));
+----
+{"":1,"tags":[1,2]}
+
+query I
+SELECT to_json(jsono('{"":1,"items":[{"n":1}]}', shredding := '{"": "BIGINT", "$.items": "STRUCT(n BIGINT)[]"}'));
+----
+{"":1,"items":[{"n":1}]}
+
+query II
+SELECT jsono_extract_string(jsono('{"":1,"tags":[1,2]}', shredding := '{"": "BIGINT", "$.tags": "BIGINT[]"}'), '$.""'),
+       jsono_extract_string(jsono('{"":1,"tags":[1,2]}', shredding := '{"": "BIGINT", "$.tags": "BIGINT[]"}'), '$.tags[0]');
+----
+1	1
+
+# Writer paths over an empty-key column: the aggregates, diff and the reshred a plain INSERT
+# triggers all mint or fold the empty-key lane like any other.
+statement ok
+CREATE TABLE ekw AS SELECT jsono('{"":1,"z":"a"}', shredding := '{"": "BIGINT", "z": "VARCHAR"}') AS j
+UNION ALL SELECT jsono('{"":2,"z":"b"}', shredding := '{"": "BIGINT", "z": "VARCHAR"}');
+
+query I
+SELECT to_json(jsono_group_merge(j)) FROM ekw;
+----
+{"":2,"z":"b"}
+
+query I
+SELECT to_json(jsono_group_merge_max(j, r)) FROM (SELECT j, row_number() OVER () AS r FROM ekw);
+----
+{"":2,"z":"b"}
+
+query I
+SELECT to_json(jsono_diff(jsono('{"":1}', shredding := '{"": "BIGINT"}'), jsono('{"":2}', shredding := '{"": "BIGINT"}')));
+----
+{"":2}
+
+statement ok
+CREATE TABLE ek_target AS SELECT jsono('{"":0,"z":"x"}', shredding := '{"": "BIGINT", "z": "VARCHAR"}') AS j LIMIT 0;
+
+statement ok
+INSERT INTO ek_target SELECT jsono('{"":7,"z":"q","extra":true}', shredding := '{"z": "VARCHAR"}');
+
+query I
+SELECT to_json(j) FROM ek_target;
+----
+{"":7,"extra":true,"z":"q"}

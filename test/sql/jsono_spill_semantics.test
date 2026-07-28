@@ -126,6 +126,33 @@ FROM wide64 ORDER BY 3, 4;
 NULL	NULL	7	NULL	1
 
 
+# A WIDE (>63 lanes) DIVERGENT set: k00..k62 plus the pair whose two orders disagree (see the
+# divergent-pair block in jsono_layout_golden.test). Past 63 lanes a rank picks the spill COLUMN
+# too (rank / 63), and the prod set-op bug this family guards against lived exactly in the wide
+# mode. In encoded-name order the pair ranks 0 ($.a.b) and 1 ($.a-c) and k61/k62 overflow into
+# "$jsono$spill$1" (ranks 63/64), while path-text order puts $.a-c first — a path-ranking bug
+# renumbers the bits AND the column split here, which the same-order k00..k63 fixture above cannot
+# see. A dirty row writes 0, not NULL, into the column carrying no diverted bit.
+statement ok
+CREATE TABLE wide_divergent AS
+SELECT tag, jsono(d, shredding := '{"k00": "BIGINT", "k01": "BIGINT", "k02": "BIGINT", "k03": "BIGINT", "k04": "BIGINT", "k05": "BIGINT", "k06": "BIGINT", "k07": "BIGINT", "k08": "BIGINT", "k09": "BIGINT", "k10": "BIGINT", "k11": "BIGINT", "k12": "BIGINT", "k13": "BIGINT", "k14": "BIGINT", "k15": "BIGINT", "k16": "BIGINT", "k17": "BIGINT", "k18": "BIGINT", "k19": "BIGINT", "k20": "BIGINT", "k21": "BIGINT", "k22": "BIGINT", "k23": "BIGINT", "k24": "BIGINT", "k25": "BIGINT", "k26": "BIGINT", "k27": "BIGINT", "k28": "BIGINT", "k29": "BIGINT", "k30": "BIGINT", "k31": "BIGINT", "k32": "BIGINT", "k33": "BIGINT", "k34": "BIGINT", "k35": "BIGINT", "k36": "BIGINT", "k37": "BIGINT", "k38": "BIGINT", "k39": "BIGINT", "k40": "BIGINT", "k41": "BIGINT", "k42": "BIGINT", "k43": "BIGINT", "k44": "BIGINT", "k45": "BIGINT", "k46": "BIGINT", "k47": "BIGINT", "k48": "BIGINT", "k49": "BIGINT", "k50": "BIGINT", "k51": "BIGINT", "k52": "BIGINT", "k53": "BIGINT", "k54": "BIGINT", "k55": "BIGINT", "k56": "BIGINT", "k57": "BIGINT", "k58": "BIGINT", "k59": "BIGINT", "k60": "BIGINT", "k61": "BIGINT", "k62": "BIGINT", "$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS j FROM (VALUES
+  ('all_fit', '{"k00": 0, "k01": 1, "k02": 2, "k03": 3, "k04": 4, "k05": 5, "k06": 6, "k07": 7, "k08": 8, "k09": 9, "k10": 10, "k11": 11, "k12": 12, "k13": 13, "k14": 14, "k15": 15, "k16": 16, "k17": 17, "k18": 18, "k19": 19, "k20": 20, "k21": 21, "k22": 22, "k23": 23, "k24": 24, "k25": 25, "k26": 26, "k27": 27, "k28": 28, "k29": 29, "k30": 30, "k31": 31, "k32": 32, "k33": 33, "k34": 34, "k35": 35, "k36": 36, "k37": 37, "k38": 38, "k39": 39, "k40": 40, "k41": 41, "k42": 42, "k43": 43, "k44": 44, "k45": 45, "k46": 46, "k47": 47, "k48": 48, "k49": 49, "k50": 50, "k51": 51, "k52": 52, "k53": 53, "k54": 54, "k55": 55, "k56": 56, "k57": 57, "k58": 58, "k59": 59, "k60": 60, "k61": 61, "k62": 62, "a-c": "x", "a": {"b": "y"}}'),
+  ('ab_divert', '{"k00": 0, "k01": 1, "k02": 2, "k03": 3, "k04": 4, "k05": 5, "k06": 6, "k07": 7, "k08": 8, "k09": 9, "k10": 10, "k11": 11, "k12": 12, "k13": 13, "k14": 14, "k15": 15, "k16": 16, "k17": 17, "k18": 18, "k19": 19, "k20": 20, "k21": 21, "k22": 22, "k23": 23, "k24": 24, "k25": 25, "k26": 26, "k27": 27, "k28": 28, "k29": 29, "k30": 30, "k31": 31, "k32": 32, "k33": 33, "k34": 34, "k35": 35, "k36": 36, "k37": 37, "k38": 38, "k39": 39, "k40": 40, "k41": 41, "k42": 42, "k43": 43, "k44": 44, "k45": 45, "k46": 46, "k47": 47, "k48": 48, "k49": 49, "k50": 50, "k51": 51, "k52": 52, "k53": 53, "k54": 54, "k55": 55, "k56": 56, "k57": 57, "k58": 58, "k59": 59, "k60": 60, "k61": 61, "k62": 62, "a-c": "x", "a": {"b": {"q": 2}}}'),
+  ('ac_divert', '{"k00": 0, "k01": 1, "k02": 2, "k03": 3, "k04": 4, "k05": 5, "k06": 6, "k07": 7, "k08": 8, "k09": 9, "k10": 10, "k11": 11, "k12": 12, "k13": 13, "k14": 14, "k15": 15, "k16": 16, "k17": 17, "k18": 18, "k19": 19, "k20": 20, "k21": 21, "k22": 22, "k23": 23, "k24": 24, "k25": 25, "k26": 26, "k27": 27, "k28": 28, "k29": 29, "k30": 30, "k31": 31, "k32": 32, "k33": 33, "k34": 34, "k35": 35, "k36": 36, "k37": 37, "k38": 38, "k39": 39, "k40": 40, "k41": 41, "k42": 42, "k43": 43, "k44": 44, "k45": 45, "k46": 46, "k47": 47, "k48": 48, "k49": 49, "k50": 50, "k51": 51, "k52": 52, "k53": 53, "k54": 54, "k55": 55, "k56": 56, "k57": 57, "k58": 58, "k59": 59, "k60": 60, "k61": 61, "k62": 62, "a-c": {"z": 1}, "a": {"b": "y"}}'),
+  ('k62_divert', '{"k00": 0, "k01": 1, "k02": 2, "k03": 3, "k04": 4, "k05": 5, "k06": 6, "k07": 7, "k08": 8, "k09": 9, "k10": 10, "k11": 11, "k12": 12, "k13": 13, "k14": 14, "k15": 15, "k16": 16, "k17": 17, "k18": 18, "k19": 19, "k20": 20, "k21": 21, "k22": 22, "k23": 23, "k24": 24, "k25": 25, "k26": 26, "k27": 27, "k28": 28, "k29": 29, "k30": 30, "k31": 31, "k32": 32, "k33": 33, "k34": 34, "k35": 35, "k36": 36, "k37": 37, "k38": 38, "k39": 39, "k40": 40, "k41": 41, "k42": 42, "k43": 43, "k44": 44, "k45": 45, "k46": 46, "k47": 47, "k48": 48, "k49": 49, "k50": 50, "k51": 51, "k52": 52, "k53": 53, "k54": 54, "k55": 55, "k56": 56, "k57": 57, "k58": 58, "k59": 59, "k60": 60, "k61": 61, "k62": "oops", "a-c": "x", "a": {"b": "y"}}')
+) t(tag, d);
+
+query TIITTTI
+SELECT tag, j.jsono."shreds$2"."$jsono$spill$0", j.jsono."shreds$2"."$jsono$spill$1",
+       j ->> '$."a-c"', j ->> '$.a.b', j ->> 'k62', jsono_validate(j)
+FROM wide_divergent ORDER BY tag;
+----
+ab_divert	1	0	x	{"q":2}	62	true
+ac_divert	2	0	{"z":1}	y	62	true
+all_fit	NULL	NULL	x	y	62	true
+k62_divert	0	2	x	y	oops	true
+
+
 require parquet
 
 # The uniform dirty-mask quarantine survives a Parquet round-trip: rows where `n` diverts stamp the

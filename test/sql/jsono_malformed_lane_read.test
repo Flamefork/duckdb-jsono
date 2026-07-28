@@ -23,6 +23,11 @@ SELECT j ->> 'a' FROM t;
 field '$.b' is not a shred lane
 
 statement error
+SELECT j -> 'a' FROM t;
+----
+field '$.b' is not a shred lane
+
+statement error
 SELECT to_json(j) FROM t;
 ----
 field '$.b' is not a shred lane
