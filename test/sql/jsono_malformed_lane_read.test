@@ -195,7 +195,7 @@ ALTER TABLE lastlane RENAME COLUMN "j"."jsono"."shreds$2".c4000 TO "$.a";
 statement ok
 ALTER TABLE lastlane DROP COLUMN "j"."jsono"."shreds$2"."$.a";
 
-query I
-SELECT jsono_layout_diagnose(j) FROM lastlane;
+query II
+SELECT x.kind, x.reason FROM (SELECT jsono_layout_diagnose(j) AS x FROM lastlane);
 ----
-not jsono: 'shreds$2' carries only reserved layout fields and no shred
+not jsono	'shreds$2' carries only reserved layout fields and no shred

@@ -195,10 +195,11 @@ SELECT jsono_layout_lanes(v) FROM rev99;
 ----
 layout revision body=1 shreds=99
 
-query I
-SELECT jsono_layout_diagnose(v) FROM rev99;
+query IIII
+SELECT x.kind, x.reason, x.body_revision, x.shreds_revision
+FROM (SELECT jsono_layout_diagnose(v) AS x FROM rev99);
 ----
-foreign: layout revision body=1 shreds=99, this build reads body=1 shreds=2
+foreign	layout revision body=1 shreds=99, this build reads body=1 shreds=2	1	99
 
 statement error
 SELECT v ->> 'a' FROM shreds_rev1;
@@ -451,9 +452,9 @@ statement ok
 RESET disabled_optimizers;
 
 query I
-SELECT jsono_layout_diagnose(v) LIKE 'not jsono:%' FROM shreds_rev1_renamed;
+SELECT jsono_layout_diagnose(v).kind FROM shreds_rev1_renamed;
 ----
-true
+not jsono
 
 # --- The rename trap is loud on JSON reads, silent on recovery paths ---
 #
@@ -475,12 +476,15 @@ SELECT struct_pack("jsono" := struct_pack(
         "gclid"          := 'kept'))) AS j
 FROM (SELECT jsono('{"gclid":"kept","r":1}', shredding := '{"gclid": "VARCHAR"}') AS v);
 
-# jsono_layout_diagnose answers about types nothing else will touch.
-query I
-SELECT jsono_layout_diagnose(j) LIKE 'not jsono: field ''gclid'' is not a shred lane%'
-FROM renamed_revision;
+# jsono_layout_diagnose answers about types nothing else will touch. The anchor DID parse here — the
+# revisions are this build's — which is what makes the failure a lane NAME rather than a foreign
+# value, and the reason says which name.
+query IIII
+SELECT x.kind, x.body_revision, x.shreds_revision,
+       starts_with(x.reason, 'field ''gclid'' is not a shred lane')
+FROM (SELECT jsono_layout_diagnose(j) AS x FROM renamed_revision);
 ----
-true
+not jsono	1	2	true
 
 # A JSON read of the renamed value is refused with the grammar's own reason instead of answering
 # NULL for every path.

@@ -96,10 +96,10 @@ SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    "03vg000" := c.jsono."shreds$2".c4000))))
+    "03vg000" := c.jsono."shreds$2".c4000)))).kind
 FROM v;
 ----
-jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
+shredded
 
 # Why the terminator is doubled, and why the escape survives a round trip. `c40fuog000` is the single
 # key `a` 0x00 `b` — serialized `61 00 FF 62 00 00`, the escape then the terminator. `c4001vr20000` is
@@ -119,10 +119,10 @@ SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    "c40fuog000" := c.jsono."shreds$2".c4000))))
+    "c40fuog000" := c.jsono."shreds$2".c4000)))).kind
 FROM v;
 ----
-jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
+shredded
 
 # The NUL key reads back whole: `$.a<NUL>b`, escape decoded, terminator consumed.
 query I
@@ -139,17 +139,18 @@ FROM (SELECT unnest(jsono_layout_lanes(struct_pack(jsono := struct_pack(
 
 # The 0xFF path is a clean decode of bytes no key may hold, so it is not a lane name. Silent, like
 # every other non-lane struct — and loud only if you ask what it is.
-query I
+query II
 WITH v AS (SELECT jsono('{"a":"x"}', shredding := '{"a": "VARCHAR"}') AS c)
-SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
-  "body$1" := c.jsono."body$1",
-  "shreds$2" := struct_pack(
-    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
-    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    "c4001vr20000" := c.jsono."shreds$2".c4000))))
-FROM v;
+SELECT x.kind, x.reason FROM (
+  SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+    "body$1" := c.jsono."body$1",
+    "shreds$2" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+      "c4001vr20000" := c.jsono."shreds$2".c4000)))) AS x
+  FROM v);
 ----
-not jsono: field 'c4001vr20000' is not a shred lane: a lane is named by the base32hex encoding of its object-key path, and this name does not decode canonically
+not jsono	field 'c4001vr20000' is not a shred lane: a lane is named by the base32hex encoding of its object-key path, and this name does not decode canonically
 
 # --- Non-canonical names stay a silent NotJsono ---------------------------------------------------
 # `c400` is `c4000` with its last character cut: it decodes to the bytes `61 00`, a key `a` whose
@@ -162,10 +163,10 @@ SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    "c400" := c.jsono."shreds$2".c4000)))) LIKE 'not jsono:%'
+    "c400" := c.jsono."shreds$2".c4000)))).kind
 FROM v;
 ----
-true
+not jsono
 
 # Upper case is rejected rather than folded. `C4000` decodes to the same bytes as `c4000`, so
 # accepting it would hand one lane two spellings — which is where case collisions came from.
@@ -176,10 +177,10 @@ SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    "C4000" := c.jsono."shreds$2".c4000)))) LIKE 'not jsono:%'
+    "C4000" := c.jsono."shreds$2".c4000)))).kind
 FROM v;
 ----
-true
+not jsono
 
 # A lane spelled the way the closed `shreds$1` revision spelled it (the path as text) is not a
 # canonical name either, so a hand-assembled mixture of the two forms is not read as JSONO.
@@ -190,10 +191,10 @@ SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    gclid := c.jsono."shreds$2".c4000)))) LIKE 'not jsono:%'
+    gclid := c.jsono."shreds$2".c4000)))).kind
 FROM v;
 ----
-true
+not jsono
 
 # --- The incident itself, end to end --------------------------------------------------------------
 # The production channel: two sources spelling one key differently (adjust.events writes `gclid`,
@@ -238,17 +239,18 @@ ORDER BY doc;
 # whose subfields are not encoded keys (ShredSubfieldNamesAreCanonical). Without that gate the type
 # is called current and the first reader to want the subfield's KEY dies mid-read with an internal
 # error — on a value whose type recognition had just said it was fine.
-query I
+query II
 WITH v AS (SELECT jsono('{"items":[{"n":1}]}', shredding := '{"$.items": "STRUCT(n BIGINT)[]"}') AS c)
-SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
-  "body$1" := c.jsono."body$1",
-  "shreds$2" := struct_pack(
-    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
-    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    "d5q6arbj0000" := [{'n': 1::BIGINT}]))))
-FROM v;
+SELECT x.kind, x.reason FROM (
+  SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+    "body$1" := c.jsono."body$1",
+    "shreds$2" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+      "d5q6arbj0000" := [{'n': 1::BIGINT}])))) AS x
+  FROM v);
 ----
-not jsono: array shred 'd5q6arbj0000' has an element subfield whose name is not the base32hex encoding of a single object key
+not jsono	array shred 'd5q6arbj0000' has an element subfield whose name is not the base32hex encoding of a single object key
 
 # The same struct with the subfield spelled the way the codec spells it IS a lane, so the refusal
 # above is about the naming and not about hand-built structs in general.
@@ -259,7 +261,7 @@ SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    "d5q6arbj0000" := [{'do000': 1::BIGINT}]))))
+    "d5q6arbj0000" := [{'do000': 1::BIGINT}])))).kind
 FROM v;
 ----
-jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
+shredded

@@ -562,12 +562,12 @@ EXECUTE lanes_of(jsono('{"a":1}', shredding := '{"a": "BIGINT"}'));
 [{'path': $.a, 'type': BIGINT}]
 
 statement ok
-PREPARE diagnose_of AS SELECT jsono_layout_diagnose($1);
+PREPARE diagnose_of AS SELECT jsono_layout_diagnose($1).kind;
 
 query I
 EXECUTE diagnose_of(jsono('{"a":1}'));
 ----
-jsono: plain, body revision 1
+plain
 
 # --- The manifest's own text form quotes a subfield key, like every other type text does ---
 #

@@ -1086,7 +1086,7 @@ void RegisterJsonoAdvisor(ExtensionLoader &loader) {
 	}
 	loader.RegisterFunction(suggest_set);
 
-	// jsono_shred_stats(shredded) -> LIST<STRUCT(path, type, lane_rate, divert_rate, complete_rate)>
+	// jsono_shred_stats(shredded) -> LIST<STRUCT(path, type, lane_rate, divert_rate)>
 	AggregateFunction stats("jsono_shred_stats", {LogicalType::ANY}, ShredStatsResultType(),
 	                        AggregateFunction::StateSize<ShredStatsState>,
 	                        AggregateFunction::StateInitialize<ShredStatsState, ShredStatsAggregate>,

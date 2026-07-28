@@ -45,18 +45,24 @@ Shredded storage:
 - [`jsono_suggest_shredding(value[, min_presence, min_fit])`](#jsono_suggest_shredding) — aggregate a *plain* JSONO column into a ready-to-paste `shredding :=` spec string.
 - [`jsono_shred_stats(value)`](#jsono_shred_stats) — aggregate an existing *shredded* column into per-shred lane / divert rates.
 
-Inspect:
+Inspect the **document** — what the JSON says:
 
 - [`jsono_type(value[, path])`](#introspection) — the value's JSON type as `VARCHAR` (`OBJECT`, `ARRAY`, a scalar type, or `NULL`).
 - [`jsono_keys(value[, path])`](#introspection) — object keys as `VARCHAR[]`.
 - [`jsono_array_length(value[, path])`](#introspection) — element count of the array as `BIGINT`, or `NULL` for a non-array.
+
+Inspect **each row** — what this row's bytes are and claim; reads the value, per row:
+
 - [`jsono_validate(value)`](#introspection) — strict current-format validation as `BOOLEAN`.
 - [`jsono_storage_size(value)`](#introspection) — physical byte sizes (body blobs, shreds, total) as a `STRUCT`.
+- [`jsono_shred_manifest(value)`](#introspection) — the paths *this row* stripped into shred columns, and their types, as a `LIST<STRUCT(path, type)>`.
+
+Inspect the **type** — what the column declares; answered at bind, reads no bytes:
+
+- [`jsono_layout_diagnose(value)`](#introspection) — what this build sees the value's type as, and which rule failed when that is not JSONO, as a `STRUCT`.
+- [`jsono_layout_lanes(value)`](#introspection) — the shred lanes the value's type declares, as logical paths.
 - [`jsono_storage_type([shredding spec])`](#introspection) — DDL of the physical `STRUCT` backing a JSONO value, plain or with the spec's shred lanes.
-- [`jsono_shred_manifest(value)`](#introspection) — paths stripped into shred columns and their types as a `LIST<STRUCT(path, type)>`.
-- [`jsono_version()`](#introspection) — the current JSONO binary format version as `INTEGER`.
-- [`jsono_layout_diagnose(value)`](#introspection) — whether this build sees the value's type as JSONO, and which rule failed if not.
-- [`jsono_layout_lanes(value)`](#introspection) — the shred lanes of the value's type, as logical paths.
+- [`jsono_version()`](#introspection) — the JSONO binary format version this build reads and writes, as `INTEGER`.
 
 ## Quick Start
 
@@ -410,7 +416,7 @@ ALTER TABLE t ADD COLUMN j.jsono."shreds$2".c8000 VARCHAR;
 
 Existing rows read the added lane as `NULL` and fall back to the residual per row (`COALESCE` in the plan, like a partial shred); newly inserted values are reshredded to the column's shred set and populate it. To make the lane total for old rows too, rewrite the column through `jsono(j, shredding := '{…}')` instead.
 
-The name is the whole contract. A field added under any other name — the path as text (`"$.b"`), a hand-shortened form, any spelling the codec did not produce — makes the struct stop matching the layout grammar. JSON reads of such a column (`->>`, `->`, `to_json`, `::JSON`) are refused loudly with the grammar's own reason (answering them would mean `NULL` for every path, including untouched lanes and the residual); passthrough (`SELECT *`, `COPY`) and the raw `::VARCHAR` render stay open. The data is intact, and the recovery is `ALTER TABLE … RENAME COLUMN` back to the encoded name (`jsono_storage_type(<spec>)` prints it): it restores every read in place, whatever the lane held. `ALTER TABLE … DROP COLUMN` recovers only a lane that held **no stripped values** — once it is gone, rows whose values were stripped into it are refused by the shred manifest, and dropping the *only* lane leaves a `shreds` struct with no shred at all, which silently stops being JSONO. `jsono_layout_diagnose(j)` gives the same diagnosis as a query. (With the extension optimizer disabled the refusal cannot run and such reads silently fall through to core json — the pre-existing behavior.)
+The name is the whole contract. A field added under any other name — the path as text (`"$.b"`), a hand-shortened form, any spelling the codec did not produce — makes the struct stop matching the layout grammar. JSON reads of such a column (`->>`, `->`, `to_json`, `::JSON`) are refused loudly with the grammar's own reason (answering them would mean `NULL` for every path, including untouched lanes and the residual); passthrough (`SELECT *`, `COPY`) and the raw `::VARCHAR` render stay open. The data is intact, and the recovery is `ALTER TABLE … RENAME COLUMN` back to the encoded name (`jsono_storage_type(<spec>)` prints it): it restores every read in place, whatever the lane held. `ALTER TABLE … DROP COLUMN` recovers only a lane that held **no stripped values** — once it is gone, rows whose values were stripped into it are refused by the shred manifest, and dropping the *only* lane leaves a `shreds` struct with no shred at all, which silently stops being JSONO. `jsono_layout_diagnose(j).reason` gives the same diagnosis as a query. (With the extension optimizer disabled the refusal cannot run and such reads silently fall through to core json — the pre-existing behavior.)
 
 ### `jsono_suggest_shredding`
 
@@ -692,19 +698,28 @@ FROM (VALUES ('b', jsono('2')), ('a', jsono('1'))) t(k, j);
 
 ### Introspection
 
+These answer three different questions, and which one a function answers is the first thing to know about it — the JSON *document*, this *row*'s bytes, or the *type* the column declares. Only the row group reads data.
+
 ```sql
+-- the document
 jsono_type(value[, path])         -> VARCHAR    -- OBJECT/ARRAY/VARCHAR/BIGINT/UBIGINT/DOUBLE/BOOLEAN/NULL
 jsono_keys(value[, path])         -> VARCHAR[]  -- object keys
 jsono_array_length(value[, path]) -> BIGINT     -- array element count, NULL for a non-array
+
+-- this row (reads the value, per row)
 jsono_validate(value)             -> BOOLEAN    -- strict current-format validation
 jsono_storage_size(value)         -> STRUCT     -- physical byte sizes (body blobs + shreds + total)
+jsono_shred_manifest(value)       -> STRUCT[]   -- paths THIS ROW stripped into shred columns, with their types
+
+-- the type (answered at bind, reads no bytes)
+jsono_layout_diagnose(value)      -> STRUCT     -- what this build sees the TYPE as, and why not JSONO when it is not
+jsono_layout_lanes(value)         -> STRUCT[]   -- the shred lanes the TYPE declares, as logical paths
 jsono_storage_type()              -> VARCHAR    -- DDL of the physical STRUCT backing plain JSONO
 jsono_storage_type(<spec>)        -> VARCHAR    -- same, shredded: residual plus the spec's shred lanes
-jsono_shred_manifest(value)       -> STRUCT[]   -- paths stripped into shred columns, with their types
-jsono_version()                   -> INTEGER    -- current JSONO binary format version
-jsono_layout_diagnose(value)      -> VARCHAR    -- whether the extension sees the value's TYPE as JSONO, and why not
-jsono_layout_lanes(value)         -> STRUCT[]   -- the shred lanes of the value's TYPE, as logical paths
+jsono_version()                   -> INTEGER    -- the JSONO binary format version this build reads and writes
 ```
+
+The type/row split is not bookkeeping: a lane the *type* declares and a lane a *row* stripped are different facts, and their difference is the diagnostic. `jsono_shred_manifest` is a subset of `jsono_layout_lanes` on a healthy column — a row whose value did not round-trip its declared type keeps it in the residual and honestly omits it — so anti-joining the two on `(path, type)` answers "which declared lanes did this row not use".
 
 `jsono_type` and `jsono_keys` inspect the shape of unknown JSON before extracting it with `jsono_transform`. The optional `path` is a constant JSONPath (same grammar as `jsono_transform`, without wildcards) that points at a nested position; a missing path yields `NULL`.
 
@@ -753,15 +768,28 @@ SELECT jsono_shred_manifest(jsono('{"a":"x","b":1}', shredding := '{"a": "VARCHA
 -- [{'path': $.a, 'type': VARCHAR}, {'path': $.b, 'type': BIGINT}]
 ```
 
-`jsono_layout_diagnose` answers whether this build recognises the argument's **type** as a JSONO value, and if not, which rule failed. It is a question about the type, answered at bind — the value's bytes are never read, and a `NULL` value diagnoses the same as any other.
+`jsono_layout_diagnose` answers what this build sees the argument's **type** as, and if that is not a JSONO value, which rule failed. It is a question about the type, answered at bind — the value's bytes are never read, and a `NULL` value diagnoses the same as any other. The answer is a `STRUCT`:
+
+| field | |
+|---|---|
+| `kind VARCHAR` | `plain`, `shredded`, `foreign` (a layout revision this build does not read), or `not jsono` |
+| `reason VARCHAR` | the grammar's own refusal text, `NULL` for the two readable kinds — so `reason IS NULL` *is* "this build can read it" |
+| `body_revision UBIGINT` | the layout revision the value was written under, once the anchor has parsed one |
+| `shreds_revision UBIGINT` | same for the shred set; `NULL` for a plain value, which has none |
+| `spill_columns UBIGINT` | spill bitmap columns the type carries; `NULL` unless the grammar read the whole shred set |
+
+Everything unknown is `NULL` rather than `0`: a refused type reporting `0 spill columns` would read as a fact about the value instead of "the grammar never got that far". The lane count is deliberately absent — `len(jsono_layout_lanes(value))` already answers it, in exactly the cases `kind` is `plain` or `shredded`. Only `reason` is prose, because it is the same string the reads that *do* refuse throw; there is no second copy of the rules to drift from the one that decides.
 
 It exists for one specific failure mode. A value carrying the current layout revision that nevertheless fails the layout grammar is classified "not JSONO" *silently* by recognition: refusing it there would break legal write paths (a DuckLake inlined-data flush narrows an all-NULL column on its way to the declared column type). A *name*-level miss — a lane name the codec did not produce, inside a fully anchored type — is additionally refused loudly on JSON reads by the optimizer (see [evolving the shred set](#evolving-the-shred-set)); the *type*-level misses stay fully silent, and with the extension optimizer disabled every read falls through to core json — `->>` reads `NULL`, `to_json` serializes the raw physical struct. When a JSONO column starts answering `NULL` for paths you know are there, this is the function that says why.
 
 ```sql
 SELECT jsono_layout_diagnose(jsono('{"a":1,"b":2}', shredding := '{"a": "BIGINT"}'));
--- jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
-SELECT jsono_layout_diagnose({'a': 1});
--- not jsono: the value's single field is named 'a', not the layout anchor 'jsono'
+-- {'kind': shredded, 'reason': NULL, 'body_revision': 1, 'shreds_revision': 2, 'spill_columns': 1}
+SELECT jsono_layout_diagnose({'a': 1}).reason;
+-- the value's single field is named 'a', not the layout anchor 'jsono'
+
+-- a column that should be JSONO and is not, without parsing any prose
+SELECT jsono_layout_diagnose(payload).kind <> 'shredded' AS lost_its_shreds FROM events LIMIT 1;
 ```
 
 A value of a foreign layout revision is *diagnosed* rather than refused here, even though every other consumer of it throws — a diagnostic that fails on the value you are diagnosing is no diagnostic.

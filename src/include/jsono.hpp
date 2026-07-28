@@ -11,6 +11,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
 #include "string_view.hpp"
@@ -324,13 +325,17 @@ enum class JsonoLayoutMatch : uint8_t { NotJsono, Current, Foreign };
 // types here) to skip formatting entirely, or a string to receive why a NotJsono was refused.
 JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out, string *reason = nullptr);
 
-// Human-readable one-line classification of `type` against the grammar, for `jsono_layout_diagnose`.
-// A NotJsono answer carries the grammar's OWN reason (see MatchJsonoLayoutType's `reason`), which is
-// what makes the diagnosis trustworthy: there is no second copy of the rules to drift from the one
-// that decides. This is the only way to see why a value of the current revision failed the grammar —
-// that case is deliberately silent at read time, so the read path hands the value to core json
-// instead (an extract reads NULL, to_json serializes the physical struct).
-string JsonoExplainLayoutMatch(const LogicalType &type);
+// Classification of `type` against the grammar, for `jsono_layout_diagnose`. The classification
+// facts are handed out as struct FIELDS rather than rendered into a sentence: the grammar already
+// holds them as JsonoLayoutMatch + JsonoLayoutType, and flattening them into prose left callers
+// (this repo's own tests included) parsing the prose back. `reason` is the exception and stays free
+// text — it is the grammar's OWN refusal text (see MatchJsonoLayoutType's `reason`), the same string
+// the reads that refuse throw, so there is no second copy of the rules to drift from the one that
+// decides. This is the only way to see why a value of the current revision failed the grammar — that
+// case is deliberately silent at read time, so the read path hands the value to core json instead (an
+// extract reads NULL, to_json serializes the physical struct).
+LogicalType JsonoLayoutDiagnoseResultType();
+Value JsonoDiagnoseLayoutMatch(const LogicalType &type);
 
 // The revision phrase a foreign layout is described by ("layout revision body=0 shreds=0, this build
 // reads body=1 shreds=2"), shared by the refusal and the diagnosis so the two cannot describe the

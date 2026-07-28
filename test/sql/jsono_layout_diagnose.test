@@ -1,64 +1,90 @@
 # name: test/sql/jsono_layout_diagnose.test
-# description: jsono_layout_diagnose(value) answers why the extension does or does not see the argument's TYPE as JSONO. It exists for the deliberately silent case: a value carrying the CURRENT revision that fails the grammar is classified NotJsono without a word (refusing it would break the legal DuckLake write path, see MatchJsonoLayoutField), and from SQL that is indistinguishable from an ordinary NULL — `->>` reads NULL through core json and to_json serializes the physical struct. The diagnosis comes out of the grammar itself (MatchJsonoLayoutType's `reason` sink), so it cannot drift from the rules that decide. It is a bind-time question about the type: the value's bytes are never read.
+# description: jsono_layout_diagnose(value) answers what the extension sees the argument's TYPE as, and why not JSONO when it is not. It exists for the deliberately silent case: a value carrying the CURRENT revision that fails the grammar is classified NotJsono without a word (refusing it would break the legal DuckLake write path, see MatchJsonoLayoutField), and from SQL that is indistinguishable from an ordinary NULL — `->>` reads NULL through core json and to_json serializes the physical struct. The classification comes out of the grammar itself (MatchJsonoLayoutType + JsonoLayoutType), so it cannot drift from the rules that decide, and it is handed out as struct FIELDS so a caller tests them instead of parsing prose; only `reason` is free text, because it is the grammar's own refusal string, shared with the errors the refusing reads throw. It is a bind-time question about the type: the value's bytes are never read.
 # group: [sql]
 
 require jsono
 
 require json
 
-# Recognised values report their layout, not an error.
-query I
-SELECT jsono_layout_diagnose(jsono('{"a":1}'));
+# Recognised values report their layout, not an error. Unknown is NULL and never zero: `spill_columns`
+# is 0 for a plain value because a plain value HAS none, and NULL below wherever the grammar never got
+# far enough to count.
+query IIIII
+SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns
+FROM (SELECT jsono_layout_diagnose(jsono('{"a":1}')) AS x);
 ----
-jsono: plain, body revision 1
+plain	NULL	1	NULL	0
 
-query I
-SELECT jsono_layout_diagnose(jsono('{"a":1,"b":2}', shredding := '{"a": "BIGINT"}'));
+query IIIII
+SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns
+FROM (SELECT jsono_layout_diagnose(jsono('{"a":1,"b":2}', shredding := '{"a": "BIGINT"}')) AS x);
 ----
-jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
+shredded	NULL	1	2	1
 
-# Ordinary values: the reason names the first rule that failed, from the outside in.
-query I
-SELECT jsono_layout_diagnose(42);
+# Ordinary values: the reason names the first rule that failed, from the outside in, and nothing about
+# a layout is claimed.
+query IIIII
+SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns
+FROM (SELECT jsono_layout_diagnose(42) AS x);
 ----
-not jsono: the value is INTEGER, not a named STRUCT
+not jsono	the value is INTEGER, not a named STRUCT	NULL	NULL	NULL
 
-query I
-SELECT jsono_layout_diagnose({'a': 1});
+query II
+SELECT x.kind, x.reason FROM (SELECT jsono_layout_diagnose({'a': 1}) AS x);
 ----
-not jsono: the value's single field is named 'a', not the layout anchor 'jsono'
+not jsono	the value's single field is named 'a', not the layout anchor 'jsono'
+
+# `reason` is exactly the "this build cannot read it" signal: NULL for the two readable kinds, set for
+# the two unreadable ones. Testing the classification takes no string parsing.
+query II
+WITH v AS (SELECT jsono('{"a":1}') AS c)
+SELECT x.kind, x.reason IS NULL FROM (
+  SELECT unnest([jsono_layout_diagnose(jsono('{"a":1}')),
+                 jsono_layout_diagnose(jsono('{"a":1}', shredding := '{"a": "BIGINT"}')),
+                 jsono_layout_diagnose(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))),
+                 jsono_layout_diagnose(42)]) AS x
+  FROM v);
+----
+plain	true
+shredded	true
+foreign	false
+not jsono	false
 
 # The case the function exists for: a value of the CURRENT revision that fails the grammar. Reads of
 # it stay silent by design, so this is the only way to see why.
-query I
+query II
 WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}') AS c)
-SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
-  "body$1" := c.jsono."body$1",
-  "shreds$2" := struct_pack(c4000 := c.jsono."shreds$2".c4000, c8000 := c.jsono."shreds$2".c8000))))
-FROM v;
+SELECT x.kind, x.reason FROM (
+  SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+    "body$1" := c.jsono."body$1",
+    "shreds$2" := struct_pack(c4000 := c.jsono."shreds$2".c4000, c8000 := c.jsono."shreds$2".c8000)))) AS x
+  FROM v);
 ----
-not jsono: 'shreds$2' has no '$jsono$set' marker field
+not jsono	'shreds$2' has no '$jsono$set' marker field
 
-query I
+query II
 WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}') AS c)
-SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
-  "body$1" := c.jsono."body$1",
-  "shreds$2" := struct_pack(
-    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
-    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    c4000 := {'weird': 1}))))
-FROM v;
+SELECT x.kind, x.reason FROM (
+  SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+    "body$1" := c.jsono."body$1",
+    "shreds$2" := struct_pack(
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+      c4000 := {'weird': 1})))) AS x
+  FROM v);
 ----
-not jsono: shred 'c4000' is STRUCT(weird INTEGER), which is not a shred value type or LIST of one
+not jsono	shred 'c4000' is STRUCT(weird INTEGER), which is not a shred value type or LIST of one
 
 # A foreign revision is DIAGNOSED, not refused. Every other consumer of such a value throws
 # (RejectForeignLayoutsInExpression), so exempting this one is what keeps a diagnostic available for
-# exactly the value that needs diagnosing — it reads the type, never the bytes.
-query I
+# exactly the value that needs diagnosing — it reads the type, never the bytes. The revision it was
+# written under is a field, which is the key into the revision map in docs/jsono_format.md.
+query IIIII
 WITH v AS (SELECT jsono('{"a":1}') AS c)
-SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))) FROM v;
+SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns FROM (
+  SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))) AS x FROM v);
 ----
-foreign: layout revision body=0, this build reads body=1 shreds=2
+foreign	layout revision body=0, this build reads body=1 shreds=2	0	NULL	NULL
 
 # The exemption is narrow: any OTHER consumer of the same foreign value still fails loud, and the
 # refusal quotes the same revision phrase the diagnosis does (JsonoDescribeForeignLayout).
@@ -70,27 +96,35 @@ JSONO value carries layout revision body=0, this build reads body=1 shreds=2
 
 # The reordered-reserved-fields shape a set-op merge produces IS recognised (it is read by name), so
 # it diagnoses as ordinary shredded jsono rather than as a broken struct.
-query I
+query IIIII
 WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}') AS c)
-SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
-  "body$1" := c.jsono."body$1",
-  "shreds$2" := struct_pack(
-    c4000 := c.jsono."shreds$2".c4000,
-    "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
-    "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
-    c8000 := c.jsono."shreds$2".c8000))))
-FROM v;
+SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns FROM (
+  SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
+    "body$1" := c.jsono."body$1",
+    "shreds$2" := struct_pack(
+      c4000 := c.jsono."shreds$2".c4000,
+      "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
+      "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
+      c8000 := c.jsono."shreds$2".c8000)))) AS x
+  FROM v);
 ----
-jsono: shredded, body revision 1, shreds revision 2, 2 shreds, 1 spill column(s)
+shredded	NULL	1	2	1
+
+# The lane COUNT is deliberately not a field here: jsono_layout_lanes already pins it, and it is
+# answerable in exactly the cases this function reports a shredded kind.
+query I
+SELECT len(jsono_layout_lanes(jsono('{"a":"x","b":"y"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}')));
+----
+2
 
 # The diagnosis is about the TYPE, so a NULL value has one like any other. Without SPECIAL_HANDLING
 # the executor short-circuits a NULL argument and the answer blanks out on exactly the all-NULL
 # column someone is trying to explain.
 query II
-SELECT jsono_layout_diagnose(NULL::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))),
-       jsono_layout_diagnose(NULL::BIGINT);
+SELECT jsono_layout_diagnose(NULL::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))).kind,
+       jsono_layout_diagnose(NULL::BIGINT).kind;
 ----
-jsono: plain, body revision 1	not jsono: the value is BIGINT, not a named STRUCT
+plain	not jsono
 
 # --- jsono_layout_lanes: the same question one level down, and the answer that makes an encoded lane
 # name affordable — the logical paths a shredded type carries, in the type's own field order.

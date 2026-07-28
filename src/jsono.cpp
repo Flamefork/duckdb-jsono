@@ -46,16 +46,16 @@ void JsonoVersionExecute(DataChunk &args, ExpressionState &state, Vector &result
 	result.SetValue(0, Value::INTEGER(int32_t(jsono::VERSION)));
 }
 
-// jsono_layout_diagnose(value) -> why the extension does or does not see `value` as JSONO. Purely a
-// question about the argument's TYPE, so it is answered at bind and returned as a constant; the
-// value's bytes are never read. It exists because the "current revision, fails the grammar" case is
-// deliberately silent (refusing it would break the legal DuckLake write path, see
+// jsono_layout_diagnose(value) -> what the extension sees `value` as, and why not JSONO when it is
+// not. Purely a question about the argument's TYPE, so it is answered at bind and returned as a
+// constant; the value's bytes are never read. It exists because the "current revision, fails the
+// grammar" case is deliberately silent (refusing it would break the legal DuckLake write path, see
 // MatchJsonoLayoutField) — and silence is indistinguishable from an ordinary NULL until something
 // downstream fails. This is the one place to ask.
 struct JsonoLayoutDiagnoseBindData : public FunctionData {
-	explicit JsonoLayoutDiagnoseBindData(string diagnosis_p) : diagnosis(std::move(diagnosis_p)) {
+	explicit JsonoLayoutDiagnoseBindData(Value diagnosis_p) : diagnosis(std::move(diagnosis_p)) {
 	}
-	string diagnosis;
+	Value diagnosis;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<JsonoLayoutDiagnoseBindData>(diagnosis);
@@ -74,14 +74,14 @@ unique_ptr<FunctionData> JsonoLayoutDiagnoseBind(ClientContext &context, ScalarF
 		// parameter would answer about UNKNOWN and keep answering that after the parameter arrives.
 		throw ParameterNotResolvedException();
 	}
-	return make_uniq<JsonoLayoutDiagnoseBindData>(JsonoExplainLayoutMatch(arguments[0]->return_type));
+	return make_uniq<JsonoLayoutDiagnoseBindData>(JsonoDiagnoseLayoutMatch(arguments[0]->return_type));
 }
 
 void JsonoLayoutDiagnoseExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)args;
 	auto &info = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoLayoutDiagnoseBindData>();
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	result.SetValue(0, Value(info.diagnosis));
+	result.SetValue(0, info.diagnosis);
 }
 
 // jsono_layout_lanes(value) -> the shred lanes of `value`'s type as (logical path, type), ordered
@@ -563,22 +563,41 @@ JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &
 	return MatchJsonoLayoutField(children[0].first, children[0].second, out, reason);
 }
 
-string JsonoExplainLayoutMatch(const LogicalType &type) {
+LogicalType JsonoLayoutDiagnoseResultType() {
+	child_list_t<LogicalType> fields;
+	fields.emplace_back("kind", LogicalType::VARCHAR);
+	fields.emplace_back("reason", LogicalType::VARCHAR);
+	fields.emplace_back("body_revision", LogicalType::UBIGINT);
+	fields.emplace_back("shreds_revision", LogicalType::UBIGINT);
+	fields.emplace_back("spill_columns", LogicalType::UBIGINT);
+	return LogicalType::STRUCT(std::move(fields));
+}
+
+Value JsonoDiagnoseLayoutMatch(const LogicalType &type) {
 	JsonoLayoutType layout;
 	string reason;
-	switch (MatchJsonoLayoutType(type, layout, &reason)) {
+	auto match = MatchJsonoLayoutType(type, layout, &reason);
+	// Unknown is NULL, never zero: a refused type reporting `0 spill columns` would read as a fact
+	// about the value rather than as "the grammar never got that far". A revision is known exactly
+	// when the anchor parsed one, which the parse already records as INVALID_INDEX-or-not; the counts
+	// only once the grammar finished reading the shred set, which is only the Current answer.
+	auto revision = [](idx_t value) {
+		return value == DConstants::INVALID_INDEX ? Value(LogicalType::UBIGINT) : Value::UBIGINT(value);
+	};
+	string kind;
+	auto reason_value = Value(LogicalType::VARCHAR);
+	auto spill_columns = Value(LogicalType::UBIGINT);
+	switch (match) {
 	case JsonoLayoutMatch::Current:
-		if (layout.kind == JsonoLayoutKind::Plain) {
-			return StringUtil::Format("jsono: plain, body revision %llu", (unsigned long long)layout.body_revision);
-		}
-		return StringUtil::Format("jsono: shredded, body revision %llu, shreds revision %llu, %llu shreds, %llu spill "
-		                          "column(s)",
-		                          (unsigned long long)layout.body_revision, (unsigned long long)layout.shreds_revision,
-		                          (unsigned long long)layout.shreds.size(), (unsigned long long)layout.spill_columns);
+		kind = layout.kind == JsonoLayoutKind::Plain ? "plain" : "shredded";
+		spill_columns = Value::UBIGINT(layout.spill_columns);
+		break;
 	case JsonoLayoutMatch::Foreign:
 		// Same wording source as the refusal itself, so the diagnosis and the error a read raises
 		// cannot describe the same value differently.
-		return StringUtil::Format("foreign: %s", JsonoDescribeForeignLayout(layout));
+		kind = "foreign";
+		reason_value = Value(JsonoDescribeForeignLayout(layout));
+		break;
 	default:
 		// A value of the CURRENT revision that fails the grammar is deliberately NOT refused at read
 		// time (it stays silent NotJsono — see MatchJsonoLayoutField), which is exactly the case this
@@ -586,8 +605,17 @@ string JsonoExplainLayoutMatch(const LogicalType &type) {
 		// extract reads NULL and to_json serializes the physical struct. The one exception is the
 		// malformed-NAME class, whose reads and conversions JsonoRejectMalformedAnchoredRead refuses
 		// with this same reason.
-		return StringUtil::Format("not jsono: %s", reason);
+		kind = "not jsono";
+		reason_value = Value(reason);
+		break;
 	}
+	child_list_t<Value> fields;
+	fields.emplace_back("kind", Value(kind));
+	fields.emplace_back("reason", std::move(reason_value));
+	fields.emplace_back("body_revision", revision(layout.body_revision));
+	fields.emplace_back("shreds_revision", revision(layout.shreds_revision));
+	fields.emplace_back("spill_columns", std::move(spill_columns));
+	return Value::STRUCT(std::move(fields));
 }
 
 string JsonoDescribeForeignLayout(const JsonoLayoutType &layout) {
@@ -832,7 +860,7 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 		// letting the executor short-circuit it would blank the diagnostic exactly on the all-NULL
 		// column someone is trying to explain.
 		ScalarFunctionSet set("jsono_layout_diagnose");
-		ScalarFunction diagnose({LogicalType::ANY}, LogicalType::VARCHAR, JsonoLayoutDiagnoseExecute,
+		ScalarFunction diagnose({LogicalType::ANY}, JsonoLayoutDiagnoseResultType(), JsonoLayoutDiagnoseExecute,
 		                        JsonoLayoutDiagnoseBind);
 		diagnose.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		set.AddFunction(std::move(diagnose));
