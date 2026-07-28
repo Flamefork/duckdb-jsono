@@ -1619,7 +1619,8 @@ unique_ptr<BaseStatistics> TryRecoverMultiFileColumnStats(ClientContext &context
 }
 
 // Decode one shredded-jsono statistics object against `type`'s own layout into the set of scalar
-// shred PATHS proven spill-clean by the two-valued marker + the spill-column statistics: all paths
+// shred LANE NAMES (the type's encoded field names, the key every rank is derived from) proven
+// spill-clean by the two-valued marker + the spill-column statistics: every lane
 // under marker min==max==clean-hash, per-bit decodes under identity-with-dirt (uniform mask word /
 // high bound — see CollectShredTotality). Shared by the scan-wide proof and the per-file proof (a
 // multi-file scan whose merged marker stats fail identity may still prove a lane by ANDing each
@@ -2710,19 +2711,19 @@ private:
 // at read time by the shred manifest stored in the residual (fail loud, not silent).
 //===--------------------------------------------------------------------===//
 
-// Reshred `column` (a plain or shredded jsono value) to the shred set of `target` through the
-// regular jsono(value, shredding := <const STRUCT>) bind, so the expression re-binds identically
-// on plan deserialization. The bind plans a single-pass reshred when every source shred survives
-// into the target; otherwise it routes through the lossless reconstruct cast itself. With no
-// shreds the plain reconstruct IS the target.
+// Reshred `column` (a plain or shredded jsono value) to the shred set of `target` through
+// __jsono_internal_reshred, whose bind decodes the lanes from `target` itself, so the expression
+// re-binds identically on plan deserialization. The bind plans a single-pass reshred when every
+// source shred survives into the target; otherwise it routes through the lossless reconstruct
+// cast itself. A plain `target` declares no lanes, so the plain reconstruct IS the target.
 unique_ptr<Expression> MakeReshredExpression(ClientContext &context, unique_ptr<Expression> column,
-                                             const child_list_t<LogicalType> &shreds, const LogicalType &target) {
+                                             const LogicalType &target) {
 	auto alias = column->GetAlias();
 	if (column->return_type == target) {
 		return column;
 	}
 	unique_ptr<Expression> result;
-	if (shreds.empty()) {
+	if (IsJsonoType(target)) {
 		result = BoundCastExpression::AddCastToType(context, std::move(column), JsonoType());
 	} else {
 		// The target rides in as a NULL constant OF the target type — the lanes are declared
@@ -2793,8 +2794,9 @@ void NormalizeShreddedCastsInExpression(ClientContext &context, unique_ptr<Expre
 	}
 	auto alias = expr->GetAlias();
 	auto target = cast.return_type;
-	// The reshred constructor canonicalizes shred order (sorted by path), so reshred to the
-	// canonical type first and let a reorder-only by-name cast produce the exact target type.
+	// The reshred constructor canonicalizes shred order (sorted by encoded lane name — which the
+	// order-preserving codec makes path order too, see SortedShreds), so reshred to the canonical
+	// type first and let a reorder-only by-name cast produce the exact target type.
 	auto canonical = SortedShreds(target_layout.shreds);
 	vector<JsonoLaneSpec> canonical_lanes;
 	canonical_lanes.reserve(canonical.size());
@@ -2802,7 +2804,7 @@ void NormalizeShreddedCastsInExpression(ClientContext &context, unique_ptr<Expre
 		canonical_lanes.push_back(JsonoLaneSpec {ShredNamePath(shred.first, "jsono cast normalization"), shred.second});
 	}
 	auto canonical_type = JsonoShreddedStructType(canonical_lanes);
-	auto replacement = MakeReshredExpression(context, std::move(cast.child), canonical, canonical_type);
+	auto replacement = MakeReshredExpression(context, std::move(cast.child), canonical_type);
 	if (canonical_type != target) {
 		replacement = BoundCastExpression::AddCastToType(context, std::move(replacement), target);
 	}

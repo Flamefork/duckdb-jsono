@@ -36,8 +36,8 @@ using namespace jsono;
 // Where one merged shred's lane sits in one input: the argument, and the field index inside that
 // input's `shreds` struct.
 struct LaneSource {
-	idx_t arg;
-	idx_t field;
+	idx_t arg = DConstants::INVALID_INDEX;
+	idx_t field = DConstants::INVALID_INDEX;
 };
 
 // The fast path's per-input facts: which arguments carry lanes, where each merged shred's lane sits
@@ -164,9 +164,14 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 			bound_function.arguments.push_back(JsonoType());
 			continue;
 		}
-		if (IsShreddedJsonoType(type)) {
-			JsonoLayoutType layout;
-			TryParseJsonoLayoutType(type, layout);
+		// One layout parse decides both branches: IsShreddedJsonoType/IsJsonoType would each re-parse
+		// the type, decoding every lane name again at bind.
+		JsonoLayoutType layout;
+		if (TryParseJsonoLayoutType(type, layout)) {
+			if (layout.kind != JsonoLayoutKind::Shredded) {
+				bound_function.arguments.push_back(JsonoType());
+				continue;
+			}
 			for (auto &layout_shred : layout.shreds) {
 				// Union by the shred path (the inputs may carry different shred sets).
 				auto &shred_name = layout_shred.first;
@@ -187,10 +192,6 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 				}
 			}
 			bound_function.arguments.push_back(type);
-			continue;
-		}
-		if (IsJsonoType(type)) {
-			bound_function.arguments.push_back(JsonoType());
 			continue;
 		}
 		// The bind is shared with jsono_overlay, so both diagnostics name the function actually called.
@@ -445,7 +446,10 @@ const MergeInputPlan &ResolveInputPlan(DataChunk &args, const vector<MergeShred>
 				if (shreds[k].name != lane.first) {
 					continue;
 				}
-				plan.lane_sources[k].push_back(LaneSource {i, JsonoFindShredsFieldIndex(shreds_type, lane.first)});
+				LaneSource source;
+				source.arg = i;
+				source.field = JsonoFindShredsFieldIndex(shreds_type, lane.first);
+				plan.lane_sources[k].push_back(source);
 				// A shred name declared with different types across inputs has incompatible lane
 				// layouts, so the per-row lane copy cannot stage its candidates together. The reshred
 				// fallback coerces every input to the merged (last-declared) type instead.
@@ -813,8 +817,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			auto &r_skips = writer.Skips();
 			auto skips_out = writer.data[BODY_SKIPS];
 			std::string skips_buf;
-			JsonoStrippedLanes stripped_lanes;
-			stripped_lanes.Init(bind_data.write.model);
+			JsonoStrippedLanes stripped_lanes(bind_data.write.model);
 			for (idx_t row = 0; row < count; row++) {
 				if (!result_validity.RowIsValid(row) || !fr_skips_validity.RowIsValid(row)) {
 					FlatVector::SetNull(r_skips, row, true);
@@ -829,7 +832,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 					}
 				}
 				if (!stripped_lanes.Empty()) {
-					JsonoAppendShredManifest(skips_buf, stripped_lanes);
+					JsonoAppendStrippedShredManifest(skips_buf, stripped_lanes);
 				}
 				skips_out[row] = WriteBlobInto(r_skips, skips_buf.data(), skips_buf.size());
 			}

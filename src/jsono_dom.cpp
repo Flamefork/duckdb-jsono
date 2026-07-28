@@ -673,14 +673,14 @@ void EmitDomRowDirect(yyjson_val *root, DomDirectState &state, JsonoBodyWriter &
 			SizeDomElement(root, state, 0);
 		}
 		shred->manifest.clear();
-		shred->stripped_lanes.Clear();
+		shred->stripped_lanes->Clear();
 		for (idx_t f = 0; f < shred->captures.size(); f++) {
 			if (shred->captures[f].stripped) {
-				shred->stripped_lanes.Mark(f);
+				shred->stripped_lanes->Mark(f);
 			}
 		}
-		if (!shred->stripped_lanes.Empty()) {
-			JsonoAppendShredManifest(shred->manifest, shred->stripped_lanes);
+		if (!shred->stripped_lanes->Empty()) {
+			JsonoAppendStrippedShredManifest(shred->manifest, *shred->stripped_lanes);
 		}
 	} else {
 		SizeDomElement(root, state, 0);

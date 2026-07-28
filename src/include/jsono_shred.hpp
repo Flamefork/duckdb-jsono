@@ -131,12 +131,6 @@ struct JsonoArrayShredSpec {
 // only has to render what is already there.
 bool ShredPathsOverlap(const vector<PathStep> &a, const vector<PathStep> &b);
 
-// One lane's manifest entry, ready to append: the length-prefixed logical path, the type code, and
-// for an object-array lane its element subfield list.
-struct JsonoShredManifestEntryBytes {
-	std::string bytes;
-};
-
 // Everything a per-row shred write reads that is a function of the shred SET alone, built once by
 // the bind that decided the set. None of it is cheap: building it decodes every lane name back to
 // its logical path and renders every lane type, so a per-chunk rebuild charges the whole shred set
@@ -163,7 +157,9 @@ struct JsonoShredManifestEntryBytes {
 // type's field names — writer and readers must rank the same string or the bits mean different lanes
 // on each side.
 struct JsonoShredWriteModel {
-	vector<JsonoShredManifestEntryBytes> entries;
+	// `entries[f]` is lane f's manifest entry, ready to append: the length-prefixed logical path,
+	// the type code, and for an object-array lane its element subfield list.
+	vector<std::string> entries;
 	vector<string> paths;
 	vector<idx_t> manifest_order;
 	vector<idx_t> spill_ranks;
@@ -180,13 +176,12 @@ JsonoShredWriteModel JsonoBuildShredWriteModel(const vector<std::pair<string, Lo
 // document — and loses only on a wide set over a sparse document, where it is still linear.
 struct JsonoStrippedLanes {
 	// Sized FROM the model it will be emitted against, and holding it: the marks are indexed by lane,
-	// so a set sized from anything else would mark the wrong lane. Passing the model here makes that
-	// agreement a property of construction instead of a check at the far end of the row write, where
-	// it could only fire after the mismatched Mark() had already run.
-	void Init(const JsonoShredWriteModel &model_p) {
-		model = &model_p;
-		marks.assign(model_p.entries.size(), 0);
-		any = false;
+	// so a set sized from anything else would mark the wrong lane. Requiring the model at
+	// construction makes that agreement a property of the type — there is no default-constructed
+	// state whose empty marks and null model a later Mark() or emit could trip over — and the
+	// emitter reads the model from here rather than being handed a second one to disagree with.
+	explicit JsonoStrippedLanes(const JsonoShredWriteModel &model_p)
+	    : model(model_p), marks(model_p.entries.size(), 0) {
 	}
 	void Clear() {
 		std::fill(marks.begin(), marks.end(), uint8_t(0));
@@ -201,19 +196,21 @@ struct JsonoStrippedLanes {
 		return !any;
 	}
 
-	// The model Init sized these against; the emitter reads it from here rather than being handed one
-	// separately, so there is no second model to disagree with.
-	const JsonoShredWriteModel *model = nullptr;
+	const JsonoShredWriteModel &model;
 	vector<uint8_t> marks;
 	bool any = false;
 	// Scratch for the manifest walk, held here so a per-row manifest write allocates nothing.
-	vector<const JsonoShredManifestEntryBytes *> selected;
+	vector<const std::string *> selected;
 };
 
-void JsonoAppendShredManifest(std::string &manifest, const JsonoShredWriteModel &model);
+// Appends the entries of ALL the model's lanes, in manifest order: the bind-time "hot manifest" a
+// one-pass writer stamps on every fully-stripped row.
+void JsonoAppendFullShredManifest(std::string &manifest, const JsonoShredWriteModel &model);
 
-// Appends the entries of the marked lanes, in manifest order.
-void JsonoAppendShredManifest(std::string &manifest, JsonoStrippedLanes &lanes);
+// Appends the entries of the MARKED lanes only, in manifest order. A distinct name on purpose: with
+// one overloaded name, a call handing `lanes.model` where `lanes` was meant still compiles and
+// silently claims every lane for a row that stripped a few.
+void JsonoAppendStrippedShredManifest(std::string &manifest, JsonoStrippedLanes &lanes);
 
 // One subfield lifted out of each array element into the LIST<STRUCT> shred column. `key` is the
 // element's JSON key — what the residual skeleton strips and what reconstruct and jsono_entries

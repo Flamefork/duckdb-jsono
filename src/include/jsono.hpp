@@ -909,8 +909,9 @@ inline void WalkShredManifestBytes(const char *data, size_t size, SINK &sink) {
 			continue;
 		}
 		// The subfield list is walked here for its bounds checks but handed on as ONE raw slice: the
-		// verify re-walks it only for a manifest tail it has not seen before (SameTail memoizes the
-		// rest), and the validate path must stay allocation-free.
+		// verify re-walks it only for a manifest tail it has not seen before
+		// (ShredManifestVerifier::TailMatches memoizes the rest), and the validate path must stay
+		// allocation-free.
 		auto block_start = cursor;
 		uint16_t subfield_count;
 		read_bytes(&subfield_count, sizeof(subfield_count));

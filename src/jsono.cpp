@@ -581,8 +581,10 @@ string JsonoExplainLayoutMatch(const LogicalType &type) {
 	default:
 		// A value of the CURRENT revision that fails the grammar is deliberately NOT refused at read
 		// time (it stays silent NotJsono — see MatchJsonoLayoutField), which is exactly the case this
-		// function exists to make visible: the read path will hand the value to core json, where an
-		// extract reads NULL and to_json serializes the physical struct.
+		// function exists to make visible: the read path hands the value to core json, where an
+		// extract reads NULL and to_json serializes the physical struct. The one exception is the
+		// malformed-NAME class, whose reads and conversions JsonoRejectMalformedAnchoredRead refuses
+		// with this same reason.
 		return StringUtil::Format("not jsono: %s", reason);
 	}
 }

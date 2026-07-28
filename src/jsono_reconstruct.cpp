@@ -304,7 +304,11 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		}
 		// No duplicate check: the lane name is a bijection on paths, so two lanes of one path are two
 		// STRUCT fields of one name — a type DuckDB cannot even build.
-		shreds.push_back(ReconShred {i, layout.shreds[i].second, std::move(steps)});
+		ReconShred shred;
+		shred.child = i;
+		shred.type = layout.shreds[i].second;
+		shred.steps = std::move(steps);
+		shreds.push_back(std::move(shred));
 	}
 	std::sort(shreds.begin(), shreds.end(), [](const ReconShred &a, const ReconShred &b) {
 		auto n = std::min(a.steps.size(), b.steps.size());

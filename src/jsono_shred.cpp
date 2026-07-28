@@ -896,8 +896,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const ShredWriteSet &write
 	}
 
 	std::string manifest;
-	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(write.model);
+	JsonoStrippedLanes stripped_lanes(write.model);
 
 	// The one-pass trie walk (trie != nullptr) reaches every scalar shred in one sorted-merge pass of
 	// the document, replacing the per-shred LocatePath loop. Its rank cache is sized to the bind-time
@@ -961,7 +960,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const ShredWriteSet &write
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, stripped_lanes);
+			JsonoAppendStrippedShredManifest(manifest, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, lstate.builder, manifest_ptr);
@@ -1360,8 +1359,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 	JsonoVectorData input;
 	InitJsonoVectorData(input_vec, count, input);
 	std::string manifest;
-	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(model);
+	JsonoStrippedLanes stripped_lanes(model);
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
@@ -1453,7 +1451,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			if (reads_merged && !stripped_lanes.Empty()) {
 				manifest.clear();
 				manifest.append(blob.skips.GetData(), blob.skips.GetSize());
-				JsonoAppendShredManifest(manifest, stripped_lanes);
+				JsonoAppendStrippedShredManifest(manifest, stripped_lanes);
 				writer.data[BODY_SKIPS][row] = WriteBlobInto(writer.Skips(), manifest.data(), manifest.size());
 			} else {
 				writer.data[BODY_SKIPS][row] =
@@ -1465,7 +1463,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, stripped_lanes);
+			JsonoAppendStrippedShredManifest(manifest, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		if (TryWriteFlatObjectStrippingPaths(view, lstate.strip_paths, lstate.flat_strip_positions,
@@ -1537,7 +1535,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 	jsono_dom::DomShredContext ctx;
 	ctx.nodes = &bind_data.trie;
 	ctx.kinds.resize(fields.size());
-	ctx.stripped_lanes.Init(bind_data.write.model);
+	ctx.stripped_lanes = make_uniq<JsonoStrippedLanes>(bind_data.write.model);
 	for (idx_t f = 0; f < fields.size(); f++) {
 		ctx.kinds[f] = fields[f].primitive;
 	}
@@ -1704,7 +1702,7 @@ void JsonoAppendShredManifestInternal(std::string &manifest, idx_t entry_count, 
 	uint32_t stored_count = uint32_t(entry_count);
 	manifest.append(reinterpret_cast<const char *>(&stored_count), sizeof(stored_count));
 	for (idx_t i = 0; i < entry_count; i++) {
-		manifest.append(entry_at(i).bytes);
+		manifest.append(entry_at(i));
 	}
 }
 
@@ -1732,17 +1730,16 @@ JsonoShredWriteModel JsonoBuildShredWriteModel(const vector<std::pair<string, Lo
 	for (idx_t f = 0; f < shreds.size(); f++) {
 		auto &entry = model.entries[f];
 		model.manifest_order[ranks[f]] = f;
-		AppendManifestLV(entry.bytes, model.paths[f]);
+		AppendManifestLV(entry, model.paths[f]);
 		if (!IsShredArrayType(shreds[f].second)) {
-			entry.bytes.push_back(
-			    char(ShredManifestCompactTypeCode(JsonoLaneLogicalType(shreds[f].second).ToString())));
+			entry.push_back(char(ShredManifestCompactTypeCode(JsonoLaneLogicalType(shreds[f].second).ToString())));
 			continue;
 		}
 		// An object-array lane spells its element subfields out, one length-prefixed (key, code) each,
 		// so a reader can tell "my subfield was dropped" from "another file's subfield was added beside
 		// mine". Keys ascending: the order is canonical, so two writers of the same element struct
 		// produce the same bytes and the common case stays a byte compare.
-		entry.bytes.push_back(char(jsono::SHRED_MANIFEST_TYPE_OBJECT_ARRAY));
+		entry.push_back(char(jsono::SHRED_MANIFEST_TYPE_OBJECT_ARRAY));
 		vector<std::pair<string, uint8_t>> subfields;
 		for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(shreds[f].second))) {
 			subfields.emplace_back(JsonoLaneSubfieldKey(sub.first, "jsono shred manifest"),
@@ -1755,32 +1752,31 @@ JsonoShredWriteModel JsonoBuildShredWriteModel(const vector<std::pair<string, Lo
 			throw InvalidInputException("jsono shred: too many element subfields for the manifest");
 		}
 		uint16_t subfield_count = uint16_t(subfields.size());
-		entry.bytes.append(reinterpret_cast<const char *>(&subfield_count), sizeof(subfield_count));
+		entry.append(reinterpret_cast<const char *>(&subfield_count), sizeof(subfield_count));
 		for (auto &subfield : subfields) {
-			AppendManifestLV(entry.bytes, subfield.first);
-			entry.bytes.push_back(char(subfield.second));
+			AppendManifestLV(entry, subfield.first);
+			entry.push_back(char(subfield.second));
 		}
 	}
 	return model;
 }
 
-void JsonoAppendShredManifest(std::string &manifest, const JsonoShredWriteModel &model) {
-	JsonoAppendShredManifestInternal(
-	    manifest, model.manifest_order.size(),
-	    [&](idx_t i) -> const JsonoShredManifestEntryBytes & { return model.entries[model.manifest_order[i]]; });
+void JsonoAppendFullShredManifest(std::string &manifest, const JsonoShredWriteModel &model) {
+	JsonoAppendShredManifestInternal(manifest, model.manifest_order.size(), [&](idx_t i) -> const std::string & {
+		return model.entries[model.manifest_order[i]];
+	});
 }
 
-void JsonoAppendShredManifest(std::string &manifest, JsonoStrippedLanes &lanes) {
-	auto &model = *lanes.model;
+void JsonoAppendStrippedShredManifest(std::string &manifest, JsonoStrippedLanes &lanes) {
+	auto &model = lanes.model;
 	lanes.selected.clear();
 	for (auto lane : model.manifest_order) {
 		if (lanes.marks[lane]) {
 			lanes.selected.push_back(&model.entries[lane]);
 		}
 	}
-	JsonoAppendShredManifestInternal(
-	    manifest, lanes.selected.size(),
-	    [&](idx_t i) -> const JsonoShredManifestEntryBytes & { return *lanes.selected[i]; });
+	JsonoAppendShredManifestInternal(manifest, lanes.selected.size(),
+	                                 [&](idx_t i) -> const std::string & { return *lanes.selected[i]; });
 }
 
 void ShredWriteSet::Build() {

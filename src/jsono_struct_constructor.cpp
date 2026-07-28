@@ -1559,7 +1559,7 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 		}
 		bound_function.return_type = JsonoShreddedStructType(lanes);
 		bind_data->write = JsonoBuildShredWriteSet(bind_data->shreds);
-		JsonoAppendShredManifest(bind_data->hot_manifest, bind_data->write.model);
+		JsonoAppendFullShredManifest(bind_data->hot_manifest, bind_data->write.model);
 
 		bind_data->one_pass_shred = true;
 		for (idx_t f = 0; f < bind_data->shreds.size(); f++) {
@@ -1871,8 +1871,7 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 	JsonoFillShredMarker(result, count);
 	auto &builder = lstate.builder;
 	vector<uint8_t> stripped(shred_count);
-	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(bind_data.write.model);
+	JsonoStrippedLanes stripped_lanes(bind_data.write.model);
 	std::string manifest;
 	for (idx_t row = 0; row < count; row++) {
 		if (ConstructorValueRowIsNull(input_data, row)) {
@@ -1935,7 +1934,7 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, stripped_lanes);
+			JsonoAppendStrippedShredManifest(manifest, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, builder, manifest_ptr);
@@ -2057,8 +2056,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 	string_t hot_blobs[BODY_BLOB_COUNT];
 
 	vector<uint8_t> stripped(shred_count);
-	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(bind_data.write.model);
+	JsonoStrippedLanes stripped_lanes(bind_data.write.model);
 	std::string manifest;
 	for (idx_t row = 0; row < count; row++) {
 		if (!parent_fmt.validity.RowIsValid(parent_fmt.sel->get_index(row))) {
@@ -2148,7 +2146,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			const std::string *manifest_ptr = nullptr;
 			if (!stripped_lanes.Empty()) {
 				manifest.clear();
-				JsonoAppendShredManifest(manifest, stripped_lanes);
+				JsonoAppendStrippedShredManifest(manifest, stripped_lanes);
 				manifest_ptr = &manifest;
 			}
 			writer.WriteRow(row, builder, manifest_ptr);
@@ -2208,7 +2206,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		const std::string *manifest_ptr = nullptr;
 		if (stripped_count > 0) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, stripped_lanes);
+			JsonoAppendStrippedShredManifest(manifest, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(row, builder, manifest_ptr);

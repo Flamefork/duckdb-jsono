@@ -312,7 +312,7 @@ struct DomShredContext {
 	// Per-row outputs: captures parallel to the shred fields, manifest = the row's serialized
 	// shred-manifest tail (empty when nothing was stripped).
 	std::vector<DomShredCapture> captures;
-	JsonoStrippedLanes stripped_lanes;
+	unique_ptr<JsonoStrippedLanes> stripped_lanes;
 	std::string manifest;
 };
 

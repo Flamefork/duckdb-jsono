@@ -1289,7 +1289,10 @@ void PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
 		auto &type = bind_shreds[i].second;
 		if (IsShredListType(type)) {
 			if (IsShredScalarArrayType(type) && steps.size() == 1) {
-				ReconShred shred {i, type, std::move(steps)};
+				ReconShred shred;
+				shred.child = i;
+				shred.type = type;
+				shred.steps = std::move(steps);
 				shred.manifest_path = JsonoLaneLogicalPath(name);
 				list_shreds.push_back(std::move(shred));
 				continue;
@@ -1297,7 +1300,10 @@ void PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
 			overlay_shreds.push_back(i);
 			continue;
 		}
-		ReconShred shred {i, type, std::move(steps)};
+		ReconShred shred;
+		shred.child = i;
+		shred.type = type;
+		shred.steps = std::move(steps);
 		shred.manifest_path = JsonoLaneLogicalPath(name);
 		scalar_shreds.push_back(std::move(shred));
 	}
@@ -1871,8 +1877,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	JsonoBuilder builder;
 	vector<const vector<PathStep> *> scalar_strip_paths;
 	vector<idx_t> stripped_child_indices;
-	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(bind_data.write.model);
+	JsonoStrippedLanes stripped_lanes(bind_data.write.model);
 	vector<idx_t> list_override_indices;
 	std::string manifest;
 	for (idx_t i = 0; i < count; i++) {
@@ -1970,7 +1975,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
 			manifest.clear();
-			JsonoAppendShredManifest(manifest, stripped_lanes);
+			JsonoAppendStrippedShredManifest(manifest, stripped_lanes);
 			manifest_ptr = &manifest;
 		}
 		writer.WriteRow(rid, builder, manifest_ptr);

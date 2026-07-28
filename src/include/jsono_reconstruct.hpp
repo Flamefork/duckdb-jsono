@@ -105,7 +105,7 @@ class ScalarFunction;
 // resolves only scalar lanes here and keeps LIST lanes in its own array-shred struct) and the keyed
 // group_merge direct fold (which stages LIST lanes in this struct too).
 struct ReconShred {
-	idx_t child;
+	idx_t child = DConstants::INVALID_INDEX;
 	LogicalType type;
 	vector<PathStep> steps; // object-key path; size 1 is a top-level key
 	// Manifest name of the path, filled only by the keyed fold (which rewrites the residual's shred

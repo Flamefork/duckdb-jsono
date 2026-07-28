@@ -280,7 +280,8 @@ SELECT count(*) FROM (
 0
 
 # A nested key with an embedded quote is JSONPath-quoted first (backslash escaping inside the
-# path step), then SQL-quoted as a struct key (quote doubling) — two distinct escaping layers.
+# path step), then escaped again as a JSON string key of the spec object — two distinct escaping
+# layers, both JSON-side; no SQL quote doubling is involved in a path.
 query I
 SELECT jsono_suggest_shredding(jsono('{"m":{"q\"uote":1}}'));
 ----
@@ -295,7 +296,8 @@ SELECT count(*) FROM (
 ----
 0
 
-# An object-array subfield name is a STRUCT field identifier in the type string — same doubling.
+# An object-array subfield name is different: it is a STRUCT field identifier inside SQL type
+# text, the one place SQL quote DOUBLING applies ("a""b").
 query I
 SELECT jsono_suggest_shredding(jsono('{"arr":[{"a\"b":1}]}'));
 ----
