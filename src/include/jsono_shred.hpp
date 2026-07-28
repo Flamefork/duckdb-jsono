@@ -44,8 +44,9 @@ enum class ShredKind : uint8_t { Scalar, Array, ScalarArray };
 // Bind validates shred types up front, so a miss here is a broken invariant, not user input.
 ShredKind ClassifyShredKind(const LogicalType &type);
 
-// The jsono(jsono, shredding := spec) overload, exposed so the optimizer's set-operation
-// normalization can reshred a branch to the merged shred set without a catalog lookup.
+// The public jsono(jsono, shredding := spec) overload: reshred an already-jsono value to the
+// spec's shred set. The optimizer does NOT go through it — its reshred is JsonoReshredFunction
+// below, declared by TYPE.
 ScalarFunction JsonoShredFromJsonoFunction();
 
 // __jsono_internal_reshred(value, target): the same reshred, but declaring its lanes by TYPE — the

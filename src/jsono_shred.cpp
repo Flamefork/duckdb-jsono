@@ -1905,13 +1905,12 @@ void JsonoShredFromLayout(Vector &input, idx_t count, const ShredWriteSet &write
 	ApplyShredFields(input, count, write, result, lstate);
 }
 
-// The jsono(jsono, shredding := spec) overload, exposed so the optimizer's cast normalization
-// can reshred a value to a target shred set without a catalog lookup. Declared on a generic
-// STRUCT so a shredded value reaches the bind natively: when every source shred survives into
-// the target the bind plans the single-pass reshred; otherwise it redeclares the argument as
-// plain JSONO and the binder's reconstruct cast feeds the plain shred path. The injected
-// expression binds through the regular JsonoShredBind (a constant STRUCT spec), so it re-binds
-// identically on plan deserialization.
+// The public jsono(jsono, shredding := spec) overload. Declared on a generic STRUCT so a shredded
+// value reaches the bind natively: when every source shred survives into the target the bind plans
+// the single-pass reshred; otherwise it redeclares the argument as plain JSONO and the binder's
+// reconstruct cast feeds the plain shred path. (The optimizer's own reshred is
+// JsonoReshredFunction below, declared by TYPE — a spec is text, and text cannot carry a
+// case-colliding element struct.)
 ScalarFunction JsonoShredFromJsonoFunction() {
 	ScalarFunction from_jsono("jsono", {LogicalTypeId::STRUCT, LogicalType::ANY}, LogicalType::ANY, JsonoShredExecute,
 	                          JsonoShredBind, nullptr, nullptr, ShredLocalState::Init);
