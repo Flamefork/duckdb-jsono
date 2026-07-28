@@ -128,8 +128,10 @@ non-zero padding bits, a truncated escape or an upper-case digit, and it refuses
 a key whose bytes are not valid UTF-8, since every lane path is a chain of JSON
 keys and no writer can mint a key the parser would not accept. (An embedded NUL
 *is* valid UTF-8 and stays supported.) A non-canonical name never decodes at all,
-so such a struct is silently *not JSONO*, the way recognition treats every
-unknown struct. `jsono_layout_diagnose(value)` explains which name failed and why.
+so such a struct is silently *not JSONO* to recognition, the way it treats every
+unknown struct — though JSON reads and JSONO conversions of a fully-anchored type
+carrying such a name are refused loudly (see [Layout revisions](#layout-revisions)).
+`jsono_layout_diagnose(value)` explains which name failed and why.
 
 The single layout name (`jsono` for both plain and shredded) and the nested
 `shreds` struct are both deliberate. DuckDB reconciles struct types by field
@@ -147,11 +149,11 @@ by-name cast silently *dropping* a shred when the optimizer is not running — i
 caught at read time by the shred manifest (below), not by the type system.
 
 Shreds are emitted in canonical order (sorted by name), so a constructed
-type is a pure function of the shred *set*: `jsono_storage_type(<shred DDL>)` and
+type is a pure function of the shred *set*: `jsono_storage_type(<spec>)` and
 the constructor produce the identical type for the same shreds regardless of the
 order they are listed in, so a column declared from one accepts a value built
 from the other.
-Shred `value` lanes stay scalar columns, so Parquet/DuckLake projection and
+Shred lanes stay bare scalar columns, so Parquet/DuckLake projection and
 filter pushdown act on them directly.
 
 **A merged type's field order is not canonical.** DuckDB merges two branches'
@@ -311,9 +313,9 @@ encoded names.
 Entries are self-describing — each carries its path and type inline — so a reader
 needs no external shred list to decode them. (Earlier revisions also
 defined layout-hash-keyed `indexed` and `bitset` tails that referenced the
-reader's own shred list; they were removed because they never beat the compact
-form on disk — their per-row bit-packing trades zstd-friendly repetition for high
-entropy, so Parquet + zstd compress the compact form smaller.)
+reader's own shred list; they were removed because they never beat this
+entry-list form on disk — their per-row bit-packing trades zstd-friendly
+repetition for high entropy, so Parquet + zstd compress the entry list smaller.)
 
 Entries are sorted by logical path, which is **not** the type's field order
 (that follows the encoded name, and the two genuinely differ: `$.a-c` sorts before
@@ -482,14 +484,17 @@ classes from there:
   `NULL`; the bytes are intact and one explicit cast to the correct lane type
   (`a BIGINT`) brings the whole document back. Declare storage columns with
   `jsono_storage_type(...)` and this cannot happen;
-- a **name**-level miss — a lane name that does not decode, inside a fully
-  anchored type (exact residual, `shreds$2`, marker and spill present) — is a
-  shape no legal write narrows into: generic round-trips change types and keep
-  names. The optimizer therefore *refuses the JSON reads* (`->>`, `->`,
-  `to_json`, `::JSON`) of such a type with the grammar's own reason instead of
-  letting the whole column silently answer `NULL`. Passthrough (`SELECT *`,
-  `COPY`), the raw `::VARCHAR` render and DDL stay open, so the bytes can be
-  moved and the offending field dropped
+- a **name**-level miss — a lane name (or an array lane's element subfield
+  name) that does not decode, inside a fully anchored type (exact residual,
+  `shreds$2`, marker and spill present) — is a shape no legal write narrows
+  into: generic round-trips change types and keep names. The optimizer
+  therefore *refuses the JSON reads* (`->>`, `->`, `to_json`, `::JSON`) of
+  such a type with the grammar's own reason instead of letting the whole
+  column silently answer `NULL`, and the constructor and cast binds refuse
+  the JSONO conversions (`jsono()`, a cast or `INSERT` into a JSONO column)
+  that would grind the document into a rebuild of its raw layout fields.
+  Passthrough (`SELECT *`, `COPY`), the raw `::VARCHAR` render and DDL stay
+  open, so the bytes can be moved and the offending field dropped
   (`test/sql/jsono_malformed_lane_read.test` pins both halves).
 
 Splitting `body$N` from `shreds$M` is what keeps a shred-layout change from
