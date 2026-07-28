@@ -1304,7 +1304,7 @@ void PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
 	// The four walkers below merge a row's manifest entries against these vectors with a single
 	// rising index, so both sequences must be in the SAME order — the manifest's, which is by logical
 	// path. That is NOT the shred order these were collected in (the type lists lanes by encoded
-	// name — a different permutation of the same lanes, see JsonoCanonicalRanks), and a set-op
+	// name — a different permutation of the same lanes, see JsonoRanksInByteOrder), and a set-op
 	// merged type is not even canonically ordered, so sort explicitly rather than inherit the field
 	// order.
 	auto by_manifest_path = [](const ReconShred &a, const ReconShred &b) {

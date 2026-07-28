@@ -1696,7 +1696,7 @@ void CollectSpillProvenPaths(const BaseStatistics &stats, const LogicalType &typ
 	for (auto &shred : layout.shreds) {
 		shred_names.push_back(shred.first);
 	}
-	auto spill_ranks = JsonoCanonicalRanks(shred_names);
+	auto spill_ranks = JsonoRanksInByteOrder(shred_names);
 	for (idx_t k = 0; k < layout.shreds.size(); k++) {
 		if (IsShredListType(layout.shreds[k].second)) {
 			continue; // array shreds are always reconstructed, never bare-read

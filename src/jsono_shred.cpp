@@ -1320,7 +1320,8 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 	for (auto &shred : src_layout.shreds) {
 		src_names.push_back(shred.first);
 	}
-	auto in_ranks = JsonoCanonicalRanks(src_names);
+	// Spill-bit numbering of the INPUT type: ranked over its encoded lane names.
+	auto in_ranks = JsonoRanksInByteOrder(src_names);
 	auto in_type_hash = int64_t(JsonoLayoutHashOf(input_vec.GetType()));
 	Vector &in_set_vec = JsonoShredSetVector(input_vec);
 	bool in_mask_readable = in_set_vec.GetType().id() == LogicalTypeId::BIGINT;
@@ -1724,12 +1725,14 @@ JsonoShredWriteModel JsonoBuildShredWriteModel(const vector<std::pair<string, Lo
 		model.paths.push_back(JsonoLaneLogicalPath(shred.first));
 		names.push_back(shred.first);
 	}
-	model.spill_ranks = JsonoCanonicalRanks(names);
-	// The manifest's own order, which is the logical-path order — NOT the lane order the shred set is
-	// listed in (the two are different permutations of the same lanes — see JsonoCanonicalRanks).
+	// Spill-bit numbering: the rank of the ENCODED lane name (what every reader recomputes from the
+	// stored type's field names).
+	model.spill_ranks = JsonoRanksInByteOrder(names);
+	// The manifest's own order, which is the LOGICAL-PATH order — NOT the lane order the shred set is
+	// listed in (the two are different permutations of the same lanes — see JsonoRanksInByteOrder).
 	// Reusing the rank helper keeps "rank == position in the byte-sorted list" spelled once;
 	// inverting the ranks turns it into the walk order every per-row write follows.
-	auto ranks = JsonoCanonicalRanks(model.paths);
+	auto ranks = JsonoRanksInByteOrder(model.paths);
 	model.entries.resize(shreds.size());
 	model.manifest_order.resize(shreds.size());
 	for (idx_t f = 0; f < shreds.size(); f++) {

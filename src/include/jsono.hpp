@@ -217,12 +217,13 @@ inline idx_t JsonoSpillColumnCount(idx_t shred_count) {
 uint64_t JsonoLayoutHashOf(const LogicalType &type);
 
 // The rank of each string in `names` (parallel vector): its position in the byte-wise sorted list.
-// Callers rank BOTH framings of a lane. Ranked over encoded lane names this is the spill-bit
-// numbering and the type's canonical field order — permutation-invariant, so a set-op reorder-only
-// cast (which keeps the order-independent set hash) cannot renumber the bits. Ranked over logical
-// paths it is the manifest's emission order, a genuinely different permutation of the same lanes;
-// the definition spells out why, and what the encoded-name order structurally is.
-vector<idx_t> JsonoCanonicalRanks(const vector<string> &names);
+// Nothing more — which order that IS belongs to what the caller ranks, and callers rank BOTH
+// framings of a lane. Ranked over encoded lane names this is the spill-bit numbering and the type's
+// canonical field order — permutation-invariant, so a set-op reorder-only cast (which keeps the
+// order-independent set hash) cannot renumber the bits. Ranked over logical paths it is the
+// manifest's emission order, a genuinely different permutation of the same lanes; the definition
+// spells out why, and what the encoded-name order structurally is.
+vector<idx_t> JsonoRanksInByteOrder(const vector<string> &names);
 
 // The one loud exception to "a current-revision grammar miss stays silent": when the miss is a
 // malformed LANE NAME inside a fully-anchored type (JsonoLayoutType::lane_name_malformed), every

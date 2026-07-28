@@ -146,11 +146,11 @@ struct JsonoShredManifestEntryBytes {
 //
 // `manifest_order` lists the lanes in the manifest's emission order, which is the logical-path order
 // and NOT the lane order (the two are different permutations of the same lanes — see
-// JsonoCanonicalRanks). It is the whole reason this is a table and not a bare vector: the write
+// JsonoRanksInByteOrder). It is the whole reason this is a table and not a bare vector: the write
 // loops reach lanes in their own order (field order, document order, tree order), so ordering the
 // manifest is a bind-time permutation walked per row, never a per-row sort.
 //
-// `spill_ranks[f]` is lane f's bit in the `$jsono$spill` bitmap (see JsonoCanonicalRanks). It is
+// `spill_ranks[f]` is lane f's bit in the `$jsono$spill` bitmap (see JsonoRanksInByteOrder). It is
 // the PHYSICAL name that ranks there, because every reader recomputes the ranks from the stored
 // type's field names — writer and readers must rank the same string or the bits mean different lanes
 // on each side.

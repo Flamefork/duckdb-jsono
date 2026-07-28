@@ -159,6 +159,29 @@ FROM (
 {"c":3,"b":2,"a":"x"}	1	1	{"a":"x","b":2,"c":3}
 {"c":3,"b":2,"a":1}	NULL	0	{"a":1,"b":2,"c":3}
 
+# Spill bits are numbered by rank over the ENCODED lane names; the manifest is emitted by rank over
+# the LOGICAL paths (JsonoBuildShredWriteModel computes both). Those are two different permutations
+# of the same lane set, and the block above cannot tell them apart: over single-key lanes like
+# a/b/c the two orders always coincide. This pair is the minimal divergence — encoded (structural,
+# step-sequence) order puts $.a.b FIRST, because its first step `a` is a proper prefix of the key
+# `a-c`; path-text order puts $.a-c first, because `-` (0x2D) sorts below the `.` separator (0x2E)
+# inside the text. So bit 0 = $.a.b and bit 1 = $.a-c, while the manifest says $.a-c, $.a.b.
+# Swapping the two rank calls keeps every same-order fixture in the suite green and silently
+# renumbers these bits: a read then trusts an "always clean" bit that belongs to the OTHER lane and
+# folds the diverted row's lane read into a bare struct_extract — NULL instead of the value.
+query IIIII
+SELECT d, j.jsono."shreds$2"."$jsono$spill$0" AS mask,
+       j ->> '$."a-c"' AS ac, j ->> '$.a.b' AS ab, to_json(j)::VARCHAR AS rt
+FROM (SELECT d, jsono(d, shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS j FROM (VALUES
+  ('{"a-c":{"z":1},"a":{"b":"y"}}'),
+  ('{"a-c":"x","a":{"b":{"q":2}}}'),
+  ('{"a-c":"x","a":{"b":"y"}}')
+) t(d)) ORDER BY d;
+----
+{"a-c":"x","a":{"b":"y"}}	NULL	x	y	{"a":{"b":"y"},"a-c":"x"}
+{"a-c":"x","a":{"b":{"q":2}}}	1	x	{"q":2}	{"a":{"b":{"q":2}},"a-c":"x"}
+{"a-c":{"z":1},"a":{"b":"y"}}	2	{"z":1}	y	{"a":{"b":"y"},"a-c":{"z":1}}
+
 # A SQL-NULL row nulls the whole value, marker and spill columns included.
 query III
 SELECT v IS NULL, v.jsono."shreds$2"."$jsono$set" IS NULL, v.jsono."shreds$2"."$jsono$spill$0" IS NULL

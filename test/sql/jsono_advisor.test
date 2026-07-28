@@ -386,7 +386,8 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
 ----
 [{"path":"$.items","type":"STRUCT(n BIGINT)[]","lane_rate":0.5,"divert_rate":0.25}]
 
-# Multiple shreds report in sorted path order.
+# Multiple shreds report in the type's lane order (sorted by encoded name; for single-key lanes
+# like these that is also path order).
 query I
 SELECT to_json(jsono_shred_stats(j)) FROM (
   SELECT jsono(d, shredding := '{"a": "BIGINT", "name": "VARCHAR"}') AS j FROM (VALUES
@@ -396,6 +397,24 @@ SELECT to_json(jsono_shred_stats(j)) FROM (
 );
 ----
 [{"path":"$.a","type":"BIGINT","lane_rate":1.0,"divert_rate":0.0},{"path":"$.name","type":"VARCHAR","lane_rate":1.0,"divert_rate":0.0}]
+
+# The stats reader derives each lane's spill-bit rank itself, a third derivation beside the
+# writer's and the optimizer's. The pair below is the one whose two orders diverge (see the
+# divergent-pair block in jsono_layout_golden.test): encoded-name order puts $.a.b first,
+# path-text order $.a-c. The rates are asymmetric on purpose — ranking by path instead of by
+# encoded name reads each lane's divert decision off the OTHER lane's spill bit and zeroes both
+# divert_rates here, while every same-order fixture above stays green.
+query I
+SELECT to_json(jsono_shred_stats(j)) FROM (
+  SELECT jsono(d, shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS j FROM (VALUES
+    ('{"a-c":"x","a":{"b":{"q":2}}}'),
+    ('{"a-c":"x","a":{"b":"y"}}'),
+    ('{"a-c":"x","a":{"b":{"q":3}}}'),
+    ('{"a-c":{"z":1},"a":{"b":"y"}}')
+  ) AS t(d)
+);
+----
+[{"path":"$.a.b","type":"VARCHAR","lane_rate":0.5,"divert_rate":0.5},{"path":"$.a-c","type":"VARCHAR","lane_rate":0.75,"divert_rate":0.25}]
 
 # An explicit JSON null keeps a complete NULL lane (it reads back as `->>` NULL) and lives in the
 # residual as null — it is NOT a divert. Here row `null` does not count toward

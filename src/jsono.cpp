@@ -734,7 +734,7 @@ idx_t JsonoFindShredsFieldIndex(const LogicalType &shreds_type, const string &na
 // in and is not the same permutation (`$.a-c` precedes `$.a.b` as text, follows it structurally).
 // The structural equality is a property of THAT serialization, not of encoding in general: re-verify
 // it first if the codec ever changes.
-vector<idx_t> JsonoCanonicalRanks(const vector<string> &names) {
+vector<idx_t> JsonoRanksInByteOrder(const vector<string> &names) {
 	vector<idx_t> order(names.size());
 	for (idx_t i = 0; i < names.size(); i++) {
 		order[i] = i;
