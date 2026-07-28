@@ -29,29 +29,30 @@ enum class JsonoRowState : uint8_t { Null, Empty, Value };
 // that build lands on every input of every chunk and is measurable against the whole operator. An
 // operator therefore keeps one of these per input in its local state, across chunks.
 //
-// Identity is the type's ExtraTypeInfo, HELD as a shared_ptr rather than compared as a bare address:
-// an expression's argument type outlives the operator, so a bare address would answer correctly
-// today, but a freed-and-reused address would be a false HIT — signatures of some other shred set,
-// i.e. the manifest check silently verifying against the wrong lanes. Holding the info makes the
-// address non-reusable, so the property is enforced instead of argued. A miss only rebuilds.
+// Identity is the LogicalType itself, compared by value (for a STRUCT the fast case is still one
+// pointer compare on the shared type info). Keying on the ExtraTypeInfo ADDRESS was wrong for every
+// type whose aux info is null — SQLNULL, VARCHAR, any scalar — where two different such types
+// compared equal; that answered correctly only through a second file's reasoning (no aux ⇒ not
+// shredded ⇒ both signature sets empty), which a new caller had no way to know it depended on.
 //
-// The returned reference is valid until this cache is asked about a different type.
+// A miss builds a NEW vector and hands out shared ownership: whatever a verifier captured from a
+// previous answer stays alive and immutable for as long as it is held, so re-resolving an input can
+// never swap the lanes out from under an un-reset memo.
 class JsonoShredSignatures {
 public:
-	const std::vector<JsonoShredSignature> &For(const LogicalType &type) {
-		auto info = type.GetAuxInfoShrPtr();
-		if (!built_ || info.get() != cached_info_.get()) {
-			JsonoBuildShredSignatures(type, signatures_);
-			cached_info_ = std::move(info);
-			built_ = true;
+	const shared_ptr<const std::vector<JsonoShredSignature>> &For(const LogicalType &type) {
+		if (!signatures_ || type != cached_type_) {
+			auto built = make_shared_ptr<std::vector<JsonoShredSignature>>();
+			JsonoBuildShredSignatures(type, *built);
+			signatures_ = std::move(built);
+			cached_type_ = type;
 		}
 		return signatures_;
 	}
 
 private:
-	std::vector<JsonoShredSignature> signatures_;
-	shared_ptr<ExtraTypeInfo> cached_info_;
-	bool built_ = false;
+	shared_ptr<const std::vector<JsonoShredSignature>> signatures_;
+	LogicalType cached_type_;
 };
 
 // Memoized shred-manifest verification (the check itself is VerifyShredManifestEntries).
@@ -67,24 +68,25 @@ public:
 	// decode happens once rather than per chunk.
 	void InitFromType(const LogicalType &type) {
 		ResetMemo();
-		external_ = nullptr;
+		external_.reset();
 		JsonoBuildShredSignatures(type, owned_);
 	}
 
-	// Signatures owned by a longer-lived cache. The reference must outlive the reader, and it is only
-	// valid until that cache is asked about a different type — JsonoShredSignatures::For rebuilds in
-	// place, so an operator holding this must re-init whenever it re-resolves its input.
-	void InitSignaturesRef(const std::vector<JsonoShredSignature> &signatures) {
+	// Signatures shared with a longer-lived cache, HELD: JsonoShredSignatures::For allocates a new
+	// vector on every miss, so what this verifier captured stays alive and immutable however the
+	// cache moves on — there is no window where a re-resolved input silently swaps the lanes under
+	// this verifier's memo.
+	void InitSignaturesRef(shared_ptr<const std::vector<JsonoShredSignature>> signatures) {
 		ResetMemo();
 		owned_.clear();
-		external_ = &signatures;
+		external_ = std::move(signatures);
 	}
 
 	// Signatures supplied by the caller (__jsono_internal_checked_residual receives them as plan
 	// constants); the paths must be the same canonical logical form InitFromType decodes to.
 	void InitSignatures(std::vector<JsonoShredSignature> signatures) {
 		ResetMemo();
-		external_ = nullptr;
+		external_.reset();
 		owned_ = std::move(signatures);
 	}
 
@@ -118,8 +120,7 @@ private:
 	// memoization keys on the manifest tail ALONE — two rows with byte-equal tails skip re-verifying —
 	// which is sound only within one set of signatures. Leaving it across an Init would bless a row of
 	// the new input against the lanes of the old one, silently, in the mechanism that exists to fail
-	// loud. InitSignaturesRef documents re-init as a supported operation (JsonoShredSignatures::For
-	// rebuilds in place), so this is the contract that makes that safe rather than a guard.
+	// loud.
 	void ResetMemo() {
 		tail_.clear();
 		entries_.clear();
@@ -146,7 +147,7 @@ private:
 		return tail.size() == tail_.size() && std::memcmp(tail.data(), tail_.data(), tail.size()) == 0;
 	}
 
-	const std::vector<JsonoShredSignature> *external_ = nullptr;
+	shared_ptr<const std::vector<JsonoShredSignature>> external_;
 	std::vector<JsonoShredSignature> owned_;
 	std::string tail_;
 	std::vector<ShredManifestEntry> entries_;
@@ -199,6 +200,23 @@ inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathSt
 	}
 }
 
+// How a reader treats a row's shred manifest. One value per meaningful state — the two bools this
+// replaces (`verify_on_read_`, `prefetch_`) spanned four states of which only three meant anything,
+// and every policy consumer switches over this enum, so a fourth policy fails compilation
+// (-Werror=switch) at each place that must decide for it instead of inheriting a leftover bool
+// combination.
+enum class ReadPolicy : uint8_t {
+	// Verify every manifested row whole-document (the default): each manifest entry must name a
+	// shred the input's type carries.
+	WholeDocument,
+	// No whole-document verify — the read checks only the two outcomes where a stripped value would
+	// silently change ITS result (CheckPathMiss / CheckContainerRead) — plus a per-row stream
+	// prefetch, since point walkers touch the streams densely anyway.
+	PointRead,
+	// No verification at all (jsono_overlay's fold: its residual was verified upstream).
+	Trusted,
+};
+
 // The row-read layer: every operator that decodes JSONO values reads rows through this object,
 // which bundles the strict row read, the header parse and the shred-manifest check — the
 // "every reader verifies the manifest" invariant (docs/jsono_format.md) holds by construction
@@ -207,54 +225,45 @@ inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathSt
 // not a lossy read.
 class JsonoRowReader {
 public:
-	// Whole-document policy (the default): every manifest entry must name a shred `input`'s
-	// type carries (a plain type carries none, so any manifest fails loud as a narrowed row).
+	// ReadPolicy::WholeDocument (a plain type carries no shreds, so any manifest fails loud as a
+	// narrowed row).
 	void Init(Vector &input, idx_t count) {
-		ResetPolicy();
+		Reset(ReadPolicy::WholeDocument);
 		InitJsonoVectorData(input, count, data_);
 		verifier_.InitFromType(input.GetType());
-		verify_on_read_ = true;
 	}
 
 	// Same policy, but with the signatures kept in an operator-lifetime cache so the per-lane decode
-	// happens once instead of on every chunk. `cache` must outlive this reader.
+	// happens once instead of on every chunk.
 	void Init(Vector &input, idx_t count, JsonoShredSignatures &cache) {
-		ResetPolicy();
+		Reset(ReadPolicy::WholeDocument);
 		InitJsonoVectorData(input, count, data_);
 		verifier_.InitSignaturesRef(cache.For(input.GetType()));
-		verify_on_read_ = true;
 	}
 
 	// Whole-document policy with caller-supplied signatures
 	// (__jsono_internal_checked_residual receives them as plan constants).
 	void Init(Vector &input, idx_t count, std::vector<JsonoShredSignature> signatures) {
-		ResetPolicy();
+		Reset(ReadPolicy::WholeDocument);
 		InitJsonoVectorData(input, count, data_);
 		verifier_.InitSignatures(std::move(signatures));
-		verify_on_read_ = true;
 	}
 
-	// Point-read policy (extract / introspect / match / project): these legitimately read a
-	// manifested residual the optimizer handed over (the rewrite routes only non-covered paths
-	// here), so Read() does not verify whole-document. The reader instead checks the two
-	// outcomes where a stripped value would silently change the result — a path miss and a
-	// whole-container read — via CheckPathMiss / CheckContainerRead. Point reads also prefetch
-	// the row's streams (bulk walkers touch them densely anyway).
+	// ReadPolicy::PointRead (extract / introspect / match / project): these legitimately read a
+	// manifested residual the optimizer handed over — the rewrite routes only non-covered paths
+	// here.
 	void InitPointRead(Vector &input, idx_t count) {
-		ResetPolicy();
+		Reset(ReadPolicy::PointRead);
 		InitJsonoVectorData(input, count, data_);
-		verify_on_read_ = false;
-		prefetch_ = true;
 	}
 
-	// No verification at all. The single sanctioned caller is jsono_overlay's fold: its
-	// residual input legitimately carries a manifest that __jsono_internal_checked_residual
-	// already verified upstream, and the overlay's job is precisely to refill those stripped
-	// paths from the shreds.
+	// ReadPolicy::Trusted. The single sanctioned caller is jsono_overlay's fold: its residual
+	// input legitimately carries a manifest that __jsono_internal_checked_residual already
+	// verified upstream, and the overlay's job is precisely to refill those stripped paths from
+	// the shreds.
 	void InitTrusted(Vector &input, idx_t count) {
-		ResetPolicy();
+		Reset(ReadPolicy::Trusted);
 		InitJsonoVectorData(input, count, data_);
-		verify_on_read_ = false;
 	}
 
 	// Always-inline: this wraps the per-row hot path of every reader (extract, match,
@@ -287,8 +296,19 @@ public:
 	}
 
 	// The verified manifest entries of the row just read (the reshred writer carries the
-	// stripped state of kept shreds over to its output manifest).
+	// stripped state of kept shreds over to its output manifest). Only the whole-document policy
+	// verifies and collects entries; under any other policy the verifier's answer for a manifested
+	// row would be the EMPTY list, which reads as "nothing was stripped" — a confident wrong
+	// answer — so asking is a caller bug. The switch has no default on purpose: a fourth policy
+	// must decide its answer here before it compiles.
 	const std::vector<ShredManifestEntry> &RowManifest(const JsonoView &view) {
+		switch (policy_) {
+		case ReadPolicy::PointRead:
+		case ReadPolicy::Trusted:
+			throw InternalException("jsono: RowManifest requires the whole-document read policy");
+		case ReadPolicy::WholeDocument:
+			break;
+		}
 		return verifier_.VerifiedEntries(view);
 	}
 
@@ -306,25 +326,25 @@ private:
 		bool ok = false;
 	};
 
-	// Every Init begins here: a re-init is a new input, and both the policy flags and the cover memos
-	// (keyed by manifest tail plus a `steps` ADDRESS, which a new call site can reuse) describe the old
-	// one. Carrying either over would answer a question about the new input with the old input's proof.
-	void ResetPolicy() {
-		verify_on_read_ = true;
-		prefetch_ = false;
+	// Every Init begins here: a re-init is a new input, and both the policy and the cover memos
+	// (keyed by manifest tail plus a `steps` ADDRESS, which a new call site can reuse) describe the
+	// old one. Carrying either over would answer a question about the new input with the old
+	// input's proof.
+	void Reset(ReadPolicy policy) {
+		policy_ = policy;
 		miss_memo_ = CoverMemo();
 		container_memo_ = CoverMemo();
 	}
 
 	JSONO_ALWAYS_INLINE JsonoRowState ParseAndVerify(const JsonoBlobRow &blob, JsonoView &view) {
 		view = MakeJsonoView(blob);
-		if (prefetch_) {
+		if (policy_ == ReadPolicy::PointRead) {
 			PrefetchJsonoRowStreams(blob);
 		}
 		if (!view.ParseHeader() || view.Slots() == 0) {
 			return JsonoRowState::Empty;
 		}
-		if (verify_on_read_) {
+		if (policy_ == ReadPolicy::WholeDocument) {
 			verifier_.Verify(view);
 		}
 		return JsonoRowState::Value;
@@ -348,8 +368,7 @@ private:
 
 	JsonoVectorData data_;
 	ShredManifestVerifier verifier_;
-	bool verify_on_read_ = true;
-	bool prefetch_ = false;
+	ReadPolicy policy_ = ReadPolicy::WholeDocument;
 	CoverMemo miss_memo_;
 	CoverMemo container_memo_;
 	std::vector<ShredManifestEntry> manifest_scratch_;

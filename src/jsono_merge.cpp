@@ -50,10 +50,12 @@ struct MergeInputPlan {
 	vector<idx_t> plain_inputs;              // arguments carrying a residual but no lanes (SQLNULL excluded)
 	vector<vector<LaneSource>> lane_sources; // per merged shred, in argument order
 	bool lane_types_agree = true;            // a shred declared with one type by every input that has it
-	// The argument types this plan was resolved against, HELD (see JsonoShredSignatures for why a bare
-	// address would make a freed-and-reused one a false hit — here that would read lanes at another
-	// type's field indices).
-	vector<shared_ptr<ExtraTypeInfo>> resolved_for;
+	// The argument types this plan was resolved against, compared by VALUE. An ExtraTypeInfo
+	// address is no identity for the types without one — SQLNULL, VARCHAR, any scalar all carry
+	// nullptr, so two different such types would compare equal, and a stale hit here reads lanes at
+	// another type's field indices. For a STRUCT the equality's fast case is still one pointer
+	// compare, and the resolve runs once per chunk.
+	vector<LogicalType> resolved_for;
 };
 
 struct JsonoMergeLocalState : public FunctionLocalState {
@@ -410,14 +412,14 @@ bool ResidualConflictsWithScalarArrayShredPath(const JsonoView &view, const vect
 }
 
 // Resolve `plan` against the argument types unless it already is. A bound expression's argument
-// types never change between chunks, so this rebuilds exactly once; keying it on the type's
-// ExtraTypeInfo (the same key JsonoShredSignatures uses) means a plan is never reused across a type
+// types never change between chunks, so this rebuilds exactly once; keying it on the types
+// themselves (the same key JsonoShredSignatures uses) means a plan is never reused across a type
 // it was not resolved against, rather than trusting the caller to notice.
 const MergeInputPlan &ResolveInputPlan(DataChunk &args, const vector<MergeShred> &shreds, MergeInputPlan &plan) {
 	idx_t ncols = args.ColumnCount();
 	bool resolved = plan.resolved_for.size() == ncols;
 	for (idx_t i = 0; i < ncols && resolved; i++) {
-		resolved = plan.resolved_for[i].get() == args.data[i].GetType().AuxInfo().get();
+		resolved = plan.resolved_for[i] == args.data[i].GetType();
 	}
 	if (resolved) {
 		return plan;
@@ -429,7 +431,7 @@ const MergeInputPlan &ResolveInputPlan(DataChunk &args, const vector<MergeShred>
 	plan.resolved_for.resize(ncols);
 	for (idx_t i = 0; i < ncols; i++) {
 		auto &type = args.data[i].GetType();
-		plan.resolved_for[i] = type.GetAuxInfoShrPtr();
+		plan.resolved_for[i] = type;
 		JsonoLayoutType layout;
 		if (!TryParseJsonoLayoutType(type, layout) || layout.kind != JsonoLayoutKind::Shredded) {
 			// A SQLNULL argument carries neither a residual nor lanes; every other input here is plain
