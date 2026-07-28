@@ -1519,8 +1519,11 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 	(void)context;
 	auto &input_type = arguments[0]->return_type;
 	// A foreign-layout value is a JSONO value we cannot read, not an ordinary struct to wrap into a
-	// document — refuse it instead of building a document out of its blob columns.
+	// document — refuse it instead of building a document out of its blob columns. Same for a
+	// misnamed-lane value of the current revision: it would fall through to
+	// BuildStructConstructorPlan below and be ground into a document of its raw layout fields.
 	JsonoRejectForeignLayout(input_type, "jsono()");
+	JsonoRejectMalformedAnchoredRead(input_type);
 	auto plan = BuildStructConstructorPlan(input_type, "jsono()");
 	idx_t next_key_cache_index = 0;
 	AssignStructConstructorKeyCacheIndexes(plan, next_key_cache_index);
@@ -2305,6 +2308,10 @@ BoundCastInfo JsonoStructCastBind(BindCastInput &input, const LogicalType &sourc
 	(void)input;
 	(void)target;
 	JsonoRejectForeignLayout(source, "cast to JSONO");
+	// A misnamed-lane value of the current revision matches neither branch below and would be
+	// ground into a document by the struct-constructor fallback — the INSERT ... SELECT into a
+	// plain JSONO column goes through exactly this cast.
+	JsonoRejectMalformedAnchoredRead(source);
 	if (IsShreddedJsonoType(source)) {
 		// A shredded value reaching a plain-JSONO context (cast or INSERT): reconstruct the
 		// full value so the shred data is preserved rather than dropped.

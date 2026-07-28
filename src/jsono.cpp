@@ -519,7 +519,12 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 			return RejectNotJsono(reason, "shred '%s' is %s, which is not a shred value type or LIST of one",
 			                      shred_fields[i].first, shred_fields[i].second.ToString());
 		}
+		// An element subfield is a lane name one level down, minted by the same codec
+		// (JsonoEncodeLaneSubfieldName) — so a non-decoding subfield name marks the same
+		// NAME-level class as a non-decoding lane name: a legal generic write narrows subfield
+		// TYPES and keeps subfield NAMES.
 		if (!ShredSubfieldNamesAreCanonical(value_type)) {
+			out.lane_name_malformed = true;
 			return RejectNotJsono(reason,
 			                      "array shred '%s' has an element subfield whose name is not the base32hex "
 			                      "encoding of a single object key",
@@ -600,16 +605,18 @@ string JsonoDescribeForeignLayout(const JsonoLayoutType &layout) {
 	                          (unsigned long long)JSONO_BODY_REVISION, (unsigned long long)JSONO_SHREDS_REVISION);
 }
 
-void JsonoRejectMalformedAnchoredJsonRead(const LogicalType &type) {
+void JsonoRejectMalformedAnchoredRead(const LogicalType &type) {
 	JsonoLayoutType layout;
 	string reason;
 	if (MatchJsonoLayoutType(type, layout, &reason) != JsonoLayoutMatch::NotJsono || !layout.lane_name_malformed) {
 		return;
 	}
-	throw BinderException("jsono: this column carries the current jsono layout anchor, but %s. Reading it as JSON "
-	                      "would silently answer NULL for every path, so it is refused. The value bytes are intact: "
-	                      "drop or rename the offending field (ALTER TABLE ... DROP COLUMN) to recover, and declare "
-	                      "lanes with the encoded name jsono_storage_type(<spec>) prints. jsono_layout_diagnose(...) "
+	throw BinderException("jsono: this column carries the current jsono layout anchor, but %s. Reading it would "
+	                      "silently treat it as an ordinary struct: a JSON read answers NULL for every path, and a "
+	                      "JSONO conversion (jsono(), a cast, an INSERT into a JSONO column) rebuilds the document "
+	                      "out of the raw layout fields — so it is refused. The value bytes are intact: drop or "
+	                      "rename the offending field (ALTER TABLE ... DROP COLUMN) to recover, and declare lanes "
+	                      "with the encoded name jsono_storage_type(<spec>) prints. jsono_layout_diagnose(...) "
 	                      "gives this diagnosis in SQL",
 	                      reason);
 }

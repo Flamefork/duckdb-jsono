@@ -67,3 +67,75 @@ query III
 SELECT j ->> 'a', j ->> 'z', j ->> 'b' FROM t;
 ----
 v1	1	NULL
+
+# The same class one level down: an array lane's element SUBFIELD name is minted by the same codec,
+# and a legal generic write narrows subfield TYPES while keeping subfield NAMES — so a non-decoding
+# subfield name is the same no-legal-writer shape as a non-decoding lane name, marked and refused
+# the same way (here "nm!" beside the canonical d5i0000/…).
+statement ok
+CREATE TABLE sub_src AS SELECT jsono('{"items":[{"id":1,"nm":"a"}],"k":1}',
+  shredding := '{"$.items": "STRUCT(id BIGINT, nm VARCHAR)[]"}') AS j;
+
+statement ok
+CREATE TABLE sub_bad AS SELECT CAST(j AS STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB,
+  string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
+  "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT,
+  d5q6arbj0000 STRUCT(d5i0000 BIGINT, "nm!" VARCHAR)[])))) AS j FROM sub_src;
+
+statement error
+SELECT j ->> 'k' FROM sub_bad;
+----
+array shred 'd5q6arbj0000' has an element subfield
+
+statement error
+SELECT to_json(j) FROM sub_bad;
+----
+array shred 'd5q6arbj0000' has an element subfield
+
+statement error
+SELECT j::JSON FROM sub_bad;
+----
+array shred 'd5q6arbj0000' has an element subfield
+
+# Passthrough and the raw render stay open here too.
+query I
+SELECT (j::VARCHAR) IS NOT NULL FROM sub_bad;
+----
+true
+
+# A JSONO conversion of a misnamed value is refused like the JSON reads: jsono() and the cast to
+# JSONO would treat it as an ordinary struct and rebuild the document out of the raw layout fields.
+# The INSERT ... SELECT into a plain JSONO column matters most: it LOOKS like the "move the bytes"
+# recovery the read error recommends, but it goes through exactly that cast and would destroy the
+# data irreversibly.
+statement ok
+CREATE TABLE lane_src AS SELECT jsono('{"a":1,"b":"x"}', shredding := '{"$.a": "BIGINT"}') AS j;
+
+statement ok
+CREATE TABLE lane_bad AS SELECT CAST(j AS STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB,
+  string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
+  "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.a" BIGINT)))) AS j FROM lane_src;
+
+statement error
+SELECT jsono(j) FROM lane_bad;
+----
+field '$.a' is not a shred lane
+
+statement ok
+CREATE TABLE plain_target AS SELECT jsono('{}') AS v LIMIT 0;
+
+statement error
+INSERT INTO plain_target SELECT j FROM lane_bad;
+----
+field '$.a' is not a shred lane
+
+# The subfield-level miss refuses the conversions too.
+statement error
+SELECT jsono(j) FROM sub_bad;
+----
+array shred 'd5q6arbj0000' has an element subfield
+
+statement error
+INSERT INTO plain_target SELECT j FROM sub_bad;
+----
+array shred 'd5q6arbj0000' has an element subfield

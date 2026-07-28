@@ -2098,7 +2098,7 @@ protected:
 				rewritten->SetAlias(alias);
 				return rewritten;
 			}
-			JsonoRejectMalformedAnchoredJsonRead(expr.children[0]->return_type);
+			JsonoRejectMalformedAnchoredRead(expr.children[0]->return_type);
 		}
 		// Path extraction off a shredded value.
 		if (IsExtractFunction(expr.function.name) && expr.children.size() == 2) {
@@ -2158,7 +2158,7 @@ protected:
 			}
 			// The `->>`/`->` operators over such a type reach here too: the binder routes them through
 			// core json's CAST(struct AS JSON), which this visit sees.
-			JsonoRejectMalformedAnchoredJsonRead(expr.child->return_type);
+			JsonoRejectMalformedAnchoredRead(expr.child->return_type);
 		}
 		return nullptr;
 	}

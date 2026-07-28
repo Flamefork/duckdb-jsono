@@ -224,14 +224,19 @@ uint64_t JsonoLayoutHashOf(const LogicalType &type);
 // the definition spells out why, and what the encoded-name order structurally is.
 vector<idx_t> JsonoCanonicalRanks(const vector<string> &names);
 
-// The one loud read-path exception to "a current-revision grammar miss stays silent": when the miss
-// is a malformed LANE NAME inside a fully-anchored type (JsonoLayoutType::lane_name_malformed), a
-// JSON read (`->>`, `->`, to_json, ::JSON) would silently answer NULL for every path — including
-// paths in intact lanes and in the residual — and serialize the raw struct: a whole column going
-// dark over one catalog typo. The optimizer calls this where it declined a shredded rewrite; it is
-// a no-op for every other type and throws the grammar's own reason for this one. Passthrough
-// (SELECT *, COPY), ::VARCHAR and DDL stay untouched, so backup and recovery (DROP COLUMN) work.
-void JsonoRejectMalformedAnchoredJsonRead(const LogicalType &type);
+// The one loud exception to "a current-revision grammar miss stays silent": when the miss is a
+// malformed LANE NAME inside a fully-anchored type (JsonoLayoutType::lane_name_malformed), every
+// consumer that interprets the document would treat the value as an ordinary struct. A JSON read
+// (`->>`, `->`, to_json, ::JSON) would silently answer NULL for every path — including paths in
+// intact lanes and in the residual — and serialize the raw struct: a whole column going dark over
+// one catalog typo. A JSONO conversion (jsono(), the cast to JSONO — and therefore the
+// INSERT ... SELECT into a plain JSONO column that LOOKS like the "move the bytes" recovery this
+// refusal recommends) would rebuild the document out of the raw layout fields, destroying it. The
+// optimizer calls this where it declined a shredded rewrite, and the constructor/cast binds call it
+// beside their foreign-layout refusal; it is a no-op for every other type and throws the grammar's
+// own reason for this one. Passthrough (SELECT *, COPY), ::VARCHAR and DDL stay untouched, so
+// backup and recovery (DROP COLUMN) work.
+void JsonoRejectMalformedAnchoredRead(const LogicalType &type);
 
 // The classification of one JSONO layout field.
 enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
@@ -289,13 +294,14 @@ struct JsonoLayoutType {
 	idx_t spill_columns = 0;
 	idx_t body_revision = DConstants::INVALID_INDEX;
 	idx_t shreds_revision = DConstants::INVALID_INDEX;
-	// Set on a NotJsono answer whose failure is a LANE NAME that does not decode — reached only
-	// after the full current-revision anchor matched (exact residual, `shreds$2`, marker and spill
-	// found by name). That combination is a catalog-evolution typo or a hand-built imitation, never
-	// a type any legal write narrows: generic value->SQL->value round-trips (the DuckLake flush)
-	// change TYPES and keep names, so the type-narrowing near-misses this flag deliberately excludes
-	// stay silent. The optimizer refuses JSON reads of a type with this flag (see
-	// JsonoRejectMalformedAnchoredJsonRead) instead of letting them silently answer NULL.
+	// Set on a NotJsono answer whose failure is a LANE NAME — or an array lane's element SUBFIELD
+	// name, minted by the same codec — that does not decode, reached only after the full
+	// current-revision anchor matched (exact residual, `shreds$2`, marker and spill found by name).
+	// That combination is a catalog-evolution typo or a hand-built imitation, never a type any
+	// legal write narrows: generic value->SQL->value round-trips (the DuckLake flush) change TYPES
+	// and keep names, so the type-narrowing near-misses this flag deliberately excludes stay
+	// silent. JSON reads and JSONO conversions of a type with this flag are refused (see
+	// JsonoRejectMalformedAnchoredRead) instead of silently answering NULL or grinding the value.
 	bool lane_name_malformed = false;
 };
 
