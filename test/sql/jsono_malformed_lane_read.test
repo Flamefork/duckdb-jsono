@@ -1,0 +1,69 @@
+# name: test/sql/jsono_malformed_lane_read.test
+# description: a non-decoding lane name inside a fully-anchored type makes JSON reads refuse loudly (a catalog-evolution typo would otherwise silently turn the whole column into NULLs); passthrough, ::VARCHAR and DROP COLUMN recovery stay open
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+statement ok
+CREATE TABLE t AS SELECT jsono('{"a":"v1","z":1}', shredding := '{"a": "VARCHAR"}') AS j;
+
+# The evolution typo: adding a lane under the path spelled as text instead of its encoded name.
+statement ok
+ALTER TABLE t ADD COLUMN j.jsono."shreds$2"."$.b" VARCHAR;
+
+# JSON reads refuse with the grammar's own reason — for every path, including intact lanes and the
+# residual, since none of them could be answered correctly.
+statement error
+SELECT j ->> 'a' FROM t;
+----
+field '$.b' is not a shred lane
+
+statement error
+SELECT to_json(j) FROM t;
+----
+field '$.b' is not a shred lane
+
+statement error
+SELECT j::JSON FROM t;
+----
+field '$.b' is not a shred lane
+
+# Type-only near-misses stay silent: that shape is what a legal generic write narrows into.
+# (Pinned by the layout-grammar cases; here only the NAME class is loud.)
+
+# Passthrough and the raw render stay open, so backup and recovery work.
+query I
+SELECT count(*) FROM t;
+----
+1
+
+statement ok
+COPY t TO '__TEST_DIR__/malformed_backup.parquet' (FORMAT parquet);
+
+query I
+SELECT (j::VARCHAR) IS NOT NULL FROM t;
+----
+true
+
+# Recovery: drop the misnamed field and the column reads again.
+statement ok
+ALTER TABLE t DROP COLUMN j.jsono."shreds$2"."$.b";
+
+query II
+SELECT j ->> 'a', j ->> 'z' FROM t;
+----
+v1	1
+
+# The legal evolution: the same lane added under its encoded name (jsono_storage_type prints it)
+# keeps every read working.
+statement ok
+ALTER TABLE t ADD COLUMN j.jsono."shreds$2".c8000 VARCHAR;
+
+query III
+SELECT j ->> 'a', j ->> 'z', j ->> 'b' FROM t;
+----
+v1	1	NULL

@@ -643,7 +643,7 @@ shred_types = st.sampled_from(["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN"])
 
 
 def shred_spec_sql(spec: dict[str, str]) -> str:
-    return "{" + ", ".join(f"'{path}': '{stype}'" for path, stype in spec.items()) + "}"
+    return sql_literal(json_dumps(spec))
 
 
 PLAIN_JSONO_TYPE_SQL = 'STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))'
@@ -977,7 +977,7 @@ def test_array_reader_parity(doc: dict[str, Any], schema: str) -> None:
     # the full scalar space over heterogeneous elements, missing / type-mismatched / explicit-null
     # subfields, tail keys, empty arrays, VARCHAR read-copies of non-string scalars, and edge doubles.
     text = json_dumps(doc)
-    shredded = f"jsono({sql_literal(text)}, shredding := {{'$.items': '{schema}'}})"
+    shredded = f"jsono({sql_literal(text)}, shredding := {shred_spec_sql({'$.items': schema})})"
     plain = f"jsono({sql_literal(text)})"
     for name, build_query in ARRAY_READER_PARITY:
         ok = SESSION.value(build_query(shredded, plain))
@@ -1030,7 +1030,7 @@ def test_scalar_array_reader_parity(doc: dict[str, Any], schema: str) -> None:
     # Fuzzes the full scalar space over heterogeneous elements (the lossless gate keeps non-conforming
     # scalars / null / object / nested-array elements in the residual skeleton).
     text = json_dumps(doc)
-    shredded = f"jsono({sql_literal(text)}, shredding := {{'$.items': '{schema}'}})"
+    shredded = f"jsono({sql_literal(text)}, shredding := {shred_spec_sql({'$.items': schema})})"
     plain = f"jsono({sql_literal(text)})"
     for name, build_query in SCALAR_ARRAY_READER_PARITY:
         ok = SESSION.value(build_query(shredded, plain))
@@ -1367,10 +1367,10 @@ manifest_mutations = st.sampled_from(
 # non-empty manifest for the mutations to target.
 manifest_documents = st.sampled_from(
     [
-        ('{"s":"hello","t":"x"}', "{'s': 'VARCHAR'}"),
-        ('{"a":"1","b":"2","c":3}', "{'a': 'VARCHAR', 'b': 'VARCHAR'}"),
-        ('{"n":7,"o":{"x":1}}', "{'n': 'BIGINT'}"),
-        (wide_object_text, "{'k00': 'BIGINT', 'k16': 'VARCHAR'}"),
+        ('{"s":"hello","t":"x"}', '\'{"s": "VARCHAR"}\''),
+        ('{"a":"1","b":"2","c":3}', '\'{"a": "VARCHAR", "b": "VARCHAR"}\''),
+        ('{"n":7,"o":{"x":1}}', '\'{"n": "BIGINT"}\''),
+        (wide_object_text, '\'{"k00": "BIGINT", "k16": "VARCHAR"}\''),
     ]
 )
 
@@ -1585,7 +1585,7 @@ def test_transform_walk_parity(generated: tuple[dict[str, Any], int]) -> None:
     # build. The shred set covers the scalar fields the spec reads (so the shred-lane read path runs);
     # values that do not fit a typed shred stay in the residual (the lossless gate), exercising the
     # residual-first / shred-fallback split inside the walk.
-    shred_spec = "{'$.a': 'VARCHAR', '$.b': 'BIGINT', '$.c': 'DOUBLE', '$.d': 'BOOLEAN'}"
+    shred_spec = shred_spec_sql({'$.a': 'VARCHAR', '$.b': 'BIGINT', '$.c': 'DOUBLE', '$.d': 'BOOLEAN'})
     shredded = f"jsono({sql_literal(text)}, shredding := {shred_spec})"
     transformed_shredded = f"jsono_transform({shredded}, {spec})"
     leg_a = SESSION.value(f"SELECT (to_json({transformed_shredded}) IS NOT DISTINCT FROM to_json({transformed_plain}))")
@@ -1724,7 +1724,7 @@ ITEMS_ELEMENT_SQL = f"STRUCT({ITEMS_SUBFIELD} BIGINT)"
 
 
 def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
-    j = f"jsono({doc_sql}, shredding := {{'$.arr':'BIGINT[]', k:'BIGINT', '$.items':'STRUCT(n BIGINT)[]'}})"
+    j = f"jsono({doc_sql}, shredding := {shred_spec_sql({'$.arr': 'BIGINT[]', 'k': 'BIGINT', '$.items': 'STRUCT(n BIGINT)[]'})})"
     marker = f'({j})."jsono"."shreds$2"."$jsono$set"'
     spill = f'({j})."jsono"."shreds$2"."$jsono$spill$0"'
     arr = f'({j})."jsono"."shreds$2".{ARR_LANE}'
@@ -1909,8 +1909,7 @@ def lane_spec_path(keys: list[str]) -> str:
 
 
 def lane_type_sql(spec: dict[str, str]) -> str:
-    entries = ", ".join(f"{sql_literal(path)}: {sql_literal(stype)}" for path, stype in spec.items())
-    return f"typeof(jsono(NULL::VARCHAR, shredding := {{{entries}}}))"
+    return f"typeof(jsono(NULL::VARCHAR, shredding := {shred_spec_sql(spec)}))"
 
 
 @settings(PROPERTY_SETTINGS)
@@ -1928,7 +1927,7 @@ def test_lane_name_codec(keys: list[str], other: list[str]) -> None:
     # (1) The logical path the lane reports must re-declare the identical lane.
     reported = SESSION.value(
         f"list_extract(jsono_layout_lanes(jsono(NULL::VARCHAR, "
-        f"shredding := {{{sql_literal(spec_path)}: 'VARCHAR'}})), 1).path"
+        f"shredding := {shred_spec_sql({spec_path: 'VARCHAR'})})), 1).path"
     )
     assert reported is not None, f"lane not reported: {keys!r}"
     redeclared = SESSION.value(lane_type_sql({reported: "VARCHAR"}))
@@ -1937,19 +1936,18 @@ def test_lane_name_codec(keys: list[str], other: list[str]) -> None:
     if keys == other:
         return
 
-    # (3) Case distinctness, which needs two SEPARATE specs: DuckDB rejects a struct literal whose
-    # keys are case-equal, so the colliding pair cannot even be written as one spec.
+    # (3) Case distinctness, checked over two SEPARATE specs so the assertion does not depend on
+    # the pair-in-one-spec path (which the JSON spec carrier also supports, checked under (2)).
     other_declared = SESSION.value(lane_type_sql({lane_spec_path(other): "VARCHAR"}))
     assert other_declared is not None, f"lane spec unreadable: {other!r}"
     assert declared.lower() != other_declared.lower(), f"lane names collapse case-insensitively: {keys!r} vs {other!r}"
 
     # (2) Ordering. Both lanes in one spec, with different lane TYPES so the reported order says
-    # which path won without the harness having to know either name.
-    if lane_spec_path(other).lower() == spec_path.lower():
-        return
+    # which path won without the harness having to know either name. The JSON spec carrier is
+    # byte-exact, so a case-colliding pair declares here too.
     first_type = SESSION.value(
         f"list_extract(jsono_layout_lanes(jsono(NULL::VARCHAR, shredding := "
-        f"{{{sql_literal(spec_path)}: 'VARCHAR', {sql_literal(lane_spec_path(other))}: 'BIGINT'}})), 1).type"
+        f"{shred_spec_sql({spec_path: 'VARCHAR', lane_spec_path(other): 'BIGINT'})})), 1).type"
     )
     assert first_type in ("VARCHAR", "BIGINT"), f"lane pair not reported: {keys!r} vs {other!r} -> {first_type!r}"
     keys_first = [key.encode("utf-8") for key in keys] < [key.encode("utf-8") for key in other]

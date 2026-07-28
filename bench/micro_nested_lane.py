@@ -26,6 +26,8 @@ from pathlib import Path
 
 import duckdb
 
+from sql_literals import sql_json
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXTENSION = REPO_ROOT / "build" / "release" / "extension" / "jsono" / "jsono.duckdb_extension"
 PARQUET = REPO_ROOT / "bench" / "data" / "micro_nested_lane.parquet"
@@ -77,7 +79,7 @@ def build(conn: duckdb.DuckDBPyConnection) -> None:
         COPY (
             SELECT jsono(
                 json::VARCHAR,
-                shredding := {{'pageViewID': 'BIGINT', 'n': 'BIGINT', '$.URL.scheme': 'VARCHAR'}}
+                shredding := '{{"pageViewID": "BIGINT", "n": "BIGINT", "$.URL.scheme": "VARCHAR"}}'
             ) AS root_params
             FROM (
                 SELECT json_object(
@@ -201,7 +203,7 @@ PLAN029_PROBES = [
 
 
 def _plan029_shred_literal(shred: dict) -> str:
-    return "{" + ", ".join(f"'{k}': '{v}'" for k, v in shred.items()) + "}"
+    return sql_json(shred)
 
 
 def _plan029_flat_pairs() -> str:

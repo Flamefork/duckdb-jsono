@@ -39,13 +39,7 @@ FROM nested_scalar_input
 WHERE jsono(v) IS NOT DISTINCT FROM
       jsono(
         plain_jsono(v),
-        shredding := {
-          '$.nested.a':'BIGINT',
-          '$.nested.b':'VARCHAR',
-          '$.nested.ok':'BOOLEAN',
-          '$.nested.score':'DOUBLE',
-          'kind':'VARCHAR'
-        });
+        shredding := '{"$.nested.a": "BIGINT", "$.nested.b": "VARCHAR", "$.nested.ok": "BOOLEAN", "$.nested.score": "DOUBLE", "kind": "VARCHAR"}');
 ----
 4
 
@@ -61,11 +55,7 @@ WITH input(v) AS (
 SELECT jsono(v) IS NOT DISTINCT FROM
        jsono(
          plain_jsono(v),
-         shredding := {
-           '$.nested.small':'BIGINT',
-           '$.nested.ts':'VARCHAR',
-           '$.nested.u':'UBIGINT'
-         })
+         shredding := '{"$.nested.small": "BIGINT", "$.nested.ts": "VARCHAR", "$.nested.u": "UBIGINT"}')
 FROM input;
 ----
 true
@@ -80,11 +70,7 @@ WITH input(v) AS (
 SELECT jsono(v) IS NOT DISTINCT FROM
        jsono(
          plain_jsono(v),
-         shredding := {
-           '$."a.b"."q.x"':'BIGINT',
-           '$."a.b".plain':'VARCHAR',
-           'kind':'VARCHAR'
-         })
+         shredding := '{"$.\"a.b\".\"q.x\"": "BIGINT", "$.\"a.b\".plain": "VARCHAR", "kind": "VARCHAR"}')
 FROM input;
 ----
 true
@@ -105,13 +91,7 @@ WITH input(v) AS (
 SELECT jsono(v) IS NOT DISTINCT FROM
        jsono(
          plain_jsono(v),
-         shredding := {
-           '$.nested.a':'BIGINT',
-           '$.nested.b':'VARCHAR',
-           'ids':'BIGINT[]',
-           'kind':'VARCHAR',
-           'products':'STRUCT(name VARCHAR, quantity BIGINT, price DOUBLE)[]'
-         })
+         shredding := '{"$.nested.a": "BIGINT", "$.nested.b": "VARCHAR", "ids": "BIGINT[]", "kind": "VARCHAR", "products": "STRUCT(name VARCHAR, quantity BIGINT, price DOUBLE)[]"}')
 FROM input;
 ----
 true
@@ -142,14 +122,7 @@ WITH input(v) AS (
     jsono(v) AS fast,
     jsono(
       plain_jsono(v),
-      shredding := {
-        '$.nested.a':'BIGINT',
-        '$.nested.b':'VARCHAR',
-        'event_name':'VARCHAR',
-        'event_ts':'BIGINT',
-        'ids':'BIGINT[]',
-        'ok':'BOOLEAN'
-      }) AS generic
+      shredding := '{"$.nested.a": "BIGINT", "$.nested.b": "VARCHAR", "event_name": "VARCHAR", "event_ts": "BIGINT", "ids": "BIGINT[]", "ok": "BOOLEAN"}') AS generic
   FROM input
 )
 SELECT hash(fast) = hash(generic), fast.jsono."body$1" IS NOT DISTINCT FROM generic.jsono."body$1"
@@ -162,7 +135,7 @@ query I
 SELECT jsono(struct_pack(nested := struct_pack(a := 1::INTEGER, b := 'x'))) IS NOT DISTINCT FROM
        jsono(
          plain_jsono(struct_pack(nested := struct_pack(a := 1::INTEGER, b := 'x'))),
-         shredding := {'$.nested.a':'BIGINT','$.nested.b':'VARCHAR'});
+         shredding := '{"$.nested.a": "BIGINT", "$.nested.b": "VARCHAR"}');
 ----
 true
 
@@ -197,12 +170,7 @@ FROM nested_vector_input
 WHERE jsono(v) IS NOT DISTINCT FROM
       jsono(
         plain_jsono(v),
-        shredding := {
-          '$.nested.a':'BIGINT',
-          '$.nested.b':'VARCHAR',
-          'ids':'BIGINT[]',
-          'kind':'VARCHAR'
-        });
+        shredding := '{"$.nested.a": "BIGINT", "$.nested.b": "VARCHAR", "ids": "BIGINT[]", "kind": "VARCHAR"}');
 ----
 3000
 
@@ -215,12 +183,7 @@ FROM nested_vector_input
 WHERE jsono(v) IS NOT DISTINCT FROM
       jsono(
         plain_jsono(v),
-        shredding := {
-          '$.nested.a':'BIGINT',
-          '$.nested.b':'VARCHAR',
-          'ids':'BIGINT[]',
-          'kind':'VARCHAR'
-        });
+        shredding := '{"$.nested.a": "BIGINT", "$.nested.b": "VARCHAR", "ids": "BIGINT[]", "kind": "VARCHAR"}');
 ----
 3000
 

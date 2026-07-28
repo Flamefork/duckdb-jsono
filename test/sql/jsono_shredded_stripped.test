@@ -109,7 +109,7 @@ SHRED
 statement ok
 CREATE TABLE manifest_stripped AS
 SELECT jsono('{"commit":{"operation":"create"},"x":1}',
-             shredding := {'$.commit.operation': 'VARCHAR'}) AS j;
+             shredding := '{"$.commit.operation": "VARCHAR"}') AS j;
 
 query I
 SELECT j ->> '$.commit' FROM manifest_stripped;
@@ -150,7 +150,7 @@ SELECT to_json(j) FROM ov_null;
 # does not catch this partial read).
 query I
 SELECT j ->> '$.b' FROM (
-    SELECT jsono('{"a":1,"b":{"c":2}}', shredding := {'$.a':'BIGINT','$.b.c':'BIGINT'}) AS j
+    SELECT jsono('{"a":1,"b":{"c":2}}', shredding := '{"$.a": "BIGINT", "$.b.c": "BIGINT"}') AS j
 );
 ----
 {"c":2}

@@ -28,7 +28,7 @@ SELECT struct_pack("jsono" := struct_pack(
            "shreds$2" := struct_pack("$jsono$set" := j."jsono"."shreds$2"."$jsono$set",
                                  "$jsono$spill$0" := j."jsono"."shreds$2"."$jsono$spill$0",
                                  c4000 := j."jsono"."shreds$2".c4000))) AS intact
-FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := {'$.a':'BIGINT[]'}) AS j);
+FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := '{"$.a": "BIGINT[]"}') AS j);
 
 # The readers fail loud on the mismatched rows (existing contract) and read the intact one.
 statement error
@@ -66,7 +66,7 @@ SELECT struct_pack("jsono" := struct_pack(
            "shreds$2" := struct_pack("$jsono$set" := j."jsono"."shreds$2"."$jsono$set",
                                  "$jsono$spill$0" := j."jsono"."shreds$2"."$jsono$spill$0",
                                  dk000qbkclmn6000 := j."jsono"."shreds$2".dk000qbkclmn6000))) AS intact
-FROM (SELECT jsono('{"m":{"items":[{"n":1},{"n":2}]},"z":1}', shredding := {'$.m.items':'STRUCT(n BIGINT)[]'}) AS j);
+FROM (SELECT jsono('{"m":{"items":[{"n":1},{"n":2}]},"z":1}', shredding := '{"$.m.items": "STRUCT(n BIGINT)[]"}') AS j);
 
 query II
 SELECT jsono_validate(truncated), jsono_validate(intact) FROM lockstep_obj;
@@ -81,13 +81,13 @@ SELECT jsono_validate(struct_pack("jsono" := struct_pack(
            "shreds$2" := struct_pack("$jsono$set" := j."jsono"."shreds$2"."$jsono$set",
                                  "$jsono$spill$0" := j."jsono"."shreds$2"."$jsono$spill$0",
                                  c4000 := NULL::BIGINT[]))))
-FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := {'$.a':'BIGINT[]'}) AS j);
+FROM (SELECT jsono('{"a":[1,2,3],"z":1}', shredding := '{"$.a": "BIGINT[]"}') AS j);
 ----
 true
 
 # Plain values and scalar-only shredded values keep their existing validate behavior.
 query II
 SELECT jsono_validate(jsono('{"a":[1,2,3]}')),
-       jsono_validate(jsono('{"k":1,"a":[1,2]}', shredding := {k:'BIGINT'}));
+       jsono_validate(jsono('{"k":1,"a":[1,2]}', shredding := '{"k": "BIGINT"}'));
 ----
 true	true

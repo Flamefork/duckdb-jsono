@@ -232,7 +232,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
 
         self.assertEqual(query.prepare_sql, ())
         self.assertIn(
-            "jsono(event_properties::VARCHAR, shredding := {'clientID': 'VARCHAR'})",
+            'jsono(event_properties::VARCHAR, shredding := \'{"clientID":"VARCHAR"}\')',
             query.timed_sql,
         )
 
@@ -250,7 +250,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
         )
 
         self.assertIn(
-            "jsono(event_properties::VARCHAR, shredding := {'clientID': 'VARCHAR'})",
+            'jsono(event_properties::VARCHAR, shredding := \'{"clientID":"VARCHAR"}\')',
             query.prepare_sql[0],
         )
         self.assertIn("SELECT jsono_extract_string(t, '$.clientID') AS r", query.timed_sql)
@@ -270,7 +270,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
         )
 
         self.assertIn(
-            "jsono(json_wide_flat::VARCHAR, shredding := {'event_name': 'VARCHAR'}) AS t",
+            'jsono(json_wide_flat::VARCHAR, shredding := \'{"event_name":"VARCHAR"}\') AS t',
             query.prepare_sql[0],
         )
         self.assertIn("g1e4 AS g", query.prepare_sql[0])
@@ -300,7 +300,7 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
         )
 
         self.assertIn(
-            "jsono(json_wide_payload::VARCHAR, shredding := {'event_name': 'VARCHAR', 'secondaryID': 'VARCHAR'}) AS wide_payload",
+            'jsono(json_wide_payload::VARCHAR, shredding := \'{"event_name":"VARCHAR","secondaryID":"VARCHAR"}\') AS wide_payload',
             query.prepare_sql[0],
         )
         self.assertIn(

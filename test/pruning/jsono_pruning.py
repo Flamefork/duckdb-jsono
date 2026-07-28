@@ -91,7 +91,7 @@ def main() -> None:
             "COPY (\n"
             "  SELECT\n"
             "    jsono('{\"seq\":' || i || ',\"kind\":\"' || printf('%08d', i) || '\"}',\n"
-            "          shredding := {'$.seq':'BIGINT','$.kind':'VARCHAR'}) AS t,\n"
+            "          shredding := '{\"$.seq\": \"BIGINT\", \"$.kind\": \"VARCHAR\"}') AS t,\n"
             "    i AS seq_native\n"
             f"  FROM range({ROWS}) r(i)\n"
             "  ORDER BY i\n"

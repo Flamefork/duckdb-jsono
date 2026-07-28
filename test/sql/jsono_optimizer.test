@@ -535,7 +535,7 @@ PRAGMA disable_verify_serializer;
 
 statement ok
 CREATE TABLE jsono_extract_shredded AS
-SELECT jsono('{"kind":"commit","n":7,"o":{"x":1}}', shredding := {'$.kind':'VARCHAR','$.n':'BIGINT'}) AS j;
+SELECT jsono('{"kind":"commit","n":7,"o":{"x":1}}', shredding := '{"$.kind": "VARCHAR", "$.n": "BIGINT"}') AS j;
 
 statement ok
 PRAGMA explain_output='physical_only';
@@ -585,7 +585,7 @@ true
 
 statement ok
 CREATE TABLE jsono_introspect_shredded AS
-SELECT jsono('{"a":1,"b":{"c":2},"name":"x"}', shredding := {'$.a':'BIGINT','name':'VARCHAR'}) AS j;
+SELECT jsono('{"a":1,"b":{"c":2},"name":"x"}', shredding := '{"$.a": "BIGINT", "name": "VARCHAR"}') AS j;
 
 statement ok
 PRAGMA explain_output='physical_only';
@@ -634,7 +634,7 @@ true	true	true	true	true
 
 statement ok
 CREATE TABLE jsono_matcher_shredded AS
-SELECT jsono(payload, shredding := {'$.kind':'VARCHAR'}) AS j
+SELECT jsono(payload, shredding := '{"$.kind": "VARCHAR"}') AS j
 FROM (
   VALUES
     ('{"kind":"commit","city":"sea","os":"mac","browser":"ff"}'),
@@ -811,7 +811,7 @@ RESET disabled_optimizers;
 # Identical residual bytes => identical rows, text-vs-numeric order ('10' < '9') included.
 statement ok
 CREATE TABLE jsono_matcher_shredded_range AS
-SELECT jsono(payload, shredding := {'$.tag':'VARCHAR'}) AS j
+SELECT jsono(payload, shredding := '{"$.tag": "VARCHAR"}') AS j
 FROM (
   VALUES
     ('{"tag":"t","city":"sea","n":10}'),
@@ -887,13 +887,13 @@ sea	chrome	commit
 # shred's value is gone from the residual) fails loud on the fused residual read, not a silent
 # non-match. Build the narrowed row the same way the cast-guard test does.
 statement ok
-CREATE TABLE jsono_matcher_narrow AS SELECT jsono('{}', shredding := {'$.a':'VARCHAR'}) AS j WHERE false;
+CREATE TABLE jsono_matcher_narrow AS SELECT jsono('{}', shredding := '{"$.a": "VARCHAR"}') AS j WHERE false;
 
 statement ok
 SET disabled_optimizers='extension';
 
 statement ok
-INSERT INTO jsono_matcher_narrow SELECT jsono('{"a":"v1","b":"v2","c":"v3"}', shredding := {'$.a':'VARCHAR','$.b':'VARCHAR','$.c':'VARCHAR'});
+INSERT INTO jsono_matcher_narrow SELECT jsono('{"a":"v1","b":"v2","c":"v3"}', shredding := '{"$.a": "VARCHAR", "$.b": "VARCHAR", "$.c": "VARCHAR"}');
 
 statement ok
 RESET disabled_optimizers;

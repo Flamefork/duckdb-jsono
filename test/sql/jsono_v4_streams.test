@@ -126,7 +126,7 @@ FROM (VALUES (1, jsono('{"a":1.5,"s":"x"}')), (2, jsono('{"b":123456789012345678
 statement ok
 CREATE TABLE v4_shredded AS
 SELECT jsono('{"name":"hello","n":7,"d":2.5,"rest":{"deep":"value"}}',
-             shredding := {'name': 'VARCHAR', '$.n': 'BIGINT'}) AS e;
+             shredding := '{"name": "VARCHAR", "$.n": "BIGINT"}') AS e;
 
 query III
 SELECT to_json(e), e ->> '$.name', e ->> '$.rest.deep' FROM v4_shredded;

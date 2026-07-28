@@ -7,13 +7,13 @@ require jsono
 require json
 
 statement ok
-CREATE TABLE pu_shred AS SELECT jsono('{"a":"A' || i || '","n":' || i || '}', shredding := {'a':'VARCHAR'}) AS e FROM range(1000) t(i);
+CREATE TABLE pu_shred AS SELECT jsono('{"a":"A' || i || '","n":' || i || '}', shredding := '{"a": "VARCHAR"}') AS e FROM range(1000) t(i);
 
 statement ok
 CREATE TABLE pu_plain AS SELECT jsono('{"a":"P' || i || '","n":' || (i + 1000) || '}') AS e FROM range(1000) t(i);
 
 statement ok
-CREATE TABLE pu_shred_b AS SELECT jsono('{"a":"B' || i || '","b":"BB"}', shredding := {'b':'VARCHAR'}) AS e FROM range(1000) t(i);
+CREATE TABLE pu_shred_b AS SELECT jsono('{"a":"B' || i || '","b":"BB"}', shredding := '{"b": "VARCHAR"}') AS e FROM range(1000) t(i);
 
 statement ok
 PRAGMA explain_output='physical_only';
@@ -126,7 +126,7 @@ A0
 # (e2) A nullable shredded column IS a bare source and gets pushed: on a SQL-NULL row the pushed
 # per-branch read yields NULL. Plan-lock (pushed, COALESCE-free) plus the NULL count through it.
 statement ok
-CREATE TABLE pu_nullable AS SELECT jsono(CASE WHEN i % 10 = 0 THEN NULL ELSE '{"a":"N' || i || '"}' END, shredding := {'a':'VARCHAR'}) AS e FROM range(1000) t(i);
+CREATE TABLE pu_nullable AS SELECT jsono(CASE WHEN i % 10 = 0 THEN NULL ELSE '{"a":"N' || i || '"}' END, shredding := '{"a": "VARCHAR"}') AS e FROM range(1000) t(i);
 
 statement ok
 PRAGMA explain_output='physical_only';
@@ -167,7 +167,7 @@ SELECT count(*) FROM (SELECT e FROM pu_shred UNION SELECT e FROM pu_plain) WHERE
 # branches), so two total branches read the lane COALESCE-free. The non-total same-type union keeps
 # the fallback: jsono_setop_totality.test owns that negative control.
 statement ok
-CREATE TABLE pu_shred_same AS SELECT jsono('{"a":"S' || i || '"}', shredding := {'a':'VARCHAR'}) AS e FROM range(100) t(i);
+CREATE TABLE pu_shred_same AS SELECT jsono('{"a":"S' || i || '"}', shredding := '{"a": "VARCHAR"}') AS e FROM range(100) t(i);
 
 statement ok
 PRAGMA explain_output='physical_only';

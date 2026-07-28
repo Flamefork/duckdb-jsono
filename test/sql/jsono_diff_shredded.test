@@ -34,8 +34,8 @@ query I
 SELECT count(*)
 FROM (
   SELECT id,
-         to_json(jsono_diff(jsono(prev, shredding := {k:'VARCHAR', n:'BIGINT', d:'DOUBLE', '$.m.deep':'BIGINT'}),
-                            jsono(cur,  shredding := {k:'VARCHAR', n:'BIGINT', d:'DOUBLE', '$.m.deep':'BIGINT'}))) AS shredded,
+         to_json(jsono_diff(jsono(prev, shredding := '{"k": "VARCHAR", "n": "BIGINT", "d": "DOUBLE", "$.m.deep": "BIGINT"}'),
+                            jsono(cur,  shredding := '{"k": "VARCHAR", "n": "BIGINT", "d": "DOUBLE", "$.m.deep": "BIGINT"}'))) AS shredded,
          to_json(jsono_diff(jsono(prev), jsono(cur))) AS plain
   FROM pairs
 )
@@ -45,8 +45,8 @@ WHERE shredded IS DISTINCT FROM plain;
 
 # The changed-lane fast path emits exactly the changed lanes merged with the residual diff.
 query I
-SELECT to_json(jsono_diff(jsono('{"k":"a","n":1,"m":{"deep":10},"other":true}', shredding := {k:'VARCHAR', n:'BIGINT', '$.m.deep':'BIGINT'}),
-                          jsono('{"k":"b","n":1,"m":{"deep":11},"other":false}', shredding := {k:'VARCHAR', n:'BIGINT', '$.m.deep':'BIGINT'})));
+SELECT to_json(jsono_diff(jsono('{"k":"a","n":1,"m":{"deep":10},"other":true}', shredding := '{"k": "VARCHAR", "n": "BIGINT", "$.m.deep": "BIGINT"}'),
+                          jsono('{"k":"b","n":1,"m":{"deep":11},"other":false}', shredding := '{"k": "VARCHAR", "n": "BIGINT", "$.m.deep": "BIGINT"}')));
 ----
 {"k":"b","m":{"deep":11},"other":false}
 
@@ -55,8 +55,8 @@ SELECT to_json(jsono_diff(jsono('{"k":"a","n":1,"m":{"deep":10},"other":true}', 
 # (UnionDiffObjects over a nested EmitLanePatch), yielding the same merged sub-object the plain diff
 # does. Both columns are asserted equal, so this pins shredded == plain for the shared-prefix union.
 query II
-SELECT to_json(jsono_diff(jsono('{"m":{"deep":1,"other":"a"}}', shredding := {'$.m.deep':'BIGINT'}),
-                          jsono('{"m":{"deep":2,"other":"b"}}', shredding := {'$.m.deep':'BIGINT'}))),
+SELECT to_json(jsono_diff(jsono('{"m":{"deep":1,"other":"a"}}', shredding := '{"$.m.deep": "BIGINT"}'),
+                          jsono('{"m":{"deep":2,"other":"b"}}', shredding := '{"$.m.deep": "BIGINT"}'))),
        to_json(jsono_diff(jsono('{"m":{"deep":1,"other":"a"}}'),
                           jsono('{"m":{"deep":2,"other":"b"}}')));
 ----
@@ -70,8 +70,8 @@ query I
 SELECT count(*)
 FROM (
   SELECT id,
-         to_json(jsono_diff(jsono(prev, shredding := {u:'UBIGINT', b:'BOOLEAN'}),
-                            jsono(cur,  shredding := {u:'UBIGINT', b:'BOOLEAN'}))) AS shredded,
+         to_json(jsono_diff(jsono(prev, shredding := '{"u": "UBIGINT", "b": "BOOLEAN"}'),
+                            jsono(cur,  shredding := '{"u": "UBIGINT", "b": "BOOLEAN"}'))) AS shredded,
          to_json(jsono_diff(jsono(prev), jsono(cur))) AS plain
   FROM (VALUES
     (1, '{"u":18446744073709551615,"b":true}',  '{"u":18446744073709551614,"b":false}'),
@@ -90,9 +90,9 @@ SELECT count(*)
 FROM (
   SELECT id, prev, cur,
          to_json(jsono_merge_patch(
-             jsono(prev, shredding := {k:'VARCHAR', n:'BIGINT', d:'DOUBLE', '$.m.deep':'BIGINT'}),
-             jsono_diff(jsono(prev, shredding := {k:'VARCHAR', n:'BIGINT', d:'DOUBLE', '$.m.deep':'BIGINT'}),
-                        jsono(cur,  shredding := {k:'VARCHAR', n:'BIGINT', d:'DOUBLE', '$.m.deep':'BIGINT'})))) AS applied
+             jsono(prev, shredding := '{"k": "VARCHAR", "n": "BIGINT", "d": "DOUBLE", "$.m.deep": "BIGINT"}'),
+             jsono_diff(jsono(prev, shredding := '{"k": "VARCHAR", "n": "BIGINT", "d": "DOUBLE", "$.m.deep": "BIGINT"}'),
+                        jsono(cur,  shredding := '{"k": "VARCHAR", "n": "BIGINT", "d": "DOUBLE", "$.m.deep": "BIGINT"}')))) AS applied
   FROM pairs
   WHERE prev IS NOT NULL AND cur IS NOT NULL
 )
@@ -102,8 +102,8 @@ WHERE applied IS DISTINCT FROM to_json(jsono(cur));
 
 # counts / elements array modes on shredded input (arrays live in the residual on this spec).
 query II
-SELECT to_json(jsono_diff(jsono(prev, shredding := {k:'VARCHAR'}), jsono(cur, shredding := {k:'VARCHAR'}), arrays := 'counts')),
-       to_json(jsono_diff(jsono(prev, shredding := {k:'VARCHAR'}), jsono(cur, shredding := {k:'VARCHAR'}), arrays := 'elements'))
+SELECT to_json(jsono_diff(jsono(prev, shredding := '{"k": "VARCHAR"}'), jsono(cur, shredding := '{"k": "VARCHAR"}'), arrays := 'counts')),
+       to_json(jsono_diff(jsono(prev, shredding := '{"k": "VARCHAR"}'), jsono(cur, shredding := '{"k": "VARCHAR"}'), arrays := 'elements'))
 FROM pairs WHERE id = 13;
 ----
 {"extra":{"added":1,"removed":2},"n":2}	{"extra":{"added":[9],"removed":[1,2]},"n":2}
@@ -114,12 +114,12 @@ FROM pairs WHERE id = 13;
 # shredded build AND the plain build in one row, so columns 1/2 (counts) and 3/4 (elements) prove the
 # shredded array-mode diff is byte-identical to the plain diff even when a lane changes alongside.
 query IIII
-SELECT to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}', shredding := {k:'VARCHAR'}),
-                          jsono('{"k":"b","extra":[9],"n":2}',   shredding := {k:'VARCHAR'}), arrays := 'counts')),
+SELECT to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}', shredding := '{"k": "VARCHAR"}'),
+                          jsono('{"k":"b","extra":[9],"n":2}',   shredding := '{"k": "VARCHAR"}'), arrays := 'counts')),
        to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}'),
                           jsono('{"k":"b","extra":[9],"n":2}'),                               arrays := 'counts')),
-       to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}', shredding := {k:'VARCHAR'}),
-                          jsono('{"k":"b","extra":[9],"n":2}',   shredding := {k:'VARCHAR'}), arrays := 'elements')),
+       to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}', shredding := '{"k": "VARCHAR"}'),
+                          jsono('{"k":"b","extra":[9],"n":2}',   shredding := '{"k": "VARCHAR"}'), arrays := 'elements')),
        to_json(jsono_diff(jsono('{"k":"a","extra":[1,2],"n":1}'),
                           jsono('{"k":"b","extra":[9],"n":2}'),                               arrays := 'elements'));
 ----
@@ -130,7 +130,7 @@ query I
 SELECT count(*)
 FROM (
   SELECT id,
-         to_json(jsono_diff(jsono(prev, shredding := {extra:'BIGINT[]'}), jsono(cur, shredding := {extra:'BIGINT[]'}))) AS shredded,
+         to_json(jsono_diff(jsono(prev, shredding := '{"extra": "BIGINT[]"}'), jsono(cur, shredding := '{"extra": "BIGINT[]"}'))) AS shredded,
          to_json(jsono_diff(jsono(prev), jsono(cur))) AS plain
   FROM pairs WHERE prev IS NOT NULL AND cur IS NOT NULL
 )
@@ -140,8 +140,8 @@ WHERE shredded IS DISTINCT FROM plain;
 
 # Mismatched shred sets also decline the direct path (different types) and stay correct.
 query I
-SELECT to_json(jsono_diff(jsono('{"k":"a","n":1}', shredding := {k:'VARCHAR'}),
-                          jsono('{"k":"b","n":2}', shredding := {n:'BIGINT'})));
+SELECT to_json(jsono_diff(jsono('{"k":"a","n":1}', shredding := '{"k": "VARCHAR"}'),
+                          jsono('{"k":"b","n":2}', shredding := '{"n": "BIGINT"}')));
 ----
 {"k":"b","n":2}
 
@@ -150,33 +150,33 @@ SELECT to_json(jsono_diff(jsono('{"k":"a","n":1}', shredding := {k:'VARCHAR'}),
 # transition is a lane-presence mismatch that falls back to per-row reconstruct. Both once broke
 # when the lane held a redundant `->>` read copy of the residual value.
 query I
-SELECT to_json(jsono_diff(jsono('{"k":42}', shredding := {k:'VARCHAR'}),
-                          jsono('{"k":43}', shredding := {k:'VARCHAR'})));
+SELECT to_json(jsono_diff(jsono('{"k":42}', shredding := '{"k": "VARCHAR"}'),
+                          jsono('{"k":43}', shredding := '{"k": "VARCHAR"}')));
 ----
 {"k":43}
 
 query I
-SELECT to_json(jsono_diff(jsono('{"k":42}', shredding := {k:'VARCHAR'}),
-                          jsono('{"k":"42"}', shredding := {k:'VARCHAR'})));
+SELECT to_json(jsono_diff(jsono('{"k":42}', shredding := '{"k": "VARCHAR"}'),
+                          jsono('{"k":"42"}', shredding := '{"k": "VARCHAR"}')));
 ----
 {"k":"42"}
 
 query I
-SELECT to_json(jsono_diff(jsono('{"k":"42"}', shredding := {k:'VARCHAR'}),
-                          jsono('{"k":42}', shredding := {k:'VARCHAR'})));
+SELECT to_json(jsono_diff(jsono('{"k":"42"}', shredding := '{"k": "VARCHAR"}'),
+                          jsono('{"k":42}', shredding := '{"k": "VARCHAR"}')));
 ----
 {"k":42}
 
 query I
-SELECT to_json(jsono_diff(jsono('{"k":42}', shredding := {k:'VARCHAR'}),
-                          jsono('{"k":42}', shredding := {k:'VARCHAR'})));
+SELECT to_json(jsono_diff(jsono('{"k":42}', shredding := '{"k": "VARCHAR"}'),
+                          jsono('{"k":42}', shredding := '{"k": "VARCHAR"}')));
 ----
 {}
 
 # A container at a VARCHAR lane diverts too: container-vs-container diffs via the residual walk.
 query I
-SELECT to_json(jsono_diff(jsono('{"a":{"x":1,"y":2}}', shredding := {a:'VARCHAR'}),
-                          jsono('{"a":{"x":1,"y":3}}', shredding := {a:'VARCHAR'})));
+SELECT to_json(jsono_diff(jsono('{"a":{"x":1,"y":2}}', shredding := '{"a": "VARCHAR"}'),
+                          jsono('{"a":{"x":1,"y":3}}', shredding := '{"a": "VARCHAR"}')));
 ----
 {"a":{"y":3}}
 
@@ -188,10 +188,10 @@ require parquet
 
 statement ok
 CREATE TABLE diff_shred_pairs AS SELECT * FROM (VALUES
-  (1, jsono('{"k":"a","n":1,"m":{"deep":10},"other":true}',  shredding := {k:'VARCHAR', n:'BIGINT', '$.m.deep':'BIGINT'}),
-      jsono('{"k":"b","n":1,"m":{"deep":11},"other":false}', shredding := {k:'VARCHAR', n:'BIGINT', '$.m.deep':'BIGINT'})),
-  (2, jsono('{"k":"x","n":1,"d":9.75}', shredding := {k:'VARCHAR', n:'BIGINT', d:'DOUBLE'}),
-      jsono('{"k":"x","n":1}',          shredding := {k:'VARCHAR', n:'BIGINT', d:'DOUBLE'}))
+  (1, jsono('{"k":"a","n":1,"m":{"deep":10},"other":true}',  shredding := '{"k": "VARCHAR", "n": "BIGINT", "$.m.deep": "BIGINT"}'),
+      jsono('{"k":"b","n":1,"m":{"deep":11},"other":false}', shredding := '{"k": "VARCHAR", "n": "BIGINT", "$.m.deep": "BIGINT"}')),
+  (2, jsono('{"k":"x","n":1,"d":9.75}', shredding := '{"k": "VARCHAR", "n": "BIGINT", "d": "DOUBLE"}'),
+      jsono('{"k":"x","n":1}',          shredding := '{"k": "VARCHAR", "n": "BIGINT", "d": "DOUBLE"}'))
 ) v(id, prev, cur);
 
 statement ok

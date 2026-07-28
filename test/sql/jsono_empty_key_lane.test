@@ -1,0 +1,57 @@
+# name: test/sql/jsono_empty_key_lane.test
+# description: an empty-key shred lane ($."") is fully readable — whole-value renders route around the patch tree (which carries keys as STRUCT field names, and an empty field name is an unnamed struct to DuckDB)
+# group: [sql]
+
+require jsono
+
+require json
+
+require parquet
+
+statement ok
+CREATE TABLE ek AS SELECT jsono('{"":1,"z":"s"}', shredding := '{"": "BIGINT", "z": "VARCHAR"}') AS j;
+
+# Whole-value renders: the empty-key lane forces the full reconstruct instead of the shred-patch
+# overlay, and the document round-trips.
+query III
+SELECT to_json(j), j::JSON::VARCHAR, j::VARCHAR FROM ek;
+----
+{"":1,"z":"s"}	{"":1,"z":"s"}	{"":1,"z":"s"}
+
+# Point reads: the named functions address the empty key (the `->>` operator cannot — its path
+# grammar is core json's, which rejects '$.""' at bind, so the operator route stays documented out).
+query II
+SELECT jsono_extract_string(j, '$.""'), j ->> 'z' FROM ek;
+----
+1	s
+
+query II
+SELECT jsono_validate(j), jsono_keys(j) FROM ek;
+----
+true	['', z]
+
+query II
+SELECT to_json(jsono_entries(j)), to_json(jsono_layout_lanes(j)) FROM ek;
+----
+[{"key":"$.\"\"","value":"1"},{"key":"$.z","value":"s"}]	[{"path":"$.\"\"","type":"BIGINT"},{"path":"$.z","type":"VARCHAR"}]
+
+# The lane survives Parquet like any other.
+statement ok
+COPY ek TO '__TEST_DIR__/empty_key_lane.parquet' (FORMAT parquet);
+
+query I
+SELECT to_json(j) FROM read_parquet('__TEST_DIR__/empty_key_lane.parquet');
+----
+{"":1,"z":"s"}
+
+# A nested empty key shreds and renders too.
+query I
+SELECT to_json(jsono('{"a":{"":5},"b":1}', shredding := '{"$.a.\"\"": "BIGINT"}'));
+----
+{"a":{"":5},"b":1}
+
+# Merge over an empty-key lane behaves like any other key.
+query I
+SELECT to_json(jsono_merge_patch(jsono('{"":1}', shredding := '{"": "BIGINT"}'), jsono('{"":9}')));
+----
+{"":9}

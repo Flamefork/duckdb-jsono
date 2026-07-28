@@ -19,16 +19,14 @@ FROM range(128) t(i);
 
 query I
 SELECT count(*) FROM (
-    (SELECT i, to_json(jsono(doc, shredding := {
-         'a': 'BIGINT', 'b': 'BIGINT', '$.nested.x': 'BIGINT'})) AS rendered
+    (SELECT i, to_json(jsono(doc, shredding := '{"a": "BIGINT", "b": "BIGINT", "$.nested.x": "BIGINT"}')) AS rendered
      FROM corpus
      EXCEPT
      SELECT i, to_json(jsono(doc)) AS rendered FROM corpus)
     UNION ALL
     (SELECT i, to_json(jsono(doc)) AS rendered FROM corpus
      EXCEPT
-     SELECT i, to_json(jsono(doc, shredding := {
-         'a': 'BIGINT', 'b': 'BIGINT', '$.nested.x': 'BIGINT'})) AS rendered
+     SELECT i, to_json(jsono(doc, shredding := '{"a": "BIGINT", "b": "BIGINT", "$.nested.x": "BIGINT"}')) AS rendered
      FROM corpus)
 );
 ----
@@ -39,8 +37,7 @@ statement ok
 PRAGMA explain_output='physical_only';
 
 query II
-EXPLAIN SELECT to_json(jsono(doc, shredding := {
-    'a': 'BIGINT', 'b': 'BIGINT', '$.nested.x': 'BIGINT'}))
+EXPLAIN SELECT to_json(jsono(doc, shredding := '{"a": "BIGINT", "b": "BIGINT", "$.nested.x": "BIGINT"}'))
 FROM corpus;
 ----
 physical_plan	<REGEX>:.*__jsono_shred_patch.*
@@ -50,20 +47,20 @@ physical_plan	<REGEX>:.*__jsono_shred_patch.*
 query I
 SELECT to_json(jsono(
     '{"s":"x","i":-7,"u":18446744073709551615,"d":1.25,"b":true,"tail":0}',
-    shredding := {'s':'VARCHAR','i':'BIGINT','u':'UBIGINT','d':'DOUBLE','b':'BOOLEAN'}))
+    shredding := '{"s": "VARCHAR", "i": "BIGINT", "u": "UBIGINT", "d": "DOUBLE", "b": "BOOLEAN"}'))
     = to_json(jsono('{"s":"x","i":-7,"u":18446744073709551615,"d":1.25,"b":true,"tail":0}'));
 ----
 true
 
 # SQL NULL stays SQL NULL.
 query I
-SELECT to_json(jsono(NULL::VARCHAR, shredding := {'a': 'BIGINT'})) IS NULL;
+SELECT to_json(jsono(NULL::VARCHAR, shredding := '{"a": "BIGINT"}')) IS NULL;
 ----
 true
 
 # A value that cannot enter its typed lane stays authoritative in the residual.
 query I
-SELECT to_json(jsono('{"a":"not-an-integer","tail":1}', shredding := {'a': 'BIGINT'}))
+SELECT to_json(jsono('{"a":"not-an-integer","tail":1}', shredding := '{"a": "BIGINT"}'))
      = to_json(jsono('{"a":"not-an-integer","tail":1}'));
 ----
 true
@@ -71,9 +68,9 @@ true
 # Set-operation widening NULL-fills the absent lane while that branch keeps the value in residual.
 query I
 WITH widened AS (
-    SELECT jsono('{"a":1,"b":2}', shredding := {'a': 'BIGINT'}) AS j
+    SELECT jsono('{"a":1,"b":2}', shredding := '{"a": "BIGINT"}') AS j
     UNION ALL
-    SELECT jsono('{"a":3,"b":4}', shredding := {'b': 'BIGINT'}) AS j
+    SELECT jsono('{"a":3,"b":4}', shredding := '{"b": "BIGINT"}') AS j
 )
 SELECT count(*) FROM widened
 WHERE to_json(j) NOT IN ('{"a":1,"b":2}'::JSON, '{"a":3,"b":4}'::JSON);
@@ -83,12 +80,12 @@ WHERE to_json(j) NOT IN ('{"a":1,"b":2}'::JSON, '{"a":3,"b":4}'::JSON);
 # Equivalent path spellings are one lane, so declaring both is refused — they would be two fields of
 # one STRUCT under one name. The single lane reconstructs to the same document either way.
 statement error
-SELECT to_json(jsono('{"a":7,"tail":8}', shredding := {'a': 'BIGINT', '$.a': 'BIGINT'}));
+SELECT to_json(jsono('{"a":7,"tail":8}', shredding := '{"a": "BIGINT", "$.a": "BIGINT"}'));
 ----
 name the same shred path
 
 query I
-SELECT to_json(jsono('{"a":7,"tail":8}', shredding := {'$.a': 'BIGINT'}))
+SELECT to_json(jsono('{"a":7,"tail":8}', shredding := '{"$.a": "BIGINT"}'))
      = to_json(jsono('{"a":7,"tail":8}'));
 ----
 true
@@ -96,24 +93,24 @@ true
 # Nested lanes refill only their stripped leaves; residual siblings remain authoritative.
 query I
 SELECT to_json(jsono('{"a":{"x":1,"y":2},"b":3}',
-                     shredding := {'$.a.x': 'BIGINT', '$.b': 'BIGINT'}))
+                     shredding := '{"$.a.x": "BIGINT", "$.b": "BIGINT"}'))
      = to_json(jsono('{"a":{"x":1,"y":2},"b":3}'));
 ----
 true
 
 # The reserved physical marker name remains an ordinary JSON key in the logical value.
 query I
-SELECT to_json(jsono('{"$jsono$set":9,"a":1}', shredding := {'a': 'BIGINT'}))
+SELECT to_json(jsono('{"$jsono$set":9,"a":1}', shredding := '{"a": "BIGINT"}'))
      = to_json(jsono('{"$jsono$set":9,"a":1}'));
 ----
 true
 
 # List shreds and strictly-overlapping paths already use full reconstruction and retain parity.
 query II
-SELECT to_json(jsono('{"items":[1,2,3],"tail":4}', shredding := {'$.items': 'BIGINT[]'}))
+SELECT to_json(jsono('{"items":[1,2,3],"tail":4}', shredding := '{"$.items": "BIGINT[]"}'))
      = to_json(jsono('{"items":[1,2,3],"tail":4}')),
        to_json(jsono('{"a":{"x":1},"tail":2}',
-                     shredding := {'a': 'VARCHAR', '$.a.x': 'BIGINT'}))
+                     shredding := '{"a": "VARCHAR", "$.a.x": "BIGINT"}'))
      = to_json(jsono('{"a":{"x":1},"tail":2}'));
 ----
 true	true

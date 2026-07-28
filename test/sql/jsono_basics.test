@@ -113,21 +113,21 @@ FROM (SELECT jsono_storage_size(jsono('{"a":"x"}')) AS s);
 # shred counts 8; total covers the body blobs plus the shreds.
 query II
 SELECT s.shreds, s.total = s.slots + s.key_heap + s.string_heap + s.skips + s.lengths + s.nums + s.shreds
-FROM (SELECT jsono_storage_size(jsono('{"name":"hello","n":7,"b":{"c":2}}', shredding := {'name':'VARCHAR','$.n':'BIGINT'})) AS s);
+FROM (SELECT jsono_storage_size(jsono('{"name":"hello","n":7,"b":{"c":2}}', shredding := '{"name": "VARCHAR", "$.n": "BIGINT"}')) AS s);
 ----
 13	true
 
 # A NULL shred value contributes 0 bytes; a plain value reports shreds = 0.
 query II
 SELECT
-  (jsono_storage_size(jsono('{"b":1}', shredding := {'name':'VARCHAR'}))).shreds,
+  (jsono_storage_size(jsono('{"b":1}', shredding := '{"name": "VARCHAR"}'))).shreds,
   (jsono_storage_size(jsono('{"a":"x"}'))).shreds;
 ----
 0	0
 
 # jsono_validate accepts a shredded value, validating its residual encoding; NULL stays NULL.
 query II
-SELECT jsono_validate(jsono('{"name":"x"}', shredding := {'name':'VARCHAR'})), jsono_validate(jsono(NULL));
+SELECT jsono_validate(jsono('{"name":"x"}', shredding := '{"name": "VARCHAR"}')), jsono_validate(jsono(NULL));
 ----
 true	NULL
 

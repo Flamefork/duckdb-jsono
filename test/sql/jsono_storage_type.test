@@ -67,8 +67,8 @@ jsono_extract_string: argument must be JSONO
 # column per spec entry inside the `shreds` struct. The DDL is byte-identical to the type the
 # constructor produces from the same shreds (asserted by equality rather than a hardcoded literal).
 query I
-SELECT jsono_storage_type('event_name VARCHAR, n BIGINT')
-     = typeof(jsono('{}', shredding := {'event_name':'VARCHAR','n':'BIGINT'}));
+SELECT jsono_storage_type('{"event_name": "VARCHAR", "n": "BIGINT"}')
+     = typeof(jsono('{}', shredding := '{"event_name": "VARCHAR", "n": "BIGINT"}'));
 ----
 true
 
@@ -76,10 +76,10 @@ true
 # set: a reversed shred order in the DDL or the spec yields the exact same type, not just a compatible
 # one. This keeps jsono_storage_type and CREATE TABLE AS SELECT in lockstep regardless of order.
 query I
-SELECT jsono_storage_type('n BIGINT, event_name VARCHAR')
-     = jsono_storage_type('event_name VARCHAR, n BIGINT')
-   AND jsono_storage_type('n BIGINT, event_name VARCHAR')
-     = typeof(jsono('{}', shredding := {'event_name':'VARCHAR','n':'BIGINT'}));
+SELECT jsono_storage_type('{"n": "BIGINT", "event_name": "VARCHAR"}')
+     = jsono_storage_type('{"event_name": "VARCHAR", "n": "BIGINT"}')
+   AND jsono_storage_type('{"n": "BIGINT", "event_name": "VARCHAR"}')
+     = typeof(jsono('{}', shredding := '{"event_name": "VARCHAR", "n": "BIGINT"}'));
 ----
 true
 
@@ -87,7 +87,7 @@ true
 # shreds (CTAS infers the shredded type); the shred reads back transparently through ->>.
 statement ok
 CREATE TABLE probe_shred AS
-SELECT jsono('{"event_name":"page_view","a":1}', shredding := {'event_name':'VARCHAR'}) AS e;
+SELECT jsono('{"event_name":"page_view","a":1}', shredding := '{"event_name": "VARCHAR"}') AS e;
 
 query I
 SELECT e ->> 'event_name' FROM probe_shred;
@@ -97,7 +97,7 @@ page_view
 # A value shredded on a different — even fully disjoint — shred set lands losslessly: the
 # optimizer rewrites the struct cast into reconstruct + reshred against the column's shred set.
 statement ok
-INSERT INTO probe_shred SELECT jsono('{"x":"y"}', shredding := {'x':'VARCHAR'});
+INSERT INTO probe_shred SELECT jsono('{"x":"y"}', shredding := '{"x": "VARCHAR"}');
 
 query I
 SELECT to_json(e)::VARCHAR FROM probe_shred ORDER BY 1;
@@ -112,8 +112,8 @@ SELECT to_json(e)::VARCHAR FROM probe_shred ORDER BY 1;
 # quoted `$.`-rooted spelling — that is the spec DSL's own reservation, not the format's.) Both sides
 # still agree, which is the point of the shared parse.
 query I
-SELECT jsono_storage_type('"$.""$jsono$set""" VARCHAR')
-     = typeof(jsono('{"$jsono$set":"x"}', shredding := {'$."$jsono$set"':'VARCHAR'}));
+SELECT jsono_storage_type('{"$.\"$jsono$set\"": "VARCHAR"}')
+     = typeof(jsono('{"$jsono$set":"x"}', shredding := '{"$.\"$jsono$set\"": "VARCHAR"}'));
 ----
 true
 
@@ -122,74 +122,74 @@ true
 # under the root. The bare quoted form is NOT the same path -- it names a key whose bytes include
 # the quotes -- so documenting one spelling and pinning the difference is the whole contract.
 query II
-SELECT [l.path FOR l IN jsono_layout_lanes(jsono('{"$foo":"v"}', shredding := {'$."$foo"':'VARCHAR'}))],
-       jsono('{"$foo":"v"}', shredding := {'$."$foo"':'VARCHAR'}) ->> '$."$foo"';
+SELECT [l.path FOR l IN jsono_layout_lanes(jsono('{"$foo":"v"}', shredding := '{"$.\"$foo\"": "VARCHAR"}'))],
+       jsono('{"$foo":"v"}', shredding := '{"$.\"$foo\"": "VARCHAR"}') ->> '$."$foo"';
 ----
 [$.$foo]	v
 
 query I
-SELECT [l.path FOR l IN jsono_layout_lanes(jsono('{"$foo":"v"}', shredding := {'"$foo"':'VARCHAR'}))];
+SELECT [l.path FOR l IN jsono_layout_lanes(jsono('{"$foo":"v"}', shredding := '{"\"$foo\"": "VARCHAR"}'))];
 ----
 ['$."\\"$foo\\""']
 
 
 query I
-SELECT jsono_storage_type('"$.""$jsono$spill$0""" VARCHAR')
-     = typeof(jsono('{"$jsono$spill$0":"x"}', shredding := {'$."$jsono$spill$0"':'VARCHAR'}));
+SELECT jsono_storage_type('{"$.\"$jsono$spill$0\"": "VARCHAR"}')
+     = typeof(jsono('{"$jsono$spill$0":"x"}', shredding := '{"$.\"$jsono$spill$0\"": "VARCHAR"}'));
 ----
 true
 
 query I
-SELECT jsono_storage_type('body BIGINT') = typeof(jsono('{"body":1}', shredding := {'body':'BIGINT'}));
+SELECT jsono_storage_type('{"body": "BIGINT"}') = typeof(jsono('{"body":1}', shredding := '{"body": "BIGINT"}'));
 ----
 true
 
 # Unsupported shred types are rejected here, not only later by the constructor.
 statement error
-SELECT jsono_storage_type('a INTEGER');
+SELECT jsono_storage_type('{"a": "INTEGER"}');
 ----
 unsupported shred type
 
 statement error
-SELECT jsono_storage_type('a JSON');
+SELECT jsono_storage_type('{"a": "JSON"}');
 ----
 unsupported shred type
 
 # `body` and `$.body` are two spellings of ONE path, so they now name one lane: the DDL helper and the
 # constructor agree whichever spelling either is given.
 query I
-SELECT jsono_storage_type('"$.body" BIGINT') = typeof(jsono('{"body":1}', shredding := {'$.body':'BIGINT'}));
+SELECT jsono_storage_type('{"$.body": "BIGINT"}') = typeof(jsono('{"body":1}', shredding := '{"$.body": "BIGINT"}'));
 ----
 true
 
 query I
-SELECT jsono_storage_type('"$.body" BIGINT') = jsono_storage_type('body BIGINT');
+SELECT jsono_storage_type('{"$.body": "BIGINT"}') = jsono_storage_type('{"body": "BIGINT"}');
 ----
 true
 
 # Two columns resolving to one path cannot both be fields of one STRUCT, so the DDL helper refuses
 # loudly rather than emit a type it cannot build.
 statement error
-SELECT jsono_storage_type('body BIGINT, "$.body" BIGINT');
+SELECT jsono_storage_type('{"body": "BIGINT", "$.body": "BIGINT"}');
 ----
 name the same shred path
 
 # Every shred path must be an object-key chain, matching the constructor: an array-index step is
 # rejected whether the shred type is an array or a scalar.
 statement error
-SELECT jsono_storage_type('"$.a[0]" STRUCT(id BIGINT)[]');
+SELECT jsono_storage_type('{"$.a[0]": "STRUCT(id BIGINT)[]"}');
 ----
 object-key path
 
 query I
-SELECT jsono_storage_type('"$.a" STRUCT(id BIGINT)[]')
-     = typeof(jsono('{"a":[{"id":1}]}', shredding := {'$.a':'STRUCT(id BIGINT)[]'}));
+SELECT jsono_storage_type('{"$.a": "STRUCT(id BIGINT)[]"}')
+     = typeof(jsono('{"a":[{"id":1}]}', shredding := '{"$.a": "STRUCT(id BIGINT)[]"}'));
 ----
 true
 
 query I
-SELECT jsono_storage_type('"$.ids" UBIGINT[]')
-     = typeof(jsono('{"ids":[1,2]}', shredding := {'$.ids':'UBIGINT[]'}));
+SELECT jsono_storage_type('{"$.ids": "UBIGINT[]"}')
+     = typeof(jsono('{"ids":[1,2]}', shredding := '{"$.ids": "UBIGINT[]"}'));
 ----
 true
 
@@ -222,7 +222,7 @@ statement ok
 CREATE TABLE hand_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 INTEGER))));
 
 statement ok
-INSERT INTO hand_declared SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'});
+INSERT INTO hand_declared SELECT jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}');
 
 query II
 SELECT v ->> 'a', v ->> 'b' FROM hand_declared;
@@ -242,7 +242,7 @@ CREATE TABLE helper_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, 
 
 
 statement ok
-INSERT INTO helper_declared SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'});
+INSERT INTO helper_declared SELECT jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}');
 
 query II
 SELECT v ->> 'a', v ->> 'b' FROM helper_declared;
@@ -252,6 +252,6 @@ SELECT v ->> 'a', v ->> 'b' FROM helper_declared;
 # …and that column type IS what the helper emits for the shred set — the declaration above is the
 # helper's own output, not a lucky hand-written match.
 query I
-SELECT jsono_storage_type('a BIGINT') = typeof(v) FROM helper_declared;
+SELECT jsono_storage_type('{"a": "BIGINT"}') = typeof(v) FROM helper_declared;
 ----
 true

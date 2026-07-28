@@ -9,7 +9,7 @@ require json
 
 # A shredded value with a typed shred ($.a BIGINT), a string shred (name) and a nested residual (b).
 statement ok
-CREATE TABLE t AS SELECT jsono('{"a":1,"b":{"c":2},"name":"x"}', shredding := {'$.a':'BIGINT','name':'VARCHAR'}) AS j;
+CREATE TABLE t AS SELECT jsono('{"a":1,"b":{"c":2},"name":"x"}', shredding := '{"$.a": "BIGINT", "name": "VARCHAR"}') AS j;
 
 # jsono_extract reads both a shred path and a residual path off the reconstructed document.
 query II

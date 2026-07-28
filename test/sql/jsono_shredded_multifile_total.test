@@ -12,11 +12,11 @@ require parquet
 # in BOTH files, but the differing shred sets make the per-file column types unequal, so the
 # engine's multi-file stats merge bails and jsono recovers the stats through the union readers.
 statement ok
-COPY (SELECT jsono('{"a":"A' || i || '","b":"B","n":' || i || '}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS e FROM range(1000) t(i))
+COPY (SELECT jsono('{"a":"A' || i || '","b":"B","n":' || i || '}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}') AS e FROM range(1000) t(i))
 TO '__TEST_DIR__/mft_a.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono('{"a":"X' || i || '","c":"C","n":' || (i + 1000) || '}', shredding := {'a':'VARCHAR','c':'VARCHAR'}) AS e FROM range(1000) t(i))
+COPY (SELECT jsono('{"a":"X' || i || '","c":"C","n":' || (i + 1000) || '}', shredding := '{"a": "VARCHAR", "c": "VARCHAR"}') AS e FROM range(1000) t(i))
 TO '__TEST_DIR__/mft_b.parquet' (FORMAT parquet);
 
 statement ok
@@ -67,7 +67,7 @@ B	1000
 # but each file is all-clean under its own marker (a SQL-NULL row is invisible to min/max and a bare
 # read of it is correctly NULL), so the per-file identity AND still folds the read COALESCE-free.
 statement ok
-COPY (SELECT CASE WHEN i % 10 = 0 THEN jsono(NULL) ELSE jsono('{"a":"N' || i || '"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) END AS e FROM range(100) t(i))
+COPY (SELECT CASE WHEN i % 10 = 0 THEN jsono(NULL) ELSE jsono('{"a":"N' || i || '"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}') END AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_null.parquet' (FORMAT parquet);
 
 statement ok
@@ -90,11 +90,11 @@ FROM read_parquet(['__TEST_DIR__/mft_null.parquet', '__TEST_DIR__/mft_b.parquet'
 # (d) a spilled value (a string in a BIGINT lane) dirties its file's marker and sets the lane's
 # spill bit; the per-file decode excludes the lane and the fallback recovers the residual value.
 statement ok
-COPY (SELECT jsono('{"n":' || i || '}', shredding := {'$.n':'BIGINT'}) AS e FROM range(100) t(i))
+COPY (SELECT jsono('{"n":' || i || '}', shredding := '{"$.n": "BIGINT"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_num.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono(CASE WHEN i = 7 THEN '{"n":"spill"}' ELSE '{"n":' || (i + 100) || '}' END, shredding := {'$.n':'BIGINT','$.z':'BIGINT'}) AS e FROM range(100) t(i))
+COPY (SELECT jsono(CASE WHEN i = 7 THEN '{"n":"spill"}' ELSE '{"n":' || (i + 100) || '}' END, shredding := '{"$.n": "BIGINT", "$.z": "BIGINT"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_spill.parquet' (FORMAT parquet);
 
 statement ok
@@ -141,7 +141,7 @@ physical_plan	<!REGEX>:.*COALESCE.*
 # lands the jsono column in a later slot (with a live scalar column keeping the
 # projection past column pruning) must still fold the lane COALESCE-free.
 statement ok
-COPY (SELECT i AS k, jsono('{"a":"A' || i || '"}', shredding := {'a':'VARCHAR'}) AS e FROM range(1000) t(i))
+COPY (SELECT i AS k, jsono('{"a":"A' || i || '"}', shredding := '{"a": "VARCHAR"}') AS e FROM range(1000) t(i))
 TO '__TEST_DIR__/mft_kv.parquet' (FORMAT parquet);
 
 statement ok
@@ -204,11 +204,11 @@ SELECT count(DISTINCT e->>'a') FROM (
 # loudly rather than fabricate a value. This pins the correctness-critical `AlignStatsToReadType`
 # divergent-type branch.
 statement ok
-COPY (SELECT jsono('{"a":"A' || i || '"}', shredding := {'a':'VARCHAR'}) AS e FROM range(100) t(i))
+COPY (SELECT jsono('{"a":"A' || i || '"}', shredding := '{"a": "VARCHAR"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_dv_a.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono('{"a":' || (i + 100) || '}', shredding := {'a':'BIGINT'}) AS e FROM range(100) t(i))
+COPY (SELECT jsono('{"a":' || (i + 100) || '}', shredding := '{"a": "BIGINT"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_dv_b.parquet' (FORMAT parquet);
 
 statement ok
@@ -241,19 +241,19 @@ converted by a raw struct cast
 # all three folds; a value spilled ONLY in the third file has to block the fold, proving the loop is
 # not truncated to the first two files.
 statement ok
-COPY (SELECT jsono('{"n":' || i || ',"x":' || i || '}', shredding := {'$.n':'BIGINT','$.x':'BIGINT'}) AS e FROM range(100) t(i))
+COPY (SELECT jsono('{"n":' || i || ',"x":' || i || '}', shredding := '{"$.n": "BIGINT", "$.x": "BIGINT"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft3_a.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono('{"n":' || (i + 100) || ',"y":' || i || '}', shredding := {'$.n':'BIGINT','$.y':'BIGINT'}) AS e FROM range(100) t(i))
+COPY (SELECT jsono('{"n":' || (i + 100) || ',"y":' || i || '}', shredding := '{"$.n": "BIGINT", "$.y": "BIGINT"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft3_b.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono('{"n":' || (i + 200) || ',"z":' || i || '}', shredding := {'$.n':'BIGINT','$.z':'BIGINT'}) AS e FROM range(100) t(i))
+COPY (SELECT jsono('{"n":' || (i + 200) || ',"z":' || i || '}', shredding := '{"$.n": "BIGINT", "$.z": "BIGINT"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft3_c.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono(CASE WHEN i = 3 THEN '{"n":"spill","z":' || i || '}' ELSE '{"n":' || (i + 200) || ',"z":' || i || '}' END, shredding := {'$.n':'BIGINT','$.z':'BIGINT'}) AS e FROM range(100) t(i))
+COPY (SELECT jsono(CASE WHEN i = 3 THEN '{"n":"spill","z":' || i || '}' ELSE '{"n":' || (i + 200) || ',"z":' || i || '}' END, shredding := '{"$.n": "BIGINT", "$.z": "BIGINT"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft3_spill.parquet' (FORMAT parquet);
 
 statement ok
@@ -312,12 +312,12 @@ A0	2000
 # hash — the per-file AND proves lane `a` total, and the read is COALESCE-free.
 statement ok
 COPY (SELECT jsono(CASE WHEN i % 3 = 0 THEN '{"z":1}' ELSE '{"a":"A' || i || '"}' END,
-                   shredding := {'a':'VARCHAR'}) AS e FROM range(100) t(i))
+                   shredding := '{"a": "VARCHAR"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_pf_a.parquet' (FORMAT parquet);
 
 statement ok
 COPY (SELECT jsono(CASE WHEN i % 3 = 0 THEN '{"z":1}' ELSE '{"a":"B' || i || '","b":' || i || '}' END,
-                   shredding := {'a':'VARCHAR','b':'BIGINT'}) AS e FROM range(100) t(i))
+                   shredding := '{"a": "VARCHAR", "b": "BIGINT"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_pf_b.parquet' (FORMAT parquet);
 
 statement ok
@@ -350,7 +350,7 @@ FROM read_parquet(['__TEST_DIR__/mft_pf_a.parquet', '__TEST_DIR__/mft_pf_b.parqu
 # and the diverted values read from the residual.
 statement ok
 COPY (SELECT jsono(CASE WHEN i % 10 = 0 THEN '{"a":' || i || '}' ELSE '{"a":"B' || i || '"}' END,
-                   shredding := {'a':'VARCHAR','b':'BIGINT'}) AS e FROM range(100) t(i))
+                   shredding := '{"a": "VARCHAR", "b": "BIGINT"}') AS e FROM range(100) t(i))
 TO '__TEST_DIR__/mft_pf_dirty.parquet' (FORMAT parquet);
 
 statement ok

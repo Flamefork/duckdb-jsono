@@ -12,14 +12,14 @@ require parquet
 # A simple key. The lane is the last field of `shreds`, so matching the tail pins the name exactly
 # without restating the six-blob body or the layout revision.
 query I
-SELECT jsono_storage_type('gclid VARCHAR') LIKE '%, cthmoqb40000 VARCHAR)))';
+SELECT jsono_storage_type('{"gclid": "VARCHAR"}') LIKE '%, cthmoqb40000 VARCHAR)))';
 ----
 true
 
 # The other spelling of the same key encodes to an unrelated name. It is quoted in the type string
 # only because it starts with a digit — the alphabet spans 0-9a-v, so a leading digit is ordinary.
 query I
-SELECT jsono_storage_type('GCLID VARCHAR') LIKE '%, "8t1koia40000" VARCHAR)))';
+SELECT jsono_storage_type('{"GCLID": "VARCHAR"}') LIKE '%, "8t1koia40000" VARCHAR)))';
 ----
 true
 
@@ -27,18 +27,18 @@ true
 # the path spelled verbatim these two types were case-equal and a type merge collapsed the two lanes
 # into one. Lower-casing both is exactly that comparison, and it must now separate them.
 query I
-SELECT lower(jsono_storage_type('gclid VARCHAR')) = lower(jsono_storage_type('GCLID VARCHAR'));
+SELECT lower(jsono_storage_type('{"gclid": "VARCHAR"}')) = lower(jsono_storage_type('{"GCLID": "VARCHAR"}'));
 ----
 false
 
 query I
-SELECT jsono_storage_type('clientID VARCHAR') LIKE '%, cdm6ipbeeh4k8000 VARCHAR)))';
+SELECT jsono_storage_type('{"clientID": "VARCHAR"}') LIKE '%, cdm6ipbeeh4k8000 VARCHAR)))';
 ----
 true
 
 # A nested path: two keys, each terminated, concatenated in path order.
 query I
-SELECT jsono_storage_type('"$.URL.fragment" VARCHAR') LIKE '%, al94o000cpp62prdcln78000 VARCHAR)))';
+SELECT jsono_storage_type('{"$.URL.fragment": "VARCHAR"}') LIKE '%, al94o000cpp62prdcln78000 VARCHAR)))';
 ----
 true
 
@@ -46,12 +46,12 @@ true
 # ("is the dot nesting or a literal?") is answered once, at spec parse, and never again inside the
 # format.
 query I
-SELECT jsono_storage_type('"URL.fragment" VARCHAR') LIKE '%, al94obj6e9gmerb5dpq0000 VARCHAR)))';
+SELECT jsono_storage_type('{"URL.fragment": "VARCHAR"}') LIKE '%, al94obj6e9gmerb5dpq0000 VARCHAR)))';
 ----
 true
 
 query I
-SELECT jsono_storage_type('"$.URL.fragment" VARCHAR') = jsono_storage_type('"URL.fragment" VARCHAR');
+SELECT jsono_storage_type('{"$.URL.fragment": "VARCHAR"}') = jsono_storage_type('{"URL.fragment": "VARCHAR"}');
 ----
 false
 
@@ -59,19 +59,19 @@ false
 # but the name it produces carries no quoting rules and cannot collide with `$jsono$...`: the
 # alphabet has no `$`.
 query I
-SELECT jsono_storage_type('"$.""$x""" VARCHAR') LIKE '%, "4hs0000" VARCHAR)))';
+SELECT jsono_storage_type('{"$.\"$x\"": "VARCHAR"}') LIKE '%, "4hs0000" VARCHAR)))';
 ----
 true
 
 # The empty key encodes to the bare terminator — representable, unlike under a text name.
 query I
-SELECT jsono_storage_type('"$.""""" VARCHAR') LIKE '%, "0000" VARCHAR)))';
+SELECT jsono_storage_type('{"$.\"\"": "VARCHAR"}') LIKE '%, "0000" VARCHAR)))';
 ----
 true
 
 # The constructor and the DDL helper encode identically — one boundary, one result.
 query I
-SELECT typeof(jsono('{"gclid":"x"}', shredding := {'gclid': 'VARCHAR'})) = jsono_storage_type('gclid VARCHAR');
+SELECT typeof(jsono('{"gclid":"x"}', shredding := '{"gclid": "VARCHAR"}')) = jsono_storage_type('{"gclid": "VARCHAR"}');
 ----
 true
 
@@ -80,7 +80,7 @@ true
 # and precedes it as a name. The general claim over random and adversarial paths belongs to the
 # property harness; this pins one concrete pair.
 query I
-SELECT jsono_storage_type('a VARCHAR, "$.URL.path" VARCHAR')
+SELECT jsono_storage_type('{"a": "VARCHAR", "$.URL.path": "VARCHAR"}')
   LIKE '%, al94o000e1gn8q0000 VARCHAR, c4000 VARCHAR)))';
 ----
 true
@@ -90,7 +90,7 @@ true
 # ASCII, so the lane is expressible as a hand-built layout and must be recognized. `03vg000` decodes
 # to the one-step path [0x00] (`00 FF` escape, then the `00 00` terminator).
 query I
-WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := '{"a": "VARCHAR"}') AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
   "shreds$2" := struct_pack(
@@ -113,7 +113,7 @@ jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
 # to a path no writer could mint, so recognition refuses it the same way it refuses any other name a
 # writer could not have produced.
 query I
-WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := '{"a": "VARCHAR"}') AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
   "shreds$2" := struct_pack(
@@ -126,7 +126,7 @@ jsono: shredded, body revision 1, shreds revision 2, 1 shreds, 1 spill column(s)
 
 # The NUL key reads back whole: `$.a<NUL>b`, escape decoded, terminator consumed.
 query I
-WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := '{"a": "VARCHAR"}') AS c)
 SELECT hex(l.path)
 FROM (SELECT unnest(jsono_layout_lanes(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
@@ -140,7 +140,7 @@ FROM (SELECT unnest(jsono_layout_lanes(struct_pack(jsono := struct_pack(
 # The 0xFF path is a clean decode of bytes no key may hold, so it is not a lane name. Silent, like
 # every other non-lane struct — and loud only if you ask what it is.
 query I
-WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := '{"a": "VARCHAR"}') AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
   "shreds$2" := struct_pack(
@@ -156,7 +156,7 @@ not jsono: field 'c4001vr20000' is not a shred lane: a lane is named by the base
 # terminator is truncated. Canonicity is `Encode(Decode(name)) == name`, so the name is not a lane
 # name and the struct is not JSONO — silently, the way recognition treats every unknown struct.
 query I
-WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := '{"a": "VARCHAR"}') AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
   "shreds$2" := struct_pack(
@@ -170,7 +170,7 @@ true
 # Upper case is rejected rather than folded. `C4000` decodes to the same bytes as `c4000`, so
 # accepting it would hand one lane two spellings — which is where case collisions came from.
 query I
-WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := '{"a": "VARCHAR"}') AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
   "shreds$2" := struct_pack(
@@ -184,7 +184,7 @@ true
 # A lane spelled the way the closed `shreds$1` revision spelled it (the path as text) is not a
 # canonical name either, so a hand-assembled mixture of the two forms is not read as JSONO.
 query I
-WITH v AS (SELECT jsono('{"a":"x"}', shredding := {'a': 'VARCHAR'}) AS c)
+WITH v AS (SELECT jsono('{"a":"x"}', shredding := '{"a": "VARCHAR"}') AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
   "shreds$2" := struct_pack(
@@ -205,11 +205,11 @@ true
 # the Metrica row's value. Encoded, the names share no prefix at all, so both lanes survive the merge.
 
 statement ok
-COPY (SELECT jsono('{"gclid":"from_adjust"}', shredding := {'gclid':'VARCHAR'}) AS v)
+COPY (SELECT jsono('{"gclid":"from_adjust"}', shredding := '{"gclid": "VARCHAR"}') AS v)
 TO '__TEST_DIR__/lane_case_low.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono('{"GCLID":"from_ym"}', shredding := {'GCLID':'VARCHAR'}) AS v)
+COPY (SELECT jsono('{"GCLID":"from_ym"}', shredding := '{"GCLID": "VARCHAR"}') AS v)
 TO '__TEST_DIR__/lane_case_up.parquet' (FORMAT parquet);
 
 # Both lanes live in the merged type — the collapse is what made the type carry only one.
@@ -239,7 +239,7 @@ ORDER BY doc;
 # is called current and the first reader to want the subfield's KEY dies mid-read with an internal
 # error — on a value whose type recognition had just said it was fine.
 query I
-WITH v AS (SELECT jsono('{"items":[{"n":1}]}', shredding := {'$.items': 'STRUCT(n BIGINT)[]'}) AS c)
+WITH v AS (SELECT jsono('{"items":[{"n":1}]}', shredding := '{"$.items": "STRUCT(n BIGINT)[]"}') AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
   "shreds$2" := struct_pack(
@@ -253,7 +253,7 @@ not jsono: array shred 'd5q6arbj0000' has an element subfield whose name is not 
 # The same struct with the subfield spelled the way the codec spells it IS a lane, so the refusal
 # above is about the naming and not about hand-built structs in general.
 query I
-WITH v AS (SELECT jsono('{"items":[{"n":1}]}', shredding := {'$.items': 'STRUCT(n BIGINT)[]'}) AS c)
+WITH v AS (SELECT jsono('{"items":[{"n":1}]}', shredding := '{"$.items": "STRUCT(n BIGINT)[]"}') AS c)
 SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
   "body$1" := c.jsono."body$1",
   "shreds$2" := struct_pack(

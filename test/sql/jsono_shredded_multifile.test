@@ -19,11 +19,11 @@ require parquet
 # other path lives in the residual (it was never a shred there), so its lane is NULL-filled on the
 # union read — yet its value must still read back.
 statement ok
-COPY (SELECT jsono('{"a":"A1","b":"B1","c":"C1"}', shredding := {'a':'VARCHAR'}) AS e)
+COPY (SELECT jsono('{"a":"A1","b":"B1","c":"C1"}', shredding := '{"a": "VARCHAR"}') AS e)
 TO '__TEST_DIR__/mf_a.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono('{"a":"X1","b":"Y1","c":"Z1"}', shredding := {'b':'VARCHAR'}) AS e)
+COPY (SELECT jsono('{"a":"X1","b":"Y1","c":"Z1"}', shredding := '{"b": "VARCHAR"}') AS e)
 TO '__TEST_DIR__/mf_b.parquet' (FORMAT parquet);
 
 # Every path reads correctly regardless of which file shredded it: the shredded path reads its lane,
@@ -67,11 +67,11 @@ X1	Y1
 # Disjoint TYPED (BIGINT) shred sets: file A shreds $.n, file B shreds $.m. The other typed value sits
 # in the residual with a NULL lane; CAST(->> AS BIGINT) must recover it (the typed COALESCE fallback).
 statement ok
-COPY (SELECT jsono('{"n":11,"m":21}', shredding := {'$.n':'BIGINT'}) AS e)
+COPY (SELECT jsono('{"n":11,"m":21}', shredding := '{"$.n": "BIGINT"}') AS e)
 TO '__TEST_DIR__/mt_a.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono('{"n":12,"m":22}', shredding := {'$.m':'BIGINT'}) AS e)
+COPY (SELECT jsono('{"n":12,"m":22}', shredding := '{"$.m": "BIGINT"}') AS e)
 TO '__TEST_DIR__/mt_b.parquet' (FORMAT parquet);
 
 query III
@@ -85,11 +85,11 @@ ORDER BY j;
 # Control: a HOMOGENEOUS multi-file read (both files the same shred set) is unaffected — every row's
 # shred-set marker carries the same hash, and the residual path reads correctly throughout.
 statement ok
-COPY (SELECT jsono('{"a":"H1","b":"G1"}', shredding := {'a':'VARCHAR'}) AS e)
+COPY (SELECT jsono('{"a":"H1","b":"G1"}', shredding := '{"a": "VARCHAR"}') AS e)
 TO '__TEST_DIR__/mh_1.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono('{"a":"H2","b":"G2"}', shredding := {'a':'VARCHAR'}) AS e)
+COPY (SELECT jsono('{"a":"H2","b":"G2"}', shredding := '{"a": "VARCHAR"}') AS e)
 TO '__TEST_DIR__/mh_2.parquet' (FORMAT parquet);
 
 query III

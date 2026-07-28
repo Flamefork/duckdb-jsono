@@ -13,10 +13,10 @@ require json
 query IIII
 SELECT j->>'a' AS a,
        j.jsono."shreds$2"."$jsono$spill$0" AS spill,
-       j.jsono."shreds$2"."$jsono$set" = jsono('{"a":1,"b":2}', shredding := {'a':'BIGINT','$.b':'BIGINT'}).jsono."shreds$2"."$jsono$set" AS clean_marker,
+       j.jsono."shreds$2"."$jsono$set" = jsono('{"a":1,"b":2}', shredding := '{"a": "BIGINT", "$.b": "BIGINT"}').jsono."shreds$2"."$jsono$set" AS clean_marker,
        to_json(j)::VARCHAR AS rt
 FROM (
-  SELECT i, jsono(d, shredding := {'a':'BIGINT','$.b':'BIGINT'}) AS j FROM (VALUES
+  SELECT i, jsono(d, shredding := '{"a": "BIGINT", "$.b": "BIGINT"}') AS j FROM (VALUES
     (1, '{"a":1,"b":2}'),      -- both fit: clean
     (2, '{"b":2}'),            -- a absent: clean
     (3, '{"a":null,"b":2}'),   -- a explicit null: clean
@@ -38,23 +38,23 @@ x	3	0	{"a":"x","b":"y"}
 # The dirty marker is exactly the clean hash with its lowest bit flipped.
 query I
 SELECT xor(d.jsono."shreds$2"."$jsono$set", c.jsono."shreds$2"."$jsono$set")
-FROM (SELECT jsono('{"a":"x"}', shredding := {'a':'BIGINT'}) AS d,
-             jsono('{"a":1}', shredding := {'a':'BIGINT'}) AS c);
+FROM (SELECT jsono('{"a":"x"}', shredding := '{"a": "BIGINT"}') AS d,
+             jsono('{"a":1}', shredding := '{"a": "BIGINT"}') AS c);
 ----
 1
 
 # A SQL-NULL row NULLs the whole shreds subtree (marker, spill, lanes).
 query III
 SELECT j IS NULL, j.jsono."shreds$2"."$jsono$set" IS NULL, j.jsono."shreds$2"."$jsono$spill$0" IS NULL
-FROM (SELECT jsono(NULL::VARCHAR, shredding := {'a':'BIGINT'}) AS j);
+FROM (SELECT jsono(NULL::VARCHAR, shredding := '{"a": "BIGINT"}') AS j);
 ----
 true	true	true
 
 # The plain-jsono shred writer (jsono(jsono, shredding :=)) stamps identically to the text path.
 query II
 SELECT j.jsono."shreds$2"."$jsono$spill$0",
-       j = jsono('{"a":"x","b":2}', shredding := {'a':'BIGINT','$.b':'BIGINT'})
-FROM (SELECT jsono(jsono('{"a":"x","b":2}'), shredding := {'a':'BIGINT','$.b':'BIGINT'}) AS j);
+       j = jsono('{"a":"x","b":2}', shredding := '{"a": "BIGINT", "$.b": "BIGINT"}')
+FROM (SELECT jsono(jsono('{"a":"x","b":2}'), shredding := '{"a": "BIGINT", "$.b": "BIGINT"}') AS j);
 ----
 1	true
 
@@ -71,8 +71,8 @@ true	true
 # fresh clean shred `b` — the mask stays 1 and the residual value still reads through the fallback.
 query III
 SELECT j.jsono."shreds$2"."$jsono$spill$0", j->>'a', j->>'b'
-FROM (SELECT jsono(jsono('{"a":"x","b":"y"}', shredding := {'a':'BIGINT'}),
-                   shredding := {'a':'BIGINT','b':'VARCHAR'}) AS j);
+FROM (SELECT jsono(jsono('{"a":"x","b":"y"}', shredding := '{"a": "BIGINT"}'),
+                   shredding := '{"a": "BIGINT", "b": "VARCHAR"}') AS j);
 ----
 1	x	y
 
@@ -80,8 +80,8 @@ FROM (SELECT jsono(jsono('{"a":"x","b":"y"}', shredding := {'a':'BIGINT'}),
 # target {a VARCHAR, z BIGINT} lists z at rank 1 — the translated mask moves the bit.
 query II
 SELECT j.jsono."shreds$2"."$jsono$spill$0", j->>'z'
-FROM (SELECT jsono(jsono('{"z":"str","a":"ok"}', shredding := {'z':'BIGINT'}),
-                   shredding := {'z':'BIGINT','a':'VARCHAR'}) AS j);
+FROM (SELECT jsono(jsono('{"z":"str","a":"ok"}', shredding := '{"z": "BIGINT"}'),
+                   shredding := '{"z": "BIGINT", "a": "VARCHAR"}') AS j);
 ----
 2	str
 
@@ -89,8 +89,8 @@ FROM (SELECT jsono(jsono('{"z":"str","a":"ok"}', shredding := {'z':'BIGINT'}),
 # reshred is clean (no mask, clean marker).
 query II
 SELECT j.jsono."shreds$2"."$jsono$spill$0" IS NULL, j->>'a'
-FROM (SELECT jsono(jsono('{"a":"x","b":1}', shredding := {'a':'BIGINT','b':'BIGINT'}),
-                   shredding := {'b':'BIGINT'}) AS j);
+FROM (SELECT jsono(jsono('{"a":"x","b":1}', shredding := '{"a": "BIGINT", "b": "BIGINT"}'),
+                   shredding := '{"b": "BIGINT"}') AS j);
 ----
 true	x
 
@@ -98,15 +98,15 @@ true	x
 # the lane is NULL and readers always reconstruct arrays from the residual.
 query II
 SELECT j.jsono."shreds$2"."$jsono$spill$0" IS NULL, to_json(j)::VARCHAR
-FROM (SELECT jsono('{"tags": 7}', shredding := {'tags':'BIGINT[]'}) AS j);
+FROM (SELECT jsono('{"tags": 7}', shredding := '{"tags": "BIGINT[]"}') AS j);
 ----
 true	{"tags":7}
 
 # A set past 63 shreds grows a second spill column ("$jsono$spill$1"): the type carries ⌈N/63⌉
 # bitmap columns, one bit per shred rank.
 query II
-SELECT jsono_storage_type('k00 BIGINT, k01 BIGINT, k02 BIGINT, k03 BIGINT, k04 BIGINT, k05 BIGINT, k06 BIGINT, k07 BIGINT, k08 BIGINT, k09 BIGINT, k10 BIGINT, k11 BIGINT, k12 BIGINT, k13 BIGINT, k14 BIGINT, k15 BIGINT, k16 BIGINT, k17 BIGINT, k18 BIGINT, k19 BIGINT, k20 BIGINT, k21 BIGINT, k22 BIGINT, k23 BIGINT, k24 BIGINT, k25 BIGINT, k26 BIGINT, k27 BIGINT, k28 BIGINT, k29 BIGINT, k30 BIGINT, k31 BIGINT, k32 BIGINT, k33 BIGINT, k34 BIGINT, k35 BIGINT, k36 BIGINT, k37 BIGINT, k38 BIGINT, k39 BIGINT, k40 BIGINT, k41 BIGINT, k42 BIGINT, k43 BIGINT, k44 BIGINT, k45 BIGINT, k46 BIGINT, k47 BIGINT, k48 BIGINT, k49 BIGINT, k50 BIGINT, k51 BIGINT, k52 BIGINT, k53 BIGINT, k54 BIGINT, k55 BIGINT, k56 BIGINT, k57 BIGINT, k58 BIGINT, k59 BIGINT, k60 BIGINT, k61 BIGINT, k62 BIGINT, k63 BIGINT') LIKE '%"$jsono$spill$1" BIGINT%',
-       jsono_storage_type('k00 BIGINT, k01 BIGINT, k02 BIGINT') LIKE '%"$jsono$spill$1"%';
+SELECT jsono_storage_type('{"k00": "BIGINT", "k01": "BIGINT", "k02": "BIGINT", "k03": "BIGINT", "k04": "BIGINT", "k05": "BIGINT", "k06": "BIGINT", "k07": "BIGINT", "k08": "BIGINT", "k09": "BIGINT", "k10": "BIGINT", "k11": "BIGINT", "k12": "BIGINT", "k13": "BIGINT", "k14": "BIGINT", "k15": "BIGINT", "k16": "BIGINT", "k17": "BIGINT", "k18": "BIGINT", "k19": "BIGINT", "k20": "BIGINT", "k21": "BIGINT", "k22": "BIGINT", "k23": "BIGINT", "k24": "BIGINT", "k25": "BIGINT", "k26": "BIGINT", "k27": "BIGINT", "k28": "BIGINT", "k29": "BIGINT", "k30": "BIGINT", "k31": "BIGINT", "k32": "BIGINT", "k33": "BIGINT", "k34": "BIGINT", "k35": "BIGINT", "k36": "BIGINT", "k37": "BIGINT", "k38": "BIGINT", "k39": "BIGINT", "k40": "BIGINT", "k41": "BIGINT", "k42": "BIGINT", "k43": "BIGINT", "k44": "BIGINT", "k45": "BIGINT", "k46": "BIGINT", "k47": "BIGINT", "k48": "BIGINT", "k49": "BIGINT", "k50": "BIGINT", "k51": "BIGINT", "k52": "BIGINT", "k53": "BIGINT", "k54": "BIGINT", "k55": "BIGINT", "k56": "BIGINT", "k57": "BIGINT", "k58": "BIGINT", "k59": "BIGINT", "k60": "BIGINT", "k61": "BIGINT", "k62": "BIGINT", "k63": "BIGINT"}') LIKE '%"$jsono$spill$1" BIGINT%',
+       jsono_storage_type('{"k00": "BIGINT", "k01": "BIGINT", "k02": "BIGINT"}') LIKE '%"$jsono$spill$1"%';
 ----
 true	false
 
@@ -115,7 +115,7 @@ true	false
 # reads and the validate discipline all hold across the column boundary.
 statement ok
 CREATE TABLE wide64 AS
-SELECT jsono(d, shredding := {'k00':'BIGINT', 'k01':'BIGINT', 'k02':'BIGINT', 'k03':'BIGINT', 'k04':'BIGINT', 'k05':'BIGINT', 'k06':'BIGINT', 'k07':'BIGINT', 'k08':'BIGINT', 'k09':'BIGINT', 'k10':'BIGINT', 'k11':'BIGINT', 'k12':'BIGINT', 'k13':'BIGINT', 'k14':'BIGINT', 'k15':'BIGINT', 'k16':'BIGINT', 'k17':'BIGINT', 'k18':'BIGINT', 'k19':'BIGINT', 'k20':'BIGINT', 'k21':'BIGINT', 'k22':'BIGINT', 'k23':'BIGINT', 'k24':'BIGINT', 'k25':'BIGINT', 'k26':'BIGINT', 'k27':'BIGINT', 'k28':'BIGINT', 'k29':'BIGINT', 'k30':'BIGINT', 'k31':'BIGINT', 'k32':'BIGINT', 'k33':'BIGINT', 'k34':'BIGINT', 'k35':'BIGINT', 'k36':'BIGINT', 'k37':'BIGINT', 'k38':'BIGINT', 'k39':'BIGINT', 'k40':'BIGINT', 'k41':'BIGINT', 'k42':'BIGINT', 'k43':'BIGINT', 'k44':'BIGINT', 'k45':'BIGINT', 'k46':'BIGINT', 'k47':'BIGINT', 'k48':'BIGINT', 'k49':'BIGINT', 'k50':'BIGINT', 'k51':'BIGINT', 'k52':'BIGINT', 'k53':'BIGINT', 'k54':'BIGINT', 'k55':'BIGINT', 'k56':'BIGINT', 'k57':'BIGINT', 'k58':'BIGINT', 'k59':'BIGINT', 'k60':'BIGINT', 'k61':'BIGINT', 'k62':'BIGINT', 'k63':'BIGINT'}) AS j
+SELECT jsono(d, shredding := '{"k00": "BIGINT", "k01": "BIGINT", "k02": "BIGINT", "k03": "BIGINT", "k04": "BIGINT", "k05": "BIGINT", "k06": "BIGINT", "k07": "BIGINT", "k08": "BIGINT", "k09": "BIGINT", "k10": "BIGINT", "k11": "BIGINT", "k12": "BIGINT", "k13": "BIGINT", "k14": "BIGINT", "k15": "BIGINT", "k16": "BIGINT", "k17": "BIGINT", "k18": "BIGINT", "k19": "BIGINT", "k20": "BIGINT", "k21": "BIGINT", "k22": "BIGINT", "k23": "BIGINT", "k24": "BIGINT", "k25": "BIGINT", "k26": "BIGINT", "k27": "BIGINT", "k28": "BIGINT", "k29": "BIGINT", "k30": "BIGINT", "k31": "BIGINT", "k32": "BIGINT", "k33": "BIGINT", "k34": "BIGINT", "k35": "BIGINT", "k36": "BIGINT", "k37": "BIGINT", "k38": "BIGINT", "k39": "BIGINT", "k40": "BIGINT", "k41": "BIGINT", "k42": "BIGINT", "k43": "BIGINT", "k44": "BIGINT", "k45": "BIGINT", "k46": "BIGINT", "k47": "BIGINT", "k48": "BIGINT", "k49": "BIGINT", "k50": "BIGINT", "k51": "BIGINT", "k52": "BIGINT", "k53": "BIGINT", "k54": "BIGINT", "k55": "BIGINT", "k56": "BIGINT", "k57": "BIGINT", "k58": "BIGINT", "k59": "BIGINT", "k60": "BIGINT", "k61": "BIGINT", "k62": "BIGINT", "k63": "BIGINT"}') AS j
 FROM (VALUES ('{"k00": 7}'), ('{"k00": 7, "k63": "oops"}')) t(d);
 
 query IIIII
@@ -137,7 +137,7 @@ COPY (
   SELECT jsono(
     '{"URL":{"scheme":"' || (CASE WHEN i % 3 = 0 THEN 'goal' ELSE 'https' END) || '"}, "n": ' ||
     (CASE WHEN i % 100 = 8 THEN '"oops"' ELSE i::VARCHAR END) || '}',
-    shredding := {'$.URL.scheme':'VARCHAR','n':'BIGINT'}) AS j
+    shredding := '{"$.URL.scheme": "VARCHAR", "n": "BIGINT"}') AS j
   FROM range(2000) tt(i)
 ) TO '__TEST_DIR__/spill_quarantine.parquet' (FORMAT parquet);
 
@@ -168,10 +168,10 @@ FROM read_parquet('__TEST_DIR__/spill_quarantine.parquet');
 # jsono_validate enforces the spill discipline: honest values pass; a forged mask on a clean-marker
 # row, a hidden divert with a clean bit, and an out-of-domain mask are all invalid.
 query IIII
-SELECT jsono_validate(jsono('{"a":1}', shredding := {'a':'BIGINT'})),
-       jsono_validate(jsono('{"a":"x"}', shredding := {'a':'BIGINT'})),
-       jsono_validate(jsono('{"b":2}', shredding := {'a':'BIGINT'})),
-       jsono_validate(jsono('{"a":null}', shredding := {'a':'BIGINT'}));
+SELECT jsono_validate(jsono('{"a":1}', shredding := '{"a": "BIGINT"}')),
+       jsono_validate(jsono('{"a":"x"}', shredding := '{"a": "BIGINT"}')),
+       jsono_validate(jsono('{"b":2}', shredding := '{"a": "BIGINT"}')),
+       jsono_validate(jsono('{"a":null}', shredding := '{"a": "BIGINT"}'));
 ----
 true	true	true	true
 
@@ -182,9 +182,9 @@ SELECT jsono_validate(struct_pack(jsono := struct_pack(
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := 1::BIGINT,
-    a := c.jsono."shreds$2".c4000
+    c4000 := c.jsono."shreds$2".c4000
   )))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
-FROM (SELECT jsono('{"a":1}', shredding := {'a':'BIGINT'}) AS c);
+FROM (SELECT jsono('{"a":1}', shredding := '{"a": "BIGINT"}') AS c);
 ----
 false
 
@@ -195,9 +195,9 @@ SELECT jsono_validate(struct_pack(jsono := struct_pack(
   "shreds$2" := struct_pack(
     "$jsono$set" := d.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := 32::BIGINT,
-    a := d.jsono."shreds$2".c4000
+    c4000 := d.jsono."shreds$2".c4000
   )))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
-FROM (SELECT jsono('{"a":"oops"}', shredding := {'a':'BIGINT'}) AS d);
+FROM (SELECT jsono('{"a":"oops"}', shredding := '{"a": "BIGINT"}') AS d);
 ----
 false
 
@@ -209,8 +209,8 @@ SELECT jsono_validate(struct_pack(jsono := struct_pack(
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := NULL::BIGINT,
-    a := 999::BIGINT
+    c4000 := 999::BIGINT
   )))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
-FROM (SELECT jsono('{"a":1}', shredding := {'a':'BIGINT'}) AS c);
+FROM (SELECT jsono('{"a":1}', shredding := '{"a": "BIGINT"}') AS c);
 ----
 false

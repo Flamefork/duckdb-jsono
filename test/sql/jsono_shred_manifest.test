@@ -20,7 +20,7 @@ query II
 SELECT m.path, m.type
 FROM (
   SELECT unnest(jsono_shred_manifest(
-    jsono('{"a":"x","b":1,"c":true}', shredding := {'a':'VARCHAR','b':'BIGINT','c':'BOOLEAN'})
+    jsono('{"a":"x","b":1,"c":true}', shredding := '{"a": "VARCHAR", "b": "BIGINT", "c": "BOOLEAN"}')
   )) m
 )
 ORDER BY m.path;
@@ -37,14 +37,14 @@ $.c	BOOLEAN
 # fact the writer walks per row.
 query I
 SELECT [m.path FOR m IN jsono_shred_manifest(v)]
-FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}) AS v);
+FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS v);
 ----
 [$.a-c, $.a.b]
 
 # The same value's lanes, in the type's own order — the reverse permutation.
 query I
 SELECT [l.path FOR l IN jsono_layout_lanes(v)]
-FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}) AS v);
+FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS v);
 ----
 [$.a.b, $.a-c]
 
@@ -52,7 +52,7 @@ FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := {'$."a-c"':'VARCHAR
 # back under its own path.
 query II
 SELECT v ->> '$."a-c"', v ->> '$.a.b'
-FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}) AS v);
+FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS v);
 ----
 x	y
 
@@ -70,7 +70,7 @@ false
 
 # A SQL NULL row yields NULL (distinct from the empty-list answer for a plain value).
 statement ok
-CREATE TABLE nullrow AS SELECT jsono('{"a":1}', shredding := {'a':'BIGINT'}) AS e WHERE 1=0;
+CREATE TABLE nullrow AS SELECT jsono('{"a":1}', shredding := '{"a": "BIGINT"}') AS e WHERE 1=0;
 
 statement ok
 INSERT INTO nullrow VALUES (NULL);
@@ -96,7 +96,7 @@ query II
 SELECT m.path, m.type
 FROM (
   SELECT unnest(jsono_shred_manifest(
-    jsono('{"a":"notanum","b":2}', shredding := {'a':'BIGINT','b':'BIGINT'})
+    jsono('{"a":"notanum","b":2}', shredding := '{"a": "BIGINT", "b": "BIGINT"}')
   )) m
 )
 ORDER BY m.path;
@@ -108,7 +108,7 @@ $.b	BIGINT
 # fully shredded value lists both paths without error.
 query I
 SELECT len(jsono_shred_manifest(
-  jsono('{"a":"x","b":1}', shredding := {'a':'VARCHAR','b':'BIGINT'})
+  jsono('{"a":"x","b":1}', shredding := '{"a": "VARCHAR", "b": "BIGINT"}')
 ));
 ----
 2
@@ -123,7 +123,7 @@ true
 # An all-NULL shredded column maps every row to NULL — no row fabricates a manifest.
 statement ok
 CREATE TABLE allnull_manifest AS
-SELECT jsono('{"a":1}', shredding := {'a':'BIGINT'}) AS e WHERE 1=0;
+SELECT jsono('{"a":1}', shredding := '{"a": "BIGINT"}') AS e WHERE 1=0;
 
 statement ok
 INSERT INTO allnull_manifest VALUES (NULL), (NULL), (NULL);
@@ -138,7 +138,7 @@ require parquet
 
 statement ok
 COPY (
-  SELECT jsono('{"a":"x","b":1,"c":true}', shredding := {'a':'VARCHAR','b':'BIGINT','c':'BOOLEAN'}) AS v
+  SELECT jsono('{"a":"x","b":1,"c":true}', shredding := '{"a": "VARCHAR", "b": "BIGINT", "c": "BOOLEAN"}') AS v
 ) TO '__TEST_DIR__/jsono_shred_manifest.parquet';
 
 query II
@@ -160,7 +160,7 @@ $.c	BOOLEAN
 # The key below is 0x01 followed by `x`; the shredding spec names it literally.
 query I
 SELECT to_json(v) FROM (
-  SELECT jsono('{"\u0001x":1,"b":2}', shredding := {'x': 'BIGINT'}) AS v
+  SELECT jsono('{"\u0001x":1,"b":2}', shredding := '{"\u0001x": "BIGINT"}') AS v
 );
 ----
 {"\u0001x":1,"b":2}
@@ -184,7 +184,7 @@ SELECT {'jsono': {'body$1': {
   'nums': v.jsono."body$1".nums},
   'shreds$2': v.jsono."shreds$2"}} AS v
 FROM (SELECT jsono('{"items":[{"id":1,"NM":"z"}]}',
-                   shredding := {'$.items': 'STRUCT(id BIGINT, NM VARCHAR)[]'}) AS v);
+                   shredding := '{"$.items": "STRUCT(id BIGINT, NM VARCHAR)[]"}') AS v);
 
 # The rewrite landed (guards the fixture itself against a format change silently making it a no-op).
 query I
@@ -213,7 +213,7 @@ object-array manifest entry declares no subfields
 
 statement ok
 CREATE TABLE manifest_order_src AS
-SELECT jsono('{"a-c":"x","a":{"b":"y"},"r":1}', shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}) AS v;
+SELECT jsono('{"a-c":"x","a":{"b":"y"},"r":1}', shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS v;
 
 # jsono_merge_patch's shred-aware fast path re-emits every row's skips from the merged shred set.
 query I
@@ -235,7 +235,7 @@ SELECT [m.path FOR m IN jsono_shred_manifest(jsono_group_merge_max(v, 1))] FROM 
 
 # Reshredding an already-shredded value (ApplyReshredShredded) carries the manifest over.
 query I
-SELECT [m.path FOR m IN jsono_shred_manifest(jsono(v, shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}))]
+SELECT [m.path FOR m IN jsono_shred_manifest(jsono(v, shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}'))]
 FROM manifest_order_src;
 ----
 [$.a-c, $.a.b]

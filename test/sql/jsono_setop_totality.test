@@ -8,11 +8,11 @@ require json
 
 statement ok
 CREATE TABLE st_a AS
-SELECT jsono('{"x": ' || i || ', "k":"a"}', shredding := {'$.x':'BIGINT'}) AS j FROM range(1000) tt(i);
+SELECT jsono('{"x": ' || i || ', "k":"a"}', shredding := '{"$.x": "BIGINT"}') AS j FROM range(1000) tt(i);
 
 statement ok
 CREATE TABLE st_b AS
-SELECT jsono('{"x": ' || (i + 1000) || ', "k":"b"}', shredding := {'$.x':'BIGINT'}) AS j FROM range(1000) tt(i);
+SELECT jsono('{"x": ' || (i + 1000) || ', "k":"b"}', shredding := '{"$.x": "BIGINT"}') AS j FROM range(1000) tt(i);
 
 statement ok
 PRAGMA explain_output='physical_only';
@@ -57,7 +57,7 @@ statement ok
 CREATE TABLE st_div AS
 SELECT jsono(
   CASE WHEN i % 2 = 0 THEN '{"x": ' || i || '}' ELSE '{"x": "str"}' END,
-  shredding := {'$.x':'BIGINT'}) AS j
+  shredding := '{"$.x": "BIGINT"}') AS j
 FROM range(1000) tt(i);
 
 statement ok

@@ -86,7 +86,7 @@ SELECT jsono_suggest_shredding(ep) FROM (
   FROM range(2000) t(i)
 ) LIMIT 1;
 ----
-{"$.URL.path": 'VARCHAR', "$.URL.query_params.utm_source": 'VARCHAR'}
+{"$.URL.path": "VARCHAR", "$.URL.query_params.utm_source": "VARCHAR"}
 
 # Advisor stays presence-gated at depth: a depth-3 key present in 1% of rows is NOT suggested at the
 # default min_presence, but IS at a low min_presence — proving depth is gated by presence, not the cap.
@@ -106,7 +106,7 @@ SELECT jsono_suggest_shredding(ep, min_presence := 0.005) FROM (
   FROM range(2000) t(i)
 ) LIMIT 1;
 ----
-{"$.URL.query_params.rare": 'VARCHAR'}
+{"$.URL.query_params.rare": "VARCHAR"}
 
 # Advisor drops a deep key whose type diverges across rows (scalar in 90%, object in 10%) at
 # min_fit = 1.0 — the intermediate object is recorded as a nonrole occurrence before recursing, so

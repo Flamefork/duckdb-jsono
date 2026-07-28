@@ -8,7 +8,7 @@ require json
 
 statement ok
 CREATE TABLE t AS SELECT jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
-                               shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}) AS j;
+                               shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}') AS j;
 
 # Value parity: wrapping the reconstruct in __jsono_reconstruct feeds the executor the same plain
 # document the anonymous cast did, so a field descending into the array shred reads unchanged.
@@ -28,7 +28,7 @@ physical_plan	<REGEX>:.*__jsono_reconstruct.*
 # __jsono_reconstruct in the plan (the argument is the bare shredded column).
 statement ok
 CREATE TABLE flat AS SELECT jsono('{"a":1,"products":[{"id":1,"name":"a"}]}',
-                                  shredding := {'$.a':'BIGINT','$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}) AS j;
+                                  shredding := '{"$.a": "BIGINT", "$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}') AS j;
 
 query II
 EXPLAIN SELECT jsono_transform(j, {'a':'BIGINT'}) FROM flat;
@@ -66,7 +66,7 @@ EXECUTE pq;
 # the same document the table-driven case produced.
 query I
 SELECT jsono_transform(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
-                             shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                             shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'),
                        {'first_id':{'type':'BIGINT','path':'$.products[0].id'}});
 ----
 {'first_id': 1}
@@ -76,7 +76,7 @@ SELECT jsono_transform(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b
 # keeps it). If the branch stopped re-marking the result CONSTANT the operator would resurface here.
 query II
 EXPLAIN SELECT jsono_transform(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
-                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                                    shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'),
                               {'first_id':{'type':'BIGINT','path':'$.products[0].id'}});
 ----
 physical_plan	<!REGEX>:.*__jsono_reconstruct.*

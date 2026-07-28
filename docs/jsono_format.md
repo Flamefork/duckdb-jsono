@@ -336,8 +336,8 @@ A shred type may be a `LIST<STRUCT<…>>` whose every struct child is one of the
 five scalar shred types. Such an *array shred* lifts the chosen leaf subfields of
 every element of a regular array — addressed by an object-key path like
 `$.products`, not `$.products[*].name` — into one parallel typed `LIST<STRUCT>`
-column (`jsono(value, shredding := {'$.products': 'STRUCT(name VARCHAR, id
-UBIGINT, …)[]'})`). On shape-stable data this is a large storage win: Parquet
+column (`jsono(value, shredding :=
+'{"$.products": "STRUCT(name VARCHAR, id UBIGINT, …)[]"}')`). On shape-stable data this is a large storage win: Parquet
 stores each element subfield as its own low-cardinality dictionary column,
 where the whole-document residual would store them in one mixed heap.
 
@@ -370,7 +370,7 @@ retypes the array shred is caught the same way (the skeleton elements are
 missing their lifted subfields and the residual alone cannot reproduce them).
 An object-array entry is the one kind that spells its element subfields out
 rather than naming a type; the entry's exact framing is in
-[Shred manifest](#shred-manifest-in-skips), which is where it is specified.
+[Shred manifest](#shred-manifest), which is where it is specified.
 
 A skeleton residual is an ordinary value, and the shred `LIST<STRUCT>` is a
 DuckDB/Parquet column inside the `shreds` struct rather than part of the blob.
@@ -385,7 +385,7 @@ shred types (`LIST<UBIGINT>`, `LIST<VARCHAR>`, `LIST<DOUBLE>`, `LIST<BIGINT>`,
 `LIST<BOOLEAN>`). Such a *scalar array shred* lifts each whole scalar element of a
 regular array — addressed by an object-key path like `$.item_ids`, not
 `$.item_ids[*]` — into one parallel typed `LIST<TYPE>` column
-(`jsono(value, shredding := {'$.item_ids': 'UBIGINT[]'})`, or the `jsono(STRUCT)`
+(`jsono(value, shredding := '{"$.item_ids": "UBIGINT[]"}')`, or the `jsono(STRUCT)`
 auto-shred of a top-level `LIST<scalar>` field). It is the strictly simpler case of
 the object array above: the element is a scalar, not a struct, so there are no
 per-element subfields to overlay — each element is either *lifted* whole or *kept*
@@ -433,7 +433,7 @@ and invalidate different data:
 
 | What | Where the version lives | How to read the current one |
 |------|-------------------------|-----------------------------|
-| The bytes **inside** the body blobs | `version` byte in `slots` | `jsono_version(value)`, and [Compatibility policy](#compatibility-policy) |
+| The bytes **inside** the body blobs | `version` byte in `slots` | `jsono_version()`, and [Compatibility policy](#compatibility-policy) |
 | The residual's **column** layout (the set, names and types of the body blobs) | the field name `body$<N>` | the value's own type |
 | The **shred** layout (reserved fields inside `shreds`, lane naming, lane shape, spill bit numbering, marker semantics) | the field name `shreds$<M>` | the value's own type |
 
@@ -467,17 +467,30 @@ results. The refusal names a *foreign* revision rather than whichever sorted
 first, so it reads the same in both orders.
 
 A value carrying the *current* revision that nevertheless fails the grammar
-stays silently non-JSONO, as before. This is deliberate: such a type also arises
-on a legal write path, where a generic value→SQL→value round-trip (DuckLake's
-inlined-data flush) narrows an all-NULL spill column to `SQLNULL` and a small
-lane to `INTEGER` on its way to the declared column type. Refusing that would
-break writing in order to catch a hand-built struct. The cost is real but
-bounded: a column *declared* with a near-miss shred lane (`a INTEGER`, which the
-constructor itself rejects as a shred type) accepts a valid current-revision
-value silently, and every read of that column then answers `NULL` — the bytes are
-intact and one explicit cast to the correct lane type (`a BIGINT`) brings the
-whole document back, but nothing warns you at write time. Declare storage columns
-with `jsono_storage_type(...)` and this cannot happen.
+stays non-JSONO in *recognition* — recognition runs over every struct in every
+plan and never throws. This is deliberate: such a type also arises on a legal
+write path, where a generic value→SQL→value round-trip (DuckLake's inlined-data
+flush) narrows an all-NULL spill column to `SQLNULL` and a small lane to
+`INTEGER` on its way to the declared column type. Refusing that would break
+writing in order to catch a hand-built struct. The near-misses split into two
+classes from there:
+
+- a **type**-level miss (the narrowing class above) stays fully silent — the
+  cost is bounded: a column *declared* with a near-miss shred lane (`a INTEGER`,
+  which the constructor itself rejects as a shred type) accepts a valid
+  current-revision value silently, and every read of that column then answers
+  `NULL`; the bytes are intact and one explicit cast to the correct lane type
+  (`a BIGINT`) brings the whole document back. Declare storage columns with
+  `jsono_storage_type(...)` and this cannot happen;
+- a **name**-level miss — a lane name that does not decode, inside a fully
+  anchored type (exact residual, `shreds$2`, marker and spill present) — is a
+  shape no legal write narrows into: generic round-trips change types and keep
+  names. The optimizer therefore *refuses the JSON reads* (`->>`, `->`,
+  `to_json`, `::JSON`) of such a type with the grammar's own reason instead of
+  letting the whole column silently answer `NULL`. Passthrough (`SELECT *`,
+  `COPY`), the raw `::VARCHAR` render and DDL stay open, so the bytes can be
+  moved and the offending field dropped
+  (`test/sql/jsono_malformed_lane_read.test` pins both halves).
 
 Splitting `body$N` from `shreds$M` is what keeps a shred-layout change from
 invalidating plain values, which are the bulk of stored data.

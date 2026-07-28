@@ -141,11 +141,11 @@ RESET threads;
 # --- Sticky shredding: a shredded input reshreds back to its own type ---
 
 query III
-SELECT to_json(m), m ->> 'event_name', typeof(m) = jsono_storage_type('event_name VARCHAR')
+SELECT to_json(m), m ->> 'event_name', typeof(m) = jsono_storage_type('{"event_name": "VARCHAR"}')
 FROM (
   SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
-    (jsono('{"event_name":"search","x":1}', shredding := {'event_name':'VARCHAR'}), 1),
-    (jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}), 2)
+    (jsono('{"event_name":"search","x":1}', shredding := '{"event_name": "VARCHAR"}'), 1),
+    (jsono('{"event_name":"page_view"}', shredding := '{"event_name": "VARCHAR"}'), 2)
   ) t(j, ts)
 );
 ----
@@ -153,11 +153,11 @@ FROM (
 
 # _min reshreds the same way, picking the earliest value.
 query III
-SELECT to_json(m), m ->> 'event_name', typeof(m) = jsono_storage_type('event_name VARCHAR')
+SELECT to_json(m), m ->> 'event_name', typeof(m) = jsono_storage_type('{"event_name": "VARCHAR"}')
 FROM (
   SELECT jsono_group_merge_min(j, ts) AS m FROM (VALUES
-    (jsono('{"event_name":"search","x":1}', shredding := {'event_name':'VARCHAR'}), 1),
-    (jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}), 2)
+    (jsono('{"event_name":"search","x":1}', shredding := '{"event_name": "VARCHAR"}'), 1),
+    (jsono('{"event_name":"page_view"}', shredding := '{"event_name": "VARCHAR"}'), 2)
   ) t(j, ts)
 );
 ----
@@ -168,20 +168,20 @@ query I
 SELECT jsono_validate(m)
 FROM (
   SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
-    (jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}), 1)
+    (jsono('{"a":"x","b":"y"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}'), 1)
   ) t(j, ts)
 );
 ----
 true
 
 statement ok
-CREATE TABLE indexed_keyed_narrow AS SELECT jsono('{}', shredding := {'a':'VARCHAR'}) AS j WHERE false;
+CREATE TABLE indexed_keyed_narrow AS SELECT jsono('{}', shredding := '{"a": "VARCHAR"}') AS j WHERE false;
 
 statement ok
 CREATE TABLE indexed_keyed_wide AS
 SELECT m FROM (
   SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
-    (jsono('{"a":"x","b":"y"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}), 1)
+    (jsono('{"a":"x","b":"y"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}'), 1)
   ) t(j, ts)
 );
 
@@ -208,8 +208,8 @@ query III
 SELECT to_json(m), m ->> '$.a.b', (jsono_storage_size(m)).shreds
 FROM (
   SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
-    (jsono('{"a":{"b":1}}', shredding := {'$.a.b':'BIGINT'}), 1),
-    (jsono('{"a":{"b":2}}', shredding := {'$.a.b':'BIGINT'}), 2)
+    (jsono('{"a":{"b":1}}', shredding := '{"$.a.b": "BIGINT"}'), 1),
+    (jsono('{"a":{"b":2}}', shredding := '{"$.a.b": "BIGINT"}'), 2)
   ) t(j, ts)
 );
 ----
@@ -227,8 +227,8 @@ SELECT to_json(m),
          nums := m."jsono"."body$1".nums))))
 FROM (
   SELECT jsono_group_merge_max(j, ts) AS m FROM (VALUES
-    (jsono('{"a":{"b":"old","c":"keep"},"x":1}', shredding := {'$.a.b':'VARCHAR'}), 1),
-    (jsono('{"a":{"b":"new"},"z":2}', shredding := {'$.a.b':'VARCHAR'}), 2)
+    (jsono('{"a":{"b":"old","c":"keep"},"x":1}', shredding := '{"$.a.b": "VARCHAR"}'), 1),
+    (jsono('{"a":{"b":"new"},"z":2}', shredding := '{"$.a.b": "VARCHAR"}'), 2)
   ) t(j, ts)
 );
 ----
@@ -237,8 +237,8 @@ FROM (
 # Stripping a nested shred must not hide a scalar/object conflict at its parent.
 statement error
 SELECT to_json(jsono_group_merge_max(j, ts)) FROM (VALUES
-  (jsono('{"a":{"b":"x"}}', shredding := {'$.a.b':'VARCHAR'}), 2),
-  (jsono('{"a":5}', shredding := {'$.a.b':'VARCHAR'}), 1)
+  (jsono('{"a":{"b":"x"}}', shredding := '{"$.a.b": "VARCHAR"}'), 2),
+  (jsono('{"a":5}', shredding := '{"$.a.b": "VARCHAR"}'), 1)
 ) t(j, ts);
 ----
 structurally-inconsistent
@@ -249,9 +249,9 @@ SELECT g, to_json(m), m ->> 'k'
 FROM (
   SELECT g, jsono_group_merge_max(j, ts) AS m
   FROM (VALUES
-    ('a', jsono('{"k":"a1"}', shredding := {'k':'VARCHAR'}), 1),
-    ('a', jsono('{"k":"a2","p":1}', shredding := {'k':'VARCHAR'}), 2),
-    ('b', jsono('{"k":"b1"}', shredding := {'k':'VARCHAR'}), 1)
+    ('a', jsono('{"k":"a1"}', shredding := '{"k": "VARCHAR"}'), 1),
+    ('a', jsono('{"k":"a2","p":1}', shredding := '{"k": "VARCHAR"}'), 2),
+    ('b', jsono('{"k":"b1"}', shredding := '{"k": "VARCHAR"}'), 1)
   ) t(g, j, ts)
   GROUP BY g
 ) s
@@ -265,7 +265,7 @@ query I
 SELECT count(*) FROM (
   SELECT g, jsono_group_merge_max(j, 1) AS m
   FROM (
-    SELECT i AS g, jsono('{"k":"v' || i || '"}', shredding := {'k':'VARCHAR'}) AS j
+    SELECT i AS g, jsono('{"k":"v' || i || '"}', shredding := '{"k": "VARCHAR"}') AS j
     FROM range(5000) t(i)
   ) GROUP BY g
 ) WHERE (m ->> 'k') = 'v' || g;
@@ -385,7 +385,7 @@ require parquet
 # g3: $.n is an object; g4: both scalar (control). Each container sits at a scalar-shred path.
 statement ok
 CREATE TABLE gm_src AS
-SELECT k, ts, jsono(json, shredding := {'$.a':'VARCHAR','$.n':'BIGINT'}) AS j
+SELECT k, ts, jsono(json, shredding := '{"$.a": "VARCHAR", "$.n": "BIGINT"}') AS j
 FROM (VALUES
   ('g1', 1, '{"a":{"z":1,"m":2},"n":3}'),
   ('g2', 1, '{"a":[3,1,2],"n":4}'),
@@ -451,7 +451,7 @@ true	true
 # Ungrouped empty group over shredded input -> SQL NULL (direct shredded finalize), both directions.
 query II
 SELECT jsono_group_merge_max(j, ts) IS NULL, jsono_group_merge_min(j, ts) IS NULL
-FROM (VALUES (jsono('{"event_name":"x"}', shredding := {'event_name':'VARCHAR'}), 1)) t(j, ts) WHERE false;
+FROM (VALUES (jsono('{"event_name":"x"}', shredding := '{"event_name": "VARCHAR"}'), 1)) t(j, ts) WHERE false;
 ----
 true	true
 
@@ -485,8 +485,8 @@ FROM (VALUES (jsono('{"a":null}'), 1)) t(j, ts);
 
 statement ok
 CREATE TABLE lww_divergent AS SELECT * FROM (VALUES
-  (jsono('{"a-c":"old","a":{"b":"bold"},"r":1}', shredding := {'$."a-c"':'VARCHAR','$.a.b':'VARCHAR'}), 1),
-  (jsono('{"a-c":"new","a":{"b":"bnew"}}',       shredding := {'$."a-c"':'VARCHAR','$.a.b':'VARCHAR'}), 2)
+  (jsono('{"a-c":"old","a":{"b":"bold"},"r":1}', shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}'), 1),
+  (jsono('{"a-c":"new","a":{"b":"bnew"}}',       shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}'), 2)
 ) v(j, ts);
 
 # Both lanes survive the fold, each carrying its own path's winner.
@@ -507,8 +507,8 @@ new	bnew
 # and DirectListShredManifestRowComplete.
 statement ok
 CREATE TABLE lww_divergent_list AS SELECT * FROM (VALUES
-  (jsono('{"a-c":[1,2],"a":{"b":"bold"},"r":1}', shredding := {'$."a-c"':'BIGINT[]','$.a.b':'VARCHAR'}), 1),
-  (jsono('{"a-c":[3],"a":{"b":"bnew"}}',         shredding := {'$."a-c"':'BIGINT[]','$.a.b':'VARCHAR'}), 2)
+  (jsono('{"a-c":[1,2],"a":{"b":"bold"},"r":1}', shredding := '{"$.\"a-c\"": "BIGINT[]", "$.a.b": "VARCHAR"}'), 1),
+  (jsono('{"a-c":[3],"a":{"b":"bnew"}}',         shredding := '{"$.\"a-c\"": "BIGINT[]", "$.a.b": "VARCHAR"}'), 2)
 ) v(j, ts);
 
 query II

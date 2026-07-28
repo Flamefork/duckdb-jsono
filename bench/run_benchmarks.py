@@ -254,7 +254,7 @@ def create_connection(target: Target) -> duckdb.DuckDBPyConnection:
 def jsono_value_sql(scenario_config: dict) -> str:
     json_column = scenario_config["json_column"]
     if "shredding" in scenario_config:
-        shredding = sql_typed_literal(scenario_config["shredding"])
+        shredding = sql_json(scenario_config["shredding"])
         return f"jsono({json_column}::VARCHAR, shredding := {shredding})"
     return f"jsono({json_column}::VARCHAR)"
 
@@ -294,7 +294,7 @@ def jsono_prepare_jsono_with_group_and_key(scenario_config: dict, data_path: Pat
 
 
 def jsono_prepare_jsono_pair_with_group_and_key(scenario_config: dict, data_path: Path) -> str:
-    wide_shredding = sql_typed_literal(scenario_config["wide_shredding"])
+    wide_shredding = sql_json(scenario_config["wide_shredding"])
     group_col = scenario_config["group_col"]
     return f"""
         CREATE OR REPLACE TEMP TABLE _bench_in AS
@@ -889,7 +889,7 @@ def build_jsono_prune_filter_query(scenario_config: dict, data_path: Path) -> Be
     json_column = scenario_config["json_column"]
     leaf = sql_string(scenario_config["shred_leaf"])
     leaf_type = scenario_config["shred_leaf_type"]
-    shred_spec = sql_typed_literal({scenario_config["shred_leaf"]: leaf_type})
+    shred_spec = sql_json({scenario_config["shred_leaf"]: leaf_type})
     native_column = sql_identifier(scenario_config["native_column"])
     cluster_expr = f"CAST({json_column}->>{leaf} AS {leaf_type})"
     copy_path = sql_string(str(scenario_config["copy_path"]))
@@ -1114,8 +1114,8 @@ def build_jsono_reshred_query(scenario_config: dict, data_path: Path) -> Benchma
     # the path. source==target exercises the shred copy-through, a superset target the
     # single-pass reshred, and a narrowing target the reconstruct+reshred fallback.
     json_column = scenario_config["json_column"]
-    source_spec = sql_typed_literal(scenario_config["source_spec"])
-    target_spec = sql_typed_literal(scenario_config["target_spec"])
+    source_spec = sql_json(scenario_config["source_spec"])
+    target_spec = sql_json(scenario_config["target_spec"])
     return BenchmarkQuery(
         prepare_sql=(
             f"""
@@ -1219,7 +1219,7 @@ def build_jsono_multifile_extract_string_query(scenario_config: dict, data_path:
     prepare_sql = tuple(
         f"""
         COPY (
-            SELECT jsono({json_column}::VARCHAR, shredding := {sql_typed_literal(spec)}) AS t
+            SELECT jsono({json_column}::VARCHAR, shredding := {sql_json(spec)}) AS t
             FROM {table_sql(data_path)}
         )
         TO {copy_path}

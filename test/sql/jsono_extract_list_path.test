@@ -91,7 +91,7 @@ select len(json_extract_string(
 # ---------------------------------------------------------------------------
 query I
 select json_extract(
-    jsono('{"a":1,"b":2}', shredding := {'$.a': 'BIGINT', '$.b': 'BIGINT'}),
+    jsono('{"a":1,"b":2}', shredding := '{"$.a": "BIGINT", "$.b": "BIGINT"}'),
     list_value('$.a', '$.b')
 ) as vals;
 ----
@@ -103,7 +103,7 @@ select json_extract(
 statement ok
 create table docs as
 select jsono('{"clientID":"CID-1","counterUserIDHash":"H-1"}',
-             shredding := {'$.clientID': 'VARCHAR', '$.counterUserIDHash': 'VARCHAR'}) e;
+             shredding := '{"$.clientID": "VARCHAR", "$.counterUserIDHash": "VARCHAR"}') e;
 
 query I
 select json_extract_string(e, list_value('$.clientID', '$.counterUserIDHash', '$.missing')) as vals

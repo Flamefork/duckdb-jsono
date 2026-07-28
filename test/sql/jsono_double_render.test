@@ -59,12 +59,12 @@ true
 # the kind gate and stays in the residual), so plain and shredded must match.
 # ---------------------------------------------------------------------------
 query I
-SELECT jsono('{"items":[{"price":1e16}]}', shredding := {'$.items': 'STRUCT(price DOUBLE)[]'}) ->> '$.items[0].price';
+SELECT jsono('{"items":[{"price":1e16}]}', shredding := '{"$.items": "STRUCT(price DOUBLE)[]"}') ->> '$.items[0].price';
 ----
 1e16
 
 query I
-SELECT (jsono('{"items":[{"price":1e16}]}', shredding := {'$.items': 'STRUCT(price DOUBLE)[]'}) ->> '$.items[0].price')
+SELECT (jsono('{"items":[{"price":1e16}]}', shredding := '{"$.items": "STRUCT(price DOUBLE)[]"}') ->> '$.items[0].price')
      = (jsono('{"items":[{"price":1e16}]}') ->> '$.items[0].price');
 ----
 true

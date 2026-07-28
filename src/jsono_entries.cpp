@@ -43,8 +43,8 @@ enum class JsonoEntriesKeyStyle : uint8_t { JsonPath, Dotted };
 enum class JsonoEntriesArrayStyle : uint8_t { IndexedElements, WholeJson };
 
 // A shred of a shredded input: its struct child index, type, and the entry key in both styles
-// (precomputed at bind). A top-level literal shred name `n` keys as `n` (dotted) or `$.n`
-// (jsonpath); a `$.`-prefixed path keys as itself (jsonpath) or without the prefix (dotted). A
+// (precomputed at bind by decoding the lane name back into its path and rendering each segment
+// through the walk's own key builders, so a quotable key spells exactly as a plain parse does). A
 // scalar shred flattens to one entry at its key; an array shred (LIST<STRUCT>) expands each
 // element's lifted subfields into `<key>[i].<subfield>` leaves keyed by `subfield_keys`, the key
 // being the array's base path. The runtime value lanes and shred kinds come from InitShredLanes.

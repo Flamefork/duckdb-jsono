@@ -155,37 +155,37 @@ void JsonoLayoutLanesExecute(DataChunk &args, ExpressionState &state, Vector &re
 	result.SetValue(0, info.lanes);
 }
 
-// jsono_storage_type(shreds) -> the shredded storage type's DDL: the 6-BLOB residual plus the
-// given shred columns, so a schema can declare a shredded jsono column from a readable shred spec
-// (e.g. 'event_name VARCHAR, n BIGINT'). The column names are the public spec DSL's paths, parsed
-// and re-emitted through JsonoShreddedStructType, so the declared column is byte-identical to a
-// value built from the same shreds. Shred specs go through the same parse the constructor uses, so
-// a declared column always matches some value the constructor can produce.
+// jsono_storage_type(spec) -> the shredded storage type's DDL: the 6-BLOB residual plus the
+// given shred lanes, so a schema can declare a shredded jsono column from the SAME spec string the
+// constructor takes (see JsonoShredSpecEntries). The paths are parsed and re-emitted through
+// JsonoShreddedStructType, so the declared column is byte-identical to a value built with the same
+// `shredding :=` spec.
 void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	// Parser::ParseColumnList parses the DDL but leaves binder-resolved type aliases (UBIGINT and the
-	// other unsigned ints, nested ones included) as unresolved USER types; bind each shred type so a
-	// declared storage column matches a value the constructor builds from the same shreds.
-	auto binder = Binder::CreateBinder(state.GetContext());
+	auto &context = state.GetContext();
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t shreds) {
-		auto columns = Parser::ParseColumnList(shreds.GetString());
+		auto entries = JsonoShredSpecEntries(Value(shreds.GetString()), "jsono_storage_type");
 		vector<JsonoLaneSpec> lanes;
 		vector<string> lane_names;
 		vector<string> spec_names;
-		for (auto &col : columns.Logical()) {
-			auto type = col.Type();
-			binder->BindLogicalType(type);
-			auto lane = JsonoParseShredSpecField(col.Name(), type);
+		for (auto &entry : entries) {
+			LogicalType type;
+			try {
+				type = TransformStringToLogicalType(entry.second, context);
+			} catch (const std::exception &) {
+				throw BinderException("jsono_storage_type: unsupported shred type '%s'", entry.second);
+			}
+			auto lane = JsonoParseShredSpecField(entry.first, type);
 			auto lane_name = JsonoEncodeLaneName(lane.path);
 			for (idx_t i = 0; i < lane_names.size(); i++) {
 				if (lane_names[i] == lane_name) {
-					// Two DDL columns naming one path would be two fields of one name — impossible in a
-					// STRUCT. The spellings differ (DuckDB already rejects a literal duplicate), so name both.
-					throw BinderException("jsono_storage_type: columns '%s' and '%s' name the same shred path",
-					                      spec_names[i], col.Name());
+					// Two spec entries naming one path would be two fields of one name — impossible in a
+					// STRUCT. The spellings differ (JSON keeps a byte-exact duplicate last-wins), so name both.
+					throw BinderException("jsono_storage_type: '%s' and '%s' name the same shred path", spec_names[i],
+					                      entry.first);
 				}
 			}
 			lane_names.push_back(std::move(lane_name));
-			spec_names.push_back(col.Name());
+			spec_names.push_back(entry.first);
 			lanes.push_back(std::move(lane));
 		}
 		// Canonical shred order (sorted by encoded lane name) so the DDL matches a value built from the
@@ -402,12 +402,15 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		return JsonoLayoutMatch::Foreign;
 	}
 	// A KNOWN-BUT-DIFFERENT revision is the loud case: such a value was written by another build and
-	// reading it would silently lose data. Everything that fails below stays silent (NotJsono) — the
-	// behaviour from before revisions existed — because a type carrying THIS revision can fail the
-	// grammar for reasons that are not stored data at all: a generic value->SQL->value round-trip
-	// (the DuckLake inlined-data flush) narrows an all-NULL spill column to SQLNULL and a small lane
-	// to INTEGER on its way to the declared column type, and a hand-built struct can put the reserved
-	// fields anywhere. Refusing those would break a legal write path in order to catch a forgery.
+	// reading it would silently lose data. Everything that fails below CLASSIFIES silent (NotJsono)
+	// — recognition runs over every struct in every plan and never throws — because a type carrying
+	// THIS revision can fail the grammar for reasons that are not stored data at all: a generic
+	// value->SQL->value round-trip (the DuckLake inlined-data flush) narrows an all-NULL spill
+	// column to SQLNULL and a small lane to INTEGER on its way to the declared column type, and a
+	// hand-built struct can put the reserved fields anywhere. Refusing those would break a legal
+	// write path in order to catch a forgery. One class is separately marked for the optimizer to
+	// refuse at the READ sites: a lane NAME that does not decode inside a fully-anchored type, which
+	// no legal narrowing produces (see JsonoLayoutType::lane_name_malformed).
 	bool foreign_body = out.body_revision != JSONO_BODY_REVISION;
 	bool foreign_shreds =
 	    out.shreds_revision != DConstants::INVALID_INDEX && out.shreds_revision != JSONO_SHREDS_REVISION;
@@ -505,6 +508,7 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		// (a decode yields nothing but a non-empty chain of keys) and the old reserved-prefix check
 		// (the alphabet `0-9a-v` cannot spell `$jsono$…`).
 		if (!JsonoLaneNameIsCanonical(shred_fields[i].first)) {
+			out.lane_name_malformed = true;
 			return RejectNotJsono(reason,
 			                      "field '%s' is not a shred lane: a lane is named by the base32hex encoding of "
 			                      "its object-key path, and this name does not decode canonically",
@@ -594,6 +598,20 @@ string JsonoDescribeForeignLayout(const JsonoLayoutType &layout) {
 	}
 	return StringUtil::Format("layout revision %s, this build reads body=%llu shreds=%llu", read,
 	                          (unsigned long long)JSONO_BODY_REVISION, (unsigned long long)JSONO_SHREDS_REVISION);
+}
+
+void JsonoRejectMalformedAnchoredJsonRead(const LogicalType &type) {
+	JsonoLayoutType layout;
+	string reason;
+	if (MatchJsonoLayoutType(type, layout, &reason) != JsonoLayoutMatch::NotJsono || !layout.lane_name_malformed) {
+		return;
+	}
+	throw BinderException("jsono: this column carries the current jsono layout anchor, but %s. Reading it as JSON "
+	                      "would silently answer NULL for every path, so it is refused. The value bytes are intact: "
+	                      "drop or rename the offending field (ALTER TABLE ... DROP COLUMN) to recover, and declare "
+	                      "lanes with the encoded name jsono_storage_type(<spec>) prints. jsono_layout_diagnose(...) "
+	                      "gives this diagnosis in SQL",
+	                      reason);
 }
 
 void JsonoRejectForeignLayout(const LogicalType &type, const string &context) {

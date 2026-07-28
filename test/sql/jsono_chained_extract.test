@@ -52,7 +52,7 @@ SELECT i, jsono(
     WHEN 1 THEN '{"URL":{"hostname":"h' || i || '"}}'                          -- leaf absent
     WHEN 2 THEN '{"other":1}'                                                  -- parent absent
     ELSE       '{"URL":"scalar"}'                                             -- parent is a scalar
-  END, shredding := {'$.URL.path':'VARCHAR'}) AS ep
+  END, shredding := '{"$.URL.path": "VARCHAR"}') AS ep
 FROM range(2000) tt(i);
 
 # The explicitly shredded nested leaf is a shred lane.
@@ -79,7 +79,7 @@ SELECT count(ep -> 'URL' ->> 'path'), count(ep ->> '$.URL.path') FROM t;
 # Previously the chain reconstructed the URL subtree per row.
 statement ok
 CREATE TABLE tot AS
-SELECT jsono('{"URL":{"path":"/p' || i || '","hostname":"h"}}', shredding := {'$.URL.path':'VARCHAR'}) AS ep
+SELECT jsono('{"URL":{"path":"/p' || i || '","hostname":"h"}}', shredding := '{"$.URL.path": "VARCHAR"}') AS ep
 FROM range(2000) tt(i);
 
 statement ok

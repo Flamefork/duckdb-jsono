@@ -71,7 +71,7 @@ bool JsonoCastToJson(Vector &source, Vector &result, idx_t count, CastParameters
 
 // Cast a shredded JSONO value to its JSON text: reconstruct the plain document first, then serialize
 // (same output as the optimizer's jsono_overlay + JsonoCastToJson path). Without this, a shredded
-// struct->VARCHAR would fall to the default struct text and leak the physical "#fp" field names.
+// struct->VARCHAR would fall to the default struct text and leak the physical field names.
 bool JsonoShreddedToVarcharCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	(void)parameters;
 	Vector plain(JsonoType(), count);

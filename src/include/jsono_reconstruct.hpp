@@ -66,6 +66,9 @@ inline const std::string &JsonoRequiredSignatureString(const Value &value, const
 }
 
 inline std::vector<JsonoShredSignature> JsonoShredSignaturesFromValue(const Value &value) {
+	if (value.IsNull()) {
+		throw InvalidInputException("__jsono_internal_checked_residual: the shred signature list must not be NULL");
+	}
 	std::vector<JsonoShredSignature> signatures;
 	for (auto &element : ListValue::GetChildren(value)) {
 		if (element.IsNull()) {

@@ -33,9 +33,7 @@ FROM range(64) t(i);
 # to_json render path (ReconstructShreddedToJson).
 query I
 SELECT count(*) FROM wide
-WHERE to_json(jsono(j, shredding := {
-        'f0': 'BIGINT', 'f1': 'BIGINT', 'f2': 'BIGINT', 'f3': 'BIGINT', 'f4': 'BIGINT', 'f5': 'BIGINT',
-        '$.url.scheme': 'VARCHAR', '$.url.host': 'VARCHAR', '$.url.path': 'VARCHAR'}))
+WHERE to_json(jsono(j, shredding := '{"f0": "BIGINT", "f1": "BIGINT", "f2": "BIGINT", "f3": "BIGINT", "f4": "BIGINT", "f5": "BIGINT", "$.url.scheme": "VARCHAR", "$.url.host": "VARCHAR", "$.url.path": "VARCHAR"}'))
    IS DISTINCT FROM to_json(jsono(j));
 ----
 0
@@ -43,9 +41,7 @@ WHERE to_json(jsono(j, shredding := {
 # ::varchar render path (ReconstructShreddedToPlainImpl — the partition fix lives here).
 query I
 SELECT count(*) FROM wide
-WHERE jsono(j, shredding := {
-        'f0': 'BIGINT', 'f1': 'BIGINT', 'f2': 'BIGINT', 'f3': 'BIGINT', 'f4': 'BIGINT', 'f5': 'BIGINT',
-        '$.url.scheme': 'VARCHAR', '$.url.host': 'VARCHAR', '$.url.path': 'VARCHAR'})::varchar
+WHERE jsono(j, shredding := '{"f0": "BIGINT", "f1": "BIGINT", "f2": "BIGINT", "f3": "BIGINT", "f4": "BIGINT", "f5": "BIGINT", "$.url.scheme": "VARCHAR", "$.url.host": "VARCHAR", "$.url.path": "VARCHAR"}')::varchar
    IS DISTINCT FROM jsono(j)::varchar;
 ----
 0
@@ -53,8 +49,7 @@ WHERE jsono(j, shredding := {
 # A — several DISTINCT nested paths (no flat shreds): the chain-overlay subset alone stays lossless.
 query I
 SELECT count(*) FROM wide
-WHERE jsono(j, shredding := {
-        '$.url.scheme': 'VARCHAR', '$.url.host': 'VARCHAR', '$.url.path': 'VARCHAR'})::varchar
+WHERE jsono(j, shredding := '{"$.url.scheme": "VARCHAR", "$.url.host": "VARCHAR", "$.url.path": "VARCHAR"}')::varchar
    IS DISTINCT FROM jsono(j)::varchar;
 ----
 0
@@ -63,7 +58,7 @@ WHERE jsono(j, shredding := {
 # key ($.a.z survives beside the shredded $.a.x) and a flat shred, all reconstruct byte-identically.
 query I
 SELECT to_json(jsono('{"a":{"x":1,"z":9},"b":{"y":2},"c":3}',
-                     shredding := {'$.a.x': 'BIGINT', '$.b.y': 'BIGINT', 'c': 'BIGINT'}))
+                     shredding := '{"$.a.x": "BIGINT", "$.b.y": "BIGINT", "c": "BIGINT"}'))
      = to_json(jsono('{"a":{"x":1,"z":9},"b":{"y":2},"c":3}'));
 ----
 true
@@ -71,7 +66,7 @@ true
 # A — flat-only (top-level partition only, no nested) is unchanged.
 query I
 SELECT count(*) FROM wide
-WHERE jsono(j, shredding := {'f0': 'BIGINT', 'f3': 'BIGINT', 'f5': 'BIGINT'})::varchar
+WHERE jsono(j, shredding := '{"f0": "BIGINT", "f3": "BIGINT", "f5": "BIGINT"}')::varchar
    IS DISTINCT FROM jsono(j)::varchar;
 ----
 0
@@ -79,8 +74,7 @@ WHERE jsono(j, shredding := {'f0': 'BIGINT', 'f3': 'BIGINT', 'f5': 'BIGINT'})::v
 # A — a single nested shred mixed with flat shreds (minimal contamination trigger), to_json.
 query I
 SELECT count(*) FROM wide
-WHERE to_json(jsono(j, shredding := {
-        'f0': 'BIGINT', 'f1': 'BIGINT', 'f2': 'BIGINT', '$.url.scheme': 'VARCHAR'}))
+WHERE to_json(jsono(j, shredding := '{"f0": "BIGINT", "f1": "BIGINT", "f2": "BIGINT", "$.url.scheme": "VARCHAR"}'))
    IS DISTINCT FROM to_json(jsono(j));
 ----
 0
@@ -92,7 +86,7 @@ WHERE to_json(jsono(j, shredding := {
 # scalar-array sibling.
 query I
 SELECT count(*) FROM wide
-WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'}), {'f0': 'BIGINT'})
+WHERE jsono_transform(jsono(j, shredding := '{"f0": "BIGINT", "$.goals": "BIGINT[]"}'), {'f0': 'BIGINT'})
    IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT'});
 ----
 0
@@ -100,7 +94,7 @@ WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[
 # object-array sibling.
 query I
 SELECT count(*) FROM wide
-WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.items': 'STRUCT(name VARCHAR, cat VARCHAR)[]'}),
+WHERE jsono_transform(jsono(j, shredding := '{"f0": "BIGINT", "$.items": "STRUCT(name VARCHAR, cat VARCHAR)[]"}'),
                       {'f0': 'BIGINT', 'f1': 'BIGINT'})
    IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT', 'f1': 'BIGINT'});
 ----
@@ -109,8 +103,7 @@ WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.items': 'STRUCT(
 # both array kinds present, sibling scalars only.
 query I
 SELECT count(*) FROM wide
-WHERE jsono_transform(jsono(j, shredding := {
-        'f0': 'BIGINT', '$.goals': 'BIGINT[]', '$.items': 'STRUCT(name VARCHAR, cat VARCHAR)[]'}),
+WHERE jsono_transform(jsono(j, shredding := '{"f0": "BIGINT", "$.goals": "BIGINT[]", "$.items": "STRUCT(name VARCHAR, cat VARCHAR)[]"}'),
         {'f0': 'BIGINT', 'f2': 'BIGINT'})
    IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT', 'f2': 'BIGINT'});
 ----
@@ -123,7 +116,7 @@ WHERE jsono_transform(jsono(j, shredding := {
 # A field descending into the scalar array ($.goals[0]) alongside a sibling scalar: both correct.
 query I
 SELECT count(*) FROM wide
-WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'}),
+WHERE jsono_transform(jsono(j, shredding := '{"f0": "BIGINT", "$.goals": "BIGINT[]"}'),
                       {'f0': 'BIGINT', 'g0': {'path': '$.goals[0]', 'type': 'BIGINT'}})
    IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT', 'g0': {'path': '$.goals[0]', 'type': 'BIGINT'}});
 ----
@@ -132,7 +125,7 @@ WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[
 # A field descending into the object array ($.items[0].name).
 query I
 SELECT count(*) FROM wide
-WHERE jsono_transform(jsono(j, shredding := {'$.items': 'STRUCT(name VARCHAR, cat VARCHAR)[]'}),
+WHERE jsono_transform(jsono(j, shredding := '{"$.items": "STRUCT(name VARCHAR, cat VARCHAR)[]"}'),
                       {'n0': {'path': '$.items[0].name', 'type': 'VARCHAR'}})
    IS DISTINCT FROM jsono_transform(jsono(j), {'n0': {'path': '$.items[0].name', 'type': 'VARCHAR'}});
 ----
@@ -141,7 +134,7 @@ WHERE jsono_transform(jsono(j, shredding := {'$.items': 'STRUCT(name VARCHAR, ca
 # A wildcard (list-mode) field over the object array — descends, must reconstruct, stays correct.
 query I
 SELECT count(*) FROM wide
-WHERE jsono_transform(jsono(j, shredding := {'$.items': 'STRUCT(name VARCHAR, cat VARCHAR)[]'}),
+WHERE jsono_transform(jsono(j, shredding := '{"$.items": "STRUCT(name VARCHAR, cat VARCHAR)[]"}'),
                       {'names': {'type': ['VARCHAR'], 'path': '$.items[*].name'}})
    IS DISTINCT FROM jsono_transform(jsono(j), {'names': {'type': ['VARCHAR'], 'path': '$.items[*].name'}});
 ----
@@ -150,7 +143,7 @@ WHERE jsono_transform(jsono(j, shredding := {'$.items': 'STRUCT(name VARCHAR, ca
 # A wildcard (list-mode) field over the scalar array.
 query I
 SELECT count(*) FROM wide
-WHERE jsono_transform(jsono(j, shredding := {'$.goals': 'BIGINT[]'}),
+WHERE jsono_transform(jsono(j, shredding := '{"$.goals": "BIGINT[]"}'),
                       {'gs': {'type': ['BIGINT'], 'path': '$.goals[*]'}})
    IS DISTINCT FROM jsono_transform(jsono(j), {'gs': {'type': ['BIGINT'], 'path': '$.goals[*]'}});
 ----
@@ -160,7 +153,7 @@ WHERE jsono_transform(jsono(j, shredding := {'$.goals': 'BIGINT[]'}),
 # the sibling stays correct, both produced together.
 query I
 SELECT count(*) FROM wide
-WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'}),
+WHERE jsono_transform(jsono(j, shredding := '{"f0": "BIGINT", "$.goals": "BIGINT[]"}'),
                       {'f0': 'BIGINT', 'gs': {'type': ['BIGINT'], 'path': '$.goals[*]'}})
    IS DISTINCT FROM jsono_transform(jsono(j), {'f0': 'BIGINT', 'gs': {'type': ['BIGINT'], 'path': '$.goals[*]'}});
 ----
@@ -171,7 +164,7 @@ WHERE jsono_transform(jsono(j, shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[
 # read, and only wraps it in a reconstruct operator when a field actually descends into the array.
 # ---------------------------------------------------------------------------
 statement ok
-CREATE TABLE arr AS SELECT jsono('{"f0":7,"goals":[1,2,3]}', shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'}) AS e;
+CREATE TABLE arr AS SELECT jsono('{"f0":7,"goals":[1,2,3]}', shredding := '{"f0": "BIGINT", "$.goals": "BIGINT[]"}') AS e;
 
 # Sibling scalar f0: fast path, argument is the bare column (no reconstruct).
 query II
@@ -195,14 +188,14 @@ physical_plan	<REGEX>:.*__jsono_reconstruct.*
 # ---------------------------------------------------------------------------
 statement ok
 CREATE TABLE narrow_goals AS
-SELECT jsono('{}', shredding := {'$.goals': 'BIGINT[]'}) AS e WHERE false;
+SELECT jsono('{}', shredding := '{"$.goals": "BIGINT[]"}') AS e WHERE false;
 
 statement ok
 SET disabled_optimizers='extension';
 
 statement ok
 INSERT INTO narrow_goals
-SELECT jsono('{"f0":7,"goals":[1,2,3]}', shredding := {'f0': 'BIGINT', '$.goals': 'BIGINT[]'});
+SELECT jsono('{"f0":7,"goals":[1,2,3]}', shredding := '{"f0": "BIGINT", "$.goals": "BIGINT[]"}');
 
 statement ok
 RESET disabled_optimizers;

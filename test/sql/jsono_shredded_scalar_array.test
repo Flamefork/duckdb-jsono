@@ -19,7 +19,7 @@ CREATE MACRO jsono_residual(j) AS struct_pack(
 # ---------------------------------------------------------------------------
 query I
 SELECT to_json(jsono('{"item_ids":[5348936,139733107,3]}',
-                     shredding := {'$.item_ids':'UBIGINT[]'}));
+                     shredding := '{"$.item_ids": "UBIGINT[]"}'));
 ----
 {"item_ids":[5348936,139733107,3]}
 
@@ -27,15 +27,15 @@ SELECT to_json(jsono('{"item_ids":[5348936,139733107,3]}',
 query II
 SELECT (j."jsono"."shreds$2".d5q6aravd5i76000)[1], (j."jsono"."shreds$2".d5q6aravd5i76000)[3]
 FROM (SELECT jsono('{"item_ids":[5348936,139733107,3]}',
-                   shredding := {'$.item_ids':'UBIGINT[]'}) AS j);
+                   shredding := '{"$.item_ids": "UBIGINT[]"}') AS j);
 ----
 5348936	3
 
 # The type is a pure function of the shred set (matches jsono_storage_type).
 query I
 SELECT typeof(jsono('{"item_ids":[1,2,3]}',
-                    shredding := {'$.item_ids':'UBIGINT[]'}))
-     = jsono_storage_type('"$.item_ids" UBIGINT[]');
+                    shredding := '{"$.item_ids": "UBIGINT[]"}'))
+     = jsono_storage_type('{"$.item_ids": "UBIGINT[]"}');
 ----
 true
 
@@ -47,55 +47,55 @@ true
 # Mixed array: only the conforming UBIGINT elements lift; string/null/bool/negative stay.
 query I
 SELECT to_json(jsono('{"a":[1,"two",3,null,true,-5]}',
-                     shredding := {'$.a':'UBIGINT[]'}));
+                     shredding := '{"$.a": "UBIGINT[]"}'));
 ----
 {"a":[1,"two",3,null,true,-5]}
 
 # All-string array into a VARCHAR lane.
 query I
-SELECT to_json(jsono('{"a":["x","y","z"]}', shredding := {'$.a':'VARCHAR[]'}));
+SELECT to_json(jsono('{"a":["x","y","z"]}', shredding := '{"$.a": "VARCHAR[]"}'));
 ----
 {"a":["x","y","z"]}
 
 # VARCHAR lane lifts only real strings; a number stays verbatim in the skeleton.
 query I
-SELECT to_json(jsono('{"a":["x",5,"z"]}', shredding := {'$.a':'VARCHAR[]'}));
+SELECT to_json(jsono('{"a":["x",5,"z"]}', shredding := '{"$.a": "VARCHAR[]"}'));
 ----
 {"a":["x",5,"z"]}
 
 # DOUBLE lane: only genuine doubles lift; an integer stays (its shred kind differs).
 query I
-SELECT to_json(jsono('{"a":[1.5,2.0,3]}', shredding := {'$.a':'DOUBLE[]'}));
+SELECT to_json(jsono('{"a":[1.5,2.0,3]}', shredding := '{"$.a": "DOUBLE[]"}'));
 ----
 {"a":[1.5,2.0,3]}
 
 # BOOLEAN lane.
 query I
-SELECT to_json(jsono('{"a":[true,false,1]}', shredding := {'$.a':'BOOLEAN[]'}));
+SELECT to_json(jsono('{"a":[true,false,1]}', shredding := '{"$.a": "BOOLEAN[]"}'));
 ----
 {"a":[true,false,1]}
 
 # BIGINT lane: negatives and large values lift.
 query I
-SELECT to_json(jsono('{"a":[-5,10,9999999999999]}', shredding := {'$.a':'BIGINT[]'}));
+SELECT to_json(jsono('{"a":[-5,10,9999999999999]}', shredding := '{"$.a": "BIGINT[]"}'));
 ----
 {"a":[-5,10,9999999999999]}
 
 # Empty array (length 0, not absent).
 query I
-SELECT to_json(jsono('{"a":[]}', shredding := {'$.a':'UBIGINT[]'}));
+SELECT to_json(jsono('{"a":[]}', shredding := '{"$.a": "UBIGINT[]"}'));
 ----
 {"a":[]}
 
 # Absent array path: nothing lifted, value round-trips unchanged.
 query I
-SELECT to_json(jsono('{"x":1}', shredding := {'$.a':'UBIGINT[]'}));
+SELECT to_json(jsono('{"x":1}', shredding := '{"$.a": "UBIGINT[]"}'));
 ----
 {"x":1}
 
 # Path present but not an array: stays whole in the residual.
 query I
-SELECT to_json(jsono('{"a":"scalar"}', shredding := {'$.a':'UBIGINT[]'}));
+SELECT to_json(jsono('{"a":"scalar"}', shredding := '{"$.a": "UBIGINT[]"}'));
 ----
 {"a":"scalar"}
 
@@ -103,21 +103,21 @@ SELECT to_json(jsono('{"a":"scalar"}', shredding := {'$.a':'UBIGINT[]'}));
 # explicit null in the residual (distinct from a lifted element's placeholder, which
 # the non-NULL shred slot reconstructs over).
 query I
-SELECT to_json(jsono('{"a":[1,null,2]}', shredding := {'$.a':'UBIGINT[]'}));
+SELECT to_json(jsono('{"a":[1,null,2]}', shredding := '{"$.a": "UBIGINT[]"}'));
 ----
 {"a":[1,null,2]}
 
 # Nested array path.
 query I
 SELECT to_json(jsono('{"order":{"items":[1,2,3]}}',
-                     shredding := {'$.order.items':'UBIGINT[]'}));
+                     shredding := '{"$.order.items": "UBIGINT[]"}'));
 ----
 {"order":{"items":[1,2,3]}}
 
 # Scalar array coexisting with a top-level scalar shred.
 query I
 SELECT to_json(jsono('{"kind":"order","item_ids":[1,2]}',
-                     shredding := {'$.kind':'VARCHAR','$.item_ids':'UBIGINT[]'}));
+                     shredding := '{"$.kind": "VARCHAR", "$.item_ids": "UBIGINT[]"}'));
 ----
 {"item_ids":[1,2],"kind":"order"}
 
@@ -127,13 +127,13 @@ SELECT to_json(jsono('{"kind":"order","item_ids":[1,2]}',
 # ---------------------------------------------------------------------------
 query I
 SELECT jsono_residual(jsono('{"a":[1,"keep",2]}',
-                            shredding := {'$.a':'UBIGINT[]'})) ->> '$.a[1]';
+                            shredding := '{"$.a": "UBIGINT[]"}')) ->> '$.a[1]';
 ----
 keep
 
 statement error
 SELECT to_json(jsono_residual(jsono('{"a":[1,2,3]}',
-                                     shredding := {'$.a':'UBIGINT[]'})));
+                                     shredding := '{"$.a": "UBIGINT[]"}')));
 ----
 row was shredded with shred '$.a
 
@@ -143,7 +143,7 @@ row was shredded with shred '$.a
 # ---------------------------------------------------------------------------
 statement ok
 CREATE TABLE arr_reads AS SELECT
-  jsono('{"a":[10,20,30],"k":"v"}', shredding := {'$.a':'UBIGINT[]'}) AS s,
+  jsono('{"a":[10,20,30],"k":"v"}', shredding := '{"$.a": "UBIGINT[]"}') AS s,
   jsono('{"a":[10,20,30],"k":"v"}') AS p;
 
 query IIIIII
@@ -173,7 +173,7 @@ NULL
 
 # $.path array shred, typed-array cast of the `->>` text.
 query I
-SELECT (jsono('{"a":[1,2,3]}', shredding := {'$.a':'UBIGINT[]'}) ->> '$.a')::UBIGINT[];
+SELECT (jsono('{"a":[1,2,3]}', shredding := '{"$.a": "UBIGINT[]"}') ->> '$.a')::UBIGINT[];
 ----
 [1, 2, 3]
 
@@ -209,7 +209,7 @@ SELECT count(*) FROM arr_cast_schema;
 query IT
 SELECT u.key, u.value FROM (
   SELECT unnest(jsono_entries(jsono('{"a":[10,null,"x",20],"k":"v"}',
-                                    shredding := {'$.a':'UBIGINT[]'}))) AS u
+                                    shredding := '{"$.a": "UBIGINT[]"}'))) AS u
 ) ORDER BY u.key;
 ----
 $.a[0]	10
@@ -236,7 +236,7 @@ $.k	v
 # ---------------------------------------------------------------------------
 query I
 SELECT (jsono_storage_size(jsono('{"a":[1,2,3,4,5]}',
-                                  shredding := {'$.a':'UBIGINT[]'}))).shreds;
+                                  shredding := '{"$.a": "UBIGINT[]"}'))).shreds;
 ----
 40
 
@@ -246,7 +246,7 @@ SELECT (jsono_storage_size(jsono('{"a":[1,2,3,4,5]}',
 # ---------------------------------------------------------------------------
 query I
 SELECT jsono_transform(jsono('{"item_ids":[5,6,7],"kind":"x"}',
-                             shredding := {'$.item_ids':'UBIGINT[]','$.kind':'VARCHAR'}),
+                             shredding := '{"$.item_ids": "UBIGINT[]", "$.kind": "VARCHAR"}'),
                        {g:{type:['VARCHAR'], path:'$.item_ids[*]'}, k:{type:'VARCHAR', path:'$.kind'}})::VARCHAR
      = jsono_transform(jsono('{"item_ids":[5,6,7],"kind":"x"}'),
                        {g:{type:['VARCHAR'], path:'$.item_ids[*]'}, k:{type:'VARCHAR', path:'$.kind'}})::VARCHAR;
@@ -257,46 +257,46 @@ true
 # Merge / set-op / group_merge preserve the scalar-array shred losslessly.
 # ---------------------------------------------------------------------------
 query I
-SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2]}', shredding := {'$.a':'UBIGINT[]'}),
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2]}', shredding := '{"$.a": "UBIGINT[]"}'),
                                  jsono('{"b":9}')));
 ----
 {"a":[1,2],"b":9}
 
 query I
-SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}),
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"k":"x"}', shredding := '{"$.a": "UBIGINT[]"}'),
                                  jsono('{"a":null}')));
 ----
 {"k":"x"}
 
 query I
-SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}),
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"k":"x"}', shredding := '{"$.a": "UBIGINT[]"}'),
                                  jsono('{"a":5}')));
 ----
 {"a":5,"k":"x"}
 
 query I
-SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}),
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1,2],"k":"x"}', shredding := '{"$.a": "UBIGINT[]"}'),
                                  jsono('{"a":[3]}')));
 ----
 {"a":[3],"k":"x"}
 
 query I
-SELECT to_json(jsono_merge_patch(jsono('{"a":[1]}', shredding := {'$.a':'UBIGINT[]'}),
-                                 jsono('{"a":5,"z":9}', shredding := {'$.z':'UBIGINT'})));
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1]}', shredding := '{"$.a": "UBIGINT[]"}'),
+                                 jsono('{"a":5,"z":9}', shredding := '{"$.z": "UBIGINT"}')));
 ----
 {"a":5,"z":9}
 
 query I
-SELECT to_json(jsono_merge_patch(jsono('{"a":[1]}', shredding := {'$.a':'UBIGINT[]'}),
-                                 jsono('{"a":[2,3]}', shredding := {'$.a':'UBIGINT[]'})));
+SELECT to_json(jsono_merge_patch(jsono('{"a":[1]}', shredding := '{"$.a": "UBIGINT[]"}'),
+                                 jsono('{"a":[2,3]}', shredding := '{"$.a": "UBIGINT[]"}')));
 ----
 {"a":[2,3]}
 
 statement ok
 CREATE TABLE setop AS
-  SELECT jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}) AS j
+  SELECT jsono('{"a":[1,2],"k":"x"}', shredding := '{"$.a": "UBIGINT[]"}') AS j
   UNION ALL
-  SELECT jsono('{"a":[3,4],"k":"y"}', shredding := {'$.a':'UBIGINT[]'}) AS j;
+  SELECT jsono('{"a":[3,4],"k":"y"}', shredding := '{"$.a": "UBIGINT[]"}') AS j;
 
 query I
 SELECT to_json(j) FROM setop ORDER BY to_json(j);
@@ -306,9 +306,9 @@ SELECT to_json(j) FROM setop ORDER BY to_json(j);
 
 statement ok
 CREATE TABLE setop_widen AS
-  SELECT jsono('{"a":[1,2],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}) AS j
+  SELECT jsono('{"a":[1,2],"k":"x"}', shredding := '{"$.a": "UBIGINT[]"}') AS j
   UNION ALL
-  SELECT jsono('{"a":[3,4],"k":"y","z":9}', shredding := {'$.a':'UBIGINT[]','$.z':'BIGINT'}) AS j;
+  SELECT jsono('{"a":[3,4],"k":"y","z":9}', shredding := '{"$.a": "UBIGINT[]", "$.z": "BIGINT"}') AS j;
 
 query I
 SELECT to_json(j) FROM setop_widen ORDER BY to_json(j);
@@ -318,23 +318,23 @@ SELECT to_json(j) FROM setop_widen ORDER BY to_json(j);
 
 query I
 SELECT to_json(jsono_group_merge_max(j, k)) FROM (
-  SELECT jsono('{"a":[7],"k":"v"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k);
+  SELECT jsono('{"a":[7],"k":"v"}', shredding := '{"$.a": "UBIGINT[]"}') AS j, 1 AS k);
 ----
 {"a":[7],"k":"v"}
 
 query I
 SELECT to_json(jsono_group_merge_max(j, k)) FROM (
-  SELECT jsono('{"a":[1],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k
+  SELECT jsono('{"a":[1],"k":"x"}', shredding := '{"$.a": "UBIGINT[]"}') AS j, 1 AS k
   UNION ALL
-  SELECT jsono('{"a":[2,3],"k":"y"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k);
+  SELECT jsono('{"a":[2,3],"k":"y"}', shredding := '{"$.a": "UBIGINT[]"}') AS j, 1 AS k);
 ----
 {"a":[2,3],"k":"y"}
 
 query I
 SELECT to_json(jsono_group_merge_max(j, k)) FROM (
-  SELECT jsono('{"a":[10,20],"k":"x"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k
+  SELECT jsono('{"a":[10,20],"k":"x"}', shredding := '{"$.a": "UBIGINT[]"}') AS j, 1 AS k
   UNION ALL
-  SELECT jsono('{"a":[10],"k":"y"}', shredding := {'$.a':'UBIGINT[]'}) AS j, 1 AS k);
+  SELECT jsono('{"a":[10],"k":"y"}', shredding := '{"$.a": "UBIGINT[]"}') AS j, 1 AS k);
 ----
 {"a":[10,20],"k":"y"}
 
@@ -343,14 +343,14 @@ SELECT to_json(jsono_group_merge_max(j, k)) FROM (
 # ---------------------------------------------------------------------------
 query I
 SELECT to_json(jsono('{"a":[1,2,3],"t":"x"}',
-                     shredding := {'$.a':'UBIGINT[]'})::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+                     shredding := '{"$.a": "UBIGINT[]"}')::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 {"a":[1,2,3],"t":"x"}
 
 # Secondary form: shred an already-plain jsono value.
 query I
 SELECT to_json(jsono(jsono('{"a":[1,2,3]}'),
-                     shredding := {'$.a':'UBIGINT[]'}));
+                     shredding := '{"$.a": "UBIGINT[]"}'));
 ----
 {"a":[1,2,3]}
 
@@ -367,7 +367,7 @@ SELECT * FROM (VALUES
 ) AS v(id, doc);
 
 query II
-SELECT id, to_json(jsono(doc, shredding := {'$.item_ids':'UBIGINT[]'})) AS full
+SELECT id, to_json(jsono(doc, shredding := '{"$.item_ids": "UBIGINT[]"}')) AS full
 FROM rows ORDER BY id;
 ----
 1	{"item_ids":[1,2]}
@@ -381,7 +381,7 @@ FROM rows ORDER BY id;
 # ---------------------------------------------------------------------------
 query I
 SELECT typeof(jsono({'item_ids': [1,2,3]::UBIGINT[]}))
-     = jsono_storage_type('"item_ids" UBIGINT[]');
+     = jsono_storage_type('{"item_ids": "UBIGINT[]"}');
 ----
 true
 
@@ -424,7 +424,7 @@ require parquet
 
 statement ok
 COPY (SELECT jsono('{"item_ids":[5348936,139733107],"kind":"x"}',
-                   shredding := {'$.item_ids':'UBIGINT[]'}) AS j)
+                   shredding := '{"$.item_ids": "UBIGINT[]"}') AS j)
 TO '__TEST_DIR__/scalar_array.parquet' (FORMAT parquet);
 
 query III

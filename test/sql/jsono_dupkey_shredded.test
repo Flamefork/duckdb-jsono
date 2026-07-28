@@ -17,14 +17,14 @@ SELECT to_json(jsono('{"a":1,"a":2}'));
 # Shredded on $.a: the lane reads the surviving value, and to_json reconstructs it identically.
 query II
 SELECT v ->> '$.a', to_json(v)
-FROM (SELECT jsono('{"a":1,"a":2}', shredding := {'$.a':'BIGINT'}) AS v);
+FROM (SELECT jsono('{"a":1,"a":2}', shredding := '{"$.a": "BIGINT"}') AS v);
 ----
 2	{"a":2}
 
 # Typed pruning read of the shred agrees too (BIGINT comparison on the lane).
 query I
 SELECT count(*)
-FROM (SELECT jsono('{"a":1,"a":2}', shredding := {'$.a':'BIGINT'}) AS v)
+FROM (SELECT jsono('{"a":1,"a":2}', shredding := '{"$.a": "BIGINT"}') AS v)
 WHERE CAST(v ->> '$.a' AS BIGINT) = 2;
 ----
 1
@@ -32,6 +32,6 @@ WHERE CAST(v ->> '$.a' AS BIGINT) = 2;
 # A duplicate key whose later value does NOT fit the shred type stays in the residual,
 # last-wins, and still reconstructs correctly (lossless gate).
 query I
-SELECT to_json(jsono('{"a":1,"a":"two"}', shredding := {'$.a':'BIGINT'}));
+SELECT to_json(jsono('{"a":1,"a":"two"}', shredding := '{"$.a": "BIGINT"}'));
 ----
 {"a":"two"}

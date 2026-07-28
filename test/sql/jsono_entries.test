@@ -311,7 +311,7 @@ unknown argument
 # --- shred-aware: a shredded value flattens its residual tape AND its shred columns ---
 query I
 SELECT jsono_entries(
-  jsono('{"a":1,"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}),
+  jsono('{"a":1,"event_name":"page_view"}', shredding := '{"event_name": "VARCHAR"}'),
   key_style := 'dotted'
 );
 ----
@@ -320,7 +320,7 @@ SELECT jsono_entries(
 # absent shred (NULL) contributes no entry
 query I
 SELECT jsono_entries(
-  jsono('{"a":1}', shredding := {'event_name':'VARCHAR'}),
+  jsono('{"a":1}', shredding := '{"event_name": "VARCHAR"}'),
   key_style := 'dotted'
 );
 ----
@@ -331,14 +331,14 @@ SELECT jsono_entries(
 # residual), with no shred-overlay double.
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"x":false}', shredding := {'$.x':'VARCHAR'}))) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"x":false}', shredding := '{"$.x": "VARCHAR"}'))) u)
 ORDER BY ALL;
 ----
 $.x	false
 
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"x":42,"y":"s"}', shredding := {'$.x':'VARCHAR','$.y':'VARCHAR'}))) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"x":42,"y":"s"}', shredding := '{"$.x": "VARCHAR", "$.y": "VARCHAR"}'))) u)
 ORDER BY ALL;
 ----
 $.x	42
@@ -347,7 +347,7 @@ $.y	s
 # --- DOUBLE shred leaf renders shortest round-trip text, identical to the residual path ---
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono(jsono({a: 1.5::DOUBLE}), shredding := {'a':'DOUBLE'}))) u);
+FROM (SELECT unnest(jsono_entries(jsono(jsono({a: 1.5::DOUBLE}), shredding := '{"a": "DOUBLE"}'))) u);
 ----
 $.a	1.5
 
@@ -362,7 +362,7 @@ $.a[0]	1.5
 require json
 
 query I
-SELECT to_json(jsono(jsono({a: 1.5::DOUBLE}), shredding := {'a':'DOUBLE'}));
+SELECT to_json(jsono(jsono({a: 1.5::DOUBLE}), shredding := '{"a": "DOUBLE"}'));
 ----
 {"a":1.5}
 
@@ -375,7 +375,7 @@ SELECT to_json(jsono(jsono({a: 1.5::DOUBLE}), shredding := {'a':'DOUBLE'}));
 # --- case 1: quoted spec spelling ($."utm.source") — both key styles match a plain parse ---
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := {'$."utm.source"':'VARCHAR'}))) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := '{"$.\"utm.source\"": "VARCHAR"}'))) u)
 ORDER BY u.key;
 ----
 $."utm.source"	g
@@ -383,7 +383,7 @@ $.kind	x
 
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := {'$."utm.source"':'VARCHAR'}), key_style := 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := '{"$.\"utm.source\"": "VARCHAR"}'), key_style := 'dotted')) u)
 ORDER BY u.key;
 ----
 kind	x
@@ -392,7 +392,7 @@ utm.source	g
 # --- case 2: bare-literal spec spelling (utm.source) — jsonpath must quote it, NOT nest ---
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := {'utm.source':'VARCHAR'}))) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := '{"utm.source": "VARCHAR"}'))) u)
 ORDER BY u.key;
 ----
 $."utm.source"	g
@@ -400,7 +400,7 @@ $.kind	x
 
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := {'utm.source':'VARCHAR'}), key_style := 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"utm.source":"g","kind":"x"}', shredding := '{"utm.source": "VARCHAR"}'), key_style := 'dotted')) u)
 ORDER BY u.key;
 ----
 kind	x
@@ -409,7 +409,7 @@ utm.source	g
 # --- case 3: bracket / embedded-quote keys — jsonpath quotes and escapes like the plain walk ---
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"a[0]":"v"}', shredding := {'a[0]':'VARCHAR'}))) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"a[0]":"v"}', shredding := '{"a[0]": "VARCHAR"}'))) u)
 ORDER BY u.key;
 ----
 $."a[0]"	v
@@ -417,26 +417,26 @@ $."a[0]"	v
 # parity-with-plain oracle (jsonpath) over quotable keys, including an embedded quote.
 query I
 SELECT (SELECT count(*) FROM (
-          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := {'a[0]':'VARCHAR','q"x':'VARCHAR'})))
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := '{"a[0]": "VARCHAR", "q\"x": "VARCHAR"}')))
           EXCEPT ALL
           SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}')))))
      + (SELECT count(*) FROM (
           SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}')))
           EXCEPT ALL
-          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := {'a[0]':'VARCHAR','q"x':'VARCHAR'})))));
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := '{"a[0]": "VARCHAR", "q\"x": "VARCHAR"}')))));
 ----
 0
 
 # parity-with-plain oracle (dotted) over the same quotable keys.
 query I
 SELECT (SELECT count(*) FROM (
-          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := {'a[0]':'VARCHAR','q"x':'VARCHAR'}), key_style := 'dotted'))
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := '{"a[0]": "VARCHAR", "q\"x": "VARCHAR"}'), key_style := 'dotted'))
           EXCEPT ALL
           SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}'), key_style := 'dotted'))))
      + (SELECT count(*) FROM (
           SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}'), key_style := 'dotted'))
           EXCEPT ALL
-          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := {'a[0]':'VARCHAR','q"x':'VARCHAR'}), key_style := 'dotted'))));
+          SELECT unnest(jsono_entries(jsono('{"a[0]":"v","q\"x":"w","kind":"k"}', shredding := '{"a[0]": "VARCHAR", "q\"x": "VARCHAR"}'), key_style := 'dotted'))));
 ----
 0
 
@@ -444,7 +444,7 @@ SELECT (SELECT count(*) FROM (
 # byte-identical to the plain parse — these must NOT change across the fix ---
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":7},"kind":"x"}', shredding := {'$.a.b':'BIGINT','kind':'VARCHAR'}))) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":7},"kind":"x"}', shredding := '{"$.a.b": "BIGINT", "kind": "VARCHAR"}'))) u)
 ORDER BY u.key;
 ----
 $.a.b	7
@@ -452,7 +452,7 @@ $.kind	x
 
 query II
 SELECT u.key, u.value
-FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":7},"kind":"x"}', shredding := {'$.a.b':'BIGINT','kind':'VARCHAR'}), key_style := 'dotted')) u)
+FROM (SELECT unnest(jsono_entries(jsono('{"a":{"b":7},"kind":"x"}', shredding := '{"$.a.b": "BIGINT", "kind": "VARCHAR"}'), key_style := 'dotted')) u)
 ORDER BY u.key;
 ----
 a.b	7

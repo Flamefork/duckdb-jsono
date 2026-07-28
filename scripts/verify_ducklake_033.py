@@ -77,7 +77,7 @@ def main() -> None:
             ATTACH 'ducklake:{tmp}/meta.ducklake' AS dl (DATA_PATH '{tmp}/data');
             CREATE TABLE dl.t AS
             SELECT jsono('{{"a":' || i || ',"b":"x' || i || '"}}',
-                         shredding := {{'$.a':'BIGINT'}}) AS j
+                         shredding := '{{"$.a": "BIGINT"}}') AS j
             FROM range(1000) t(i);
             PRAGMA explain_output='physical_only';
             {marker}
@@ -90,7 +90,7 @@ def main() -> None:
             {marker}
             INSERT INTO dl.t
             SELECT jsono('{{"a":' || (i + 1000) || ',"b":"y' || i || '"}}',
-                         shredding := {{'$.a':'BIGINT','$.b':'VARCHAR'}})
+                         shredding := '{{"$.a": "BIGINT", "$.b": "VARCHAR"}}')
             FROM range(1000) t(i);
             EXPLAIN SELECT MIN(j->>'$.b') FROM dl.t;
             {marker}
@@ -102,7 +102,7 @@ def main() -> None:
             ORDER BY column_id;
             {marker}
             CREATE TABLE dl.nul AS
-            SELECT jsono('{{"a\\u0000b":"v","z":1}}', shredding := {{'z':'BIGINT'}}) AS j;
+            SELECT jsono('{{"a\\u0000b":"v","z":1}}', shredding := '{{"z": "BIGINT"}}') AS j;
             ALTER TABLE dl.nul ADD COLUMN j.jsono."shreds$2".c40fuog000 VARCHAR;
             SELECT (SELECT count(*) FROM (SELECT unnest(jsono_layout_lanes(j)) AS l FROM dl.nul)
                     WHERE l.path = ('$.a' || chr(0) || 'b')) AS decoded_exact,

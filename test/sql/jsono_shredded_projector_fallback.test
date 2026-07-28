@@ -23,8 +23,8 @@ require json
 query II
 SELECT (rp->>'primaryID')::ubigint, (rp->>'secondaryID')::ubigint
 FROM (VALUES
-  (jsono('{"secondaryID":100,"primaryID":50}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'})),
-  (jsono('{"secondaryID":101,"primaryID":60}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'}))
+  (jsono('{"secondaryID":100,"primaryID":50}', shredding := '{"$.secondaryID": "UBIGINT", "$.primaryID": "UBIGINT"}')),
+  (jsono('{"secondaryID":101,"primaryID":60}', shredding := '{"$.secondaryID": "UBIGINT", "$.primaryID": "UBIGINT"}'))
 ) t(rp)
 ORDER BY 1;
 ----
@@ -35,7 +35,7 @@ ORDER BY 1;
 query II
 SELECT rp->>'primaryID', rp->>'secondaryID'
 FROM (VALUES
-  (jsono('{"secondaryID":100,"primaryID":50}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'}))
+  (jsono('{"secondaryID":100,"primaryID":50}', shredding := '{"$.secondaryID": "UBIGINT", "$.primaryID": "UBIGINT"}'))
 ) t(rp);
 ----
 50	100
@@ -45,7 +45,7 @@ FROM (VALUES
 query II
 SELECT (rp->>'primaryID')::ubigint, rp->>'dateTime'
 FROM (VALUES
-  (jsono('{"primaryID":50,"dateTime":"x"}', shredding := {'$.primaryID':'UBIGINT'}))
+  (jsono('{"primaryID":50,"dateTime":"x"}', shredding := '{"$.primaryID": "UBIGINT"}'))
 ) t(rp);
 ----
 50	x
@@ -55,8 +55,8 @@ FROM (VALUES
 query I
 SELECT (jsono_group_merge_min(rp, (rp->>'secondaryID')::ubigint) ->> 'primaryID')::ubigint
 FROM (VALUES
-  (jsono('{"secondaryID":100,"primaryID":50}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'}), 10),
-  (jsono('{"secondaryID":101,"primaryID":60}', shredding := {'$.secondaryID':'UBIGINT','$.primaryID':'UBIGINT'}), 20)
+  (jsono('{"secondaryID":100,"primaryID":50}', shredding := '{"$.secondaryID": "UBIGINT", "$.primaryID": "UBIGINT"}'), 10),
+  (jsono('{"secondaryID":101,"primaryID":60}', shredding := '{"$.secondaryID": "UBIGINT", "$.primaryID": "UBIGINT"}'), 20)
 ) t(rp, dt)
 GROUP BY (rp->>'primaryID')::ubigint
 ORDER BY 1;

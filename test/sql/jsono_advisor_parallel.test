@@ -32,7 +32,7 @@ statement ok
 CREATE TABLE ref AS
   SELECT g,
          jsono_suggest_shredding(jsono(doc)) AS sug,
-         to_json(jsono_shred_stats(jsono(doc, shredding := {'a':'BIGINT','x':'BIGINT','tags':'BIGINT[]'}))) AS stats
+         to_json(jsono_shred_stats(jsono(doc, shredding := '{"a": "BIGINT", "x": "BIGINT", "tags": "BIGINT[]"}'))) AS stats
   FROM docs GROUP BY g;
 
 # Recompute under 4 threads: each group's suggestion and shred-stats result must match the reference
@@ -45,7 +45,7 @@ query I
 SELECT count(*)
 FROM ( SELECT g,
               jsono_suggest_shredding(jsono(doc)) AS sug,
-              to_json(jsono_shred_stats(jsono(doc, shredding := {'a':'BIGINT','x':'BIGINT','tags':'BIGINT[]'}))) AS stats
+              to_json(jsono_shred_stats(jsono(doc, shredding := '{"a": "BIGINT", "x": "BIGINT", "tags": "BIGINT[]"}'))) AS stats
        FROM docs GROUP BY g ) cur
 JOIN ref USING (g)
 WHERE cur.sug IS DISTINCT FROM ref.sug

@@ -23,11 +23,11 @@ FROM (VALUES
 # Shredded inputs fold the same as plain (latest non-null wins, nulls ignored), and the
 # result stays shredded with the same shred set so the shred reads back from its column.
 query III
-SELECT to_json(m), m ->> 'event_name', typeof(m) = jsono_storage_type('event_name VARCHAR')
+SELECT to_json(m), m ->> 'event_name', typeof(m) = jsono_storage_type('{"event_name": "VARCHAR"}')
 FROM (
   SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
-    (jsono('{"event_name":"search","x":1}', shredding := {'event_name':'VARCHAR'}), 1),
-    (jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}), 2)
+    (jsono('{"event_name":"search","x":1}', shredding := '{"event_name": "VARCHAR"}'), 1),
+    (jsono('{"event_name":"page_view"}', shredding := '{"event_name": "VARCHAR"}'), 2)
   ) t(j, ts)
 );
 ----
@@ -38,8 +38,8 @@ query III
 SELECT to_json(m), m ->> '$.event_name', (jsono_storage_size(m)).shreds
 FROM (
   SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
-    (jsono('{"event_name":"search","x":1}', shredding := {'$.event_name':'VARCHAR'}), 1),
-    (jsono('{"event_name":"page_view"}', shredding := {'$.event_name':'VARCHAR'}), 2)
+    (jsono('{"event_name":"search","x":1}', shredding := '{"$.event_name": "VARCHAR"}'), 1),
+    (jsono('{"event_name":"page_view"}', shredding := '{"$.event_name": "VARCHAR"}'), 2)
   ) t(j, ts)
 );
 ----
@@ -51,9 +51,9 @@ SELECT g, to_json(m), m ->> 'k'
 FROM (
   SELECT g, jsono_group_merge(j ORDER BY ts) AS m
   FROM (VALUES
-    ('a', jsono('{"k":"a1"}', shredding := {'k':'VARCHAR'}), 1),
-    ('a', jsono('{"k":"a2","p":1}', shredding := {'k':'VARCHAR'}), 2),
-    ('b', jsono('{"k":"b1"}', shredding := {'k':'VARCHAR'}), 1)
+    ('a', jsono('{"k":"a1"}', shredding := '{"k": "VARCHAR"}'), 1),
+    ('a', jsono('{"k":"a2","p":1}', shredding := '{"k": "VARCHAR"}'), 2),
+    ('b', jsono('{"k":"b1"}', shredding := '{"k": "VARCHAR"}'), 1)
   ) t(g, j, ts)
   GROUP BY g
 ) s
@@ -68,7 +68,7 @@ query I
 SELECT count(*) FROM (
   SELECT g, jsono_group_merge(j) AS m
   FROM (
-    SELECT i AS g, jsono('{"k":"v' || i || '"}', shredding := {'k':'VARCHAR'}) AS j
+    SELECT i AS g, jsono('{"k":"v' || i || '"}', shredding := '{"k": "VARCHAR"}') AS j
     FROM range(5000) t(i)
   ) GROUP BY g
 ) WHERE (m ->> 'k') = 'v' || g;
@@ -80,8 +80,8 @@ query I
 SELECT DISTINCT m ->> 'k' FROM (
   SELECT jsono_group_merge(j) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS m
   FROM (VALUES
-    (jsono('{"k":"a"}', shredding := {'k':'VARCHAR'}), 1),
-    (jsono('{"k":"b"}', shredding := {'k':'VARCHAR'}), 2)
+    (jsono('{"k":"a"}', shredding := '{"k": "VARCHAR"}'), 1),
+    (jsono('{"k":"b"}', shredding := '{"k": "VARCHAR"}'), 2)
   ) t(j, ts)
 );
 ----
@@ -90,10 +90,10 @@ b
 # A group whose only value is NULL has zero non-NULL inputs and finalizes to SQL NULL
 # (DEFAULT_NULL_HANDLING); typeof still reports the sticky shredded type on the NULL value.
 query III
-SELECT to_json(m), m ->> 'k', typeof(m) = jsono_storage_type('k VARCHAR')
+SELECT to_json(m), m ->> 'k', typeof(m) = jsono_storage_type('{"k": "VARCHAR"}')
 FROM (
   SELECT jsono_group_merge(j) AS m FROM (
-    SELECT CASE WHEN i > 0 THEN jsono('{"k":"x"}', shredding := {'k':'VARCHAR'}) END AS j
+    SELECT CASE WHEN i > 0 THEN jsono('{"k":"x"}', shredding := '{"k": "VARCHAR"}') END AS j
     FROM range(1) t(i)
   )
 );
@@ -103,11 +103,11 @@ NULL	NULL	true
 # A non-object value replaces the accumulator wholesale; reshredding a scalar yields a
 # scalar residual with a NULL shred (still the shredded type).
 query III
-SELECT to_json(m), m ->> 'k', typeof(m) = jsono_storage_type('k VARCHAR')
+SELECT to_json(m), m ->> 'k', typeof(m) = jsono_storage_type('{"k": "VARCHAR"}')
 FROM (
   SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
-    (jsono('{"k":"x"}', shredding := {'k':'VARCHAR'}), 1),
-    (jsono('5', shredding := {'k':'VARCHAR'}), 2)
+    (jsono('{"k":"x"}', shredding := '{"k": "VARCHAR"}'), 1),
+    (jsono('5', shredding := '{"k": "VARCHAR"}'), 2)
   ) t(j, ts)
 );
 ----
@@ -118,8 +118,8 @@ query III
 SELECT to_json(m), m ->> '$.a.b', (jsono_storage_size(m)).shreds
 FROM (
   SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
-    (jsono('{"a":{"b":1}}', shredding := {'$.a.b':'BIGINT'}), 1),
-    (jsono('{"a":{"b":2}}', shredding := {'$.a.b':'BIGINT'}), 2)
+    (jsono('{"a":{"b":1}}', shredding := '{"$.a.b": "BIGINT"}'), 1),
+    (jsono('{"a":{"b":2}}', shredding := '{"$.a.b": "BIGINT"}'), 2)
   ) t(j, ts)
 );
 ----
@@ -132,12 +132,12 @@ SET disabled_optimizers='extension';
 
 statement error
 SELECT
-  typeof(m) = jsono_storage_type('event_name VARCHAR'),
+  typeof(m) = jsono_storage_type('{"event_name": "VARCHAR"}'),
   to_json(m::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))))
 FROM (
   SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
-    (jsono('{"event_name":"search","x":1}', shredding := {'event_name':'VARCHAR'}), 1),
-    (jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'}), 2)
+    (jsono('{"event_name":"search","x":1}', shredding := '{"event_name": "VARCHAR"}'), 1),
+    (jsono('{"event_name":"page_view"}', shredding := '{"event_name": "VARCHAR"}'), 2)
   ) t(j, ts)
 );
 ----

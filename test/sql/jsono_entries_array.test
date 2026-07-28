@@ -11,7 +11,7 @@ require json
 query II
 SELECT e.key, e.value FROM (
   SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
-                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e
+                                    shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'))) AS e
 ) ORDER BY ALL;
 ----
 $.products[0].id	1
@@ -23,7 +23,7 @@ $.products[1].name	b
 query II
 SELECT e.key, e.value FROM (
   SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a"}]}',
-                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                                    shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'),
                               key_style := 'dotted')) AS e
 ) ORDER BY ALL;
 ----
@@ -35,7 +35,7 @@ products.0.name	a
 query II
 SELECT e.key, e.value FROM (
   SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}',
-                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e
+                                    shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'))) AS e
 ) ORDER BY ALL;
 ----
 $.products[0].id	1
@@ -53,14 +53,14 @@ $.products[5].name	c
 query I
 SELECT (SELECT count(*) FROM (
           SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}',
-                                            shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})))
+                                            shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}')))
           EXCEPT ALL
           SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}'))))) +
        (SELECT count(*) FROM (
           SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}')))
           EXCEPT ALL
           SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":null,"name":"b"},{"id":"x","name":"c"}]}',
-                                            shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})))));
+                                            shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}')))));
 ----
 0
 
@@ -69,7 +69,7 @@ SELECT (SELECT count(*) FROM (
 query II
 SELECT e.key, e.value FROM (
   SELECT unnest(jsono_entries(jsono('{"kind":"order","products":[{"id":1,"name":"a"}],"note":"x"}',
-                                    shredding := {'$.kind':'VARCHAR','$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e
+                                    shredding := '{"$.kind": "VARCHAR", "$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'))) AS e
 ) ORDER BY ALL;
 ----
 $.kind	order
@@ -81,7 +81,7 @@ $.products[0].name	a
 query II
 SELECT e.key, e.value FROM (
   SELECT unnest(jsono_entries(jsono('{"order":{"items":[{"sku":"s1","qty":2}]}}',
-                                    shredding := {'$.order.items':'STRUCT(sku VARCHAR, qty UBIGINT)[]'}))) AS e
+                                    shredding := '{"$.order.items": "STRUCT(sku VARCHAR, qty UBIGINT)[]"}'))) AS e
 ) ORDER BY ALL;
 ----
 $.order.items[0].qty	2
@@ -91,7 +91,7 @@ $.order.items[0].sku	s1
 query II
 SELECT e.key, e.value FROM (
   SELECT unnest(jsono_entries(jsono('{"products":[],"other":true}',
-                                    shredding := {'$.products':'STRUCT(id UBIGINT)[]'}))) AS e
+                                    shredding := '{"$.products": "STRUCT(id UBIGINT)[]"}'))) AS e
 ) ORDER BY ALL;
 ----
 $.other	true
@@ -102,7 +102,7 @@ $.other	true
 query II
 SELECT e.key, e.value FROM (
   SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":false},{"id":2,"name":"real"}]}',
-                                    shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e
+                                    shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'))) AS e
 ) ORDER BY ALL;
 ----
 $.products[0].id	1
@@ -122,7 +122,7 @@ SELECT * FROM (VALUES
 ) AS v(id, doc);
 
 query I
-WITH s AS (SELECT id, unnest(jsono_entries(jsono(doc, shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))) AS e FROM arr_entries),
+WITH s AS (SELECT id, unnest(jsono_entries(jsono(doc, shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'))) AS e FROM arr_entries),
      p AS (SELECT id, unnest(jsono_entries(jsono(doc))) AS e FROM arr_entries)
 SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM p)) +
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT ALL SELECT * FROM s));
@@ -138,7 +138,7 @@ SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM p)) +
 # A scalar-array shred (goalsID — the events4 segfault shape) renders as one whole-JSON leaf.
 query II
 SELECT e.key, e.value FROM (
-  SELECT unnest(jsono_entries(jsono('{"goalsID":[1,2]}', shredding := {'$.goalsID':'BIGINT[]'}),
+  SELECT unnest(jsono_entries(jsono('{"goalsID":[1,2]}', shredding := '{"$.goalsID": "BIGINT[]"}'),
                               array_style := 'whole_json')) AS e
 ) ORDER BY ALL;
 ----
@@ -147,7 +147,7 @@ $.goalsID	[1,2]
 # An object-array shred (LIST<STRUCT>) renders as one whole-JSON leaf, all element fields in order.
 query II
 SELECT e.key, e.value FROM (
-  SELECT unnest(jsono_entries(jsono('{"items":[{"sku":"a"}]}', shredding := {'$.items':'STRUCT(sku VARCHAR)[]'}),
+  SELECT unnest(jsono_entries(jsono('{"items":[{"sku":"a"}]}', shredding := '{"$.items": "STRUCT(sku VARCHAR)[]"}'),
                               array_style := 'whole_json')) AS e
 ) ORDER BY ALL;
 ----
@@ -158,7 +158,7 @@ $.items	[{"sku":"a"}]
 query II
 SELECT e.key, e.value FROM (
   SELECT unnest(jsono_entries(jsono('{"kind":"order","products":[{"id":1,"name":"a"},{"id":2,"name":"b"}],"note":"x"}',
-                                    shredding := {'$.kind':'VARCHAR','$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                                    shredding := '{"$.kind": "VARCHAR", "$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'),
                               key_style := 'dotted', array_style := 'whole_json')) AS e
 ) ORDER BY ALL;
 ----
@@ -171,7 +171,7 @@ products	[{"id":1,"name":"a"},{"id":2,"name":"b"}]
 query I
 SELECT (SELECT count(*) FROM (
           SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":"x"}]}',
-                                            shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                                            shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'),
                                       array_style := 'whole_json'))
           EXCEPT ALL
           SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":"x"}]}'),
@@ -181,14 +181,14 @@ SELECT (SELECT count(*) FROM (
                                       array_style := 'whole_json'))
           EXCEPT ALL
           SELECT unnest(jsono_entries(jsono('{"products":[{"id":1,"name":"a","sku":"S1"},5,null,{"id":2},{"id":"x"}]}',
-                                            shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}),
+                                            shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'),
                                       array_style := 'whole_json'))));
 ----
 0
 
 # Multi-row whole_json parity over a table (empty array, missing path, NULL row): shredded == plain.
 query I
-WITH s AS (SELECT id, unnest(jsono_entries(jsono(doc, shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}), array_style := 'whole_json')) AS e FROM arr_entries),
+WITH s AS (SELECT id, unnest(jsono_entries(jsono(doc, shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'), array_style := 'whole_json')) AS e FROM arr_entries),
      p AS (SELECT id, unnest(jsono_entries(jsono(doc), array_style := 'whole_json')) AS e FROM arr_entries)
 SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM p)) +
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT ALL SELECT * FROM s));
@@ -206,7 +206,7 @@ SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM p)) +
 # a mismatch double-emits (residual null + shred value) under key_style := 'dotted'.
 query II
 SELECT e.key, e.value FROM (
-  SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'$."tags.raw"':'VARCHAR[]'}),
+  SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := '{"$.\"tags.raw\"": "VARCHAR[]"}'),
                               key_style := 'dotted')) AS e
 ) ORDER BY ALL;
 ----
@@ -218,7 +218,7 @@ tags.raw.1	b
 # a mismatch double-emits under the default jsonpath style.
 query II
 SELECT e.key, e.value FROM (
-  SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'tags.raw':'VARCHAR[]'}))) AS e
+  SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := '{"tags.raw": "VARCHAR[]"}'))) AS e
 ) ORDER BY ALL;
 ----
 $."tags.raw"[0]	a
@@ -228,21 +228,21 @@ $.k	1
 # parity-with-plain oracle: each lifted element appears exactly once, every spelling × style.
 query I
 SELECT (SELECT count(*) FROM (
-          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'$."tags.raw"':'VARCHAR[]'}), key_style := 'dotted'))
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := '{"$.\"tags.raw\"": "VARCHAR[]"}'), key_style := 'dotted'))
           EXCEPT ALL
           SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}'), key_style := 'dotted'))))
      + (SELECT count(*) FROM (
           SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}'), key_style := 'dotted'))
           EXCEPT ALL
-          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'$."tags.raw"':'VARCHAR[]'}), key_style := 'dotted'))))
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := '{"$.\"tags.raw\"": "VARCHAR[]"}'), key_style := 'dotted'))))
      + (SELECT count(*) FROM (
-          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'tags.raw':'VARCHAR[]'})))
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := '{"tags.raw": "VARCHAR[]"}')))
           EXCEPT ALL
           SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}')))))
      + (SELECT count(*) FROM (
           SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}')))
           EXCEPT ALL
-          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := {'tags.raw':'VARCHAR[]'})))));
+          SELECT unnest(jsono_entries(jsono('{"tags.raw":["a","b"],"k":1}', shredding := '{"tags.raw": "VARCHAR[]"}')))));
 ----
 0
 
@@ -257,7 +257,7 @@ require parquet
 statement ok
 CREATE TABLE arr_entries_pq AS
 SELECT jsono('{"products":[{"id":1,"name":"a"},{"id":2,"name":"b"}]}',
-             shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}) AS j;
+             shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}') AS j;
 
 statement ok
 COPY arr_entries_pq TO '__TEST_DIR__/jsono_entries_array.parquet' (FORMAT parquet);

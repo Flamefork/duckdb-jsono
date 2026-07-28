@@ -7,24 +7,24 @@ require jsono
 require json
 
 statement ok
-CREATE TABLE shred_ab AS SELECT jsono('{"a":"AAA","b":"BBB"}', shredding := {'a':'VARCHAR','b':'VARCHAR'}) AS e;
+CREATE TABLE shred_ab AS SELECT jsono('{"a":"AAA","b":"BBB"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}') AS e;
 
 statement ok
-INSERT INTO shred_ab SELECT jsono('{"a":"CCC","b":"DDD"}', shredding := {'a':'VARCHAR','b':'VARCHAR'});
+INSERT INTO shred_ab SELECT jsono('{"a":"CCC","b":"DDD"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}');
 
 # The same shred set in reverse spec order produces the same canonical type (specs are sorted),
 # so it inserts directly.
 statement ok
-INSERT INTO shred_ab SELECT jsono('{"a":"EEE","b":"FFF"}', shredding := {'b':'VARCHAR','a':'VARCHAR'});
+INSERT INTO shred_ab SELECT jsono('{"a":"EEE","b":"FFF"}', shredding := '{"b": "VARCHAR", "a": "VARCHAR"}');
 
 # An overlapping shred set is NOT an error: the optimizer rewrites the lossy by-name cast into
 # reconstruct + reshred against the target spec, so the value lands losslessly — a path with no
 # shred in the target falls back into the residual.
 statement ok
-INSERT INTO shred_ab SELECT jsono('{"a":"q"}', shredding := {'a':'VARCHAR'});
+INSERT INTO shred_ab SELECT jsono('{"a":"q"}', shredding := '{"a": "VARCHAR"}');
 
 statement ok
-INSERT INTO shred_ab SELECT jsono('{"a":"1","b":"x"}', shredding := {'a':'BIGINT','b':'VARCHAR'});
+INSERT INTO shred_ab SELECT jsono('{"a":"1","b":"x"}', shredding := '{"a": "BIGINT", "b": "VARCHAR"}');
 
 statement ok
 INSERT INTO shred_ab SELECT jsono('{"a":"AAA","b":"BBB"}');
@@ -33,7 +33,7 @@ INSERT INTO shred_ab SELECT jsono('{"a":"AAA","b":"BBB"}');
 # so `body` is a field every two JSONO types share and the struct cast always binds — the
 # optimizer then rewrites it into the same lossless reconstruct + reshred.
 statement ok
-INSERT INTO shred_ab SELECT jsono('{"x":"y"}', shredding := {'x':'VARCHAR'});
+INSERT INTO shred_ab SELECT jsono('{"x":"y"}', shredding := '{"x": "VARCHAR"}');
 
 query I
 SELECT to_json(e)::VARCHAR FROM shred_ab ORDER BY 1;
@@ -59,7 +59,7 @@ NULL	y
 
 # Shredded -> plain JSON is the lossless reconstruction path; never blocked.
 query I
-SELECT to_json(jsono('{"a":"AAA","b":"BBB"}', shredding := {'a':'VARCHAR'}));
+SELECT to_json(jsono('{"a":"AAA","b":"BBB"}', shredding := '{"a": "VARCHAR"}'));
 ----
 {"a":"AAA","b":"BBB"}
 
@@ -70,13 +70,13 @@ SELECT to_json(jsono('{"a":"AAA","b":"BBB"}', shredding := {'a':'VARCHAR'}));
 # such a row fails loud instead of silently losing the value. ---
 
 statement ok
-CREATE TABLE narrow_target AS SELECT jsono('{}', shredding := {'a':'VARCHAR'}) AS e WHERE false;
+CREATE TABLE narrow_target AS SELECT jsono('{}', shredding := '{"a": "VARCHAR"}') AS e WHERE false;
 
 statement ok
 SET disabled_optimizers='extension';
 
 statement ok
-INSERT INTO narrow_target SELECT jsono('{"a":"v1","b":"v2"}', shredding := {'a':'VARCHAR','b':'VARCHAR'});
+INSERT INTO narrow_target SELECT jsono('{"a":"v1","b":"v2"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}');
 
 statement ok
 RESET disabled_optimizers;
@@ -128,7 +128,7 @@ narrowed by a raw struct cast
 
 # An honest row in the same narrow type reads fine alongside (the manifest check is per row).
 statement ok
-INSERT INTO narrow_target SELECT jsono('{"a":"ok","b":"kept"}', shredding := {'a':'VARCHAR'});
+INSERT INTO narrow_target SELECT jsono('{"a":"ok","b":"kept"}', shredding := '{"a": "VARCHAR"}');
 
 query I
 SELECT e ->> 'a' FROM narrow_target ORDER BY 1;
@@ -141,13 +141,13 @@ v1
 # placeholder content). ---
 
 statement ok
-CREATE TABLE narrow_arr AS SELECT jsono('{}', shredding := {'a':'VARCHAR'}) AS e WHERE false;
+CREATE TABLE narrow_arr AS SELECT jsono('{}', shredding := '{"a": "VARCHAR"}') AS e WHERE false;
 
 statement ok
 SET disabled_optimizers='extension';
 
 statement ok
-INSERT INTO narrow_arr SELECT jsono('{"a":"v","tags":[1,2]}', shredding := {'a':'VARCHAR','tags':'BIGINT[]'});
+INSERT INTO narrow_arr SELECT jsono('{"a":"v","tags":[1,2]}', shredding := '{"a": "VARCHAR", "tags": "BIGINT[]"}');
 
 statement ok
 RESET disabled_optimizers;
@@ -208,7 +208,7 @@ SELECT e ->> 'b' FROM shred_ab WHERE e ->> 'a' = 'q';
 NULL
 
 statement ok
-INSERT INTO narrow_target SELECT jsono('{"a":"ser","b":"ialized"}', shredding := {'a':'VARCHAR','b':'VARCHAR'});
+INSERT INTO narrow_target SELECT jsono('{"a":"ser","b":"ialized"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}');
 
 query I
 SELECT to_json(e)::VARCHAR FROM narrow_target WHERE e ->> 'a' = 'ser';
@@ -226,7 +226,7 @@ PRAGMA disable_verification;
 statement ok
 CREATE TABLE plain_narrowed AS
 SELECT struct_pack("jsono" := struct_pack("body$1" := j."jsono"."body$1")) AS p
-FROM (SELECT jsono('{"a":"v1","b":"v2"}', shredding := {'a':'VARCHAR'}) AS j);
+FROM (SELECT jsono('{"a":"v1","b":"v2"}', shredding := '{"a": "VARCHAR"}') AS j);
 
 statement error
 SELECT to_json(p) FROM plain_narrowed;
@@ -314,7 +314,7 @@ RESET disabled_optimizers;
 # A set operation that NULL-fills a body branch produces the same NULL-body row and fails loud.
 statement error
 WITH u AS (
-  SELECT jsono('{"a":"v1"}', shredding := {'a':'VARCHAR'}) AS e
+  SELECT jsono('{"a":"v1"}', shredding := '{"a": "VARCHAR"}') AS e
   UNION ALL
   SELECT struct_pack("jsono" := struct_pack("body$1" := NULL::STRUCT(
     slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
@@ -339,7 +339,7 @@ NULL	NULL	NULL
 # shreds: the narrowed row's manifest lists 'b VARCHAR' which no input carries, so the merge
 # throws instead of re-emitting a manifest without it (laundering the loss).
 statement error
-SELECT jsono_merge_patch(e, jsono('{"z":"1"}', shredding := {'z':'VARCHAR'})) FROM narrow_target;
+SELECT jsono_merge_patch(e, jsono('{"z":"1"}', shredding := '{"z": "VARCHAR"}')) FROM narrow_target;
 ----
 narrowed by a raw struct cast
 
@@ -381,7 +381,7 @@ narrowed by a raw struct cast
 # Shredding a narrowed plain value re-emits the residual with a fresh manifest; without the check
 # the stripped 'a' would become permanently undetectable.
 statement error
-SELECT jsono(p, shredding := {'b': 'VARCHAR'}) FROM plain_narrowed;
+SELECT jsono(p, shredding := '{"b": "VARCHAR"}') FROM plain_narrowed;
 ----
 narrowed by a raw struct cast
 
@@ -396,7 +396,7 @@ narrowed by a raw struct cast
 # it — the injected expression declares its lanes structurally for exactly this reason.
 statement ok
 CREATE TABLE array_shredded AS
-SELECT jsono('{"items":[{"id":1}],"o":"x"}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v;
+SELECT jsono('{"items":[{"id":1}],"o":"x"}', shredding := '{"$.items": "STRUCT(id BIGINT)[]"}') AS v;
 
 statement ok
 INSERT INTO array_shredded SELECT jsono('{"items":[{"id":2},{"id":3}],"o":"y"}');
@@ -414,9 +414,9 @@ SELECT v::json::varchar FROM array_shredded ORDER BY 1;
 # on a type it cannot build. This is the read side of the same guarantee the lane names carry.
 query I
 SELECT to_json(v) FROM (
-  SELECT jsono('{"items":[{"id":1}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v
+  SELECT jsono('{"items":[{"id":1}]}', shredding := '{"$.items": "STRUCT(id BIGINT)[]"}') AS v
   UNION ALL
-  SELECT jsono('{"items":[{"ID":2}]}', shredding := {'$.items': 'STRUCT(ID BIGINT)[]'})
+  SELECT jsono('{"items":[{"ID":2}]}', shredding := '{"$.items": "STRUCT(ID BIGINT)[]"}')
 ) ORDER BY 1;
 ----
 {"items":[{"ID":2}]}
@@ -425,8 +425,8 @@ SELECT to_json(v) FROM (
 # CASE reaches the same merged type through the binder rather than through set-op resolution.
 query I
 SELECT to_json(CASE WHEN i = 1
-                    THEN jsono('{"items":[{"id":1}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'})
-                    ELSE jsono('{"items":[{"ID":2}]}', shredding := {'$.items': 'STRUCT(ID BIGINT)[]'}) END)
+                    THEN jsono('{"items":[{"id":1}]}', shredding := '{"$.items": "STRUCT(id BIGINT)[]"}')
+                    ELSE jsono('{"items":[{"ID":2}]}', shredding := '{"$.items": "STRUCT(ID BIGINT)[]"}') END)
 FROM (SELECT unnest([1, 2]) AS i) ORDER BY 1;
 ----
 {"items":[{"ID":2}]}
@@ -439,9 +439,9 @@ FROM (SELECT unnest([1, 2]) AS i) ORDER BY 1;
 query II
 SELECT l.path, l.type FROM (
   SELECT unnest(jsono_layout_lanes(v)) AS l FROM (
-    SELECT jsono('{"items":[{"id":1}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v
+    SELECT jsono('{"items":[{"id":1}]}', shredding := '{"$.items": "STRUCT(id BIGINT)[]"}') AS v
     UNION ALL
-    SELECT jsono('{"items":[{"ID":2}]}', shredding := {'$.items': 'STRUCT(ID BIGINT)[]'})
+    SELECT jsono('{"items":[{"ID":2}]}', shredding := '{"$.items": "STRUCT(ID BIGINT)[]"}')
   ) LIMIT 1
 );
 ----
@@ -457,11 +457,11 @@ $.items	STRUCT(id BIGINT, ID BIGINT)[]
 require parquet
 
 statement ok
-COPY (SELECT jsono('{"items":[{"id":1}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v)
+COPY (SELECT jsono('{"items":[{"id":1}]}', shredding := '{"$.items": "STRUCT(id BIGINT)[]"}') AS v)
 TO '__TEST_DIR__/arr_id.parquet' (FORMAT PARQUET);
 
 statement ok
-COPY (SELECT jsono('{"items":[{"name":"n"}]}', shredding := {'$.items': 'STRUCT(name VARCHAR)[]'}) AS v)
+COPY (SELECT jsono('{"items":[{"name":"n"}]}', shredding := '{"$.items": "STRUCT(name VARCHAR)[]"}') AS v)
 TO '__TEST_DIR__/arr_name.parquet' (FORMAT PARQUET);
 
 query I
@@ -474,7 +474,7 @@ SELECT to_json(v) FROM read_parquet(['__TEST_DIR__/arr_id.parquet', '__TEST_DIR_
 # The same scan where the two subfields differ only in case: the encoded names keep them apart in
 # the union, and each row still reads under the spelling it was written with.
 statement ok
-COPY (SELECT jsono('{"items":[{"ID":2}]}', shredding := {'$.items': 'STRUCT(ID BIGINT)[]'}) AS v)
+COPY (SELECT jsono('{"items":[{"ID":2}]}', shredding := '{"$.items": "STRUCT(ID BIGINT)[]"}') AS v)
 TO '__TEST_DIR__/arr_upper.parquet' (FORMAT PARQUET);
 
 query I
@@ -487,14 +487,14 @@ SELECT to_json(v) FROM read_parquet(['__TEST_DIR__/arr_id.parquet', '__TEST_DIR_
 # Widening is accepted; NARROWING is still the loss the manifest exists to catch. A raw cast that
 # drops a subfield the row stripped fails loud, and so does one that retypes it.
 statement ok
-CREATE TABLE arr_narrow AS SELECT jsono('{}', shredding := {'$.items': 'STRUCT(name VARCHAR)[]'}) AS v WHERE false;
+CREATE TABLE arr_narrow AS SELECT jsono('{}', shredding := '{"$.items": "STRUCT(name VARCHAR)[]"}') AS v WHERE false;
 
 statement ok
 SET disabled_optimizers='extension';
 
 statement ok
 INSERT INTO arr_narrow
-SELECT jsono('{"items":[{"id":7,"name":"n"}]}', shredding := {'$.items': 'STRUCT(id BIGINT, name VARCHAR)[]'});
+SELECT jsono('{"items":[{"id":7,"name":"n"}]}', shredding := '{"$.items": "STRUCT(id BIGINT, name VARCHAR)[]"}');
 
 statement ok
 RESET disabled_optimizers;
@@ -509,13 +509,13 @@ SELECT to_json(v) FROM arr_narrow;
 shred '$.items STRUCT(id BIGINT, "name" VARCHAR)[]' but the column carries it as a different type
 
 statement ok
-CREATE TABLE arr_retyped AS SELECT jsono('{}', shredding := {'$.items': 'STRUCT(id VARCHAR)[]'}) AS v WHERE false;
+CREATE TABLE arr_retyped AS SELECT jsono('{}', shredding := '{"$.items": "STRUCT(id VARCHAR)[]"}') AS v WHERE false;
 
 statement ok
 SET disabled_optimizers='extension';
 
 statement ok
-INSERT INTO arr_retyped SELECT jsono('{"items":[{"id":7}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'});
+INSERT INTO arr_retyped SELECT jsono('{"items":[{"id":7}]}', shredding := '{"$.items": "STRUCT(id BIGINT)[]"}');
 
 statement ok
 RESET disabled_optimizers;
@@ -531,7 +531,7 @@ shred '$.items STRUCT(id BIGINT)[]' but the column carries it as a different typ
 # where the lane gained a `name` column of NULLs. If a reader ever took a NULL subfield for "the key
 # is absent", this row is where it would lose data, and it is the row the relaxed check legalizes.
 statement ok
-COPY (SELECT jsono('{"items":[{"id":1,"name":"kept"}]}', shredding := {'$.items': 'STRUCT(id BIGINT)[]'}) AS v)
+COPY (SELECT jsono('{"items":[{"id":1,"name":"kept"}]}', shredding := '{"$.items": "STRUCT(id BIGINT)[]"}') AS v)
 TO '__TEST_DIR__/arr_residual.parquet' (FORMAT PARQUET);
 
 query II
@@ -557,7 +557,7 @@ statement ok
 PREPARE lanes_of AS SELECT jsono_layout_lanes($1);
 
 query I
-EXECUTE lanes_of(jsono('{"a":1}', shredding := {'a': 'BIGINT'}));
+EXECUTE lanes_of(jsono('{"a":1}', shredding := '{"a": "BIGINT"}'));
 ----
 [{'path': $.a, 'type': BIGINT}]
 
@@ -578,7 +578,7 @@ jsono: plain, body revision 1
 query II
 SELECT [m."type" FOR m IN jsono_shred_manifest(v)], [l."type" FOR l IN jsono_layout_lanes(v)]
 FROM (SELECT jsono('{"items":[{"x BIGINT, y":"s"}]}',
-                   shredding := {'$.items':'STRUCT("x BIGINT, y" VARCHAR)[]'}) AS v);
+                   shredding := '{"$.items": "STRUCT(\"x BIGINT, y\" VARCHAR)[]"}') AS v);
 ----
 ['STRUCT("x BIGINT, y" VARCHAR)[]']	['STRUCT("x BIGINT, y" VARCHAR)[]']
 
@@ -598,5 +598,10 @@ statement error
 SELECT __jsono_internal_checked_residual(
   jsono('{"a":1}'),
   [{'path': '$.a', 'type': 'BIGINT', 'subfields': [NULL::STRUCT(key VARCHAR, "type" VARCHAR)]}]);
+----
+Invalid Input Error
+
+statement error
+SELECT __jsono_internal_checked_residual(jsono('{"a":1}'), NULL);
 ----
 Invalid Input Error

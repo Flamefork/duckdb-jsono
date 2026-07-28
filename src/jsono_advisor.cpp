@@ -332,8 +332,10 @@ void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, const string &
 		auto child_key = view.KeyAt(SlotPayload(key_slot));
 		auto child_tag = SlotTag(view.SlotAt(cursor.pos));
 		if (child_key.empty()) {
-			// An empty nested key is out of the shred universe (its lane name would carry an empty quoted
-			// path step) — it names no candidate at all, so it is not even a nonrole occurrence.
+			// An empty nested key is out of the shred universe: the lane reads fine, but the `->>`
+			// operator cannot address it (core json's path grammar rejects '$.""' at bind), and the
+			// advisor suggests lanes for exactly that transparent read path. It names no candidate at
+			// all, so it is not even a nonrole occurrence.
 			SkipValueFast(view, cursor);
 			continue;
 		}
@@ -368,8 +370,9 @@ void WalkNestedObject(const JsonoView &view, JsonoCursor &cursor, const string &
 // (bare name), nested scalar keys (`$.parent.child`(`.grandchild`) up to JSONO_AUTO_SHRED_MAX_DEPTH),
 // and top-level array keys (scalar-
 // or object-array). A non-object document contributes nothing (no key to name a shred). Empty keys
-// (at any level) are out of the universe: their lane name would carry an empty quoted path step
-// (`$.""`), which the shredded readers do not support.
+// (at any level) are out of the universe: an empty-key lane (`$.""`) encodes and reads fine, but the
+// `->>` operator cannot address it (core json's path grammar), and suggested lanes exist for that
+// transparent read path.
 void AccumulateDocument(const JsonoView &view, std::map<string, SuggestCandidate> &paths) {
 	if (view.Slots() == 0 || SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
 		return;
@@ -419,10 +422,10 @@ bool PickLanePrimitive(const FitCounts &fit, idx_t present, double min_fit, Json
 	return false;
 }
 
-// Append a struct-literal key, bare when it is a plain SQL identifier, else double-quoted with
-// embedded quotes doubled (SQL identifier escaping — the spec must re-parse when pasted into
-// jsono(value, shredding := {...})).
-void AppendSpecKey(string &out, const string &key) {
+// Append a subfield name into a STRUCT(...) type string, bare when it is a plain SQL identifier,
+// else double-quoted with embedded quotes doubled — the type text must re-parse through
+// TransformStringToLogicalType when the emitted spec is pasted back.
+void AppendTypeFieldName(string &out, const string &key) {
 	bool simple = !key.empty();
 	for (size_t i = 0; simple && i < key.size(); i++) {
 		char c = key[i];
@@ -458,7 +461,7 @@ string BuildObjectArrayType(const SuggestCandidate &candidate, double min_presen
 		if (!fields.empty()) {
 			fields.append(", ");
 		}
-		AppendSpecKey(fields, entry.first);
+		AppendTypeFieldName(fields, entry.first);
 		fields.push_back(' ');
 		fields.append(JsonoScalarPrimitiveTypeName(primitive));
 	}
@@ -487,7 +490,7 @@ string ChooseShredType(const SuggestCandidate &candidate, idx_t non_null_rows, d
 		JsonoScalarPrimitive primitive;
 		if (candidate.scalar_present > 0 && double(candidate.scalar_present) >= presence_floor - 1e-9 &&
 		    PickLanePrimitive(candidate.scalar_fit, total_present, min_fit, primitive)) {
-			best = string("'") + JsonoScalarPrimitiveTypeName(primitive) + "'";
+			best = JsonoScalarPrimitiveTypeName(primitive);
 			best_present = candidate.scalar_present;
 		}
 	}
@@ -496,7 +499,7 @@ string ChooseShredType(const SuggestCandidate &candidate, idx_t non_null_rows, d
 	    double(candidate.array_rows) >= presence_floor - 1e-9 && candidate.array_rows > best_present) {
 		JsonoScalarPrimitive primitive;
 		if (PickLanePrimitive(candidate.sarray_fit, total_present, min_fit, primitive)) {
-			best = string("'") + JsonoScalarPrimitiveTypeName(primitive) + "[]'";
+			best = string(JsonoScalarPrimitiveTypeName(primitive)) + "[]";
 			best_present = candidate.array_rows;
 		}
 	}
@@ -506,7 +509,7 @@ string ChooseShredType(const SuggestCandidate &candidate, idx_t non_null_rows, d
 	    double(candidate.oarray_object_rows) >= min_fit * double(total_present) - 1e-9) {
 		auto struct_type = BuildObjectArrayType(candidate, min_presence, min_fit);
 		if (!struct_type.empty()) {
-			best = string("'") + struct_type + "'";
+			best = struct_type;
 			best_present = candidate.array_rows;
 		}
 	}
@@ -709,9 +712,11 @@ void JsonoSuggestFinalize(Vector &states, AggregateInputData &aggr_input_data, V
 				spec.append(", ");
 			}
 			first = false;
-			AppendSpecKey(spec, entry.first);
+			// JSON-escaped through the render escaper, so the emitted spec re-parses when pasted
+			// into jsono(value, shredding := ...), whatever bytes the key or type text holds.
+			AppendJsonString(entry.first, spec);
 			spec.append(": ");
-			spec.append(type);
+			AppendJsonString(type, spec);
 		}
 		if (first) {
 			FlatVector::SetNull(result, rid, true);

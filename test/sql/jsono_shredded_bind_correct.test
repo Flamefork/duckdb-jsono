@@ -7,7 +7,7 @@ require jsono
 require json
 
 statement ok
-CREATE TABLE t AS SELECT jsono('{"a":1,"b":{"c":2}}', shredding := {'$.a':'BIGINT'}) AS j;
+CREATE TABLE t AS SELECT jsono('{"a":1,"b":{"c":2}}', shredding := '{"$.a": "BIGINT"}') AS j;
 
 # With the extension optimizer disabled (no visitor rewrite), casting a shredded value to VARCHAR is
 # bind-correct: the registered wildcard cast reconstructs the document and serializes it as JSON text.

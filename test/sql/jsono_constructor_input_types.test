@@ -86,8 +86,8 @@ STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB,
 # An explicit shredding spec over a constructed value re-shreds the string-rendered lane
 # losslessly (the `shredding :=` overload takes JSON text or a jsono value, not a SQL STRUCT).
 query II
-SELECT typeof(jsono(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789'}), shredding := {'$.ts': 'VARCHAR'})),
-       to_json(jsono(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789'}), shredding := {'$.ts': 'VARCHAR'}))::VARCHAR;
+SELECT typeof(jsono(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789'}), shredding := '{"$.ts": "VARCHAR"}')),
+       to_json(jsono(jsono({'ts': TIMESTAMP '2024-01-01 12:34:56.789'}), shredding := '{"$.ts": "VARCHAR"}'))::VARCHAR;
 ----
 STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, ehpg000 VARCHAR)))	{"ts":"2024-01-01 12:34:56.789"}
 

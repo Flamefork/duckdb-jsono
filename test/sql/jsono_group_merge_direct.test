@@ -26,7 +26,7 @@ INSERT INTO seq VALUES
   (4, '{"a":null,"c":4.5,"keep":false,"extra":null}');
 
 query I
-SELECT to_json(jsono_group_merge(jsono(doc, shredding := {a:'BIGINT', b:'VARCHAR', c:'DOUBLE', keep:'BOOLEAN'}) ORDER BY ord))
+SELECT to_json(jsono_group_merge(jsono(doc, shredding := '{"a": "BIGINT", "b": "VARCHAR", "c": "DOUBLE", "keep": "BOOLEAN"}') ORDER BY ord))
      = to_json(jsono_group_merge(jsono(doc) ORDER BY ord))
 FROM seq WHERE doc IS NOT NULL OR ord = 2;
 ----
@@ -47,7 +47,7 @@ INSERT INTO tricky VALUES
 query II
 SELECT to_json(m1) = to_json(m2), to_json(m1)
 FROM (
-  SELECT jsono_group_merge(jsono(doc, shredding := {k:'BIGINT', '$.n.deep':'BIGINT'}) ORDER BY ord) AS m1,
+  SELECT jsono_group_merge(jsono(doc, shredding := '{"k": "BIGINT", "$.n.deep": "BIGINT"}') ORDER BY ord) AS m1,
          jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
   FROM tricky
 );
@@ -67,7 +67,7 @@ INSERT INTO replaced VALUES
 query II
 SELECT to_json(m1) = to_json(m2), to_json(m1)
 FROM (
-  SELECT jsono_group_merge(jsono(doc, shredding := {a:'BIGINT', c:'BIGINT'}) ORDER BY ord) AS m1,
+  SELECT jsono_group_merge(jsono(doc, shredding := '{"a": "BIGINT", "c": "BIGINT"}') ORDER BY ord) AS m1,
          jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
   FROM replaced
 );
@@ -78,7 +78,7 @@ true	{"c":3}
 query II
 SELECT to_json(m1) = to_json(m2), to_json(m1)
 FROM (
-  SELECT jsono_group_merge(jsono(doc, shredding := {a:'BIGINT'}) ORDER BY ord) AS m1,
+  SELECT jsono_group_merge(jsono(doc, shredding := '{"a": "BIGINT"}') ORDER BY ord) AS m1,
          jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
   FROM (VALUES (1, '{"a":1}'), (2, '"scalar-wins"')) v(ord, doc)
 );
@@ -90,7 +90,7 @@ true	"scalar-wins"
 query II
 SELECT to_json(m1) = to_json(m2), to_json(m1)
 FROM (
-  SELECT jsono_group_merge(jsono(doc, shredding := {big:'UBIGINT'}) ORDER BY ord) AS m1,
+  SELECT jsono_group_merge(jsono(doc, shredding := '{"big": "UBIGINT"}') ORDER BY ord) AS m1,
          jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
   FROM (VALUES
     (1, '{"big":18446744073709551615}'),
@@ -115,7 +115,7 @@ INSERT INTO arrs VALUES
 query II
 SELECT to_json(m1) = to_json(m2), to_json(m1)
 FROM (
-  SELECT jsono_group_merge(jsono(doc, shredding := {tags:'BIGINT[]', items:'STRUCT(n BIGINT, s VARCHAR)[]'}) ORDER BY ord) AS m1,
+  SELECT jsono_group_merge(jsono(doc, shredding := '{"tags": "BIGINT[]", "items": "STRUCT(n BIGINT, s VARCHAR)[]"}') ORDER BY ord) AS m1,
          jsono_group_merge(jsono(doc) ORDER BY ord) AS m2
   FROM arrs
 );
@@ -125,13 +125,13 @@ true	{"items":[{"n":1,"s":"a"},{"n":2,"s":"b"}],"other":3,"tags":[9]}
 # The direct result stays shredded (sticky type) and its manifest reflects what actually
 # stripped after the fold.
 query I
-SELECT typeof(jsono_group_merge(jsono(doc, shredding := {a:'BIGINT', b:'VARCHAR'}))) = jsono_storage_type('a BIGINT, b VARCHAR')
+SELECT typeof(jsono_group_merge(jsono(doc, shredding := '{"a": "BIGINT", "b": "VARCHAR"}'))) = jsono_storage_type('{"a": "BIGINT", "b": "VARCHAR"}')
 FROM (VALUES ('{"a":1,"b":"x"}')) v(doc);
 ----
 true
 
 query I
-SELECT jsono_shred_manifest(jsono_group_merge(jsono(doc, shredding := {a:'BIGINT'})))
+SELECT jsono_shred_manifest(jsono_group_merge(jsono(doc, shredding := '{"a": "BIGINT"}')))
 FROM (VALUES ('{"a":"diverted"}')) v(doc);
 ----
 []
@@ -141,7 +141,7 @@ FROM (VALUES ('{"a":"diverted"}')) v(doc);
 query II
 SELECT to_json(m), m.jsono."shreds$2".c4000 IS NULL
 FROM (
-  SELECT jsono_group_merge(jsono(doc, shredding := {a:'BIGINT'})) AS m
+  SELECT jsono_group_merge(jsono(doc, shredding := '{"a": "BIGINT"}')) AS m
   FROM (VALUES (NULL), (NULL)) v(doc)
 );
 ----
@@ -170,7 +170,7 @@ query I
 SELECT count(*)
 FROM (
   SELECT g,
-         to_json(jsono_group_merge(jsono(doc, shredding := {k:'BIGINT', c:'DOUBLE', '$.n.deep':'BIGINT', tags:'BIGINT[]'}) ORDER BY ord)) AS shredded,
+         to_json(jsono_group_merge(jsono(doc, shredding := '{"k": "BIGINT", "c": "DOUBLE", "$.n.deep": "BIGINT", "tags": "BIGINT[]"}') ORDER BY ord)) AS shredded,
          to_json(jsono_group_merge(jsono(doc) ORDER BY ord)) AS plain
   FROM mixed GROUP BY g
 )
@@ -197,7 +197,7 @@ CREATE TABLE combine_conflict AS
 query II
 SELECT to_json(m1) = to_json(m2), to_json(m1)
 FROM (
-  SELECT jsono_group_merge(jsono(doc, shredding := {k:'BIGINT', '$.n.deep':'BIGINT'})) AS m1,
+  SELECT jsono_group_merge(jsono(doc, shredding := '{"k": "BIGINT", "$.n.deep": "BIGINT"}')) AS m1,
          jsono_group_merge(jsono(doc)) AS m2
   FROM combine_conflict
 );
@@ -214,7 +214,7 @@ RESET threads;
 query I
 SELECT count(*)
 FROM (
-  SELECT to_json(jsono_group_merge(jsono(doc, shredding := {k:'BIGINT', c:'DOUBLE', '$.n.deep':'BIGINT', tags:'BIGINT[]'})) OVER w) AS shredded,
+  SELECT to_json(jsono_group_merge(jsono(doc, shredding := '{"k": "BIGINT", "c": "DOUBLE", "$.n.deep": "BIGINT", "tags": "BIGINT[]"}')) OVER w) AS shredded,
          to_json(jsono_group_merge(jsono(doc)) OVER w) AS plain
   FROM mixed
   WINDOW w AS (PARTITION BY g ORDER BY ord ROWS BETWEEN 50 PRECEDING AND CURRENT ROW)
@@ -233,7 +233,7 @@ statement ok
 CREATE TABLE gm_direct AS
 SELECT g, jsono_group_merge(j ORDER BY ord) AS m
 FROM (
-  SELECT g, ord, jsono(doc, shredding := {k:'BIGINT', '$.n.deep':'BIGINT'}) AS j
+  SELECT g, ord, jsono(doc, shredding := '{"k": "BIGINT", "$.n.deep": "BIGINT"}') AS j
   FROM (VALUES
     ('g1', 1, '{"k":1,"n":{"deep":10},"extra":"a"}'),
     ('g1', 2, '{"k":2}'),
@@ -263,13 +263,13 @@ g2	{"extra":"b","k":"diverted","n":5}
 # its `->>` text (the lane held a redundant read copy and shadow-delete dropped the residual value).
 query I
 SELECT to_json(jsono_group_merge(j))
-FROM (VALUES (jsono('{"k":42}', shredding := {k:'VARCHAR'}))) t(j);
+FROM (VALUES (jsono('{"k":42}', shredding := '{"k": "VARCHAR"}'))) t(j);
 ----
 {"k":42}
 
 query I
 SELECT to_json(jsono_group_merge(j))
-FROM (VALUES (jsono('{"attrs":{"z":1}}', shredding := {attrs:'VARCHAR'}))) t(j);
+FROM (VALUES (jsono('{"attrs":{"z":1}}', shredding := '{"attrs": "VARCHAR"}'))) t(j);
 ----
 {"attrs":{"z":1}}
 
@@ -278,15 +278,15 @@ FROM (VALUES (jsono('{"attrs":{"z":1}}', shredding := {attrs:'VARCHAR'}))) t(j);
 # (the residual-authoritative finalize prefers the residual).
 query I
 SELECT to_json(jsono_group_merge(j ORDER BY ord))
-FROM (VALUES (1, jsono('{"k":42}', shredding := {k:'VARCHAR'})),
-             (2, jsono('{"k":"s"}', shredding := {k:'VARCHAR'}))) t(ord, j);
+FROM (VALUES (1, jsono('{"k":42}', shredding := '{"k": "VARCHAR"}')),
+             (2, jsono('{"k":"s"}', shredding := '{"k": "VARCHAR"}'))) t(ord, j);
 ----
 {"k":"s"}
 
 query I
 SELECT to_json(jsono_group_merge(j ORDER BY ord))
-FROM (VALUES (1, jsono('{"k":"s"}', shredding := {k:'VARCHAR'})),
-             (2, jsono('{"k":42}', shredding := {k:'VARCHAR'}))) t(ord, j);
+FROM (VALUES (1, jsono('{"k":"s"}', shredding := '{"k": "VARCHAR"}')),
+             (2, jsono('{"k":42}', shredding := '{"k": "VARCHAR"}'))) t(ord, j);
 ----
 {"k":42}
 
@@ -295,14 +295,14 @@ FROM (VALUES (1, jsono('{"k":"s"}', shredding := {k:'VARCHAR'})),
 # Ungrouped empty group (WHERE false) over shredded input -> SQL NULL, not {} with null shreds.
 query I
 SELECT jsono_group_merge(j) IS NULL
-FROM (VALUES (jsono('{"a":1}', shredding := {a:'BIGINT'}))) t(j) WHERE false;
+FROM (VALUES (jsono('{"a":1}', shredding := '{"a": "BIGINT"}'))) t(j) WHERE false;
 ----
 true
 
 # GROUP BY over shredded input: the all-NULL group is NULL, the fed group is not.
 query II
 SELECT g, jsono_group_merge(j) IS NULL
-FROM (VALUES ('x', jsono('{"a":1}', shredding := {a:'BIGINT'})),
+FROM (VALUES ('x', jsono('{"a":1}', shredding := '{"a": "BIGINT"}')),
              ('y', NULL), ('y', NULL)) t(g, j)
 GROUP BY g ORDER BY g;
 ----
@@ -313,7 +313,7 @@ y	true
 # NULL — it had input, so the empty object is the legitimate result.
 query II
 SELECT to_json(jsono_group_merge(j)), jsono_group_merge(j) IS NULL
-FROM (VALUES (jsono('{"a":null}', shredding := {a:'BIGINT'}))) t(j);
+FROM (VALUES (jsono('{"a":null}', shredding := '{"a": "BIGINT"}'))) t(j);
 ----
 {}	false
 
@@ -322,13 +322,13 @@ FROM (VALUES (jsono('{"a":null}', shredding := {a:'BIGINT'}))) t(j);
 # overlay verifies each row's manifest against ALL of the type's shreds, not just the folded subset
 # — narrowing the check to the subset would let this row silently drop the value of 'a'.
 statement ok
-CREATE TABLE gm_narrow_arr AS SELECT jsono('{}', shredding := {'tags':'BIGINT[]'}) AS e WHERE false;
+CREATE TABLE gm_narrow_arr AS SELECT jsono('{}', shredding := '{"tags": "BIGINT[]"}') AS e WHERE false;
 
 statement ok
 SET disabled_optimizers='extension';
 
 statement ok
-INSERT INTO gm_narrow_arr SELECT jsono('{"a":1,"tags":[1,2]}', shredding := {'a':'BIGINT','tags':'BIGINT[]'});
+INSERT INTO gm_narrow_arr SELECT jsono('{"a":1,"tags":[1,2]}', shredding := '{"a": "BIGINT", "tags": "BIGINT[]"}');
 
 statement ok
 RESET disabled_optimizers;

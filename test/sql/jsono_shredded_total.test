@@ -11,7 +11,7 @@ require json
 # struct_extract with no residual COALESCE fallback.
 statement ok
 CREATE TABLE total_t AS
-SELECT jsono('{"x": ' || (i * 2)::VARCHAR || ', "k":"a"}', shredding := {'$.x':'BIGINT'}) AS j
+SELECT jsono('{"x": ' || (i * 2)::VARCHAR || ', "k":"a"}', shredding := '{"$.x": "BIGINT"}') AS j
 FROM range(2000) tt(i);
 
 statement ok
@@ -62,7 +62,7 @@ statement ok
 CREATE TABLE hetero_t AS
 SELECT jsono(
   CASE WHEN i % 2 = 0 THEN '{"x": ' || i::VARCHAR || '}' ELSE '{"x": "str"}' END,
-  shredding := {'$.x':'BIGINT'}) AS j
+  shredding := '{"$.x": "BIGINT"}') AS j
 FROM range(1000) tt(i);
 
 statement ok
@@ -91,7 +91,7 @@ statement ok
 CREATE TABLE vc_absent AS
 SELECT jsono(
   CASE WHEN i % 3 = 0 THEN '{"k":"a"}' ELSE '{"x": ' || i::VARCHAR || '}' END,
-  shredding := {'$.x':'BIGINT'}) AS j
+  shredding := '{"$.x": "BIGINT"}') AS j
 FROM range(3000) tt(i);
 
 statement ok
@@ -120,8 +120,8 @@ PRAGMA explain_output='physical_only';
 query II
 EXPLAIN
 SELECT MIN(CAST(v->>'$.x' AS BIGINT))
-FROM (VALUES (jsono('{"x":1}', shredding := {'$.x':'BIGINT'})),
-             (jsono('{"x":2}', shredding := {'$.x':'BIGINT'}))) AS rows(v);
+FROM (VALUES (jsono('{"x":1}', shredding := '{"$.x": "BIGINT"}')),
+             (jsono('{"x":2}', shredding := '{"$.x": "BIGINT"}'))) AS rows(v);
 ----
 physical_plan	<REGEX>:.*COALESCE.*
 
@@ -131,7 +131,7 @@ PRAGMA explain_output='all';
 # (d) narrowing-safety: a raw by-name struct cast that drops a shred narrows the row, and any read of
 # the dropped path still fails loud via the shred manifest — the total fast path does not mask it.
 statement ok
-CREATE TABLE narrow_total AS SELECT jsono('{}', shredding := {'$.a':'BIGINT'}) AS j WHERE false;
+CREATE TABLE narrow_total AS SELECT jsono('{}', shredding := '{"$.a": "BIGINT"}') AS j WHERE false;
 
 statement ok
 SET disabled_optimizers='extension';
@@ -139,7 +139,7 @@ SET disabled_optimizers='extension';
 # The raw cast drops $.b: its value was stripped from the residual at write time, so the manifest
 # records the loss.
 statement ok
-INSERT INTO narrow_total SELECT jsono('{"a":1,"b":2}', shredding := {'$.a':'BIGINT','$.b':'BIGINT'});
+INSERT INTO narrow_total SELECT jsono('{"a":1,"b":2}', shredding := '{"$.a": "BIGINT", "$.b": "BIGINT"}');
 
 statement ok
 RESET disabled_optimizers;
@@ -166,9 +166,9 @@ narrowed by a raw struct cast
 # reads COALESCE-free — the fast path now reaches set-op / CASE / INSERT-into-shredded outputs.
 statement ok
 CREATE TABLE reshred_vc AS
-SELECT jsono('{"x":' || i || ',"a":"A"}', shredding := {'$.x':'BIGINT','$.a':'VARCHAR'}) AS j FROM range(1000) tt(i)
+SELECT jsono('{"x":' || i || ',"a":"A"}', shredding := '{"$.x": "BIGINT", "$.a": "VARCHAR"}') AS j FROM range(1000) tt(i)
 UNION ALL
-SELECT jsono('{"x":' || (i + 1000) || ',"b":"B"}', shredding := {'$.x':'BIGINT','$.b':'VARCHAR'}) AS j FROM range(1000) tt(i);
+SELECT jsono('{"x":' || (i + 1000) || ',"b":"B"}', shredding := '{"$.x": "BIGINT", "$.b": "VARCHAR"}') AS j FROM range(1000) tt(i);
 
 statement ok
 PRAGMA explain_output='physical_only';
@@ -193,9 +193,9 @@ SELECT MIN(CAST(j->>'$.x' AS BIGINT)), MAX(CAST(j->>'$.x' AS BIGINT)), COUNT(CAS
 # would miss those values and MIN would be 1000 instead of 0.
 statement ok
 CREATE TABLE reshred_div AS
-SELECT jsono('{"x":"' || i || '","a":"A"}', shredding := {'$.x':'BIGINT','$.a':'VARCHAR'}) AS j FROM range(10) tt(i)
+SELECT jsono('{"x":"' || i || '","a":"A"}', shredding := '{"$.x": "BIGINT", "$.a": "VARCHAR"}') AS j FROM range(10) tt(i)
 UNION ALL
-SELECT jsono('{"x":' || (i + 1000) || ',"b":"B"}', shredding := {'$.x':'BIGINT','$.b':'VARCHAR'}) AS j FROM range(10) tt(i);
+SELECT jsono('{"x":' || (i + 1000) || ',"b":"B"}', shredding := '{"$.x": "BIGINT", "$.b": "VARCHAR"}') AS j FROM range(10) tt(i);
 
 statement ok
 PRAGMA explain_output='physical_only';
@@ -220,8 +220,8 @@ SELECT MIN(TRY_CAST(j->>'$.x' AS BIGINT)), MAX(TRY_CAST(j->>'$.x' AS BIGINT)) FR
 statement ok
 CREATE TABLE merge_vc AS
 SELECT jsono_merge_patch(
-         jsono('{"x":' || i || '}', shredding := {'$.x':'BIGINT'}),
-         jsono('{"y":"' || i || '"}', shredding := {'$.y':'VARCHAR'})) AS j
+         jsono('{"x":' || i || '}', shredding := '{"$.x": "BIGINT"}'),
+         jsono('{"y":"' || i || '"}', shredding := '{"$.y": "VARCHAR"}')) AS j
 FROM range(1000) tt(i);
 
 statement ok
@@ -250,7 +250,7 @@ CREATE TABLE bad_spill AS
 SELECT struct_pack(jsono := struct_pack(
   "body$1" := jsono('{"a":"oops"}')."jsono"."body$1",
   "shreds$2" := struct_pack(
-    "$jsono$set" := jsono('{"a":"oops"}', shredding := {'a':'BIGINT'}).jsono."shreds$2"."$jsono$set",
+    "$jsono$set" := jsono('{"a":"oops"}', shredding := '{"a": "BIGINT"}').jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := 32::BIGINT,
     a := NULL::BIGINT
   )

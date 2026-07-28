@@ -14,7 +14,7 @@ require json
 # every shred is a scalar. The document carries only $.a and $.n.x; the other three lanes are absent.
 query I
 SELECT to_json(jsono(jsono('{"a":7,"n":{"x":"deep"},"keep":true}'),
-                     shredding := {'$.a':'BIGINT','$.b':'BIGINT','$.c':'VARCHAR','$.n.x':'VARCHAR','$.n.y':'BIGINT'}));
+                     shredding := '{"$.a": "BIGINT", "$.b": "BIGINT", "$.c": "VARCHAR", "$.n.x": "VARCHAR", "$.n.y": "BIGINT"}'));
 ----
 {"a":7,"keep":true,"n":{"x":"deep"}}
 
@@ -22,7 +22,7 @@ SELECT to_json(jsono(jsono('{"a":7,"n":{"x":"deep"},"keep":true}'),
 query IIIII
 SELECT j->>'$.a', j->>'$.b', j->>'$.c', j->>'$.n.x', j->>'$.n.y'
 FROM (SELECT jsono(jsono('{"a":7,"n":{"x":"deep"},"keep":true}'),
-                   shredding := {'$.a':'BIGINT','$.b':'BIGINT','$.c':'VARCHAR','$.n.x':'VARCHAR','$.n.y':'BIGINT'}) AS j);
+                   shredding := '{"$.a": "BIGINT", "$.b": "BIGINT", "$.c": "VARCHAR", "$.n.x": "VARCHAR", "$.n.y": "BIGINT"}') AS j);
 ----
 7	NULL	NULL	deep	NULL
 
@@ -30,7 +30,7 @@ FROM (SELECT jsono(jsono('{"a":7,"n":{"x":"deep"},"keep":true}'),
 # the residual, so `->>` recovers it. `{"a":"text"}` into a BIGINT $.a lane.
 query II
 SELECT j->>'$.a', to_json(j)
-FROM (SELECT jsono(jsono('{"a":"text","b":5}'), shredding := {'$.a':'BIGINT','$.b':'BIGINT'}) AS j);
+FROM (SELECT jsono(jsono('{"a":"text","b":5}'), shredding := '{"$.a": "BIGINT", "$.b": "BIGINT"}') AS j);
 ----
 text	{"a":"text","b":5}
 
@@ -40,7 +40,7 @@ text	{"a":"text","b":5}
 query I
 SELECT to_json(jsono_shred_stats(j))
 FROM (SELECT jsono(jsono('{"a":"text","present":9}'),
-                   shredding := {'$.a':'BIGINT','$.absent':'BIGINT','$.present':'BIGINT'}) AS j);
+                   shredding := '{"$.a": "BIGINT", "$.absent": "BIGINT", "$.present": "BIGINT"}') AS j);
 ----
 [{"path":"$.a","type":"BIGINT","lane_rate":0.0,"divert_rate":1.0},{"path":"$.absent","type":"BIGINT","lane_rate":0.0,"divert_rate":0.0},{"path":"$.present","type":"BIGINT","lane_rate":1.0,"divert_rate":0.0}]
 
@@ -48,13 +48,13 @@ FROM (SELECT jsono(jsono('{"a":"text","present":9}'),
 # name, so they cannot both be fields of one STRUCT. The one lane the surviving spelling declares
 # still reads and round-trips through the one-pass writer.
 statement error
-SELECT jsono(jsono('{"x":42}'), shredding := {'$.x':'BIGINT','x':'BIGINT'});
+SELECT jsono(jsono('{"x":42}'), shredding := '{"$.x": "BIGINT", "x": "BIGINT"}');
 ----
 name the same shred path
 
 query II
 SELECT j->>'$.x', to_json(j)
-FROM (SELECT jsono(jsono('{"x":42}'), shredding := {'$.x':'BIGINT'}) AS j);
+FROM (SELECT jsono(jsono('{"x":42}'), shredding := '{"$.x": "BIGINT"}') AS j);
 ----
 42	{"x":42}
 
@@ -63,8 +63,7 @@ FROM (SELECT jsono(jsono('{"x":42}'), shredding := {'$.x':'BIGINT'}) AS j);
 statement ok
 CREATE TABLE wide AS
 SELECT jsono(jsono('{"src":"' || (i % 3) || '","v":' || i || ',"n":{"x":' || (i * 2) || '}}'),
-             shredding := {'$.src':'VARCHAR','$.v':'BIGINT','$.n.x':'BIGINT',
-                           '$.cold1':'VARCHAR','$.cold2':'BIGINT','$.cold3':'VARCHAR','$.n.cold':'BIGINT'}) AS j
+             shredding := '{"$.src": "VARCHAR", "$.v": "BIGINT", "$.n.x": "BIGINT", "$.cold1": "VARCHAR", "$.cold2": "BIGINT", "$.cold3": "VARCHAR", "$.n.cold": "BIGINT"}') AS j
 FROM range(2000) t(i);
 
 query III

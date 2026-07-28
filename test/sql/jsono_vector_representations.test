@@ -19,15 +19,15 @@ statement ok
 CREATE TABLE docs AS
 SELECT i,
   jsono('{"name":"n' || i || '","x":' || i || ',"nested":{"a":' || (i % 7) || '},"arr":[' || i || ',' || (i + 1) || ']}') AS plain,
-  jsono('{"name":"n' || i || '","x":' || i || '}', shredding := {'name':'VARCHAR','x':'BIGINT'}) AS shred,
-  jsono('{"event_name":"e' || (i % 3) || '","v":' || i || '}', shredding := {'event_name':'VARCHAR'}) AS shred2,
+  jsono('{"name":"n' || i || '","x":' || i || '}', shredding := '{"name": "VARCHAR", "x": "BIGINT"}') AS shred,
+  jsono('{"event_name":"e' || (i % 3) || '","v":' || i || '}', shredding := '{"event_name": "VARCHAR"}') AS shred2,
   -- LIST-typed lanes: a scalar-array lane and an object-array lane, plus a nested scalar lane. The
   -- shred paths above are all top-level scalars, so the LIST child vectors of the shred columns --
   -- where a selection-sized Copy goes wrong -- were never exercised under a non-flat input.
   jsono('{"tags":["t' || (i % 5) || '","t' || (i % 3) || '"],"items":[{"id":' || i || ',"sku":"s' || i || '"}],"u":{"n":' || (i % 11) || '}}',
-        shredding := {'$.tags':'VARCHAR[]', '$.items':'STRUCT(id BIGINT, sku VARCHAR)[]', '$.u.n':'BIGINT'}) AS shred_list,
+        shredding := '{"$.tags": "VARCHAR[]", "$.items": "STRUCT(id BIGINT, sku VARCHAR)[]", "$.u.n": "BIGINT"}') AS shred_list,
   jsono('{"tags":["z' || (i % 4) || '"],"u":{"n":' || (i % 13) || '}}',
-        shredding := {'$.tags':'VARCHAR[]', '$.u.n':'BIGINT'}) AS shred_list2
+        shredding := '{"$.tags": "VARCHAR[]", "$.u.n": "BIGINT"}') AS shred_list2
 FROM range(3000) tbl(i);
 
 # --- Dictionary-encoded inputs (the representation that surfaced the merge crash) ---

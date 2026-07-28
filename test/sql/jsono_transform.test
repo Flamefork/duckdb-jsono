@@ -319,7 +319,7 @@ SELECT jsono_transform(jsono({'event_name': 'view'}), {'event_name':'VARCHAR','n
 # residual (shred holds only the ->> text), so a VARCHAR field over that path yields NULL
 # exactly like the plain tape — the shred is not read in preference to the residual.
 query I
-SELECT jsono_transform(jsono('{"k":5}', shredding := {'$.k':'VARCHAR'}), {'k':'VARCHAR'})
+SELECT jsono_transform(jsono('{"k":5}', shredding := '{"$.k": "VARCHAR"}'), {'k':'VARCHAR'})
      = jsono_transform(jsono('{"k":5}'), {'k':'VARCHAR'});
 ----
 true
@@ -327,6 +327,6 @@ true
 # A stripped string shred reads back through transform: the residual lacks the key and the
 # shred refills it.
 query I
-SELECT jsono_transform(jsono('{"k":"hi"}', shredding := {'$.k':'VARCHAR'}), {'k':'VARCHAR'});
+SELECT jsono_transform(jsono('{"k":"hi"}', shredding := '{"$.k": "VARCHAR"}'), {'k':'VARCHAR'});
 ----
 {'k': hi}

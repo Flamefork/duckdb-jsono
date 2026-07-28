@@ -1479,12 +1479,11 @@ bool RewriteProjectionProjector(OptimizerExtensionInput &input, LogicalProjectio
 // Shredded JSONO transparency
 //
 // A shredded JSONO column reaches the binder as a plain STRUCT: a `jsono` layout field wrapping a
-// six-blob `body$1` and a sibling `shreds$2` struct of typed columns named by canonical path (each a
-// bare scalar lane or a LIST, with the per-row divert bits in the spill bitmap). No implicit cast turns
-// that struct into JSONO, so a bare `j->>'path'` / `to_json(j)` binds to core json's
-// STRUCT->JSON path, which serializes the raw struct (wrong: leaks the blobs, never
-// reads the value). This pre-optimize pass rewrites those bound expressions off the
-// shred manifest carried in the column type itself:
+// six-blob `body$1` and a sibling `shreds$2` struct of typed columns, each named by the encoding of
+// its path (each a bare scalar lane or a LIST, with the per-row divert bits in the spill bitmap). No implicit cast
+// turns that struct into JSONO, so a bare `j->>'path'` / `to_json(j)` binds to core json's STRUCT->JSON path, which
+// serializes the raw struct (wrong: leaks the blobs, never reads the value). This pre-optimize pass rewrites those
+// bound expressions off the shred manifest carried in the column type itself:
 //   - `->>`/json_extract_string on a shred path -> struct_extract of the shred column.
 //     The shred already holds the extracted text, so this skips the JSONO parse and
 //     lets projection/row-group pruning act on the shred column directly.
@@ -1504,7 +1503,7 @@ struct JsonoShred {
 	vector<PathStep> steps;
 };
 
-// The shreds of a shredded layout, each named by its canonical path. A shred may be typed (a hot
+// The shreds of a shredded layout, each named by the encoding of its path. A shred may be typed (a hot
 // number stored as BIGINT/DOUBLE), so the type is carried: the `->>` text contract reads the shred
 // and casts it to VARCHAR, while reconstruction injects it back at its JSON type. child_index is the
 // shred's 0-based position over the shred set (`shreds` struct field 1 + child_index, after the
@@ -2092,12 +2091,14 @@ protected:
 	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *expr_ptr) override {
 		(void)expr_ptr;
 		// Whole-value conversion: reconstruct the full value from residual + shreds.
-		if ((expr.function.name == "to_json" || expr.function.name == "json_quote") && expr.children.size() == 1 &&
-		    IsShreddedJsonoType(expr.children[0]->return_type)) {
-			auto alias = expr.GetAlias();
-			auto rewritten = ReconstructShreddedToJson(std::move(expr.children[0]));
-			rewritten->SetAlias(alias);
-			return rewritten;
+		if ((expr.function.name == "to_json" || expr.function.name == "json_quote") && expr.children.size() == 1) {
+			if (IsShreddedJsonoType(expr.children[0]->return_type)) {
+				auto alias = expr.GetAlias();
+				auto rewritten = ReconstructShreddedToJson(std::move(expr.children[0]));
+				rewritten->SetAlias(alias);
+				return rewritten;
+			}
+			JsonoRejectMalformedAnchoredJsonRead(expr.children[0]->return_type);
 		}
 		// Path extraction off a shredded value.
 		if (IsExtractFunction(expr.function.name) && expr.children.size() == 2) {
@@ -2148,11 +2149,16 @@ protected:
 			return folded;
 		}
 		// Whole-value -> JSON: reconstruct from residual + shreds.
-		if (IsJsonTextType(expr.return_type) && IsShreddedJsonoType(expr.child->return_type)) {
-			auto alias = expr.GetAlias();
-			auto rewritten = ReconstructShreddedToJson(std::move(expr.child));
-			rewritten->SetAlias(alias);
-			return rewritten;
+		if (IsJsonTextType(expr.return_type)) {
+			if (IsShreddedJsonoType(expr.child->return_type)) {
+				auto alias = expr.GetAlias();
+				auto rewritten = ReconstructShreddedToJson(std::move(expr.child));
+				rewritten->SetAlias(alias);
+				return rewritten;
+			}
+			// The `->>`/`->` operators over such a type reach here too: the binder routes them through
+			// core json's CAST(struct AS JSON), which this visit sees.
+			JsonoRejectMalformedAnchoredJsonRead(expr.child->return_type);
 		}
 		return nullptr;
 	}
@@ -2614,6 +2620,18 @@ private:
 		bool has_list_shreds = false;
 		bool direct_list_render = true;
 		for (idx_t i = 0; i < shreds.size() && !needs_full_reconstruct; i++) {
+			for (auto &step : shreds[i].steps) {
+				// An empty-key lane cannot ride the patch tree: the patch carries keys as STRUCT field
+				// names, and a STRUCT with an empty field name is an unnamed struct to DuckDB. The full
+				// reconstruct overlays lanes by path bytes, so it renders such a lane correctly.
+				if (step.key.empty()) {
+					needs_full_reconstruct = true;
+					break;
+				}
+			}
+			if (needs_full_reconstruct) {
+				break;
+			}
 			if (IsShredListType(shreds[i].type)) {
 				has_list_shreds = true;
 				if (shreds[i].steps.size() != 1) {

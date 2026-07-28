@@ -79,7 +79,10 @@ LogicalType JsonoBodyStructType();
 
 // One lane of a shred set as its producers hold it: the LOGICAL object-key path it lifts and the
 // lane's value type. The physical STRUCT field name is derived from the path, never spelled by the
-// caller — see JsonoShreddedStructType.
+// caller — see JsonoShreddedStructType. The type is the PHYSICAL lane type: an object-array lane's
+// element subfield names arrive already encoded (a logical element type is not a lane any writer
+// emits, and the layout grammar classifies a struct carrying one as NotJsono rather than throwing —
+// see ShredSubfieldNamesAreCanonical); JsonoLaneLogicalType is the decoded rendering.
 struct JsonoLaneSpec {
 	vector<PathStep> path;
 	LogicalType type;
@@ -95,7 +98,10 @@ struct JsonoLaneSpec {
 // It is also the ONE place a lane's physical field name is minted (JsonoEncodeLaneName over the
 // logical path). Taking paths rather than names is what makes that true: a producer holding an
 // already-encoded name (a merged layout, the optimizer's canonical order) must decode it to get
-// here, so no caller can smuggle a hand-spelled name into the type.
+// here, so no caller can smuggle a hand-spelled name into the type. An object-array lane's element
+// SUBFIELD names are the one part minted elsewhere: they live inside the lane's value type, so the
+// producer that builds that element type encodes them (JsonoEncodeLaneSubfieldName) before the
+// spec reaches here — see JsonoLaneSpec.
 //
 // Shred field order follows `shreds`; callers pass them in canonical (encoded-name-sorted) order so
 // the type is a pure function of the shred set, and they write shreds in that same order (shreds
@@ -210,11 +216,22 @@ inline idx_t JsonoSpillColumnCount(idx_t shred_count) {
 // to verify per-scan shred-set coverage before trusting the spill bitmap.
 uint64_t JsonoLayoutHashOf(const LogicalType &type);
 
-// The canonical spill-bit rank of each name in `names` (parallel vector): its position in the
-// byte-wise sorted name list. Field lists every constructor emits are already name-sorted, so
-// rank == index there; a set-op reorder-only cast permutes fields while the order-independent
-// set hash still matches, which is why the bit numbering must be permutation-invariant.
+// The rank of each string in `names` (parallel vector): its position in the byte-wise sorted list.
+// Callers rank BOTH framings of a lane. Ranked over encoded lane names this is the spill-bit
+// numbering and the type's canonical field order — permutation-invariant, so a set-op reorder-only
+// cast (which keeps the order-independent set hash) cannot renumber the bits. Ranked over logical
+// paths it is the manifest's emission order, a genuinely different permutation of the same lanes;
+// the definition spells out why, and what the encoded-name order structurally is.
 vector<idx_t> JsonoCanonicalRanks(const vector<string> &names);
+
+// The one loud read-path exception to "a current-revision grammar miss stays silent": when the miss
+// is a malformed LANE NAME inside a fully-anchored type (JsonoLayoutType::lane_name_malformed), a
+// JSON read (`->>`, `->`, to_json, ::JSON) would silently answer NULL for every path — including
+// paths in intact lanes and in the residual — and serialize the raw struct: a whole column going
+// dark over one catalog typo. The optimizer calls this where it declined a shredded rewrite; it is
+// a no-op for every other type and throws the grammar's own reason for this one. Passthrough
+// (SELECT *, COPY), ::VARCHAR and DDL stay untouched, so backup and recovery (DROP COLUMN) work.
+void JsonoRejectMalformedAnchoredJsonRead(const LogicalType &type);
 
 // The classification of one JSONO layout field.
 enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
@@ -272,6 +289,14 @@ struct JsonoLayoutType {
 	idx_t spill_columns = 0;
 	idx_t body_revision = DConstants::INVALID_INDEX;
 	idx_t shreds_revision = DConstants::INVALID_INDEX;
+	// Set on a NotJsono answer whose failure is a LANE NAME that does not decode — reached only
+	// after the full current-revision anchor matched (exact residual, `shreds$2`, marker and spill
+	// found by name). That combination is a catalog-evolution typo or a hand-built imitation, never
+	// a type any legal write narrows: generic value->SQL->value round-trips (the DuckLake flush)
+	// change TYPES and keep names, so the type-narrowing near-misses this flag deliberately excludes
+	// stay silent. The optimizer refuses JSON reads of a type with this flag (see
+	// JsonoRejectMalformedAnchoredJsonRead) instead of letting them silently answer NULL.
+	bool lane_name_malformed = false;
 };
 
 // How a type relates to the JSONO layout grammar. `Foreign` is the whole point of the anchor: a
@@ -1478,7 +1503,7 @@ inline void VerifyShredManifestEntries(const std::vector<ShredManifestEntry> &ma
 			throw InvalidInputException(
 			    "JSONO: row was shredded with shred '%s %s' but the column no longer carries that shred; the value "
 			    "was narrowed by a raw struct cast and cannot be read losslessly. Reshred through "
-			    "jsono(value, shredding := {...}) (the extension optimizer does this automatically)",
+			    "jsono(value, shredding := '{...}') (the extension optimizer does this automatically)",
 			    std::string(entry.path).c_str(), DescribeShredManifestEntry(entry).c_str());
 		}
 	}

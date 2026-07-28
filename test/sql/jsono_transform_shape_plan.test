@@ -121,7 +121,7 @@ CREATE TABLE shredded_mix AS
 SELECT i, jsono(CASE i % 2
     WHEN 0 THEN '{"name": "u' || i || '", "extra": ' || i || '}'
     ELSE '{"name": ' || i || ', "extra": ' || i || '}'
-END, shredding := {name: 'VARCHAR'}) AS j
+END, shredding := '{"name": "VARCHAR"}') AS j
 FROM range(2000) r(i);
 
 query III

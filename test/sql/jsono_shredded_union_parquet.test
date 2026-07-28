@@ -9,10 +9,10 @@ require json
 require parquet
 
 statement ok
-CREATE TABLE sa AS SELECT jsono('{"a":"AAA","b":"BBB"}', shredding := {'a':'VARCHAR'}) AS e;
+CREATE TABLE sa AS SELECT jsono('{"a":"AAA","b":"BBB"}', shredding := '{"a": "VARCHAR"}') AS e;
 
 statement ok
-CREATE TABLE sb AS SELECT jsono('{"a":"XXX","b":"YYY"}', shredding := {'b':'VARCHAR'}) AS e;
+CREATE TABLE sb AS SELECT jsono('{"a":"XXX","b":"YYY"}', shredding := '{"b": "VARCHAR"}') AS e;
 
 statement ok
 CREATE TABLE um AS SELECT e FROM sa UNION ALL SELECT e FROM sb;
@@ -38,7 +38,7 @@ FROM '__TEST_DIR__/jsono_union_merged.parquet' ORDER BY 1;
 # set WITHOUT the optimizer (the raw by-name cast drops the 'a'/'b' shred), then verify the
 # narrowed rows fail loud on read.
 statement ok
-CREATE TABLE narrowed AS SELECT jsono('{}', shredding := {'a':'VARCHAR'}) AS e WHERE false;
+CREATE TABLE narrowed AS SELECT jsono('{}', shredding := '{"a": "VARCHAR"}') AS e WHERE false;
 
 statement ok
 SET disabled_optimizers='extension';

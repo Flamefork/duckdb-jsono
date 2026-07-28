@@ -25,7 +25,7 @@ SELECT jsono_storage_type();
 STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 query I
-SELECT jsono_storage_type('a BIGINT, b VARCHAR');
+SELECT jsono_storage_type('{"a": "BIGINT", "b": "VARCHAR"}');
 ----
 STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT, c8000 VARCHAR)))
 
@@ -35,7 +35,7 @@ SELECT typeof(jsono('{"a":1}'));
 STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 query I
-SELECT typeof(jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}));
+SELECT typeof(jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}'));
 ----
 STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT)))
 
@@ -70,7 +70,7 @@ SELECT body_hex(jsono('{"a":1,"b":"x"}'));
 # the marker is the clean layout hash and the spill column stays NULL on a clean row.
 query III
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
-FROM (SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}) AS v);
+FROM (SELECT jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}') AS v);
 ----
 4A534E4F050100000100000000000000010000000000004000000000000000800000000000000010|62|78|000000000000000000000000010000000300242E6102|01000000|	-538597865238962405	NULL
 
@@ -81,22 +81,22 @@ FROM (SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}) AS v);
 query IIII
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0",
        v.jsono."shreds$2".c4000 IS NULL
-FROM (SELECT jsono('{"a":{"n":1},"b":"x"}', shredding := {'a':'BIGINT'}) AS v);
+FROM (SELECT jsono('{"a":{"n":1},"b":"x"}', shredding := '{"a": "BIGINT"}') AS v);
 ----
 4A534E4F050100000200000000000000010000000000004001000001000000400100000100000000010000020000004000000000000000A0000000000000001000000000000000800000000000000010|61626E|78|000000000000000000000000|01000000|0100000000000000	-538597865238962406	1	true
 
 # The dirty marker is exactly the clean marker with bit 0 flipped — the two-valued stamp every
 # totality proof reads as a plain min/max question.
 query I
-SELECT xor((SELECT v.jsono."shreds$2"."$jsono$set" FROM (SELECT jsono('{"a":{"n":1},"b":"x"}', shredding := {'a':'BIGINT'}) AS v)),
-           (SELECT v.jsono."shreds$2"."$jsono$set" FROM (SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}) AS v))) = 1;
+SELECT xor((SELECT v.jsono."shreds$2"."$jsono$set" FROM (SELECT jsono('{"a":{"n":1},"b":"x"}', shredding := '{"a": "BIGINT"}') AS v)),
+           (SELECT v.jsono."shreds$2"."$jsono$set" FROM (SELECT jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}') AS v))) = 1;
 ----
 true
 
 # Nested lane: the residual keeps the object skeleton, the leaf is stripped.
 query III
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
-FROM (SELECT jsono('{"o":{"k":"v"}}', shredding := {'$.o.k':'VARCHAR'}) AS v);
+FROM (SELECT jsono('{"o":{"k":"v"}}', shredding := '{"$.o.k": "VARCHAR"}') AS v);
 ----
 4A534E4F0501000001000000000000000100000000000040000000010000000000000000000000100000000000000010|6F||000000000000000000000000010000000500242E6F2E6B01||	-7243425711980707825	NULL
 
@@ -108,7 +108,7 @@ FROM (SELECT jsono('{"o":{"k":"v"}}', shredding := {'$.o.k':'VARCHAR'}) AS v);
 # only this row goes red.
 query III
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
-FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := {'$."a-c"':'VARCHAR', '$.a.b':'VARCHAR'}) AS v);
+FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS v);
 ----
 4A534E4F0501000001000000000000000100000000000040000000010000000000000000000000100000000000000010|61||000000000000000000000000020000000500242E612D63010500242E612E6201||	1806171218575348807	NULL
 
@@ -120,7 +120,7 @@ FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := {'$."a-c"':'VARCHAR
 # canonical one, not the element struct's declaration order.
 query III
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
-FROM (SELECT jsono('{"items":[{"id":1,"NM":"z"}]}', shredding := {'$.items': 'STRUCT(id BIGINT, NM VARCHAR)[]'}) AS v);
+FROM (SELECT jsono('{"items":[{"id":1,"NM":"z"}]}', shredding := '{"$.items": "STRUCT(id BIGINT, NM VARCHAR)[]"}') AS v);
 ----
 4A534E4F050100000100000000000000050000000000004000000001000000200000000200000000000000000000001000000000000000300000000000000010|6974656D73||01000000000000000000000001000000040000000000000000000000000000000000000000000000010000000700242E6974656D730B020002004E4D010200696402||	2987070229399712739	NULL
 
@@ -129,7 +129,7 @@ FROM (SELECT jsono('{"items":[{"id":1,"NM":"z"}]}', shredding := {'$.items': 'ST
 query IIII
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0",
        v.jsono."shreds$2".e0000::VARCHAR
-FROM (SELECT jsono('{"p":[1,2]}', shredding := {'$.p':'BIGINT[]'}) AS v);
+FROM (SELECT jsono('{"p":[1,2]}', shredding := '{"$.p": "BIGINT[]"}') AS v);
 ----
 4A534E4F050100000100000000000000010000000000004000000001000000200000000000000050000000000000005000000000000000300000000000000010|70||01000000000000000000000001000000040000000000000000000000000000000000000000000000010000000300242E7007||	870299297690790912	NULL	[1, 2]
 
@@ -143,10 +143,10 @@ FROM (SELECT jsono('{"p":[1,2]}', shredding := {'$.p':'BIGINT[]'}) AS v);
 query IIII
 SELECT d, j.jsono."shreds$2"."$jsono$spill$0" AS mask,
        xor(j.jsono."shreds$2"."$jsono$set",
-           jsono('{"c":3,"b":2,"a":1}', shredding := {'c':'BIGINT','b':'BIGINT','a':'BIGINT'}).jsono."shreds$2"."$jsono$set") AS marker_flip,
+           jsono('{"c":3,"b":2,"a":1}', shredding := '{"c": "BIGINT", "b": "BIGINT", "a": "BIGINT"}').jsono."shreds$2"."$jsono$set") AS marker_flip,
        to_json(j)::VARCHAR AS rt
 FROM (
-  SELECT d, jsono(d, shredding := {'c':'BIGINT','b':'BIGINT','a':'BIGINT'}) AS j FROM (VALUES
+  SELECT d, jsono(d, shredding := '{"c": "BIGINT", "b": "BIGINT", "a": "BIGINT"}') AS j FROM (VALUES
     ('{"c":3,"b":2,"a":"x"}'),
     ('{"c":3,"b":"y","a":1}'),
     ('{"c":"z","b":2,"a":1}'),
@@ -162,7 +162,7 @@ FROM (
 # A SQL-NULL row nulls the whole value, marker and spill columns included.
 query III
 SELECT v IS NULL, v.jsono."shreds$2"."$jsono$set" IS NULL, v.jsono."shreds$2"."$jsono$spill$0" IS NULL
-FROM (SELECT jsono(NULL::VARCHAR, shredding := {'a':'BIGINT'}) AS v);
+FROM (SELECT jsono(NULL::VARCHAR, shredding := '{"a": "BIGINT"}') AS v);
 ----
 true	true	true
 

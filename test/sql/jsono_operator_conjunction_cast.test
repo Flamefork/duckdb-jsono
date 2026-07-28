@@ -71,7 +71,7 @@ json_extract(BOOLEAN, BOOLEAN)
 # Shredded JSONO column — same contract (the struct just carries the shred fields).
 # ---------------------------------------------------------------------------
 statement ok
-create table shred as select jsono('{"k":"v"}', shredding := {'$.k':'VARCHAR'}) e;
+create table shred as select jsono('{"k":"v"}', shredding := '{"$.k": "VARCHAR"}') e;
 
 query I
 select count(*) from shred where true and (e ->> '$.k') is not null;
@@ -87,7 +87,7 @@ select count(*) from shred where true and e ->> '$.k' is not null;
 statement ok
 create table arr as
 select jsono('{"event_name":"x","products":[{"name":"A"}]}',
-             shredding := {'$.event_name':'VARCHAR','$.products':'STRUCT("name" VARCHAR)[]'}) e;
+             shredding := '{"$.event_name": "VARCHAR", "$.products": "STRUCT(\"name\" VARCHAR)[]"}') e;
 
 query I
 select count(*) from arr

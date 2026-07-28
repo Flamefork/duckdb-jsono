@@ -45,10 +45,7 @@ SELECT count(*)
 FROM docs
 WHERE to_json(jsono(
         doc,
-        shredding := {
-          'kind':'VARCHAR',
-          'products':'STRUCT(name VARCHAR, price DOUBLE, quantity BIGINT)[]'
-        }))
+        shredding := '{"kind": "VARCHAR", "products": "STRUCT(name VARCHAR, price DOUBLE, quantity BIGINT)[]"}'))
       = to_json(jsono(doc));
 ----
 3
@@ -63,7 +60,7 @@ WITH docs(doc) AS (VALUES
 )
 SELECT count(*)
 FROM docs
-WHERE to_json(jsono(doc, shredding := {'a':'UBIGINT[]','kind':'VARCHAR'}))
+WHERE to_json(jsono(doc, shredding := '{"a": "UBIGINT[]", "kind": "VARCHAR"}'))
       = to_json(jsono(doc));
 ----
 4

@@ -11,29 +11,29 @@ require json
 query II
 SELECT s.shreds, s.total = s.slots + s.key_heap + s.string_heap + s.skips + s.lengths + s.nums + s.shreds
 FROM (SELECT jsono_storage_size(jsono('{"products":[{"id":1,"name":"aa"},{"id":2,"name":"bbb"}]}',
-                                       shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})) AS s);
+                                       shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}')) AS s);
 ----
 21	true
 
 # An element missing a shredded subfield contributes 0 for that subfield (NULL leaf): {id:8} only.
 query I
 SELECT (jsono_storage_size(jsono('{"products":[{"id":1}]}',
-                                  shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))).shreds;
+                                  shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'))).shreds;
 ----
 8
 
 # An empty array (length 0) and an absent array path both report 0 shred bytes.
 query II
 SELECT
-  (jsono_storage_size(jsono('{"products":[]}', shredding := {'$.products':'STRUCT(id UBIGINT)[]'}))).shreds,
-  (jsono_storage_size(jsono('{"x":1}', shredding := {'$.products':'STRUCT(id UBIGINT)[]'}))).shreds;
+  (jsono_storage_size(jsono('{"products":[]}', shredding := '{"$.products": "STRUCT(id UBIGINT)[]"}'))).shreds,
+  (jsono_storage_size(jsono('{"x":1}', shredding := '{"$.products": "STRUCT(id UBIGINT)[]"}'))).shreds;
 ----
 0	0
 
 # A non-object element (scalar 5) is a NULL struct row -> 0; the sibling object {id:8, name:"z"=1} -> 9.
 query I
 SELECT (jsono_storage_size(jsono('{"products":[5,{"id":7,"name":"z"}]}',
-                                  shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))).shreds;
+                                  shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'))).shreds;
 ----
 9
 
@@ -42,7 +42,7 @@ SELECT (jsono_storage_size(jsono('{"products":[5,{"id":7,"name":"z"}]}',
 query II
 SELECT s.shreds, s.total = s.slots + s.key_heap + s.string_heap + s.skips + s.lengths + s.nums + s.shreds
 FROM (SELECT jsono_storage_size(jsono('{"kind":"order","products":[{"id":1,"name":"a"}]}',
-                                       shredding := {'$.kind':'VARCHAR','$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'})) AS s);
+                                       shredding := '{"$.kind": "VARCHAR", "$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}')) AS s);
 ----
 14	true
 
@@ -58,7 +58,7 @@ SELECT * FROM (VALUES
 ) AS v(id, doc);
 
 query II
-SELECT id, (jsono_storage_size(jsono(doc, shredding := {'$.products':'STRUCT(id UBIGINT, name VARCHAR)[]'}))).shreds
+SELECT id, (jsono_storage_size(jsono(doc, shredding := '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'))).shreds
 FROM arr_sizes ORDER BY id;
 ----
 1	19

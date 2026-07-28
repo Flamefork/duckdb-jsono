@@ -8,11 +8,11 @@ require json
 
 statement ok
 CREATE TABLE su_a AS
-SELECT jsono('{"x":' || i || ',"a":"A"}', shredding := {'$.x':'BIGINT','$.a':'VARCHAR'}) AS j FROM range(1000) tt(i);
+SELECT jsono('{"x":' || i || ',"a":"A"}', shredding := '{"$.x": "BIGINT", "$.a": "VARCHAR"}') AS j FROM range(1000) tt(i);
 
 statement ok
 CREATE TABLE su_b AS
-SELECT jsono('{"x":' || (i + 1000) || ',"b":"B"}', shredding := {'$.x':'BIGINT','$.b':'VARCHAR'}) AS j FROM range(1000) tt(i);
+SELECT jsono('{"x":' || (i + 1000) || ',"b":"B"}', shredding := '{"$.x": "BIGINT", "$.b": "VARCHAR"}') AS j FROM range(1000) tt(i);
 
 statement ok
 PRAGMA explain_output='physical_only';

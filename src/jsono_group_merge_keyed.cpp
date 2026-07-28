@@ -75,7 +75,7 @@ struct GroupMergeLWWBindData : public FunctionData {
 	vector<ReconShred> list_shreds;
 	vector<idx_t> overlay_shreds;
 	vector<idx_t> scalar_text_indices;
-	JsonoShredWriteModel write_model;
+	ShredWriteSet write;
 	// Carried into Update/Combine to account the LWW tree/lane growth; re-captured on plan round-trips
 	// (no serialize callback, so deserialize re-runs the bind).
 	BufferManager &buffer_manager;
@@ -1304,9 +1304,9 @@ void PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
 	// The four walkers below merge a row's manifest entries against these vectors with a single
 	// rising index, so both sequences must be in the SAME order — the manifest's, which is by logical
 	// path. That is NOT the shred order these were collected in (the type lists lanes by encoded
-	// name, and the two orders genuinely differ: `$.a-c` sorts before `$.a.b` as text while the
-	// nested path sorts first structurally), and a set-op merged type is not even canonically
-	// ordered, so sort explicitly rather than inherit the field order.
+	// name — a different permutation of the same lanes, see JsonoCanonicalRanks), and a set-op
+	// merged type is not even canonically ordered, so sort explicitly rather than inherit the field
+	// order.
 	auto by_manifest_path = [](const ReconShred &a, const ReconShred &b) {
 		return a.manifest_path < b.manifest_path;
 	};
@@ -1320,7 +1320,7 @@ void GroupMergeLWWBindData::BuildShredPlan() {
 	overlay_shreds.clear();
 	PrepareDirectLWWShreddedInput(shreds, scalar_shreds, list_shreds, overlay_shreds);
 	scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
-	write_model = JsonoBuildShredWriteModel(shreds);
+	write = JsonoBuildShredWriteSet(shreds);
 }
 
 // The four manifest walkers below each run the same two-pointer advance (manifest and shreds are
@@ -1866,13 +1866,13 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	}
 	JsonoSpillStamp stamp;
 	stamp.Init(result);
-	auto &spill_ranks = bind_data.write_model.spill_ranks;
+	auto &spill_ranks = bind_data.write.model.spill_ranks;
 
 	JsonoBuilder builder;
 	vector<const vector<PathStep> *> scalar_strip_paths;
 	vector<idx_t> stripped_child_indices;
 	JsonoStrippedLanes stripped_lanes;
-	stripped_lanes.Init(bind_data.write_model);
+	stripped_lanes.Init(bind_data.write.model);
 	vector<idx_t> list_override_indices;
 	std::string manifest;
 	for (idx_t i = 0; i < count; i++) {
@@ -2248,7 +2248,7 @@ void JsonoGroupMergeLWWFinalize(Vector &states, AggregateInputData &aggr_input_d
 	Vector plain(JsonoType(), count);
 	FinalizeLWWPlainGroups(plain, state_fmt, state_data, count, 0);
 	Vector shredded(result.GetType(), count);
-	JsonoShredFromLayout(plain, count, bind_data.shreds, shredded);
+	JsonoShredFromLayout(plain, count, bind_data.write, shredded);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	VectorOperations::Copy(shredded, result, count, 0, offset);
 }

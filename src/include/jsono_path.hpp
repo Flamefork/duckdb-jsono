@@ -249,37 +249,20 @@ inline bool TryStepsToJsonPath(const vector<PathStep> &steps, string &out) {
 // A shred lane has two names. The LOGICAL path is the object-key chain it lifts out of the
 // document: what reconstruct, render, jsono_entries and every diagnostic emit, and what the per-row
 // shred manifest records. The PHYSICAL name is the STRUCT field the lane occupies inside `shreds`,
-// and it is NOT that path as text — it is the path's STRUCTURE, serialized and encoded.
+// and it is NOT that path as text — it is the path's STRUCTURE, serialized and encoded, so that two
+// case-spellings of one key cannot collapse under DuckDB's case-insensitive field matching, and so
+// that how the spec DSL spells a path cannot leak into the stored format. The functions below are
+// the codec's implementation; the codec itself — the serialization, the alphabet, why the
+// terminator is doubled, the worked examples — is specified in docs/jsono_format.md §Lane names,
+// and only there.
 //
-// DuckDB matches STRUCT field names case-insensitively over ASCII A-Z, so a lane named by its path
-// verbatim collapses with another spelling of the same key: two sources writing `gclid` and `GCLID`
-// merge into one lane, and the by-name cast then moves one key's values into the other key's lane —
-// loud on the dropped spelling, silently wrong on the surviving one. The encoded alphabet has no
-// upper case at all, so distinct paths can never produce names differing only in case: the collapse
-// becomes unrepresentable rather than guarded against. The same bijection ends a second conflation —
-// `gclid` and `$.gclid` are one path and now encode to one name, so how the public spec DSL spells
-// a path stops leaking into the stored format.
-//
-// Two stages, both order-preserving, so sorting encoded names IS sorting paths:
-//
-//   1. serialize the steps — each key's raw bytes with 0x00 escaped as `00 FF`, then terminated by
-//      `00 00`; keys concatenate in path order;
-//   2. base32hex (RFC 4648, alphabet `0-9a-v`, lowercase, unpadded) over those bytes.
-//
-// The DOUBLED terminator is what makes stage 1 self-delimiting: 0x00 ALWAYS appears in a pair, so a
-// decoder that has read a 0x00 decides on the single byte after it and never depends on what the
-// next key starts with. A single-0x00 terminator is ambiguous the moment the next key starts with
-// 0xFF: `61 00 FF 62 00` would then be both [`a`, `\xFFb`] and [`a\x00b`]. Doubled, they are
-// `61 00 00 FF 62 00 00` and `61 00 FF 62 00 00` — distinct, which is why the pair is not optional.
-//
-// Order preservation is a property of THIS serialization, not of encoding in general (a
-// length-prefixed variant breaks it: `a` sorts AFTER `URL`→`path` as a path, because `a` > `U`, but
-// BEFORE it once the leading length byte dominates). It is the first thing to re-verify if the
-// serialization is ever revisited, and `test_lane_name_codec` in test/property/jsono_property.py is
-// what re-verifies it. No list of what depends on it is kept anywhere: such a list inverts a
-// dependency the compiler already tracks, and it goes stale the moment a client stops relying on the
-// property — which is exactly what happened to the list that used to stand here, within one arc,
-// when the keyed group_merge walkers started sorting by manifest path explicitly.
+// Both stages are order-preserving, so sorting encoded names IS sorting paths. That property is
+// pinned by `test_lane_name_codec` in test/property/jsono_property.py, and it is the first thing to
+// re-verify if the serialization is ever revisited. No list of what depends on it is kept anywhere:
+// such a list inverts a dependency the compiler already tracks, and it goes stale the moment a
+// client stops relying on the property — which is exactly what happened to the list that used to
+// stand here, within one arc, when the keyed group_merge walkers started sorting by manifest path
+// explicitly.
 
 // Encode the lane path `steps` as its STRUCT field name. Every step must be an object key: an
 // index or wildcard step has no lane to name (each step strips one object key from the residual),

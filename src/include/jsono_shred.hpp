@@ -28,7 +28,7 @@ class ScalarFunction;
 // turning a deep value's reconstruct into a super-linear cost, not to limit realistic use. It is a
 // fixed cap, not configurable: the constructor has no per-row frequency signal at bind, so depth is
 // the only honest lever; the advisor is additionally presence/fit-gated but shares the cap so a
-// pasted suggestion and the auto path agree. Deeper lanes go through explicit `shredding := {...}`
+// pasted suggestion and the auto path agree. Deeper lanes go through explicit `shredding := '{...}'`
 // (no cap). The read/write/manifest machinery itself is depth-agnostic.
 constexpr idx_t JSONO_AUTO_SHRED_MAX_DEPTH = 16;
 
@@ -85,6 +85,19 @@ bool IsShredListType(const LogicalType &type);
 // go through it, so a declared storage column always matches a value the constructor can produce.
 JsonoLaneSpec JsonoParseShredSpecField(const string &path, const LogicalType &type);
 
+// The public shredding spec: a constant VARCHAR holding a JSON object that maps each path to its
+// shred type string, e.g. '{"$.kind": "VARCHAR", "$.commit.seq": "BIGINT"}' — the key is the path
+// (a bare top-level key or a `$.`-rooted JSONPath), the value the stringified shred type (the spec
+// language core json_transform takes; read_json's `columns` and Parquet's SHREDDING option are the
+// same idea). An array shred names a LIST<STRUCT<...>> type, e.g.
+// '{"$.products": "STRUCT(id UBIGINT, name VARCHAR)[]"}'. JSON keys are byte-exact — a
+// STRUCT-literal carrier would fold two case-spellings of one key into a duplicate-field error,
+// un-declaring exactly the lanes the lane-name codec keeps distinct.
+//
+// Parses one spec into its (path, type-string) entries, spec-text errors prefixed with `fn_name`;
+// every consumer of the spec language goes through here, so the surfaces cannot drift apart.
+vector<std::pair<string, string>> JsonoShredSpecEntries(const Value &spec, const char *fn_name);
+
 // One array shred for the residual-skeleton emit: the object-key chain to the array, plus the
 // lifted-element primitive description. An object array (kind == Array) lifts element subfields into
 // a LIST<STRUCT> column; a scalar array (kind == ScalarArray) lifts each whole element into a
@@ -132,11 +145,10 @@ struct JsonoShredManifestEntryBytes {
 // its own type the same way, so both sides name the lane identically by construction.
 //
 // `manifest_order` lists the lanes in the manifest's emission order, which is the logical-path order
-// and NOT the lane order (that follows the encoded name, and the two genuinely differ: `$.a-c` sorts
-// before `$.a.b` as text, while the nested path sorts first structurally). It is the whole reason
-// this is a table and not a bare vector: the write loops reach lanes in their own order (field
-// order, document order, tree order), so ordering the manifest is a bind-time permutation walked per
-// row, never a per-row sort.
+// and NOT the lane order (the two are different permutations of the same lanes — see
+// JsonoCanonicalRanks). It is the whole reason this is a table and not a bare vector: the write
+// loops reach lanes in their own order (field order, document order, tree order), so ordering the
+// manifest is a bind-time permutation walked per row, never a per-row sort.
 //
 // `spill_ranks[f]` is lane f's bit in the `$jsono$spill` bitmap (see JsonoCanonicalRanks). It is
 // the PHYSICAL name that ranks there, because every reader recomputes the ranks from the stored
@@ -195,14 +207,59 @@ void JsonoAppendShredManifest(std::string &manifest, const JsonoShredWriteModel 
 // Appends the entries of the marked lanes, in manifest order.
 void JsonoAppendShredManifest(std::string &manifest, JsonoStrippedLanes &lanes);
 
+// One subfield lifted out of each array element into the LIST<STRUCT> shred column. `key` is the
+// element's JSON key — what the residual skeleton strips and what reconstruct and jsono_entries
+// emit; `name` is the STRUCT field it occupies inside the lane's element type, which is that key
+// run through the lane-name codec (a subfield is a one-step path).
+struct ShredArraySubfield {
+	string key;
+	string name;
+	jsono::JsonoScalarPrimitive primitive;
+};
+
+struct ShredField {
+	// The lane's two names (see the lane-name boundary in jsono_path.hpp): `steps` is the object-key
+	// path lifted out of the document, `lane_name` the STRUCT field the lane occupies inside
+	// `shreds` — the encoding of that path. The canonical spill ranks and the type's field order are
+	// keyed by lane_name; the manifest records the path, decoded back out of it.
+	vector<PathStep> steps;
+	string lane_name;
+	// kind == Scalar: one leaf scalar lifted at `steps` (use `primitive`). kind == Array: `steps`
+	// addresses a regular array; `subfields` are the element leaves lifted into a parallel LIST<STRUCT>
+	// column. kind == ScalarArray: `steps` addresses a regular array; each whole scalar element lifts
+	// into a parallel LIST<element_type> column (use `element_primitive`).
+	ShredKind kind = ShredKind::Scalar;
+	jsono::JsonoScalarPrimitive primitive;         // valid when kind == Scalar
+	vector<ShredArraySubfield> subfields;          // valid when kind == Array, element-struct order
+	jsono::JsonoScalarPrimitive element_primitive; // valid when kind == ScalarArray
+};
+
+// A shred set compiled for writing: the lanes, plus the per-lane tables every per-row write reads.
+// Built once where the set is decided — a bind — because each table decodes every lane name and
+// allocates; rebuilding them per chunk charged the whole shred set to every batch of rows.
+struct ShredWriteSet {
+	vector<ShredField> fields;
+	JsonoShredWriteModel model;
+	// The non-scalar lanes' residual-skeleton specs (path + lifted-element description). The skeleton
+	// emit strips, per array element, exactly what the WriteArrayShred / WriteScalarArrayShred pass
+	// reports lifted (both gate on JsonoScalarFitsPrimitive), keeping the array as the position
+	// carrier. Empty — the common case — means the plain leaf-strip emit.
+	vector<JsonoArrayShredSpec> array_specs;
+
+	void Build();
+};
+
+// Compile a result layout's shred set for writing. `shreds[i]` names a lane by its PHYSICAL field
+// name and type — the caller already has the result layout (a merged shred set, a group_merge
+// accumulator's, the constructor's auto-shred set) and the write must reproduce it exactly, so the
+// names are decoded to paths, never re-parsed as the public spec DSL (a name fed back through the
+// DSL would reinterpret it as a fresh path spelling and mint a lane the layout does not have). A
+// name that is not a canonical lane name is a broken invariant, not user input.
+ShredWriteSet JsonoBuildShredWriteSet(const vector<std::pair<string, LogicalType>> &shreds);
+
 // Shred a plain JSONO `input` vector into the shredded `result` STRUCT (the six-BLOB residual
-// prefix followed by one shred column per `shreds` entry, in order). `shreds[i]` names a lane by
-// its PHYSICAL field name and type — the caller already has the result layout (a merged shred set,
-// a group_merge accumulator's, the constructor's auto-shred set) and this must reproduce it
-// exactly, so the names are decoded to paths, not re-parsed as the public spec DSL. Reuses the
-// jsono_shred executor so the constructor and the shred function share strip and shred-write
-// semantics. A name that is not a canonical lane name is a broken invariant, not user input.
-void JsonoShredFromLayout(Vector &input, idx_t count, const vector<std::pair<string, LogicalType>> &shreds,
-                          Vector &result);
+// prefix followed by one shred column per lane of `write`, in order). Reuses the jsono_shred
+// executor so the constructor and the shred function share strip and shred-write semantics.
+void JsonoShredFromLayout(Vector &input, idx_t count, const ShredWriteSet &write, Vector &result);
 
 } // namespace duckdb

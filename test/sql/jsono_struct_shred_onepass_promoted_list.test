@@ -36,7 +36,7 @@ query I
 SELECT count(*)
 FROM promoted_scalar_list_input
 WHERE jsono(v) IS NOT DISTINCT FROM
-      jsono(plain_jsono_promoted_list(v), shredding := {'kind':'VARCHAR','moments':'VARCHAR[]'});
+      jsono(plain_jsono_promoted_list(v), shredding := '{"kind": "VARCHAR", "moments": "VARCHAR[]"}');
 ----
 4
 
@@ -89,10 +89,7 @@ FROM promoted_object_list_input
 WHERE jsono(v) IS NOT DISTINCT FROM
       jsono(
         plain_jsono_promoted_list(v),
-        shredding := {
-          'items':'STRUCT(event_ts VARCHAR, n BIGINT)[]',
-          'kind':'VARCHAR'
-        });
+        shredding := '{"items": "STRUCT(event_ts VARCHAR, n BIGINT)[]", "kind": "VARCHAR"}');
 ----
 3
 
@@ -103,7 +100,7 @@ SELECT
     jsono(
       plain_jsono_promoted_list(
         struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02', NULL])),
-      shredding := {'moments':'VARCHAR[]'}),
+      shredding := '{"moments": "VARCHAR[]"}'),
   to_json(jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02', NULL])))::VARCHAR;
 ----
 true	{"moments":["2024-01-01 10:34:56+00",null]}
@@ -136,7 +133,7 @@ FROM promoted_list_vector_input
 WHERE jsono(v) IS NOT DISTINCT FROM
       jsono(
         plain_jsono_promoted_list(v),
-        shredding := {'kind':'VARCHAR','moments':'VARCHAR[]'});
+        shredding := '{"kind": "VARCHAR", "moments": "VARCHAR[]"}');
 ----
 3000
 
@@ -149,7 +146,7 @@ FROM promoted_list_vector_input
 WHERE jsono(v) IS NOT DISTINCT FROM
       jsono(
         plain_jsono_promoted_list(v),
-        shredding := {'kind':'VARCHAR','moments':'VARCHAR[]'});
+        shredding := '{"kind": "VARCHAR", "moments": "VARCHAR[]"}');
 ----
 3000
 

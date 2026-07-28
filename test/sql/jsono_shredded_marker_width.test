@@ -43,7 +43,7 @@ SELECT to_json(r) FROM marker_rt;
 # The reconstructed value is exactly the canonical shredded type (reserved fields back to BIGINT,
 # same shreds): the cast took the lossless plain struct-cast path, NOT a reshred.
 query I
-SELECT typeof(r) = jsono_storage_type('event_name VARCHAR, goals VARCHAR') FROM marker_rt;
+SELECT typeof(r) = jsono_storage_type('{"event_name": "VARCHAR", "goals": "VARCHAR"}') FROM marker_rt;
 ----
 true
 
@@ -99,7 +99,7 @@ SELECT to_json(r)::VARCHAR, r ->> '$.event_name' FROM spill_deg;
 {"event_name":"pv","goals":"buy"}	pv
 
 query I
-SELECT to_json(jsono(r, shredding := {'event_name':'VARCHAR','goals':'VARCHAR'}))::VARCHAR FROM spill_deg;
+SELECT to_json(jsono(r, shredding := '{"event_name": "VARCHAR", "goals": "VARCHAR"}'))::VARCHAR FROM spill_deg;
 ----
 {"event_name":"pv","goals":"buy"}
 
@@ -122,7 +122,7 @@ SELECT
 FROM v;
 
 query I
-SELECT typeof(r) = jsono_storage_type('event_name VARCHAR, goals VARCHAR') FROM spill_rt;
+SELECT typeof(r) = jsono_storage_type('{"event_name": "VARCHAR", "goals": "VARCHAR"}') FROM spill_rt;
 ----
 true
 

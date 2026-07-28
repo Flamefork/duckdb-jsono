@@ -14,7 +14,7 @@ CREATE TABLE hits AS
   SELECT (i % 200) AS g, i AS ts,
          jsono('{"f' || (i % 7) || '":' || i || ',"common":' || (i % 200) || '}') AS j,
          jsono('{"f' || (i % 7) || '":' || i || ',"common":' || (i % 200) || '}',
-               shredding := {'common':'BIGINT'}) AS js
+               shredding := '{"common": "BIGINT"}') AS js
   FROM range(20000) t(i);
 
 # Single-threaded reference for the ordered fold (plain and shredded).
@@ -46,7 +46,7 @@ WHERE cur.plain IS DISTINCT FROM ref.plain
 
 # The shredded fold also stays shredded (reads back from its shred column under threads).
 query I
-SELECT count(*) FILTER (WHERE typeof(m) <> jsono_storage_type('common BIGINT'))
+SELECT count(*) FILTER (WHERE typeof(m) <> jsono_storage_type('{"common": "BIGINT"}'))
 FROM ( SELECT jsono_group_merge(js ORDER BY ts) AS m FROM hits GROUP BY g );
 ----
 0

@@ -319,8 +319,8 @@ SELECT
 
 query I
 SELECT to_json(jsono_diff(
-  jsono('{"status":"new","amount":10}', shredding := {'status':'VARCHAR','amount':'BIGINT'}),
-  jsono('{"status":"paid","amount":10}', shredding := {'status':'VARCHAR','amount':'BIGINT'})
+  jsono('{"status":"new","amount":10}', shredding := '{"status": "VARCHAR", "amount": "BIGINT"}'),
+  jsono('{"status":"paid","amount":10}', shredding := '{"status": "VARCHAR", "amount": "BIGINT"}')
 ));
 ----
 {"status":"paid"}
@@ -329,8 +329,8 @@ SELECT to_json(jsono_diff(
 # reconstructed independently at bind).
 query II
 SELECT
-  to_json(jsono_diff(jsono('{"status":"new","amount":10}'), jsono('{"status":"paid","amount":10}', shredding := {'status':'VARCHAR','amount':'BIGINT'}))),
-  to_json(jsono_diff(jsono('{"status":"new","amount":10}', shredding := {'status':'VARCHAR','amount':'BIGINT'}), jsono('{"status":"paid","amount":10}')));
+  to_json(jsono_diff(jsono('{"status":"new","amount":10}'), jsono('{"status":"paid","amount":10}', shredding := '{"status": "VARCHAR", "amount": "BIGINT"}'))),
+  to_json(jsono_diff(jsono('{"status":"new","amount":10}', shredding := '{"status": "VARCHAR", "amount": "BIGINT"}'), jsono('{"status":"paid","amount":10}')));
 ----
 {"status":"paid"}	{"status":"paid"}
 

@@ -23,10 +23,6 @@ namespace jsono {
 // the shredded readers that still emit shred-only output); Value hands out a parsed view.
 enum class JsonoRowState : uint8_t { Null, Empty, Value };
 
-// Memoized shred-manifest verification (the check itself is VerifyShredManifestEntries).
-// Vectors are overwhelmingly manifest-homogeneous — the rows of one column chunk were shredded
-// with the same spec — so after the first row a verification is one byte-compare of the row's
-// manifest tail against the last verified tail.
 // The (logical path, type-string) pairs of a reading type's shreds. Building them decodes every lane
 // name out of its base32 form and renders every lane type — O(lanes) with an allocation per lane —
 // which must not repeat on each chunk: a wide shredded merge inits a reader per input per chunk, so
@@ -58,6 +54,10 @@ private:
 	bool built_ = false;
 };
 
+// Memoized shred-manifest verification (the check itself is VerifyShredManifestEntries).
+// Vectors are overwhelmingly manifest-homogeneous — the rows of one column chunk were shredded
+// with the same spec — so after the first row a verification is one byte-compare of the row's
+// manifest tail against the last verified tail.
 class ShredManifestVerifier {
 public:
 	// Signatures = the shreds the reading type carries, as (logical path, type-string) pairs. The

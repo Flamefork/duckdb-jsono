@@ -14,7 +14,7 @@ require parquet
 # touched — so the bodies below are current bytes and carry no meaning of their own.
 
 statement ok
-CREATE TABLE src AS SELECT jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}) AS v;
+CREATE TABLE src AS SELECT jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}') AS v;
 
 # Revision 0, shredded: unrevisioned field names, and the pre-plan-054 lane shape
 # (STRUCT(value, complete) pairs, no spill bitmap).
@@ -146,7 +146,7 @@ SELECT jsono_shred_stats(v) FROM rev0_shredded;
 jsono_shred_stats: JSONO value carries layout revision body=0 shreds=0
 
 statement error
-SELECT jsono(v, shredding := {'a':'BIGINT'}) FROM rev0_shredded;
+SELECT jsono(v, shredding := '{"a": "BIGINT"}') FROM rev0_shredded;
 ----
 jsono(value, shredding := ...): JSONO value carries layout revision body=0 shreds=0
 
@@ -220,7 +220,7 @@ SELECT jsono('{"a":1}') ->> 'a';
 1
 
 query I
-SELECT to_json(jsono('{"a":1,"b":"x"}', shredding := {'a':'BIGINT'}));
+SELECT to_json(jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}'));
 ----
 {"a":1,"b":"x"}
 
@@ -455,16 +455,16 @@ SELECT jsono_layout_diagnose(v) LIKE 'not jsono:%' FROM shreds_rev1_renamed;
 ----
 true
 
-# --- The trap this leaves open, pinned so it cannot be discovered twice ---
+# --- The rename trap is loud on JSON reads, silent on recovery paths ---
 #
 # A user who hits the refusal above and follows "rebuild the layout struct in SQL" by renaming
 # `shreds$<old>` to this revision's name gets a value that is no longer JSONO at all: the lane names
-# are still the closed revision's. The VARCHAR-cast refusal only fires for Foreign, so from here a
-# CSV dump of raw blobs is written with NO error. That silence is not fixable by recognition: the
-# type carries no evidence separating a renamed old value from any other hand-built struct with a
-# non-lane field, and that struct must stay silent (see the layout-grammar cases in jsono_shred.test,
-# jsono_spill_semantics.test and jsono_lane_name_codec.test, which pin exactly that). The upgrade path
-# is the old build, not a rename.
+# are still the closed revision's. RECOGNITION still classifies it silently (it runs over every
+# struct in every plan, and a type-only near-miss is what a legal DuckLake flush produces) — but a
+# name that does not decode inside a fully-anchored type is a shape no legal write narrows into, so
+# the optimizer refuses the JSON reads that would silently answer NULL for every path. Passthrough
+# (SELECT *, COPY) and the ::VARCHAR render stay open, so the data can still be moved and recovered.
+# The upgrade path is the old build, not a rename.
 statement ok
 CREATE TABLE renamed_revision AS
 SELECT struct_pack("jsono" := struct_pack(
@@ -473,12 +473,24 @@ SELECT struct_pack("jsono" := struct_pack(
         "$jsono$set"     := v.jsono."shreds$2"."$jsono$set",
         "$jsono$spill$0" := v.jsono."shreds$2"."$jsono$spill$0",
         "gclid"          := 'kept'))) AS j
-FROM (SELECT jsono('{"gclid":"kept","r":1}', shredding := {'gclid':'VARCHAR'}) AS v);
+FROM (SELECT jsono('{"gclid":"kept","r":1}', shredding := '{"gclid": "VARCHAR"}') AS v);
 
-# Silent: not JSONO, so no refusal stands in front of a render. jsono_layout_diagnose is the one
-# tool that says so, which is why it answers about types nothing else will touch.
-query II
-SELECT jsono_layout_diagnose(j) LIKE 'not jsono: field ''gclid'' is not a shred lane%', j ->> 'gclid'
+# jsono_layout_diagnose answers about types nothing else will touch.
+query I
+SELECT jsono_layout_diagnose(j) LIKE 'not jsono: field ''gclid'' is not a shred lane%'
 FROM renamed_revision;
 ----
-true	NULL
+true
+
+# A JSON read of the renamed value is refused with the grammar's own reason instead of answering
+# NULL for every path.
+statement error
+SELECT j ->> 'gclid' FROM renamed_revision;
+----
+field 'gclid' is not a shred lane
+
+# Passthrough and the raw ::VARCHAR render stay open: the bytes can be moved and recovered.
+query II
+SELECT count(*), (j::VARCHAR) IS NOT NULL FROM renamed_revision GROUP BY 2;
+----
+1	true

@@ -99,9 +99,10 @@ struct JsonoMergeBindData : public FunctionData {
 	// are sorted by physical name, and for a one-step path that name encodes the key alone, so the
 	// encoding's order preservation makes this subsequence key-sorted already.
 	vector<idx_t> top_level_shreds;
-	// The merged shred set's manifest entries, indexed by shred. The fast path re-emits every row's
-	// skips with them, so they are a bind fact, not a per-chunk one.
-	JsonoShredWriteModel write_model;
+	// The merged shred set compiled for writing: the fast path re-emits every row's skips from its
+	// model's manifest entries, and the reshred fallback shreds the folded plain value through it —
+	// a bind fact, not a per-chunk one.
+	ShredWriteSet write;
 	// Whether the fast path's SHAPE preconditions hold: no array shred, every path step an object
 	// key, and no shred path prefixing another. A function of the merged shred set alone — the one
 	// remaining precondition (the inputs must declare each lane with one type) is per-input and
@@ -225,7 +226,7 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 	for (auto &shred : shreds) {
 		manifest_shreds.emplace_back(shred.name, shred.type);
 	}
-	bind_data->write_model = JsonoBuildShredWriteModel(manifest_shreds);
+	bind_data->write = JsonoBuildShredWriteSet(manifest_shreds);
 	bound_function.return_type = JsonoShreddedStructType(lanes);
 	auto &result_shreds_type = JsonoShredsStructType(bound_function.return_type);
 	for (auto &shred : shreds) {
@@ -601,12 +602,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 		}
 		Vector fold_out(JsonoType(), fallback_count);
 		RunResidualFold(mode, inputs, ncols, fallback_count, fold_out, lstate);
-		vector<std::pair<string, LogicalType>> shred_specs;
-		shred_specs.reserve(bind_data.shreds.size());
-		for (auto &shred : bind_data.shreds) {
-			shred_specs.emplace_back(shred.name, shred.type);
-		}
-		JsonoShredFromLayout(fold_out, fallback_count, shred_specs, fallback_result);
+		JsonoShredFromLayout(fold_out, fallback_count, bind_data.write, fallback_result);
 	};
 
 	if (fast_viable) {
@@ -818,7 +814,7 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			auto skips_out = writer.data[BODY_SKIPS];
 			std::string skips_buf;
 			JsonoStrippedLanes stripped_lanes;
-			stripped_lanes.Init(bind_data.write_model);
+			stripped_lanes.Init(bind_data.write.model);
 			for (idx_t row = 0; row < count; row++) {
 				if (!result_validity.RowIsValid(row) || !fr_skips_validity.RowIsValid(row)) {
 					FlatVector::SetNull(r_skips, row, true);

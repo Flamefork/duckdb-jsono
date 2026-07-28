@@ -12,8 +12,8 @@ require json
 query I
 SELECT typeof(jsono_merge_patch(
   jsono('{"a":1}'),
-  jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'})
-)) = typeof(jsono('{}', shredding := {'event_name':'VARCHAR'}));
+  jsono('{"event_name":"page_view"}', shredding := '{"event_name": "VARCHAR"}')
+)) = typeof(jsono('{}', shredding := '{"event_name": "VARCHAR"}'));
 ----
 true
 
@@ -22,7 +22,7 @@ query II
 SELECT to_json(m), m ->> 'event_name' FROM (
   SELECT jsono_merge_patch(
     jsono('{"a":1}'),
-    jsono('{"event_name":"page_view"}', shredding := {'event_name':'VARCHAR'})
+    jsono('{"event_name":"page_view"}', shredding := '{"event_name": "VARCHAR"}')
   ) AS m
 );
 ----
@@ -77,7 +77,7 @@ SELECT to_json(jsono_merge_patch(jsono('{"event_name":"a","x":1}'),
 
 # The merged value still round-trips its shred via the typed accessor (result stays shredded).
 query II
-SELECT typeof(m) = typeof(jsono('{}', shredding := {'event_name':'VARCHAR'})), m ->> 'event_name' FROM (
+SELECT typeof(m) = typeof(jsono('{}', shredding := '{"event_name": "VARCHAR"}')), m ->> 'event_name' FROM (
   SELECT jsono_merge_patch(jsono('{"event_name":"search","x":1}'), jsono({'event_name': 'page_view'})) AS m
 );
 ----
@@ -92,12 +92,12 @@ SELECT to_json(jsono_merge_patch(jsono(NULL), jsono({'event_name': 'x'})));
 # Reconstructing a shredded value whose residual is a non-object scalar must emit it verbatim
 # (shreds are object-key paths, necessarily absent here) rather than overlaying onto a non-object.
 query I
-SELECT to_json(jsono('5', shredding := {'k':'VARCHAR'})::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+SELECT to_json(jsono('5', shredding := '{"k": "VARCHAR"}')::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 5
 
 query I
-SELECT to_json(jsono_merge_patch(jsono('5', shredding := {'k':'VARCHAR'}), jsono('{"a":1}')));
+SELECT to_json(jsono_merge_patch(jsono('5', shredding := '{"k": "VARCHAR"}'), jsono('{"a":1}')));
 ----
 {"a":1}
 
@@ -105,7 +105,7 @@ SELECT to_json(jsono_merge_patch(jsono('5', shredding := {'k':'VARCHAR'}), jsono
 
 # Disjoint shredded base + shredded patch: both stay shreds, result is shredded.
 query II
-SELECT to_json(m), typeof(m) = jsono_storage_type('a VARCHAR, b VARCHAR, c VARCHAR') FROM (
+SELECT to_json(m), typeof(m) = jsono_storage_type('{"a": "VARCHAR", "b": "VARCHAR", "c": "VARCHAR"}') FROM (
   SELECT jsono_merge_patch(jsono({'a': '1', 'b': '2'}), jsono({'c': '3'})) AS m
 );
 ----
@@ -118,14 +118,16 @@ SELECT to_json(jsono_merge_patch(jsono({'a': 'old', 'b': 'keep'}), jsono({'a': '
 ----
 {"a":"new","b":"keep"}
 
-# JSONPath shred names must stay JSONPath names when merge_patch falls back to reconstruct+reshred;
-# otherwise the reshred populates a literal "$.a" key shred and transparent reads of $.a return NULL.
+# A lane's path must survive merge_patch's reconstruct+reshred fallback: the reshred decodes the
+# target type's lane names rather than re-parsing them as spec text. An encoded name fed back
+# through the spec DSL would be read as a fresh path spelling (naming some other path entirely),
+# mint a different lane, and transparent reads of $.a would return NULL.
 query III
 SELECT (jsono_storage_size(m)).shreds, m ->> '$.a', to_json(m)
 FROM (
   SELECT jsono_merge_patch(
-    jsono('{"a":"old","b":1}', shredding := {'$.a':'VARCHAR'}),
-    jsono('{"a":"new"}', shredding := {'$.a':'VARCHAR'})
+    jsono('{"a":"old","b":1}', shredding := '{"$.a": "VARCHAR"}'),
+    jsono('{"a":"new"}', shredding := '{"$.a": "VARCHAR"}')
   ) AS m
 );
 ----
@@ -162,7 +164,7 @@ SELECT to_json(jsono_merge_patch(jsono({'name': 'x', 'meta': {'src': 'web'}}), j
 # Disjoint plain patch (an object-valued key, kept plain): the base lanes copy through, the
 # plain key folds into the residual.
 query II
-SELECT to_json(m), typeof(m) = jsono_storage_type('event_name VARCHAR, goals VARCHAR, url VARCHAR')
+SELECT to_json(m), typeof(m) = jsono_storage_type('{"event_name": "VARCHAR", "goals": "VARCHAR", "url": "VARCHAR"}')
 FROM (
   SELECT jsono_merge_patch(
     jsono({'event_name': 'pv', 'url': 'u'}),
@@ -222,7 +224,7 @@ FROM (
   SELECT g, jsono_merge_patch(j, jsono('{"params":{"n":' || g || '}}')) AS m
   FROM (
     SELECT i AS g, jsono('{"event_name":"e' || i || '","seq":"' || i || '"}',
-                         shredding := {'event_name':'VARCHAR','seq':'VARCHAR'}) AS j
+                         shredding := '{"event_name": "VARCHAR", "seq": "VARCHAR"}') AS j
     FROM range(2050) t(i)
   )
 ) WHERE g IN (0, 1024, 2049)
@@ -240,7 +242,7 @@ FROM (
   SELECT g, jsono_merge_patch(j, jsono('{"event_name":null}')) AS m
   FROM (
     SELECT i AS g, jsono('{"event_name":"e' || i || '","seq":"' || i || '"}',
-                         shredding := {'event_name':'VARCHAR','seq':'VARCHAR'}) AS j
+                         shredding := '{"event_name": "VARCHAR", "seq": "VARCHAR"}') AS j
     FROM range(2050) t(i)
   )
 ) WHERE g IN (0, 1024, 2049)
@@ -259,7 +261,7 @@ FROM (
   FROM (
     SELECT i AS g,
            jsono('{"event_name":"e' || i || '","seq":"' || i || '"}',
-                 shredding := {'event_name':'VARCHAR','seq':'VARCHAR'}) AS j,
+                 shredding := '{"event_name": "VARCHAR", "seq": "VARCHAR"}') AS j,
            CASE WHEN i = 5 THEN jsono('{"event_name":null}') ELSE jsono('{"kept":1}') END AS patch
     FROM range(2050) t(i)
   )
@@ -279,7 +281,7 @@ ORDER BY g;
 # The nested $.params.* lanes copy through; the result stays shredded over the union shred set.
 query II
 SELECT to_json(m), typeof(m) = jsono_storage_type(
-  'event_name VARCHAR, goals VARCHAR, url VARCHAR, "$.params.a" VARCHAR, "$.params.b" VARCHAR'
+  '{"event_name": "VARCHAR", "goals": "VARCHAR", "url": "VARCHAR", "$.params.a": "VARCHAR", "$.params.b": "VARCHAR"}'
 )
 FROM (
   SELECT jsono_merge_patch(
@@ -360,7 +362,7 @@ SELECT to_json(jsono_merge_patch(jsono('{"a":null}'), jsono('{"a":{"a":false}}')
 
 query I
 SELECT to_json(jsono_merge_patch(
-  jsono('{"a":null}', shredding := {'a':'VARCHAR'}),
+  jsono('{"a":null}', shredding := '{"a": "VARCHAR"}'),
   jsono({'a': {'a': false}}),
   jsono({'a': false})
 ));
@@ -370,10 +372,10 @@ SELECT to_json(jsono_merge_patch(
 # The merge keeps the value shredded over both overlapping lanes (it is not reduced to plain).
 query I
 SELECT typeof(jsono_merge_patch(
-  jsono('{"a":null}', shredding := {'a':'VARCHAR'}),
+  jsono('{"a":null}', shredding := '{"a": "VARCHAR"}'),
   jsono({'a': {'a': false}}),
   jsono({'a': false})
-)) = jsono_storage_type('a BOOLEAN, "$.a.a" BOOLEAN');
+)) = jsono_storage_type('{"a": "BOOLEAN", "$.a.a": "BOOLEAN"}');
 ----
 true
 
@@ -381,7 +383,7 @@ true
 # equals plain.
 query I
 SELECT to_json(jsono_merge_patch(
-  jsono('{"a":false}', shredding := {'a':'BOOLEAN'}),
+  jsono('{"a":false}', shredding := '{"a": "BOOLEAN"}'),
   jsono({'a': {'a': true}})
 )) = to_json(jsono_merge_patch(jsono('{"a":false}'), jsono('{"a":{"a":true}}')));
 ----
@@ -396,8 +398,8 @@ true
 # The last input (the patch) declared shred k but its lane is NULL on this row.
 query I
 SELECT to_json(jsono_merge_patch(
-  jsono('{"k":"old"}', shredding := {k:'VARCHAR'}),
-  jsono('{}', shredding := {k:'VARCHAR'})
+  jsono('{"k":"old"}', shredding := '{"k": "VARCHAR"}'),
+  jsono('{}', shredding := '{"k": "VARCHAR"}')
 ));
 ----
 {"k":"old"}
@@ -405,8 +407,8 @@ SELECT to_json(jsono_merge_patch(
 # Patch: the patch carries a different key; the base's shred key is absent from the patch document.
 query I
 SELECT to_json(jsono_merge_patch(
-  jsono('{"k":"old","x":1}', shredding := {k:'VARCHAR'}),
-  jsono('{"x":2}', shredding := {k:'VARCHAR'})
+  jsono('{"k":"old","x":1}', shredding := '{"k": "VARCHAR"}'),
+  jsono('{"x":2}', shredding := '{"k": "VARCHAR"}')
 ));
 ----
 {"k":"old","x":2}
@@ -415,8 +417,8 @@ SELECT to_json(jsono_merge_patch(
 # The first input (the base) declared shred k but its lane is NULL on this row.
 query I
 SELECT to_json(jsono_overlay(
-  jsono('{"x":1}', shredding := {k:'VARCHAR'}),
-  jsono('{"k":"new"}', shredding := {k:'VARCHAR'})
+  jsono('{"x":1}', shredding := '{"k": "VARCHAR"}'),
+  jsono('{"k":"new"}', shredding := '{"k": "VARCHAR"}')
 ));
 ----
 {"k":"new","x":1}
@@ -424,8 +426,8 @@ SELECT to_json(jsono_overlay(
 # Overlay: the base owns the key, the patch omits it — base-authoritative, base lane preserved.
 query I
 SELECT to_json(jsono_overlay(
-  jsono('{"k":"base","x":1}', shredding := {k:'VARCHAR'}),
-  jsono('{"x":9}', shredding := {k:'VARCHAR'})
+  jsono('{"k":"base","x":1}', shredding := '{"k": "VARCHAR"}'),
+  jsono('{"x":9}', shredding := '{"k": "VARCHAR"}')
 ));
 ----
 {"k":"base","x":1}
@@ -436,8 +438,8 @@ SELECT to_json(jsono_overlay(
 # divert to the reshred fallback for the delete to win over the surviving base lane.
 query I
 SELECT to_json(jsono_merge_patch(
-  jsono('{"k":"old","x":1}', shredding := {k:'VARCHAR'}),
-  jsono('{"k":null}', shredding := {k:'VARCHAR'})
+  jsono('{"k":"old","x":1}', shredding := '{"k": "VARCHAR"}'),
+  jsono('{"k":null}', shredding := '{"k": "VARCHAR"}')
 ));
 ----
 {"x":1}
@@ -445,8 +447,8 @@ SELECT to_json(jsono_merge_patch(
 # Present-null delete on a typed (BIGINT) shred, same divert.
 query I
 SELECT to_json(jsono_merge_patch(
-  jsono('{"n":5,"x":1}', shredding := {n:'BIGINT'}),
-  jsono('{"n":null}', shredding := {n:'BIGINT'})
+  jsono('{"n":5,"x":1}', shredding := '{"n": "BIGINT"}'),
+  jsono('{"n":null}', shredding := '{"n": "BIGINT"}')
 ));
 ----
 {"x":1}
@@ -454,9 +456,9 @@ SELECT to_json(jsono_merge_patch(
 # Three inputs, present-null in the middle deletes; the last omits the key so the delete stands.
 query I
 SELECT to_json(jsono_merge_patch(
-  jsono('{"k":"old"}', shredding := {k:'VARCHAR'}),
-  jsono('{"k":null}', shredding := {k:'VARCHAR'}),
-  jsono('{"z":"1"}', shredding := {k:'VARCHAR'})
+  jsono('{"k":"old"}', shredding := '{"k": "VARCHAR"}'),
+  jsono('{"k":null}', shredding := '{"k": "VARCHAR"}'),
+  jsono('{"z":"1"}', shredding := '{"k": "VARCHAR"}')
 ));
 ----
 {"z":"1"}
@@ -466,9 +468,9 @@ SELECT to_json(jsono_merge_patch(
 query II
 SELECT g, to_json(m) FROM (
   SELECT g, jsono_merge_patch(
-    jsono('{"k":"base' || g || '"}', shredding := {k:'VARCHAR'}),
-    CASE WHEN g % 2 = 0 THEN jsono('{"k":"patch' || g || '"}', shredding := {k:'VARCHAR'})
-         ELSE jsono('{}', shredding := {k:'VARCHAR'}) END
+    jsono('{"k":"base' || g || '"}', shredding := '{"k": "VARCHAR"}'),
+    CASE WHEN g % 2 = 0 THEN jsono('{"k":"patch' || g || '"}', shredding := '{"k": "VARCHAR"}')
+         ELSE jsono('{}', shredding := '{"k": "VARCHAR"}') END
   ) AS m
   FROM range(4) t(g)
 ) ORDER BY g;
@@ -482,8 +484,8 @@ SELECT g, to_json(m) FROM (
 query II
 SELECT g, to_json(m) FROM (
   SELECT g, jsono_merge_patch(
-    jsono('{"k":"b' || g || '"}', shredding := {k:'VARCHAR'}),
-    CASE WHEN g = 1 THEN NULL ELSE jsono('{"k":"p' || g || '"}', shredding := {k:'VARCHAR'}) END
+    jsono('{"k":"b' || g || '"}', shredding := '{"k": "VARCHAR"}'),
+    CASE WHEN g = 1 THEN NULL ELSE jsono('{"k":"p' || g || '"}', shredding := '{"k": "VARCHAR"}') END
   ) AS m
   FROM range(3) t(g)
 ) ORDER BY g;
@@ -500,8 +502,8 @@ SELECT g, to_json(m) FROM (
 query III
 SELECT count(*), count(m), count(*) FILTER (WHERE (m ->> 'k') = 'p' || i) FROM (
   SELECT i, jsono_merge_patch(
-    jsono(CASE WHEN i % 4 = 0 THEN NULL ELSE '{"k":"b' || i || '"}' END, shredding := {k:'VARCHAR'}),
-    jsono(CASE WHEN i % 4 = 0 THEN NULL ELSE '{"k":"p' || i || '"}' END, shredding := {k:'VARCHAR'})
+    jsono(CASE WHEN i % 4 = 0 THEN NULL ELSE '{"k":"b' || i || '"}' END, shredding := '{"k": "VARCHAR"}'),
+    jsono(CASE WHEN i % 4 = 0 THEN NULL ELSE '{"k":"p' || i || '"}' END, shredding := '{"k": "VARCHAR"}')
   ) AS m
   FROM range(2000) t(i)
 );
@@ -513,7 +515,7 @@ SELECT count(*), count(m), count(*) FILTER (WHERE (m ->> 'k') = 'p' || i) FROM (
 query II
 SELECT g, to_json(m) FROM (
   SELECT g, jsono_merge_patch(
-    jsono('{"k":"b' || g || '"}', shredding := {k:'VARCHAR'}),
+    jsono('{"k":"b' || g || '"}', shredding := '{"k": "VARCHAR"}'),
     CASE WHEN g = 1 THEN jsono('5') ELSE jsono('{}') END
   ) AS m
   FROM range(3) t(g)
@@ -528,8 +530,8 @@ SELECT g, to_json(m) FROM (
 query I
 SELECT count(*) FROM (
   SELECT
-    to_json(jsono_merge_patch(jsono(a_txt, shredding := {k:'VARCHAR', n:'BIGINT'}),
-                              jsono(b_txt, shredding := {k:'VARCHAR', n:'BIGINT'}))) AS shredded,
+    to_json(jsono_merge_patch(jsono(a_txt, shredding := '{"k": "VARCHAR", "n": "BIGINT"}'),
+                              jsono(b_txt, shredding := '{"k": "VARCHAR", "n": "BIGINT"}'))) AS shredded,
     to_json(jsono_merge_patch(jsono(a_txt), jsono(b_txt))) AS plain
   FROM (VALUES
     ('{"k":"old"}', '{}'),
@@ -554,8 +556,8 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT
-    to_json(jsono_overlay(jsono(a_txt, shredding := {k:'VARCHAR'}),
-                          jsono(b_txt, shredding := {k:'VARCHAR'}))) AS shredded,
+    to_json(jsono_overlay(jsono(a_txt, shredding := '{"k": "VARCHAR"}'),
+                          jsono(b_txt, shredding := '{"k": "VARCHAR"}'))) AS shredded,
     to_json(jsono_overlay(jsono(a_txt), jsono(b_txt))) AS plain
   FROM (VALUES
     ('{"x":1}', '{"k":"new"}'),
@@ -576,8 +578,8 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT
-    to_json(jsono_merge_patch(jsono(a_txt, shredding := {k:'VARCHAR'}),
-                              jsono(b_txt, shredding := {k:'BIGINT'}))) AS shredded,
+    to_json(jsono_merge_patch(jsono(a_txt, shredding := '{"k": "VARCHAR"}'),
+                              jsono(b_txt, shredding := '{"k": "BIGINT"}'))) AS shredded,
     to_json(jsono_merge_patch(jsono(a_txt), jsono(b_txt))) AS plain
   FROM (VALUES
     ('{"k":"old"}', '{"k":42}'),

@@ -22,7 +22,7 @@ SELECT jsono(
     ELSE '{"URL":{"scheme":"' || (CASE WHEN i % 3 = 0 THEN 'goal' ELSE 'https' END) || '"}, "n": ' ||
          (CASE WHEN i % 500 = 8 THEN '"oops"' ELSE i::VARCHAR END) || '}'
   END,
-  shredding := {'$.URL.scheme':'VARCHAR','n':'BIGINT'}) AS j
+  shredding := '{"$.URL.scheme": "VARCHAR", "n": "BIGINT"}') AS j
 FROM range(2000) tt(i);
 
 statement ok
@@ -69,7 +69,7 @@ WHERE (j->>'$.URL.scheme') IS DISTINCT FROM (jsono(to_json(j)::VARCHAR)->>'$.URL
 # the residual fallback. This was once a silent wrong-NULL: a NULL lane trusted as complete read NULL.
 statement ok
 CREATE TABLE varchar_container AS
-SELECT i, jsono(json, shredding := {'$.a':'VARCHAR'}) AS j
+SELECT i, jsono(json, shredding := '{"$.a": "VARCHAR"}') AS j
 FROM (VALUES
   (0, '{"a":"str"}'),
   (1, '{"a":{"z":1,"m":2}}'),
@@ -119,7 +119,7 @@ SELECT i, to_json(j)::VARCHAR FROM read_parquet('__TEST_DIR__/varchar_container.
 # keeps the COALESCE fallback and serializes correctly from the residual.
 statement ok
 CREATE TABLE typed_container AS
-SELECT i, jsono(json, shredding := {'$.a':'BIGINT'}) AS j
+SELECT i, jsono(json, shredding := '{"$.a": "BIGINT"}') AS j
 FROM (VALUES (0, '{"a":7}'), (1, '{"a":{"k":1}}'), (2, '{"a":"x"}')) v(i, json);
 
 query II
@@ -134,7 +134,7 @@ SELECT i, j->>'$.a' FROM typed_container ORDER BY i;
 # reconstructs (overlaying the nested shred) and returns the complete container.
 statement ok
 CREATE TABLE unsafe_container AS
-SELECT jsono('{"a":{"b":"x","c":"y"}}', shredding := {'$.a':'VARCHAR','$.a.b':'VARCHAR'}) AS j;
+SELECT jsono('{"a":{"b":"x","c":"y"}}', shredding := '{"$.a": "VARCHAR", "$.a.b": "VARCHAR"}') AS j;
 
 query I
 SELECT j->>'$.a' FROM unsafe_container;
@@ -151,12 +151,12 @@ x
 # read type's, so the optimizer keeps the residual COALESCE — B's rows read from the residual, not a
 # silent bare NULL.
 statement ok
-COPY (SELECT jsono(json, shredding := {'$.URL.scheme':'VARCHAR','n':'BIGINT'}) AS j
+COPY (SELECT jsono(json, shredding := '{"$.URL.scheme": "VARCHAR", "n": "BIGINT"}') AS j
       FROM (VALUES ('{"URL":{"scheme":"goal"},"n":1}'),('{"URL":{"scheme":"https"},"n":2}')) v(json))
   TO '__TEST_DIR__/union_a.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT jsono(json, shredding := {'other':'VARCHAR'}) AS j
+COPY (SELECT jsono(json, shredding := '{"other": "VARCHAR"}') AS j
       FROM (VALUES ('{"URL":{"scheme":"autogoal"},"other":"z"}'),('{"URL":{"scheme":"direct"}}')) v(json))
   TO '__TEST_DIR__/union_b.parquet' (FORMAT parquet);
 
