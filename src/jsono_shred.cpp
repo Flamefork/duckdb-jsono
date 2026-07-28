@@ -411,13 +411,7 @@ void BindShredField(const string &path, const LogicalType &type, const string &t
 // Resolve one spec entry's type string into a shred field: a scalar leaf shred, or a
 // LIST<STRUCT<...>> array shred lifting the element subfields of the array at `path`.
 void BindShredFieldType(const string &type_name, ClientContext &context, const string &path, ShredField &field) {
-	LogicalType type;
-	try {
-		type = TransformStringToLogicalType(type_name, context);
-	} catch (const std::exception &) {
-		throw BinderException("jsono shred: unsupported shred type '%s'", type_name);
-	}
-	BindShredField(path, type, type_name, field);
+	BindShredField(path, JsonoParseShredSpecType(type_name, context, "jsono shred"), type_name, field);
 }
 
 // Everything a shred bind derives once its lanes are settled, whichever end declared them: the
@@ -1815,6 +1809,29 @@ void ShredWriteSet::Build() {
 			}
 		}
 		array_specs.push_back(std::move(spec));
+	}
+}
+
+LogicalType JsonoParseShredSpecType(const string &type_name, ClientContext &context, const char *fn_name) {
+	// Routed by the carried ExceptionType, not the static C++ type: a catalog miss reaches here as a
+	// bare `Exception` tagged CATALOG (Catalog::LookupEntry funnels it through ErrorData::Throw), so
+	// per-class catch clauses would let it escape without the caller's context. The three expected
+	// tags are the parser's user-facing failures — unparseable type text (INVALID_INPUT), an unknown
+	// type name (CATALOG), a semantic refusal such as a duplicate STRUCT field name (BINDER); each
+	// rewraps with the caller's context and the parser's own reason. Anything else — an internal
+	// error above all — propagates untouched.
+	try {
+		return TransformStringToLogicalType(type_name, context);
+	} catch (const Exception &error) {
+		ErrorData data(error);
+		switch (data.Type()) {
+		case ExceptionType::INVALID_INPUT:
+		case ExceptionType::CATALOG:
+		case ExceptionType::BINDER:
+			throw BinderException("%s: cannot parse shred type '%s': %s", fn_name, type_name, data.RawMessage());
+		default:
+			throw;
+		}
 	}
 }
 

@@ -206,6 +206,27 @@ SELECT jsono('{"a":1}', {'$.a':'BIGINT'});
 ----
 unknown argument
 
+# A type string DuckDB's own parser refuses carries the parser's reason, not a bare "unsupported":
+# here the reason is the actual defect — SQL type text folds STRUCT field names case-insensitively,
+# so an element struct with case-colliding subfields cannot ride through the spec at all (the
+# paste-back limit README documents under jsono_layout_lanes). jsono_suggest_shredding emits exactly
+# this spec over documents whose element keys collide, so the refusal must point at the collision.
+statement error
+SELECT jsono('{"products":[{"id":1,"ID":"x"}]}', shredding := '{"$.products": "STRUCT(ID VARCHAR, id BIGINT)[]"}');
+----
+Duplicate STRUCT type argument name
+
+# An unknown type name and unparseable type text propagate their reasons the same way.
+statement error
+SELECT jsono('{"a":1}', shredding := '{"a": "BIGIN"}');
+----
+Type with name BIGIN does not exist
+
+statement error
+SELECT jsono('{"a":1}', shredding := '{"a": "STRUCT(("}');
+----
+can not be converted to a DuckDB Type
+
 # A shred path must be a non-empty object-key chain. An array-index step, a nested index, and the
 # root '$' are rejected at bind: otherwise the value would be lifted into a lane while ALSO staying
 # in the residual (a read-copy), and every reconstruct-based reader would throw on the non-key lane.

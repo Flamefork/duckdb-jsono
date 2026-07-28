@@ -155,6 +155,14 @@ SELECT jsono_storage_type('{"a": "JSON"}');
 ----
 unsupported shred type
 
+# A type string DuckDB's own parser refuses carries the parser's reason (the same helper the
+# constructor's spec parse goes through): the case-colliding element struct names the fold that
+# refuses it instead of a bare "unsupported".
+statement error
+SELECT jsono_storage_type('{"$.products": "STRUCT(ID VARCHAR, id BIGINT)[]"}');
+----
+Duplicate STRUCT type argument name
+
 # `body` and `$.body` are two spellings of ONE path, so they now name one lane: the DDL helper and the
 # constructor agree whichever spelling either is given.
 query I

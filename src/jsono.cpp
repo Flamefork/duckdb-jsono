@@ -168,12 +168,7 @@ void JsonoStorageTypeWithShredsExecute(DataChunk &args, ExpressionState &state, 
 		vector<string> lane_names;
 		vector<string> spec_names;
 		for (auto &entry : entries) {
-			LogicalType type;
-			try {
-				type = TransformStringToLogicalType(entry.second, context);
-			} catch (const std::exception &) {
-				throw BinderException("jsono_storage_type: unsupported shred type '%s'", entry.second);
-			}
+			auto type = JsonoParseShredSpecType(entry.second, context, "jsono_storage_type");
 			auto lane = JsonoParseShredSpecField(entry.first, type);
 			auto lane_name = JsonoEncodeLaneName(lane.path);
 			for (idx_t i = 0; i < lane_names.size(); i++) {

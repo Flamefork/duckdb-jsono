@@ -14,6 +14,7 @@
 
 namespace duckdb {
 
+class ClientContext;
 class ScalarFunction;
 
 // How deep auto-shred (the struct constructor) and jsono_suggest_shredding descend when lifting
@@ -97,6 +98,13 @@ JsonoLaneSpec JsonoParseShredSpecField(const string &path, const LogicalType &ty
 // Parses one spec into its (path, type-string) entries, spec-text errors prefixed with `fn_name`;
 // every consumer of the spec language goes through here, so the surfaces cannot drift apart.
 vector<std::pair<string, string>> JsonoShredSpecEntries(const Value &spec, const char *fn_name);
+
+// Parse one spec entry's type string as SQL type text, rewrapping a parse failure with the caller's
+// context WITHOUT erasing the parser's own reason: "Duplicate STRUCT type argument name" points at
+// the actual defect (SQL type text folds STRUCT field names case-insensitively — the paste-back
+// limit README documents under jsono_layout_lanes), where a bare "unsupported" pointed away from
+// it. A type that parses but is no shred type is the caller's refusal, not this one.
+LogicalType JsonoParseShredSpecType(const string &type_name, ClientContext &context, const char *fn_name);
 
 // One array shred for the residual-skeleton emit: the object-key chain to the array, plus the
 // lifted-element primitive description. An object array (kind == Array) lifts element subfields into
