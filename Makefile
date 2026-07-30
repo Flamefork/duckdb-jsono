@@ -11,6 +11,15 @@ GEN ?= ninja
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
+# The ci-tools wasm recipes configure with $(GENERATOR) but always build with `emmake make`, so a
+# Ninja generator leaves them with build files no `make` can run ("No targets specified and no
+# makefile found"). That is why the distribution workflow sets GEN=ninja for the linux/macos/windows
+# jobs and leaves it unset for wasm — and why the GEN ?= ninja default above leaks Ninja into the one
+# job that must not have it. GENERATOR is computed from GEN when this file is parsed, so overriding
+# GEN per target would come too late; override GENERATOR itself, for the wasm targets and the wasm
+# configuration step they depend on.
+wasm_mvp wasm_eh wasm_threads extension_configuration_wasm: GENERATOR=
+
 # extension-ci-tools ships the `relassert` build (RelWithDebInfo + FORCE_ASSERT=1) but no runner for
 # its unittest binary; mirror test_release_internal against that build directory, behind the same
 # SKIP_TESTS switch ci-tools puts in front of its own test targets.
