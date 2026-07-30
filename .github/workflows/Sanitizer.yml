@@ -89,6 +89,63 @@ jobs:
           JSONO_EXTENSION: build/debug/extension/jsono/jsono.duckdb_extension
         run: uv run --frozen test/pruning/jsono_pruning.py
 
+  # ThreadSanitizer leg. Races are the one class none of the other jobs can see: ASan, UBSan and the
+  # fuzz harness all run correct-but-single-threaded reasoning over a parallel engine. The parallel
+  # aggregate paths (group_merge, collect, the advisor) fold per-thread state, so a race there would
+  # surface as a wrong answer or a crash on some other machine's scheduler — which is exactly the
+  # class that stays invisible on the developer's.
+  #
+  # Weekly only (and on demand): TSan is far slower than the ASan leg, and the answer changes when
+  # the parallel paths change, not on every push. It belongs here rather than in the weekly
+  # NextDuckDB canary because it must run against the DuckDB version we ship — a race report against
+  # unreleased DuckDB main would conflate two variables and not be actionable.
+  #
+  # Note the suite only survives here because JSONO_MAX_NESTING_DEPTH has a TSan row: TSan frames are
+  # fatter than ASan's, and with the uninstrumented bound the depth test overflows the stack (SIGILL,
+  # no diagnostic) before a single race can be reported.
+  thread-sanitizer:
+    name: TSan (linux_amd64)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GEN: ninja
+      CC: clang
+      CXX: clang++
+      # ci-tools turns this into -DENABLE_THREAD_SANITIZER=1; DuckDB's CMake then drops ASan itself,
+      # since the two instrumentations cannot coexist.
+      THREADSAN: 1
+      # Report every race in one run instead of aborting on the first; TSan still exits non-zero.
+      TSAN_OPTIONS: halt_on_error=0
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build clang
+
+      # Distinct key: TSan instrumentation is part of the compile flags, so these objects can never
+      # be shared with the ASan leg's cache.
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+        with:
+          key: sanitizer-tsan
+          max-size: 1G
+
+      - name: Build (Debug = TSan)
+        env:
+          EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        run: make debug
+
+      # The SQLLogic suite only — the property/fuzz harness stays on the ASan leg. Under TSan it
+      # would cost hours for a class of bug (corrupt-blob handling) that has nothing to do with
+      # threading.
+      - name: SQLLogic tests under TSan
+        run: make test_debug
+
   # Release-build fuzz leg. The property/fuzz harness is env-pointable at any build, so this runs the
   # same corrupt-blob sweep against an -O2 optimizer-enabled build: release codegen inlines and
   # reorders the reader's bound checks differently than the sanitizer Debug build, and if that single
