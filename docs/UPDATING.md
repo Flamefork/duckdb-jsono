@@ -13,7 +13,30 @@ each place that participates in local builds or CI:
   - reusable workflow refs for `duckdb-stable-build` and `code-quality-check`.
   - `duckdb_version` and `ci_tools_version` inputs in both jobs.
 
+`.github/workflows/NextDuckDB.yml` needs no bump: it tracks DuckDB `main` on
+purpose, and a red run there is the signal that the next release will need the
+work below.
+
 Update `duckdb/` only via explicit `git submodule` commands.
+
+## What a published extension adds
+
+The extension is distributed through
+[DuckDB Community Extensions](https://duckdb.org/community_extensions/), where
+the descriptor `extensions/jsono/description.yml` pins one source ref and the
+community CI builds it against the current stable DuckDB.
+
+- If the extension compiles against the upcoming DuckDB, **no action is needed**
+  for the release itself: every community extension is rebuilt as part of a
+  DuckDB release.
+- After a DuckDB bump lands here, open a pull request against
+  `duckdb/community-extensions` that moves `repo.ref` to the new commit or tag.
+- If the upcoming DuckDB needs source changes, they must be ready *before* the
+  release: DuckDB starts a ~2-week feature freeze with a `vX.Y-<codename>`
+  branch, and the extension needs a branch of the same name carrying the fixes,
+  pointed at by `repo.ref_next` in the descriptor. Miss that window and the
+  extension is absent on release day, and stays out of the automatic rebuild
+  until it compiles again.
 
 ## When the build breaks after a bump
 

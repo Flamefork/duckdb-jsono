@@ -54,8 +54,9 @@ Copyright 2009 The RE2 Authors.
 ### yyjson
 
 - Upstream: https://github.com/ibireme/yyjson
-- Source in DuckDB: `duckdb/third_party/yyjson` (not vendored here; the extension
-  links yyjson symbols exported by DuckDB)
+- Source in DuckDB: `duckdb/third_party/yyjson` (not vendored here; the loadable
+  extension statically links the objects built from that copy, as core `json`
+  does, so release binaries carry yyjson code)
 - License: MIT
 - License file: `duckdb/third_party/yyjson/LICENSE`
 
