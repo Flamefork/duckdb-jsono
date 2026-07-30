@@ -200,22 +200,8 @@ inline void EmitValueStrip(const jsono::JsonoView &view, jsono::JsonoCursor &cur
 	EmitScalarVerbatim(view, cursor, builder);
 }
 
-JSONO_ALWAYS_INLINE int CompareJsonoKeys(nonstd::string_view a, nonstd::string_view b) {
-	auto n = std::min(a.size(), b.size());
-	if (n > 0) {
-		auto c = std::memcmp(a.data(), b.data(), n);
-		if (c != 0) {
-			return c;
-		}
-	}
-	if (a.size() < b.size()) {
-		return -1;
-	}
-	if (a.size() > b.size()) {
-		return 1;
-	}
-	return 0;
-}
+// The key order lives in jsono.hpp; this makes it unqualified for the merge walkers below.
+using jsono::CompareJsonoKeys;
 
 // Captures every child and returns the cursor just past the last child, so the merge
 // value phase can read child r's per-stream span as the gap between consecutive

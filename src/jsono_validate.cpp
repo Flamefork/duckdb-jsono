@@ -29,23 +29,6 @@ namespace {
 
 using namespace jsono;
 
-int CompareJsonoKeys(nonstd::string_view a, nonstd::string_view b) {
-	auto n = std::min(a.size(), b.size());
-	if (n > 0) {
-		auto c = std::memcmp(a.data(), b.data(), n);
-		if (c != 0) {
-			return c;
-		}
-	}
-	if (a.size() < b.size()) {
-		return -1;
-	}
-	if (a.size() > b.size()) {
-		return 1;
-	}
-	return 0;
-}
-
 static constexpr uint32_t JSONO_ARRAY_CONTAINER = std::numeric_limits<uint32_t>::max();
 
 bool IsValidJsonNumberText(nonstd::string_view text) {

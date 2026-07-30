@@ -1,0 +1,46 @@
+# name: test/sql/jsono_key_order.test
+# description: object keys are ordered by UNSIGNED byte, identically on every platform and by both writers
+# group: [sql]
+
+require jsono
+
+require json
+
+# A key whose first byte is >= 0x80 is what separates an unsigned comparison from a signed one, and
+# nothing else in the suite has one: every other object here is ASCII, where both orders agree. That
+# gap let a Windows build sort "ключ" (0xD0 -> -48 signed) ahead of "s" (0x73) and store a different
+# key order in the blob — passing every test on Linux and macOS. See CompareJsonoKeys in jsono.hpp.
+
+# The rendered order.
+query I
+SELECT to_json(jsono('{"s":"héllo","ключ":"😀"}'));
+----
+{"s":"héllo","ключ":"😀"}
+
+# The WRITER's stored order, read before any render can reorder it: the key heap holds the keys back
+# to back in the order they were written. This is the assertion that fails on a signed comparison —
+# the rendered one merely inherits it.
+query I
+SELECT hex((jsono('{"s":"héllo","ключ":"😀"}')).jsono."body$2".key_heap);
+----
+73D0BAD0BBD18ED187
+
+# The whole permutation, not just a pair: every ASCII key sorts before the UTF-8 one.
+query I
+SELECT to_json(jsono('{"a":1,"s":2,"ключ":3,"z":4}'));
+----
+{"a":1,"s":2,"z":4,"ключ":3}
+
+# The other writer — the STRUCT constructor reaches its own sort, so it needs its own pin.
+query I
+SELECT to_json(jsono({'s': 'h', 'ключ': 'k'}));
+----
+{"s":"h","ключ":"k"}
+
+# Reads resolve by key regardless of how the order came out, so a wrong order is silent here: this
+# pins that they keep working, not that they would have caught the bug.
+query II
+SELECT jsono('{"s":"héllo","ключ":"😀"}') ->> '$.s',
+       jsono('{"s":"héllo","ключ":"😀"}') ->> '$.ключ';
+----
+héllo	😀

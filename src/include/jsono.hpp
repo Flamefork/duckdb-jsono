@@ -641,6 +641,32 @@ static_assert(HashMix64Portable(0xAC0AE4E2F729B4C8ULL, 0xC76ABF436FA84DCAULL) ==
               "portable HashMix64 must fold the full 128-bit product");
 #endif
 
+// THE key order: unsigned byte comparison, then length. Every path that sorts, dedups, binary-searches
+// or validates object keys must go through this one function.
+//
+// It is spelled with an explicit memcmp rather than `nonstd::string_view::compare` because that is not
+// the same order on every compiler. Under C++11 string-view-lite compares through its own
+// `detail::compare`, which is a per-character `*s1 < *s2` over `char` — signed on the usual targets —
+// and only a `__builtin_memcmp` overload, gated on the compiler having that builtin, rescues it. Clang
+// and GCC take the rescue; MSVC does not, and sorted `"ключ"` (0xD0 → -48) ahead of `"s"` (0x73), so a
+// Windows writer stored a different key order, in the blob bytes, than every other platform.
+JSONO_ALWAYS_INLINE int CompareJsonoKeys(nonstd::string_view a, nonstd::string_view b) {
+	auto n = std::min(a.size(), b.size());
+	if (n > 0) {
+		auto c = std::memcmp(a.data(), b.data(), n);
+		if (c != 0) {
+			return c;
+		}
+	}
+	if (a.size() < b.size()) {
+		return -1;
+	}
+	if (a.size() > b.size()) {
+		return 1;
+	}
+	return 0;
+}
+
 constexpr uint64_t HASH_PRIME = 0x9E3779B97F4A7C15ULL;
 constexpr uint64_t HASH_SEED = 0xCBF29CE484222325ULL;
 

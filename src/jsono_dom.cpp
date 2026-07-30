@@ -40,7 +40,7 @@ JSONO_ALWAYS_INLINE size_t SortAndDedupObjectIndices(STATE &s, size_t kv_offset,
 	// Tie-break equal keys by input index so the last duplicate sorts last in its run.
 	std::sort(s.indices.begin() + idx_offset, s.indices.begin() + idx_offset + N,
 	          [&s, kv_offset](uint32_t a, uint32_t c) {
-		          int cmp = s.kvs[kv_offset + a].first.compare(s.kvs[kv_offset + c].first);
+		          int cmp = CompareJsonoKeys(s.kvs[kv_offset + a].first, s.kvs[kv_offset + c].first);
 		          return cmp != 0 ? cmp < 0 : a < c;
 	          });
 	size_t write = idx_offset;
@@ -301,7 +301,7 @@ void SizeDomObject(yyjson_val *obj, DomDirectState &s, size_t depth, DomShredCon
 			size_t pos = emit_count;
 			while (lo < hi) {
 				size_t mid = lo + (hi - lo) / 2;
-				int cmp = s.kvs[kv_offset + s.indices[idx_offset + mid]].first.compare(edge_key);
+				int cmp = CompareJsonoKeys(s.kvs[kv_offset + s.indices[idx_offset + mid]].first, edge_key);
 				if (cmp == 0) {
 					pos = mid;
 					break;
