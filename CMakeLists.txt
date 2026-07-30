@@ -46,6 +46,11 @@ set(EXTENSION_SOURCES
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# The loadable extension resolves yyjson symbols from the host binary on Linux/macOS, but a Windows
+# loadable extension links against duckdb.lib, which does not export yyjson (no DUCKDB_API). Link the
+# vendored yyjson directly, exactly as core json does (duckdb/extension/json/CMakeLists.txt).
+target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_yyjson)
+
 # Treat a switch over an enum that omits a case (with no `default`) as an error in our own sources.
 # The shred-type dispatch (ShredKind / ShredPrimitive) relies on this: adding a shred category or
 # scalar type then fails to compile in every native reader rather than reaching a silently-swallowing
