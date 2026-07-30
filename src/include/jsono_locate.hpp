@@ -33,7 +33,7 @@ inline int CompareTrieKeyToJsonKey(const string &trie_key, nonstd::string_view j
 			return trie_first < json_first ? -1 : 1;
 		}
 	}
-	return nonstd::string_view(trie_key).compare(json_key);
+	return CompareJsonoKeys(nonstd::string_view(trie_key.data(), trie_key.size()), json_key);
 }
 
 inline nonstd::string_view ObjectKeyAtRank(const JsonoView &view, const ObjectLayout &layout, size_t rank) {
@@ -57,7 +57,7 @@ inline bool FindObjectKeyRank(const JsonoView &view, const ObjectLayout &layout,
 	while (lo < hi) {
 		auto mid = lo + (hi - lo) / 2;
 		auto mid_key = ObjectKeyAtRank(view, layout, mid);
-		if (mid_key < key) {
+		if (CompareJsonoKeys(mid_key, nonstd::string_view(key.data(), key.size())) < 0) {
 			lo = mid + 1;
 		} else {
 			hi = mid;
@@ -88,13 +88,13 @@ inline bool ValidateCachedObjectRank(const JsonoView &view, const ObjectLayout &
 	}
 	if (rank > 0) {
 		auto previous_key = ObjectKeyAtRank(view, layout, rank - 1);
-		if (previous_key >= key) {
+		if (CompareJsonoKeys(previous_key, nonstd::string_view(key.data(), key.size())) >= 0) {
 			return false;
 		}
 	}
 	if (rank < layout.key_count) {
 		auto next_key = ObjectKeyAtRank(view, layout, rank);
-		if (next_key <= key) {
+		if (CompareJsonoKeys(next_key, nonstd::string_view(key.data(), key.size())) <= 0) {
 			return false;
 		}
 	}
