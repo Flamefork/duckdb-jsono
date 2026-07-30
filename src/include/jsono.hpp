@@ -581,18 +581,50 @@ constexpr size_t JSONO_MAX_NESTING_DEPTH = 1000;
 // salt that guards against constructed collisions are documented in jsono_dom.hpp. The
 // mixer is NOT keyed (fixed seed/prime below) — which is exactly why that lookup is salted
 // while the re-validated persisted hash is not.
+// The compiler chooses the branch, so the two MUST agree bit for bit: this value is persisted in
+// ContainerSpan.shape_hash, and jsono_validate recomputes it, so a writer built by a compiler
+// without __int128 (MSVC) would otherwise store bytes a reader built by clang calls invalid — the
+// format would depend on the compiler. The portable half is split into named steps because a C++11
+// constexpr body is one return expression, and these are static_asserted below; a compiler that has
+// __int128 never executes them at run time.
+constexpr uint64_t MulPartialT(uint64_t a, uint64_t b) {
+	return (a >> 32) * (b & 0xFFFFFFFFULL) + (((a & 0xFFFFFFFFULL) * (b & 0xFFFFFFFFULL)) >> 32);
+}
+constexpr uint64_t MulPartialMid(uint64_t a, uint64_t b) {
+	return (a & 0xFFFFFFFFULL) * (b >> 32) + (MulPartialT(a, b) & 0xFFFFFFFFULL);
+}
+constexpr uint64_t MulHigh64(uint64_t a, uint64_t b) {
+	return (a >> 32) * (b >> 32) + (MulPartialT(a, b) >> 32) + (MulPartialMid(a, b) >> 32);
+}
+constexpr uint64_t MulLow64(uint64_t a, uint64_t b) {
+	return (MulPartialMid(a, b) << 32) | ((a & 0xFFFFFFFFULL) * (b & 0xFFFFFFFFULL) & 0xFFFFFFFFULL);
+}
+constexpr uint64_t HashMix64Portable(uint64_t a, uint64_t b) {
+	return MulLow64(a, b) ^ MulHigh64(a, b);
+}
+
 inline uint64_t HashMix64(uint64_t a, uint64_t b) {
 #if defined(__SIZEOF_INT128__)
 	__uint128_t r = static_cast<__uint128_t>(a) * b;
 	return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
 #else
-	uint64_t ah = a >> 32, al = a & 0xFFFFFFFFULL, bh = b >> 32, bl = b & 0xFFFFFFFFULL;
-	uint64_t low = al * bl;
-	uint64_t mid = ah * bl + al * bh + (low >> 32);
-	uint64_t high = ah * bh + (mid >> 32);
-	return (low & 0xFFFFFFFFULL) ^ (mid << 32) ^ high;
+	return HashMix64Portable(a, b);
 #endif
 }
+
+#if defined(__SIZEOF_INT128__)
+// Pin the portable half against the branch this build actually runs. The suite cannot do this: every
+// document it covers stays inside the operand range where even a carry-dropping fold agrees, which is
+// exactly how a fold that dropped the carry out of `ah*bl + al*bh` survived here unnoticed — and it
+// would have shipped a Windows writer whose shape_hash disagreed with every other platform's. The
+// three pairs below are ones where that fold diverged.
+static_assert(HashMix64Portable(0xEB8F624FB804D820ULL, 0x633A50EEE0F9E038ULL) == 0x167271FF02080419ULL,
+              "portable HashMix64 must fold the full 128-bit product");
+static_assert(HashMix64Portable(0xC9C18070B6D13089ULL, 0x6D4B9ADBEBCD1F5EULL) == 0xC8DBD2A74E1AF1A3ULL,
+              "portable HashMix64 must fold the full 128-bit product");
+static_assert(HashMix64Portable(0xAC0AE4E2F729B4C8ULL, 0xC76ABF436FA84DCAULL) == 0x402D847F4B4C1896ULL,
+              "portable HashMix64 must fold the full 128-bit product");
+#endif
 
 constexpr uint64_t HASH_PRIME = 0x9E3779B97F4A7C15ULL;
 constexpr uint64_t HASH_SEED = 0xCBF29CE484222325ULL;
