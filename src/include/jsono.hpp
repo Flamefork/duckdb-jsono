@@ -534,6 +534,18 @@ constexpr uint32_t OBJECT_CHECKPOINT_STRIDE = 16;
 #define JSONO_UB_SANITIZER 1
 #endif
 #endif
+// Whether this translation unit is built with ThreadSanitizer instrumentation. TSan's shadow
+// bookkeeping makes frames fatter than ASan's, so a build that keeps the uninstrumented depth
+// bound dies in jsono_depth_limit.test before it can report a single race — which is what the
+// first TSan run of this repository did.
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define JSONO_THREAD_SANITIZER 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define JSONO_THREAD_SANITIZER 1
+#endif
 
 // Maximum container nesting accepted by the writer and the recursive readers.
 // The tape walkers recurse per nesting level, so an unbounded depth overflows
@@ -558,7 +570,10 @@ constexpr uint32_t OBJECT_CHECKPOINT_STRIDE = 16;
 // The depth-999 stress showed even the RELEASE recursion plus the guard throw overflowing the macOS
 // stack ASLR-dependently (2/10 unittest runs, bus error) — the guard must trip before the stack does,
 // so the release bound is halved on macOS.
-#if defined(JSONO_ADDRESS_SANITIZER)
+// ThreadSanitizer is the fattest of the three: its per-frame shadow bookkeeping killed the depth-30
+// document outright (SIGILL, no diagnostic — a stack overflow, not a race report), so it takes the
+// same low bound as ASan on every platform rather than only on macOS.
+#if defined(JSONO_ADDRESS_SANITIZER) || defined(JSONO_THREAD_SANITIZER)
 constexpr size_t JSONO_MAX_NESTING_DEPTH = 32;
 #elif defined(JSONO_UB_SANITIZER) && defined(__APPLE__)
 constexpr size_t JSONO_MAX_NESTING_DEPTH = 32;
