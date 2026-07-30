@@ -320,9 +320,9 @@ inline string_t WriteBlobInto(Vector &vec, const char *data, size_t size) {
 inline void WriteJsonoHeaderInto(uint8_t *slots_buf, uint8_t flags) {
 	JsonoHeader header;
 	header.magic = MAGIC;
-	header.version = VERSION;
+	header.reserved0 = 0;
 	header.flags = flags;
-	header.reserved = 0;
+	header.reserved1 = 0;
 	std::memcpy(slots_buf, &header, JSONO_HEADER_SIZE);
 }
 

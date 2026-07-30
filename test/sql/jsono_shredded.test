@@ -17,7 +17,7 @@ statement ok
 CREATE TABLE shred AS
 SELECT struct_pack(
     "jsono" := struct_pack(
-        "body$1" := jsono('{"kind":"commit","did":"d1","extra":"e1"}')."jsono"."body$1",
+        "body$2" := jsono('{"kind":"commit","did":"d1","extra":"e1"}')."jsono"."body$2",
         "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
@@ -72,7 +72,7 @@ statement ok
 CREATE TABLE shred_sentinel AS
 SELECT struct_pack(
     "jsono" := struct_pack(
-        "body$1" := jsono('{"kind":"commit","did":"d1"}')."jsono"."body$1",
+        "body$2" := jsono('{"kind":"commit","did":"d1"}')."jsono"."body$2",
         "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
@@ -179,7 +179,7 @@ statement ok
 CREATE TABLE shred_typed AS
 SELECT struct_pack(
     "jsono" := struct_pack(
-        "body$1" := jsono('{"n":5,"s":"blob_s"}')."jsono"."body$1",
+        "body$2" := jsono('{"n":5,"s":"blob_s"}')."jsono"."body$2",
         "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 0::BIGINT,
@@ -212,7 +212,7 @@ statement ok
 CREATE TABLE typed_het AS
 SELECT struct_pack(
     "jsono" := struct_pack(
-        "body$1" := jsono('{"n":"hello"}')."jsono"."body$1",
+        "body$2" := jsono('{"n":"hello"}')."jsono"."body$2",
         "shreds$2" := struct_pack(
             "$jsono$set" := NULL::BIGINT,
             "$jsono$spill$0" := 1::BIGINT,

@@ -92,7 +92,7 @@ SELECT to_json(jsono_merge_patch(jsono(NULL), jsono({'event_name': 'x'})));
 # Reconstructing a shredded value whose residual is a non-object scalar must emit it verbatim
 # (shreds are object-key paths, necessarily absent here) rather than overlaying onto a non-object.
 query I
-SELECT to_json(jsono('5', shredding := '{"k": "VARCHAR"}')::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+SELECT to_json(jsono('5', shredding := '{"k": "VARCHAR"}')::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 5
 

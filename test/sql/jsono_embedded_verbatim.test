@@ -32,11 +32,11 @@ SELECT to_json(jsono({'eo': jsono('{}'), 'ea': jsono('[]')}));
 
 # An embedded jsono value is a subtree, not a SQL struct: auto-shred must not descend into its
 # layout. The six body blobs are BLOB, which promotes to a VARCHAR lane, so descending would lift
-# `$.nested.jsono."body$1".slots` and friends into shreds of a document that has no such paths.
+# `$.nested.jsono."body$2".slots` and friends into shreds of a document that has no such paths.
 query I
 SELECT typeof(jsono({'z': 1, 'nested': jsono('{"a":1}')}));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, f8000 BIGINT)))
+STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, f8000 BIGINT)))
 
 # A shredded value embeds as its document at every position the constructor takes it: struct field,
 # MAP value, LIST element, and the document root. Only the plain layout is recognized structurally,

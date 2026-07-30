@@ -211,7 +211,7 @@ def blob_hex_expr(body_expr: str) -> str:
 
 
 def jsono_blob_hex_expr(text: str) -> str:
-    body_expr = f'jsono({sql_literal(text)})."jsono"."body$1"'
+    body_expr = f'jsono({sql_literal(text)})."jsono"."body$2"'
     return blob_hex_expr(body_expr)
 
 
@@ -226,7 +226,7 @@ def jsono_struct_sql(blobs: BlobHex) -> str:
         f"'nums': unhex('{nums}')",
     ]
     body = "{" + ", ".join(body_fields) + "}"
-    return "{'jsono': {'body$1': " + body + "}}"
+    return "{'jsono': {'body$2': " + body + "}}"
 
 
 def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
@@ -332,7 +332,7 @@ def mutate_jsono_blobs(blobs: BlobHex, mutation: str) -> BlobHex:
 
 
 def shredded_blob_hex_expr(text: str, spec_sql: str) -> str:
-    body_expr = f'jsono({sql_literal(text)}, shredding := {spec_sql})."jsono"."body$1"'
+    body_expr = f'jsono({sql_literal(text)}, shredding := {spec_sql})."jsono"."body$2"'
     return blob_hex_expr(body_expr)
 
 
@@ -647,7 +647,7 @@ def shred_spec_sql(spec: dict[str, str]) -> str:
     return sql_literal(json_dumps(spec))
 
 
-PLAIN_JSONO_TYPE_SQL = 'STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))'
+PLAIN_JSONO_TYPE_SQL = 'STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))'
 
 
 @settings(PROPERTY_SETTINGS)
@@ -1765,7 +1765,7 @@ def lane_mutant_sql(doc_sql: str, mutation: str) -> str:
     elif mutation == "marker_flip":
         marker = f"{marker} + 1"
     return (
-        f'struct_pack("jsono" := struct_pack("body$1" := ({j})."jsono"."body$1", '
+        f'struct_pack("jsono" := struct_pack("body$2" := ({j})."jsono"."body$2", '
         f'"shreds$2" := struct_pack("$jsono$set" := {marker}, '
         f'"$jsono$spill$0" := {spill}, '
         f'{ARR_LANE} := {arr}, '

@@ -518,7 +518,7 @@ def build_jsono_parse_struct_plain_query(scenario_config: dict, data_path: Path)
         prepare_sql=(jsono_prepare_typed_struct(scenario_config, data_path),),
         timed_sql="""
             CREATE OR REPLACE TEMP TABLE _bench_out AS
-            SELECT CAST(payload AS STRUCT(jsono STRUCT("body$1" STRUCT(
+            SELECT CAST(payload AS STRUCT(jsono STRUCT("body$2" STRUCT(
                 slots BLOB,
                 key_heap BLOB,
                 string_heap BLOB,
@@ -556,7 +556,7 @@ def build_jsono_parse_struct_json_roundtrip_query(scenario_config: dict, data_pa
 def build_jsono_render_struct_query(scenario_config: dict, data_path: Path, plain: bool) -> BenchmarkQuery:
     value_sql = (
         """
-        CAST(payload AS STRUCT(jsono STRUCT("body$1" STRUCT(
+        CAST(payload AS STRUCT(jsono STRUCT("body$2" STRUCT(
             slots BLOB,
             key_heap BLOB,
             string_heap BLOB,

@@ -5,7 +5,7 @@
 require jsono
 
 statement ok
-CREATE MACRO plain_jsono(v) AS CAST(v AS STRUCT(jsono STRUCT("body$1" STRUCT(
+CREATE MACRO plain_jsono(v) AS CAST(v AS STRUCT(jsono STRUCT("body$2" STRUCT(
   slots BLOB,
   key_heap BLOB,
   string_heap BLOB,

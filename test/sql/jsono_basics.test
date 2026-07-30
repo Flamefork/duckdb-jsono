@@ -35,16 +35,16 @@ SELECT
 ----
 [a, b, c]	true
 
-# jsono_validate fully checks the current VERSION=4 storage contract; SQL NULL stays NULL.
+# jsono_validate fully checks the current storage contract; SQL NULL stays NULL.
 # The last blob is a header plus a lone OBJ_START slot: the walk never reaches an OBJ_END.
 query IIII
 SELECT
   jsono_validate(jsono('{"a":"x","b":[1,true,null]}')),
   jsono_validate(jsono(NULL)) IS NULL,
-  jsono_validate({'jsono': {'body$1': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}),
+  jsono_validate({'jsono': {'body$2': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}),
   jsono_validate({
-    'jsono': {'body$1': {
-      'slots': unhex('4A534E4F050100000000000000000000'),
+    'jsono': {'body$2': {
+      'slots': unhex('4A534E4F000100000000000000000000'),
       'key_heap': ''::BLOB,
       'string_heap': ''::BLOB,
       'skips': ''::BLOB,
@@ -57,12 +57,12 @@ true	true	false	false
 
 # Nested arrays must have distinct closing slots. This blob is a valid `[["x"]]`
 # value with the outer ARR_END slot removed and the outer span shortened so the
-# inner ARR_END would be reused by both arrays. VERSION=4 skips carry a sorted u32 id
+# inner ARR_END would be reused by both arrays. The skips blob carries a sorted u32 id
 # index before the 24-byte spans (u32 slot_span, u32 string_byte_span, u64 shape_hash,
 # u32 length_count, u32 num_count); the "x" length lives in the lengths stream.
 query I
-SELECT jsono_validate({'jsono': {'body$1': {
-  'slots': unhex('4A534E4F0501000000000000000000200000000100000020000000000000008000000000000000'||'30'),
+SELECT jsono_validate({'jsono': {'body$2': {
+  'slots': unhex('4A534E4F0001000000000000000000200000000100000020000000000000008000000000000000'||'30'),
   'key_heap': ''::BLOB,
   'string_heap': unhex('78'),
   'skips': unhex('020000000000000000000000'||'0000000001000000'||'040000000100000000000000000000000100000000000000'||'030000000100000000000000000000000100000000000000'),
@@ -79,13 +79,13 @@ WITH base AS (
 )
 SELECT
   jsono_validate(jsono('{"\u00e9":1}')),
-  jsono_validate({'jsono': {'body$1': {
-    'slots': raw."jsono"."body$1".slots,
+  jsono_validate({'jsono': {'body$2': {
+    'slots': raw."jsono"."body$2".slots,
     'key_heap': unhex('FF'),
-    'string_heap': raw."jsono"."body$1".string_heap,
-    'skips': raw."jsono"."body$1".skips,
-    'lengths': raw."jsono"."body$1".lengths,
-    'nums': raw."jsono"."body$1".nums
+    'string_heap': raw."jsono"."body$2".string_heap,
+    'skips': raw."jsono"."body$2".skips,
+    'lengths': raw."jsono"."body$2".lengths,
+    'nums': raw."jsono"."body$2".nums
   }}})
 FROM base;
 ----

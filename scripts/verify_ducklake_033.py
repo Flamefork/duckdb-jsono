@@ -21,7 +21,7 @@ Checks, over a DuckLake table of shredded jsono rows evolved with
 Layout note (plan 054 + 055 + 056): a scalar shred is a BARE typed lane, so the
 ALTER adds `VARCHAR`, not a value/complete pair; per-row divert information lives
 in the `$jsono$spill$0` bitmap column that the table already carries, and the
-layout fields are revisioned (`body$1` / `shreds$2`). A lane's field name is the
+layout fields are revisioned (`body$2` / `shreds$2`). A lane's field name is the
 base32hex encoding of its path (`c8000` is `$.b`), so the ALTER also exercises the
 plan-056 naming across the catalog. The spill bits of the old files are numbered
 for the one-shred set they were written under, so after the ALTER the marker no

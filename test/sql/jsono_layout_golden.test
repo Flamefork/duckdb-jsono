@@ -9,35 +9,38 @@ require json
 # ---------------------------------------------------------------------------
 # GOLDEN TYPE. Written as literals, not as `typeof(x) = jsono_storage_type()`:
 # a self-comparison moves along with any change, a literal does not. If one of
-# these goes red, the physical layout changed — bump the revision in the field
-# name (JSONO_BODY_REVISION / JSONO_SHREDS_REVISION in src/include/jsono.hpp),
-# add a refusal fixture for the closed revision in jsono_layout_revision.test
-# (a struct literal, NOT these bytes — a foreign revision is decided by the field
-# name before a blob is read), and add its row to the revision map in
-# docs/jsono_format.md → "Revision history". All three, same commit. The bytes
-# below stay here and close with the commit: git is where a closed layout is read
-# back from, so they are never copied anywhere.
+# these goes red, the physical layout changed — that is a revision bump, and
+# since the first published revision a bump is one commit of FOUR parts: bump
+# the revision in the field name (JSONO_BODY_REVISION / JSONO_SHREDS_REVISION
+# in src/include/jsono.hpp); ship the compat reader for the revision being
+# closed, with a read-test over that revision's own bytes — the bytes below
+# MOVE into that read-fixture, they do not retire into git history; add a
+# closed-revision fixture in jsono_layout_revision.test (a struct literal, NOT
+# these bytes — a revision is decided by the field name before a blob is read);
+# and add the row to the revision map in docs/jsono_format.md → "Revision
+# history". All four, same commit. The literals below then pin the NEW current
+# revision.
 # ---------------------------------------------------------------------------
 
 query I
 SELECT jsono_storage_type();
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 query I
 SELECT jsono_storage_type('{"a": "BIGINT", "b": "VARCHAR"}');
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT, c8000 VARCHAR)))
+STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT, c8000 VARCHAR)))
 
 query I
 SELECT typeof(jsono('{"a":1}'));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 query I
 SELECT typeof(jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}'));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT)))
+STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT)))
 
 # The layout name is the permanent anchor: it must never gain a revision suffix, or a value of any
 # revision stops being recognizable as JSONO at all (which is what made an old layout read as a bare
@@ -56,15 +59,15 @@ true
 # ---------------------------------------------------------------------------
 
 statement ok
-CREATE MACRO body_hex(v) AS concat_ws('|', hex(v.jsono."body$1".slots), hex(v.jsono."body$1".key_heap),
-                                      hex(v.jsono."body$1".string_heap), hex(v.jsono."body$1".skips),
-                                      hex(v.jsono."body$1".lengths), hex(v.jsono."body$1".nums));
+CREATE MACRO body_hex(v) AS concat_ws('|', hex(v.jsono."body$2".slots), hex(v.jsono."body$2".key_heap),
+                                      hex(v.jsono."body$2".string_heap), hex(v.jsono."body$2".skips),
+                                      hex(v.jsono."body$2".lengths), hex(v.jsono."body$2".nums));
 
 # Plain: the whole document lives in the residual.
 query I
 SELECT body_hex(jsono('{"a":1,"b":"x"}'));
 ----
-4A534E4F0501000002000000000000000100000000000040010000010000004000000000000000A000000000000000800000000000000010|6162|78|000000000000000000000000|01000000|0100000000000000
+4A534E4F0001000002000000000000000100000000000040010000010000004000000000000000A000000000000000800000000000000010|6162|78|000000000000000000000000|01000000|0100000000000000
 
 # Clean scalar shred: `a` is stripped from the residual (its skips tail carries the shred manifest),
 # the marker is the clean layout hash and the spill column stays NULL on a clean row.
@@ -72,7 +75,7 @@ query III
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
 FROM (SELECT jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}') AS v);
 ----
-4A534E4F050100000100000000000000010000000000004000000000000000800000000000000010|62|78|000000000000000000000000010000000300242E6102|01000000|	-538597865238962405	NULL
+4A534E4F000100000100000000000000010000000000004000000000000000800000000000000010|62|78|000000000000000000000000010000000300242E6102|01000000|	-538597865238962405	NULL
 
 # Dirty row (a container at the shred path diverts into the residual): the lane is NULL, the whole
 # document stays in the residual, the marker is the clean hash with its lowest bit flipped and the
@@ -83,7 +86,7 @@ SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$
        v.jsono."shreds$2".c4000 IS NULL
 FROM (SELECT jsono('{"a":{"n":1},"b":"x"}', shredding := '{"a": "BIGINT"}') AS v);
 ----
-4A534E4F050100000200000000000000010000000000004001000001000000400100000100000000010000020000004000000000000000A0000000000000001000000000000000800000000000000010|61626E|78|000000000000000000000000|01000000|0100000000000000	-538597865238962406	1	true
+4A534E4F000100000200000000000000010000000000004001000001000000400100000100000000010000020000004000000000000000A0000000000000001000000000000000800000000000000010|61626E|78|000000000000000000000000|01000000|0100000000000000	-538597865238962406	1	true
 
 # The dirty marker is exactly the clean marker with bit 0 flipped — the two-valued stamp every
 # totality proof reads as a plain min/max question.
@@ -98,7 +101,7 @@ query III
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
 FROM (SELECT jsono('{"o":{"k":"v"}}', shredding := '{"$.o.k": "VARCHAR"}') AS v);
 ----
-4A534E4F0501000001000000000000000100000000000040000000010000000000000000000000100000000000000010|6F||000000000000000000000000010000000500242E6F2E6B01||	-7243425711980707825	NULL
+4A534E4F0001000001000000000000000100000000000040000000010000000000000000000000100000000000000010|6F||000000000000000000000000010000000500242E6F2E6B01||	-7243425711980707825	NULL
 
 # Manifest EMISSION ORDER, the second semantic no type can express. The manifest is emitted in
 # logical-path TEXT order while the type lists lanes in encoded-name order, which is structural path
@@ -110,7 +113,7 @@ query III
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
 FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}', shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS v);
 ----
-4A534E4F0501000001000000000000000100000000000040000000010000000000000000000000100000000000000010|61||000000000000000000000000020000000500242E612D63010500242E612E6201||	1806171218575348807	NULL
+4A534E4F0001000001000000000000000100000000000040000000010000000000000000000000100000000000000010|61||000000000000000000000000020000000500242E612D63010500242E612E6201||	1806171218575348807	NULL
 
 # Object-array lane: its manifest entry is the one that does NOT render a type string. After the
 # path comes type code 0x0B, then the element subfields as their own list — `0200` (two of them),
@@ -122,7 +125,7 @@ query III
 SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$spill$0"
 FROM (SELECT jsono('{"items":[{"id":1,"NM":"z"}]}', shredding := '{"$.items": "STRUCT(id BIGINT, NM VARCHAR)[]"}') AS v);
 ----
-4A534E4F050100000100000000000000050000000000004000000001000000200000000200000000000000000000001000000000000000300000000000000010|6974656D73||01000000000000000000000001000000040000000000000000000000000000000000000000000000010000000700242E6974656D730B020002004E4D010200696402||	2987070229399712739	NULL
+4A534E4F000100000100000000000000050000000000004000000001000000200000000200000000000000000000001000000000000000300000000000000010|6974656D73||01000000000000000000000001000000040000000000000000000000000000000000000000000000010000000700242E6974656D730B020002004E4D010200696402||	2987070229399712739	NULL
 
 # Scalar array lane: the residual keeps one VAL_NULL placeholder per lifted element; an array shred
 # is never bare-read, so it never sets a spill bit.
@@ -131,7 +134,7 @@ SELECT body_hex(v), v.jsono."shreds$2"."$jsono$set", v.jsono."shreds$2"."$jsono$
        v.jsono."shreds$2".e0000::VARCHAR
 FROM (SELECT jsono('{"p":[1,2]}', shredding := '{"$.p": "BIGINT[]"}') AS v);
 ----
-4A534E4F050100000100000000000000010000000000004000000001000000200000000000000050000000000000005000000000000000300000000000000010|70||01000000000000000000000001000000040000000000000000000000000000000000000000000000010000000300242E7007||	870299297690790912	NULL	[1, 2]
+4A534E4F000100000100000000000000010000000000004000000001000000200000000000000050000000000000005000000000000000300000000000000010|70||01000000000000000000000001000000040000000000000000000000000000000000000000000000010000000300242E7007||	870299297690790912	NULL	[1, 2]
 
 # Spill bit NUMBERING, the one semantic the single-shred fixtures above cannot show: with several
 # shreds, bit `r` belongs to the shred of canonical rank `r` — shreds sorted by NAME, independent of
@@ -188,10 +191,3 @@ SELECT v IS NULL, v.jsono."shreds$2"."$jsono$set" IS NULL, v.jsono."shreds$2"."$
 FROM (SELECT jsono(NULL::VARCHAR, shredding := '{"a": "BIGINT"}') AS v);
 ----
 true	true	true
-
-# The blob encoding version is versioned separately from the layout: it describes the bytes INSIDE
-# the body blobs, which the golden bytes above pin.
-query I
-SELECT jsono_version();
-----
-5

@@ -205,12 +205,12 @@ true	true	true	true
 # Forged: clean marker but a mask present.
 query I
 SELECT jsono_validate(struct_pack(jsono := struct_pack(
-  "body$1" := c.jsono."body$1",
+  "body$2" := c.jsono."body$2",
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := 1::BIGINT,
     c4000 := c.jsono."shreds$2".c4000
-  )))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
+  )))::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
 FROM (SELECT jsono('{"a":1}', shredding := '{"a": "BIGINT"}') AS c);
 ----
 false
@@ -218,12 +218,12 @@ false
 # Forged: dirty row whose mask is out of domain (bit 5 with one shred).
 query I
 SELECT jsono_validate(struct_pack(jsono := struct_pack(
-  "body$1" := d.jsono."body$1",
+  "body$2" := d.jsono."body$2",
   "shreds$2" := struct_pack(
     "$jsono$set" := d.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := 32::BIGINT,
     c4000 := d.jsono."shreds$2".c4000
-  )))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
+  )))::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
 FROM (SELECT jsono('{"a":"oops"}', shredding := '{"a": "BIGINT"}') AS d);
 ----
 false
@@ -232,12 +232,12 @@ false
 # lane must mean the path was stripped.
 query I
 SELECT jsono_validate(struct_pack(jsono := struct_pack(
-  "body$1" := jsono('{"a":1}')."jsono"."body$1",
+  "body$2" := jsono('{"a":1}')."jsono"."body$2",
   "shreds$2" := struct_pack(
     "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
     "$jsono$spill$0" := NULL::BIGINT,
     c4000 := 999::BIGINT
-  )))::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
+  )))::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
 FROM (SELECT jsono('{"a":1}', shredding := '{"a": "BIGINT"}') AS c);
 ----
 false

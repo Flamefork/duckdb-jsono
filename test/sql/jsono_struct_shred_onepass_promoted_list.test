@@ -9,7 +9,7 @@ require json
 require icu
 
 statement ok
-CREATE MACRO plain_jsono_promoted_list(v) AS CAST(v AS STRUCT(jsono STRUCT("body$1" STRUCT(
+CREATE MACRO plain_jsono_promoted_list(v) AS CAST(v AS STRUCT(jsono STRUCT("body$2" STRUCT(
   slots BLOB,
   key_heap BLOB,
   string_heap BLOB,
@@ -43,7 +43,7 @@ WHERE jsono(v) IS NOT DISTINCT FROM
 query I
 SELECT typeof(jsono(struct_pack(moments := [TIMESTAMPTZ '2024-01-01 12:34:56+02'])));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, dlnmqpbeehpg000 VARCHAR[])))
+STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, dlnmqpbeehpg000 VARCHAR[])))
 
 # DefaultCast is deliberately independent of the session TimeZone: the lane and reconstructed
 # document both store the UTC representation.

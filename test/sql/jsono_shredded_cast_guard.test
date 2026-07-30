@@ -225,7 +225,7 @@ PRAGMA disable_verification;
 
 statement ok
 CREATE TABLE plain_narrowed AS
-SELECT struct_pack("jsono" := struct_pack("body$1" := j."jsono"."body$1")) AS p
+SELECT struct_pack("jsono" := struct_pack("body$2" := j."jsono"."body$2")) AS p
 FROM (SELECT jsono('{"a":"v1","b":"v2"}', shredding := '{"a": "VARCHAR"}') AS j);
 
 statement error
@@ -276,7 +276,7 @@ narrowed by a raw struct cast
 
 statement ok
 CREATE TABLE null_body AS
-SELECT struct_pack("jsono" := struct_pack("body$1" := NULL::STRUCT(
+SELECT struct_pack("jsono" := struct_pack("body$2" := NULL::STRUCT(
   slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))) AS p;
 
 statement error
@@ -316,7 +316,7 @@ statement error
 WITH u AS (
   SELECT jsono('{"a":"v1"}', shredding := '{"a": "VARCHAR"}') AS e
   UNION ALL
-  SELECT struct_pack("jsono" := struct_pack("body$1" := NULL::STRUCT(
+  SELECT struct_pack("jsono" := struct_pack("body$2" := NULL::STRUCT(
     slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 )
 SELECT to_json(e) FROM u;
@@ -327,7 +327,7 @@ body is NULL
 # the strict reader treats a NULL top-level struct as an absent value and every reader yields NULL.
 statement ok
 CREATE TABLE genuine_null AS
-SELECT NULL::STRUCT("jsono" STRUCT("body$1" STRUCT(
+SELECT NULL::STRUCT("jsono" STRUCT("body$2" STRUCT(
   slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))) AS p;
 
 query III

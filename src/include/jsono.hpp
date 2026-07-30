@@ -35,7 +35,7 @@ class ExtensionLoader;
 class ClientContext;
 
 // A jsono value is physically a nested STRUCT with exactly one layout field, named "jsono" for
-// both plain and shredded values. Inside the layout field live a `body$1` STRUCT of six BLOBs (the
+// both plain and shredded values. Inside the layout field live a `body$2` STRUCT of six BLOBs (the
 // binary JSONO body, see JsonoBodyStructType) and, for shredded values, a `shreds$2` STRUCT holding
 // a reserved `$jsono$set` marker (the shred-set hash), the reserved `$jsono$spill$0`, `$jsono$spill$1`,
 // … bitmap columns (per-row spilled-shred bits) plus one field per shred — a scalar shred is a bare
@@ -67,7 +67,7 @@ class ClientContext;
 // JsonoRawStructType (kept as the name the function registrations read against).
 LogicalType JsonoType();
 
-// The physical plain JSONO STRUCT: STRUCT("jsono" STRUCT("body$1" STRUCT(6 BLOB))). There is no
+// The physical plain JSONO STRUCT: STRUCT("jsono" STRUCT("body$2" STRUCT(6 BLOB))). There is no
 // logical-type alias on top (DuckLake/Parquet reject user-defined aliases, so jsono carries none);
 // this is the single source of truth for the plain layout. `jsono_storage_type()` exposes its DDL
 // string so writers can declare storage columns without hardcoding the fields.
@@ -89,7 +89,7 @@ struct JsonoLaneSpec {
 	LogicalType type;
 };
 
-// The physical STRUCT of a shredded JSONO value: STRUCT("jsono" STRUCT("body$1" STRUCT(6 BLOB),
+// The physical STRUCT of a shredded JSONO value: STRUCT("jsono" STRUCT("body$2" STRUCT(6 BLOB),
 // "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT [, "$jsono$spill$1" …], <shred fields>))).
 // One shred field per `shreds` entry — a scalar shred is its bare value type, an array shred is the
 // LIST as-is. This is the single source of truth for the shredded shape: the constructor and
@@ -135,7 +135,7 @@ inline LogicalType JsonoLaneLogicalType(const LogicalType &lane_type) {
 // it never carries a revision, so a value of ANY revision stays recognizable as JSONO.
 string JsonoLayoutName();
 
-// The revisioned name of the residual field inside the layout struct: "body$1".
+// The revisioned name of the residual field inside the layout struct: "body$2".
 string JsonoBodyName();
 
 // The revisioned name of the nested STRUCT (sibling of the residual) that holds the shred set:
@@ -245,36 +245,37 @@ void JsonoRejectMalformedAnchoredRead(const LogicalType &type);
 enum class JsonoLayoutKind : uint8_t { Plain, Shredded };
 
 // The layout revisions this build reads and writes. They are carried in the layout field NAMES
-// (`body$1`, `shreds$2`) because a name is the only thing that survives Parquet and DuckLake, and
-// they are split because they version independent things: `body$N` the residual's column layout
-// (the set, names and types of the body blobs), `shreds$M` the shred layout (the reserved fields
-// inside `shreds`, how a lane's path becomes its field name, the lane shape, the spill bit
-// numbering, the marker's meaning). Splitting them keeps a shred-layout change from invalidating
-// plain values, which are the bulk of stored data.
-// Neither versions the bytes INSIDE the blobs — that is jsono::VERSION.
+// (`body$2`, `shreds$2`) because a name is the only thing that survives Parquet and DuckLake, and
+// they are split because they version independent things: `body$N` the residual format WHOLE — its
+// column layout (the set, names and types of the body blobs) AND the byte encoding inside them —
+// `shreds$M` the shred layout (the reserved fields inside `shreds`, how a lane's path becomes its
+// field name, the lane shape, the spill bit numbering, the marker's meaning). Splitting them keeps
+// a shred-layout change from invalidating plain values, which are the bulk of stored data. There
+// is no third axis: the header byte that once versioned the blob bytes separately is reserved
+// space now, because a byte change and a column change invalidate exactly the same data, and only
+// a version the TYPE carries can be refused at bind — once per column, before any partial output —
+// and can force the rewrite-before-new-writes policy on an old column, which a byte inside the
+// blobs never could.
 //
-// Bump `body$N` when a body blob column is added, removed, renamed or retyped. Bump `shreds$M`
-// when the reserved field set inside `shreds`, the LANE NAMING (the path → field-name codec), the
-// lane shape, the canonical rank numbering, the marker semantics or the spill bit encoding change —
-// INCLUDING purely semantic changes the type cannot show, which is the case golden-byte tests exist
-// to catch. Neither is bumped by the user's shred set or by the ⌈N/63⌉ spill column count: those are
-// data under a fixed layout.
+// Bump `body$N` when a body blob column is added, removed, renamed or retyped, AND when the byte
+// encoding inside the blobs changes — slot tags, payload semantics, heap layout, navigation
+// metadata, required header flags. Bump `shreds$M` when the reserved field set inside `shreds`,
+// the LANE NAMING (the path → field-name codec), the lane shape, the canonical rank numbering, the
+// marker semantics or the spill bit encoding change — INCLUDING purely semantic changes the type
+// cannot show, which is the case golden-byte tests exist to catch. Neither is bumped by the user's
+// shred set or by the ⌈N/63⌉ spill column count: those are data under a fixed layout.
 //
-// The per-row shred manifest lives INSIDE the skips blob, so its framing is versioned by
-// jsono::VERSION, not here. What a shred-layout change does to it — a lane's path spelled
+// The per-row shred manifest lives INSIDE the skips blob, so its framing is versioned by `body$N`
+// like every other residual byte. What a shred-layout change does to it — a lane's path spelled
 // differently, a different emission order — follows from the change that bumped `shreds$M` in the
 // first place, and golden bytes are what pin it either way.
 //
-// Closing a revision is a three-step commit: bump the name here; add a closed-revision fixture
-// (a struct literal over a live body) to test/sql/jsono_layout_revision.test asserting the loud
-// refusal — without the golden bytes, which assert nothing there, since the refusal is decided by
-// the field NAME before a single blob is read; and add one row to the revision map in
-// docs/jsono_format.md → "Revision history": the commit range that wrote the closed shape and how
-// it differs from the new one. Not its full layout — the build that wrote it and its golden bytes
-// are in git, and a second copy in the doc can only drift from them. The doc owes a user holding
-// old files the way back (which commit to build, or the struct rebuild that upgrades in place),
-// not an archive.
-constexpr idx_t JSONO_BODY_REVISION = 1;
+// Closing a revision is one commit with four parts; the checklist lives in docs/jsono_format.md →
+// "Layout revisions" and is deliberately not restated here. The part easy to forget from this seat:
+// since the first published revision, storage read-compat is a commitment, so the bump ships the
+// compat reader for the revision it closes, with a read-test over that revision's own golden bytes
+// (they move out of test/sql/jsono_layout_golden.test into that read-fixture).
+constexpr idx_t JSONO_BODY_REVISION = 2;
 constexpr idx_t JSONO_SHREDS_REVISION = 2;
 
 // A parsed JSONO layout field: its shred (PHYSICAL lane name, LOGICAL-value-type) columns — the
@@ -338,7 +339,7 @@ LogicalType JsonoLayoutDiagnoseResultType();
 Value JsonoDiagnoseLayoutMatch(const LogicalType &type);
 
 // The revision phrase a foreign layout is described by ("layout revision body=0 shreds=0, this build
-// reads body=1 shreds=2"), shared by the refusal and the diagnosis so the two cannot describe the
+// reads body=2 shreds=2"), shared by the refusal and the diagnosis so the two cannot describe the
 // same value differently.
 string JsonoDescribeForeignLayout(const JsonoLayoutType &layout);
 
@@ -349,18 +350,18 @@ string JsonoDescribeForeignLayout(const JsonoLayoutType &layout);
 void JsonoRejectForeignLayout(const LogicalType &type, const string &context);
 
 // Parse `type` as an ordinary JSONO value of the CURRENT revision: a top-level STRUCT with exactly
-// one valid `jsono` layout field (`body$1` only for plain, `body$1` + non-empty `shreds$2` for
+// one valid `jsono` layout field (`body$2` only for plain, `body$2` + non-empty `shreds$2` for
 // shredded). The single classifier the thin predicates (IsJsonoType / IsShreddedJsonoType) delegate
 // to; a foreign layout answers false here, so callers that must reject it loudly go through
 // JsonoRejectForeignLayout first.
 bool TryParseJsonoLayoutType(const LogicalType &type, JsonoLayoutType &out);
 
-// True when `type` is the plain JSONO STRUCT (a `jsono` layout field carrying only `body$1`). Strict:
+// True when `type` is the plain JSONO STRUCT (a `jsono` layout field carrying only `body$2`). Strict:
 // a shredded value is not a plain value (extending this to shredded would give silently wrong
 // results where call sites read only the residual body).
 bool IsJsonoType(const LogicalType &type);
 
-// True when `type` is a shredded JSONO struct: a `jsono` layout field carrying `body$1` plus a
+// True when `type` is a shredded JSONO struct: a `jsono` layout field carrying `body$2` plus a
 // non-empty `shreds$2`. Set operations over differently-shredded values reconcile into this same
 // shape (the shred union), so there is no separate merged classification.
 bool IsShreddedJsonoType(const LogicalType &type);
@@ -403,7 +404,7 @@ void JsonoParseTextVector(Vector &source, idx_t count, Vector &result);
 //
 // Header (little-endian throughout):
 //   u32 magic        = 'JSNO' (0x4F4E534A)
-//   u8  version
+//   u8  reserved     (0; held the blob format version until `body$N` took over versioning the bytes)
 //   u8  flags        (bit0 = SORTED_KEYS)
 //   u16 reserved
 //
@@ -420,22 +421,6 @@ void JsonoParseTextVector(Vector &source, idx_t count, Vector &result);
 namespace jsono {
 
 constexpr uint32_t MAGIC = 0x4F4E534A; // 'JSNO' little-endian
-// version 2: ContainerSpan carries a per-object shape_hash (sorted-key
-// fingerprint) so readers can trust a cached object key-rank by an int compare
-// instead of a key-heap read+string-compare. See docs/jsono_format.md.
-// version 3: the skips blob may carry a trailing shred manifest — the (path, type)
-// entries this row's shred writer stripped out of the residual. Readers verify the
-// manifest against the shreds actually present, turning a shred silently dropped or
-// retyped by a raw struct cast into a loud read error. See docs/jsono_format.md.
-// version 4: variable payloads leave the slots. String/number-text lengths move to
-// the `lengths` stream (u32 LE, walk order) and numeric payloads (INT60/DEC60 and
-// the former VAL_EXT trailing data slots) to the `nums` stream (u64 LE, walk
-// order), making slot words shape-constant across rows. ContainerSpan gains
-// length_count/num_count, ObjectCursorCheckpoint gains length_delta/num_delta, and
-// spans are stored only where a skip needs them — non-empty arrays and objects
-// with child_count > OBJECT_CHECKPOINT_STRIDE — addressed through a sorted sparse
-// container-id index.
-constexpr uint8_t VERSION = 0x05;
 
 namespace flags {
 constexpr uint8_t SORTED_KEYS = 0x01;
@@ -1072,11 +1057,16 @@ inline double Dec60ToDouble(bool negative, uint64_t mantissa, uint64_t scale) {
 // Header (8 bytes) prepended to the slots BLOB.
 constexpr size_t JSONO_HEADER_SIZE = 8;
 
+// The byte between `magic` and `flags` held the blob format version until the byte axis collapsed
+// into `body$N` (the field name versions the residual format whole, bytes included). It is reserved
+// now: written 0 and ignored on every read, jsono_validate included — a body written before the
+// collapse still carries its old version stamp there, and the documented rebuild-in-place recipe
+// rewraps such bodies under the current name. Ignoring it keeps `flags` at its historical offset 5.
 struct JsonoHeader {
 	uint32_t magic;
-	uint8_t version;
+	uint8_t reserved0;
 	uint8_t flags;
-	uint16_t reserved;
+	uint16_t reserved1;
 };
 
 static_assert(sizeof(JsonoHeader) == JSONO_HEADER_SIZE, "JsonoHeader must be exactly 8 bytes");
@@ -1106,10 +1096,10 @@ public:
 	// Returns false only for an *absent* value: the slots blob is too short to even hold a
 	// header (a NULL/empty jsono_slots field), which callers map to SQL NULL. A real jsono
 	// value always has a header plus at least one slot, so any blob that has a header but is
-	// unreadable — wrong magic, a different format version, misaligned slots, or a metadata
-	// blob shorter than its declared spans — is corruption or non-JSONO bytes and must fail
-	// loud, never silently read as SQL NULL. The validate function recovers a boolean by
-	// catching these (see ValidateJsonoBlob); read/extract paths let them propagate.
+	// unreadable — wrong magic, misaligned slots, or a metadata blob shorter than its declared
+	// spans — is corruption or non-JSONO bytes and must fail loud, never silently read as SQL
+	// NULL. The validate function recovers a boolean by catching these (see ValidateJsonoBlob);
+	// read/extract paths let them propagate.
 	bool ParseHeader() {
 		if (slots_size_ < JSONO_HEADER_SIZE) {
 			return false;
@@ -1117,11 +1107,6 @@ public:
 		std::memcpy(&header_, slots_, JSONO_HEADER_SIZE);
 		if (header_.magic != MAGIC) {
 			throw InvalidInputException("not a JSONO value: header magic mismatch (the column holds non-JSONO bytes)");
-		}
-		if (header_.version != VERSION) {
-			throw InvalidInputException("JSONO format version mismatch: stored value is v%d, this extension reads v%d. "
-			                            "Re-materialize the jsono column with the current extension.",
-			                            int(header_.version), int(VERSION));
 		}
 		auto slots_bytes = slots_size_ - JSONO_HEADER_SIZE;
 		if (slots_bytes % sizeof(uint64_t) != 0) {
@@ -1169,7 +1154,7 @@ public:
 	}
 
 	uint16_t HeaderReserved() const {
-		return header_.reserved;
+		return header_.reserved1;
 	}
 
 	const ContainerMetadataHeader &MetadataHeader() const {

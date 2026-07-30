@@ -10,47 +10,38 @@ A DuckDB extension for analytics-optimized JSON storage and queries.
 - **A typed SQL toolset.** One-pass projection into a typed `STRUCT` (`jsono_transform`), RFC 7396 merge aggregates, structural diff, and introspection of the document, the row, and the type — see the [Function reference](#function-reference).
 
 > [!WARNING]
-> This extension is experimental. The maintainer does not write C++ professionally and maintains the extension on a best-effort basis. Rough edges are possible. The extension is not hardened for production. The JSONO binary format and the SQL API are not stable, and they can change between revisions. Do tests of the behavior and the performance on your own data before you use the extension. Give feedback and contributions through GitHub.
+> This extension is experimental. The maintainer does not write C++ professionally and maintains the extension on a best-effort basis. Rough edges are possible. The extension is not hardened for production. Do tests of the behavior and the performance on your own data before you use the extension. Give feedback and contributions through GitHub.
+
+> [!NOTE]
+> **Stability.** Stored values stay readable across upgrades: a newer build reads the values that an older release wrote. The SQL API is not frozen: function names and signatures can change while the version is `0.x`.
+
+## Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [The JSONO format](#the-jsono-format)
+- [Function reference](#function-reference)
+- [Troubleshooting](#troubleshooting)
+- [Configuration](#configuration)
+- [Interop and limits](#interop-and-limits)
+- [Build from source](#build-from-source)
+- [Development](#development)
+- [Benchmarks](#benchmarks)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Installation
 
-> **Note:** This extension is not in DuckDB's extension repository. The JSONO binary format and the SQL API are not stable. Build the extension from source and load the local extension file.
+Install the extension from the [DuckDB Community Extensions](https://duckdb.org/community_extensions/) repository:
 
-### Prerequisites
-
-- [`uv`](https://docs.astral.sh/uv/) — controls the build and the Python tools.
-- A C++17 toolchain and CMake.
-- [Ninja](https://ninja-build.org/) — the build uses the Ninja generator by default. Use `GEN=make` to use Make.
-- `ccache` (optional) — makes incremental builds faster.
-
-### Build and load (CLI)
-
-1. Build the release extension:
-
-   ```bash
-   uv run make release
-   ```
-
-2. Start DuckDB with unsigned extensions permitted:
-
-   ```bash
-   ./build/release/duckdb -unsigned
-   ```
-
-3. Load the extension:
-
-   ```sql
-   LOAD './build/release/extension/jsono/jsono.duckdb_extension';
-   ```
-
-### Python
-
-```python
-import duckdb
-
-con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
-con.execute("LOAD './build/release/extension/jsono/jsono.duckdb_extension'")
+```sql
+INSTALL jsono FROM community;
+LOAD jsono;
 ```
+
+Community builds are signed. No special flags are necessary.
+
+For development, or for a platform that has no community build, see [Build from source](#build-from-source).
 
 ## Quick Start
 
@@ -83,7 +74,7 @@ JSONO is a format. It is not a SQL type. A JSONO value is the extension's pre-pa
 ```text
 STRUCT                             -- a JSONO value
 └─ jsono                           -- the layout anchor field
-   ├─ body$1                       -- the document body
+   ├─ body$2                       -- the document body
    │  ├─ slots          BLOB
    │  ├─ key_heap       BLOB
    │  ├─ string_heap    BLOB
@@ -189,7 +180,7 @@ Shredded storage:
 
 - document: [`jsono_type`, `jsono_keys`, `jsono_array_length`](#introspection)
 - row: [`jsono_validate`, `jsono_storage_size`, `jsono_shred_manifest`](#introspection)
-- type: [`jsono_layout_diagnose`, `jsono_layout_lanes`, `jsono_storage_type`, `jsono_version`](#introspection)
+- type: [`jsono_layout_diagnose`, `jsono_layout_lanes`, `jsono_storage_type`](#introspection)
 
 ### `jsono(json)`
 
@@ -689,7 +680,6 @@ jsono_layout_diagnose(value)      -> STRUCT     -- what this build sees the TYPE
 jsono_layout_lanes(value)         -> STRUCT[]   -- the shred lanes the TYPE declares, as logical paths
 jsono_storage_type()              -> VARCHAR    -- DDL of the physical STRUCT backing plain JSONO
 jsono_storage_type(<spec>)        -> VARCHAR    -- same, shredded: residual plus the spec's shred lanes
-jsono_version()                   -> INTEGER    -- the JSONO binary format version this build reads and writes
 ```
 
 A lane that the *type* declares and a lane that a *row* used are different facts. On a healthy column, `jsono_shred_manifest` is a subset of `jsono_layout_lanes`, and an anti-join of the two on `(path, type)` answers which declared lanes a row did not use.
@@ -722,14 +712,14 @@ SELECT jsono_array_length(jsono('{"a":1}'));
 
 ```sql
 SELECT jsono_storage_type();
--- STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+-- STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 ```
 
 With a shredding spec argument — the same JSON object string that the constructor's `shredding :=` takes — the function returns the *shredded* storage type with those lanes. This type is byte-identical to the type of a value that the same spec constructs. This is also the way to get the encoded physical field name of a lane, which the [Troubleshooting](#a-jsono-column-answers-null-or-refuses-reads) recovery needs.
 
 ```sql
 SELECT jsono_storage_type('{"event_name": "VARCHAR", "$.commit.seq": "BIGINT"}');
--- STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, cdnmqrb9eg000sr5e4000 BIGINT, clr6arjkbtn62rb50000 VARCHAR)))
+-- STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, cdnmqrb9eg000sr5e4000 BIGINT, clr6arjkbtn62rb50000 VARCHAR)))
 ```
 
 `jsono_shred_manifest` returns a `LIST<STRUCT(path VARCHAR, type VARCHAR)>`. It lists the shredded paths of the value — the paths whose values are in shred columns, not in the residual — each with the written shred type, in canonical (sorted) order. A plain value returns an empty list (nothing is shredded). A SQL `NULL` returns `NULL`. The function reads the row's own manifest record and, unlike the other readers, does not stop on a narrowed row. Use it together with `jsono_validate` to examine shredding, layout, or migration questions — which paths are shredded, or did a cast remove one. A shred value that did not fit its declared type stays in the residual, and the manifest correctly does not show it. So a short manifest does not mean "shredding did not occur".
@@ -757,7 +747,7 @@ The function exists for one specific failure mode. A type of the current revisio
 
 ```sql
 SELECT jsono_layout_diagnose(jsono('{"a":1,"b":2}', shredding := '{"a": "BIGINT"}'));
--- {'kind': shredded, 'reason': NULL, 'body_revision': 1, 'shreds_revision': 2, 'spill_columns': 1}
+-- {'kind': shredded, 'reason': NULL, 'body_revision': 2, 'shreds_revision': 2, 'spill_columns': 1}
 SELECT jsono_layout_diagnose({'a': 1}).reason;
 -- the value's single field is named 'a', not the layout anchor 'jsono'
 
@@ -815,15 +805,70 @@ When a JSONO column starts to answer `NULL` for paths that you know are there, o
 
 An error on one specific row, not on the type, usually comes from the shred manifest: a raw struct cast removed or retyped a shred column, and the read of the narrowed row refuses to return partial data — see [Shredded storage](#shredded-storage).
 
-## Benchmarks
+## Configuration
 
-The `bench/` directory is the harness for comparisons between `jsono` versions and the core DuckDB `json` baseline. Run a smoke benchmark:
+`JSONO_SHAPE_CACHE_SIZE` controls the size of the JSONO writer shape cache:
 
 ```bash
-uv run --frozen python bench/bench.py --filter group_merge/1k --runs 1
+JSONO_SHAPE_CACHE_SIZE=16384 duckdb
 ```
 
-[bench/README.md](bench/README.md) documents the operation set, the version and core-json comparisons, the field-sample scenarios, and the result-reading contract. [bench/PROFILING.md](bench/PROFILING.md) documents profiling.
+Use power-of-two values for performance comparisons. The default is adjusted for the local benchmark workloads, but real data can be different.
+
+## Interop and limits
+
+**Shredded values and core json.** The jsono-named functions (`jsono_extract`, `jsono_extract_string`, `jsono_type`, `jsono_keys`, `jsono_validate`, `jsono_storage_size`), `jsono_group_merge`, the `::VARCHAR` cast, and the shredded→plain JSONO reconstruction are bind-correct: they accept a shredded value directly and operate correctly with the extension optimizer off. The operators and casts that go to the bundled core `json` extension — `->>`, `->`, `json_extract`, `::JSON`, and `to_json` — are correct over a shredded value only with the extension optimizer on (the default). The optimizer changes them to read the shreds and the residual. With the optimizer fully off (`PRAGMA disable_optimizer`), those core-routed operations bind into core json and serialize the physical fields. This is a structural DuckDB limit: core json owns the `STRUCT → JSON` cast, and the extension cannot intercept it.
+
+**Chained operators over a constant literal.** Over a shredded **column**, `value -> 'a' ->> 'b'` becomes one deep-path shred read, the same as `value ->> '$.a.b'`. Over a **fully-constant `jsono({…})` literal**, the same chain returns `NULL` — DuckDB folds it before the extension optimizer runs. For a constant literal, use the JSONPath form `jsono({…}) ->> '$.a.b'`.
+
+**Nesting depth.** The parser refuses JSON that has more than 1000 levels (512 on macOS, where the worker-thread stacks are too small for the deeper recursion). Sanitizer builds decrease the limit only where their larger frames make it necessary: 32 with AddressSanitizer (each platform), and 32 with UndefinedBehaviorSanitizer on macOS. The UndefinedBehaviorSanitizer build on Linux keeps the full 1000.
+
+**Not implemented.** The current surface is intentionally small:
+
+- There is no cast from JSONO to a scalar type (`jsono('42')::INTEGER` is unsupported). Project string values with `->>` / `jsono_extract_string`, or typed fields with `jsono_transform`.
+- There is no cast from JSONO to an arbitrary `STRUCT`. Only the physical six-BLOB shape is interchangeable with JSONO. Field extraction goes through `jsono_transform`.
+- There is no dedicated table function that changes a JSONO array or object into rows. Use `unnest(jsono_entries(...))` for flattened scalar leaves, or `unnest(jsono_array_elements(...))` for array elements as rows.
+- Object key order is not kept: keys are stored and written in sorted byte order.
+
+## Build from source
+
+A local build is the alternative to the community build. Use it for development, or for a platform that has no community build. A local build is unsigned, so DuckDB must permit unsigned extensions.
+
+Prerequisites:
+
+- [`uv`](https://docs.astral.sh/uv/) — controls the build and the Python tools.
+- A C++17 toolchain and CMake.
+- [Ninja](https://ninja-build.org/) — the build uses the Ninja generator by default. Use `GEN=make` to use Make.
+- `ccache` (optional) — makes incremental builds faster.
+
+Build and load (CLI):
+
+1. Build the release extension:
+
+   ```bash
+   uv run make release
+   ```
+
+2. Start DuckDB with unsigned extensions permitted:
+
+   ```bash
+   ./build/release/duckdb -unsigned
+   ```
+
+3. Load the extension:
+
+   ```sql
+   LOAD './build/release/extension/jsono/jsono.duckdb_extension';
+   ```
+
+Python:
+
+```python
+import duckdb
+
+con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+con.execute("LOAD './build/release/extension/jsono/jsono.duckdb_extension'")
+```
 
 ## Development
 
@@ -854,30 +899,15 @@ uv run --frozen python bench/compare_results.py
 
 The DuckDB submodule is in `duckdb/`. Update it only with explicit submodule commands.
 
-## Configuration
+## Benchmarks
 
-`JSONO_SHAPE_CACHE_SIZE` controls the size of the JSONO writer shape cache:
+The `bench/` directory is the harness for comparisons between `jsono` versions and the core DuckDB `json` baseline. Run a smoke benchmark:
 
 ```bash
-JSONO_SHAPE_CACHE_SIZE=16384 ./build/release/duckdb -unsigned
+uv run --frozen python bench/bench.py --filter group_merge/1k --runs 1
 ```
 
-Use power-of-two values for performance comparisons. The default is adjusted for the local benchmark workloads, but real data can be different.
-
-## Interop and limits
-
-**Shredded values and core json.** The jsono-named functions (`jsono_extract`, `jsono_extract_string`, `jsono_type`, `jsono_keys`, `jsono_validate`, `jsono_storage_size`), `jsono_group_merge`, the `::VARCHAR` cast, and the shredded→plain JSONO reconstruction are bind-correct: they accept a shredded value directly and operate correctly with the extension optimizer off. The operators and casts that go to the bundled core `json` extension — `->>`, `->`, `json_extract`, `::JSON`, and `to_json` — are correct over a shredded value only with the extension optimizer on (the default). The optimizer changes them to read the shreds and the residual. With the optimizer fully off (`PRAGMA disable_optimizer`), those core-routed operations bind into core json and serialize the physical fields. This is a structural DuckDB limit: core json owns the `STRUCT → JSON` cast, and the extension cannot intercept it.
-
-**Chained operators over a constant literal.** Over a shredded **column**, `value -> 'a' ->> 'b'` becomes one deep-path shred read, the same as `value ->> '$.a.b'`. Over a **fully-constant `jsono({…})` literal**, the same chain returns `NULL` — DuckDB folds it before the extension optimizer runs. For a constant literal, use the JSONPath form `jsono({…}) ->> '$.a.b'`.
-
-**Nesting depth.** The parser refuses JSON that has more than 1000 levels (512 on macOS, where the worker-thread stacks are too small for the deeper recursion). Sanitizer builds decrease the limit only where their larger frames make it necessary: 32 with AddressSanitizer (each platform), and 32 with UndefinedBehaviorSanitizer on macOS. The UndefinedBehaviorSanitizer build on Linux keeps the full 1000.
-
-**Not implemented.** The current surface is intentionally small:
-
-- There is no cast from JSONO to a scalar type (`jsono('42')::INTEGER` is unsupported). Project string values with `->>` / `jsono_extract_string`, or typed fields with `jsono_transform`.
-- There is no cast from JSONO to an arbitrary `STRUCT`. Only the physical six-BLOB shape is interchangeable with JSONO. Field extraction goes through `jsono_transform`.
-- There is no dedicated table function that changes a JSONO array or object into rows. Use `unnest(jsono_entries(...))` for flattened scalar leaves, or `unnest(jsono_array_elements(...))` for array elements as rows.
-- Object key order is not kept: keys are stored and written in sorted byte order.
+[bench/README.md](bench/README.md) documents the operation set, the version and core-json comparisons, the field-sample scenarios, and the result-reading contract. [bench/PROFILING.md](bench/PROFILING.md) documents profiling.
 
 ## Contributing
 

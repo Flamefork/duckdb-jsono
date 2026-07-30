@@ -133,7 +133,7 @@ SET disabled_optimizers='extension';
 statement error
 SELECT
   typeof(m) = jsono_storage_type('{"event_name": "VARCHAR"}'),
-  to_json(m::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))))
+  to_json(m::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))))
 FROM (
   SELECT jsono_group_merge(j ORDER BY ts) AS m FROM (VALUES
     (jsono('{"event_name":"search","x":1}', shredding := '{"event_name": "VARCHAR"}'), 1),

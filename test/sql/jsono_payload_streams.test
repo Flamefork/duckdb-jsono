@@ -1,5 +1,5 @@
-# name: test/sql/jsono_v4_streams.test
-# description: v4 format: lengths/nums payload streams and threshold container spans
+# name: test/sql/jsono_payload_streams.test
+# description: external lengths/nums payload streams and threshold container spans
 # group: [sql]
 
 require jsono
@@ -22,8 +22,8 @@ SELECT to_json(jsono('{"s":"hello","empty":"","i":7,"neg":-42,"big":576460752303
 # directly: 4 entries x 4 bytes, and 5 nums entries x 8 bytes (i, neg, big, u, d).
 query II
 SELECT
-  octet_length(j."jsono"."body$1".lengths) / 4,
-  octet_length(j."jsono"."body$1".nums) / 8
+  octet_length(j."jsono"."body$2".lengths) / 4,
+  octet_length(j."jsono"."body$2".nums) / 8
 FROM (SELECT jsono('{"s":"hi","empty":"","i":7,"neg":-42,"big":576460752303423488,"u":18446744073709551615,"d":2.5,"bn":123456789012345678901234567890,"e":1.5e-3,"t":true,"n":null}') AS j);
 ----
 4	5
@@ -32,9 +32,9 @@ FROM (SELECT jsono('{"s":"hi","empty":"","i":7,"neg":-42,"big":57646075230342348
 # the bare 12-byte metadata header. A non-empty array stores one (12 + 4 id + 24 span).
 query III
 SELECT
-  octet_length(jsono('{"a":1,"b":"x"}')."jsono"."body$1".skips),
-  octet_length(jsono('[]')."jsono"."body$1".skips),
-  octet_length(jsono('[1,2]')."jsono"."body$1".skips);
+  octet_length(jsono('{"a":1,"b":"x"}')."jsono"."body$2".skips),
+  octet_length(jsono('[]')."jsono"."body$2".skips),
+  octet_length(jsono('[1,2]')."jsono"."body$2".skips);
 ----
 12	12	40
 
@@ -42,8 +42,8 @@ SELECT
 # is a bounded subtree walk. A nested non-empty array stores its own span.
 query II
 SELECT
-  octet_length(jsono('{"a":1,"o":{"x":1}}')."jsono"."body$1".skips),
-  octet_length(jsono('{"a":1,"l":[1,2]}')."jsono"."body$1".skips);
+  octet_length(jsono('{"a":1,"o":{"x":1}}')."jsono"."body$2".skips),
+  octet_length(jsono('{"a":1,"l":[1,2]}')."jsono"."body$2".skips);
 ----
 12	40
 
@@ -51,7 +51,7 @@ SELECT
 # navigation would otherwise replay the whole subtree on every row.
 query II
 SELECT
-  octet_length(jsono('{"root":{"a":1,"l":[1,2,3,4,5,6,7,8,9,10]},"z":1}')."jsono"."body$1".skips),
+  octet_length(jsono('{"root":{"a":1,"l":[1,2,3,4,5,6,7,8,9,10]},"z":1}')."jsono"."body$2".skips),
   jsono_validate(jsono('{"root":{"a":1,"l":[1,2,3,4,5,6,7,8,9,10]},"z":1}'));
 ----
 96	true
@@ -80,7 +80,7 @@ FROM (SELECT jsono('{"a":"text","b":12345678901234567890,"c":[1,"two",3.5],"m":{
 last	deep	{"p":1.25,"q":"deep"}
 
 # An object with > 16 keys is spanned and checkpointed; reaching a high-rank key uses the
-# checkpoint jump with the v4 per-stream deltas. Values before the jump consume all three
+# checkpoint jump with the per-stream deltas. Values before the jump consume all three
 # streams so a wrong delta would misread.
 query III
 SELECT
@@ -124,20 +124,20 @@ FROM (VALUES (1, jsono('{"a":1.5,"s":"x"}')), (2, jsono('{"b":123456789012345678
 # Shredded residual: the stripped path's payload leaves the residual streams; the value
 # reconstructs from the shred, including through a Parquet round-trip of all six blobs.
 statement ok
-CREATE TABLE v4_shredded AS
+CREATE TABLE shredded_streams AS
 SELECT jsono('{"name":"hello","n":7,"d":2.5,"rest":{"deep":"value"}}',
              shredding := '{"name": "VARCHAR", "$.n": "BIGINT"}') AS e;
 
 query III
-SELECT to_json(e), e ->> '$.name', e ->> '$.rest.deep' FROM v4_shredded;
+SELECT to_json(e), e ->> '$.name', e ->> '$.rest.deep' FROM shredded_streams;
 ----
 {"d":2.5,"n":7,"name":"hello","rest":{"deep":"value"}}	hello	value
 
 statement ok
-COPY v4_shredded TO '__TEST_DIR__/v4_shredded.parquet' (FORMAT PARQUET);
+COPY shredded_streams TO '__TEST_DIR__/shredded_streams.parquet' (FORMAT PARQUET);
 
 query II
-SELECT to_json(e), jsono_validate(e) FROM read_parquet('__TEST_DIR__/v4_shredded.parquet');
+SELECT to_json(e), jsono_validate(e) FROM read_parquet('__TEST_DIR__/shredded_streams.parquet');
 ----
 {"d":2.5,"n":7,"name":"hello","rest":{"deep":"value"}}	true
 
@@ -145,10 +145,10 @@ SELECT to_json(e), jsono_validate(e) FROM read_parquet('__TEST_DIR__/v4_shredded
 # ints, decimals, doubles-from-struct excluded — text path has none).
 statement ok
 COPY (SELECT jsono('{"arr":[1,"two",3.5,{"k":"v"}],"big":99999999999999999999,"s":"tail"}') AS j)
-TO '__TEST_DIR__/v4_plain.parquet' (FORMAT PARQUET);
+TO '__TEST_DIR__/plain_streams.parquet' (FORMAT PARQUET);
 
 query II
-SELECT to_json(j), jsono_validate(j) FROM read_parquet('__TEST_DIR__/v4_plain.parquet');
+SELECT to_json(j), jsono_validate(j) FROM read_parquet('__TEST_DIR__/plain_streams.parquet');
 ----
 {"arr":[1,"two",3.5,{"k":"v"}],"big":99999999999999999999,"s":"tail"}	true
 

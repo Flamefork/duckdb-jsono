@@ -3,12 +3,12 @@
 JSONO stores JSON as a sequence of 64-bit slots plus two byte heaps, two
 fixed-width payload streams, and a navigation block. There is no logical type
 alias; physically a JSONO value is a nested DuckDB STRUCT with exactly one
-layout field, `jsono`, wrapping the six-BLOB residual `body$1`:
+layout field, `jsono`, wrapping the six-BLOB residual `body$2`:
 
 ```
 STRUCT(
   jsono STRUCT(                -- the anchor: never revisioned
-    "body$1" STRUCT(           -- residual column layout, revision 1
+    "body$2" STRUCT(           -- residual column layout, revision 2
       slots       BLOB,   -- [Header 8 bytes][Slots n × 8 bytes]
       key_heap    BLOB,   -- key bytes, addressed by KEY slots
       string_heap BLOB,   -- string/number-text bytes, consumed by a cursor in walk order
@@ -24,18 +24,18 @@ There is no user-defined type alias (it could not survive `read_parquet` or
 DuckLake); a stored value is just this nested STRUCT, recognised structurally.
 The six body BLOBs round-trip through every storage layer unchanged.
 
-Splitting the variable payloads out of the slots is deliberate: a v3 slot
-carried its payload inline (string length, inline int60), so two rows with the
-same shape still produced different slot bytes. In v4 every value slot is a
-shape-constant tag word — rows sharing a schema produce byte-identical `slots`
-blobs — and the per-row variability is concentrated in the small fixed-width
-`lengths`/`nums` streams, which general-purpose compression (Parquet + zstd)
-handles far better.
+Splitting the variable payloads out of the slots is deliberate: a retired
+encoding carried the payload inline in the slot (string length, inline int60),
+so two rows with the same shape still produced different slot bytes. Now every
+value slot is a shape-constant tag word — rows sharing a schema produce
+byte-identical `slots` blobs — and the per-row variability is concentrated in
+the small fixed-width `lengths`/`nums` streams, which general-purpose
+compression (Parquet + zstd) handles far better.
 
 ## Shredded layout
 
 For fast columnar reads of hot paths, a JSONO value can be stored *shredded*:
-the `jsono` layout field carries the residual `body$1` plus a sibling
+the `jsono` layout field carries the residual `body$2` plus a sibling
 `shreds$2` STRUCT — a reserved shred-set marker followed by one typed *shred*
 per chosen path
 (produced by `jsono(value, shredding := spec)`).
@@ -43,7 +43,7 @@ per chosen path
 ```
 STRUCT(
   jsono STRUCT(
-    "body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB,
+    "body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB,
                     lengths BLOB, nums BLOB),
     "shreds$2" STRUCT(         -- shred layout, revision 2
       "$jsono$set" BIGINT,       -- shred-set marker (see below)
@@ -59,8 +59,8 @@ STRUCT(
 
 Shredding does **not** change the binary slot format. The six `body` blobs are
 an ordinary JSONO value — the *residual* — so everything else in this spec
-applies to them unchanged, including `version`. A plain (unshredded) value has
-**no** `shreds` field (`STRUCT(jsono STRUCT("body$1" …))`); shredded-ness is
+applies to them unchanged. A plain (unshredded) value has
+**no** `shreds` field (`STRUCT(jsono STRUCT("body$2" …))`); shredded-ness is
 exactly the presence of `shreds$2`. Each scalar *shred* is the value at its
 canonical path (`$.kind`, `$.commit.operation`, …) materialized as a plain typed
 DuckDB column (`VARCHAR`, `BIGINT`, `UBIGINT`, `DOUBLE`, `BOOLEAN`). Nested shred
@@ -430,19 +430,27 @@ than part of the blob.
 
 ## Layout revisions
 
-Three things are versioned independently, because they fail in different ways
-and invalidate different data:
+Two things are versioned independently, because they invalidate different data:
 
 | What | Where the version lives | How to read the current one |
 |------|-------------------------|-----------------------------|
-| The bytes **inside** the body blobs | `version` byte in `slots` | `jsono_version()`, and [Compatibility policy](#compatibility-policy) |
-| The residual's **column** layout (the set, names and types of the body blobs) | the field name `body$<N>` | the value's own type |
+| The **residual format**, whole — the set, names and types of the body blob columns AND the byte encoding inside them | the field name `body$<N>` | the value's own type |
 | The **shred** layout (reserved fields inside `shreds`, lane naming, lane shape, spill bit numbering, marker semantics) | the field name `shreds$<M>` | the value's own type |
 
+There is no third axis. The header once carried a separate version byte for the
+bytes inside the blobs; that byte is reserved space now (see [Header](#header)).
+A byte-encoding change and a column change invalidate exactly the same data —
+every value has residual blobs — so the separate byte axis only moved the
+refusal from bind time to row time, and bind is strictly better: earlier, once
+per column, before any partial output. The name is also the only form of
+version an `INSERT` cannot bypass: under a byte-only bump an old column's type
+stayed identical to the current one, so "rewrite the column before it accepts
+new writes" was documentation rather than a check, while a name bump makes the
+binder enforce it.
+
 The current numbers are deliberately not restated here. Each already has one
-authority that a reader can query — the version byte through `jsono_version()`,
-the two layout revisions through the field names in any type printout — and a
-second copy of a number that changes is a copy that eventually disagrees with
+authority that a reader can query — the field names in any type printout — and
+a second copy of a number that changes is a copy that eventually disagrees with
 the first. Where a revision bump happened and what the closed form looked like
 is in [Revision history](#revision-history).
 
@@ -459,14 +467,24 @@ existed: an older shredded value bound to core `json`'s `->>`/`to_json`, which
 returned `NULL` or serialized the raw blob struct.
 
 A layout struct carrying **more than one** revisioned stem of a kind (`body` and
-`body$1` side by side, say) is a *mixture* of revisions and is refused the same
+`body$2` side by side, say) is a *mixture* of revisions and is refused the same
 way. That is what a multi-file scan produces: `read_parquet(…, union_by_name :=
 true)` merges the per-file schemas by name, so an old file beside a current one
-yields `body$1, shreds$2, body, shreds` in whichever order the files were
-listed. Nothing can be done to such a scan as a whole (there is no single
-revision to upgrade from) — upgrade the old files separately and `UNION ALL` the
+yields `body$2, shreds$2, body, shreds` in whichever order the files were
+listed. Today nothing can be done to such a scan as a whole (this build reads
+exactly one revision) — upgrade the old files separately and `UNION ALL` the
 results. The refusal names a *foreign* revision rather than whichever sorted
 first, so it reads the same in both orders.
+
+Every revision closed so far predates publication, and the loud refusal above
+is the whole story for them. From the first *published* revision the policy
+changes: storage compatibility is a **read** commitment, so a bump ships — in
+the same commit — a reader for the revision it closes. The writer still writes
+only the current revision; an old column must be rewritten before it accepts
+new writes. What that reader looks like is decided inside the bump, not in
+advance, because the right answer depends on what the change does: whether the
+change is transcodable, how a revision mixture in one scan is handled per row,
+and whether old data stays read-only or becomes read+write.
 
 A value carrying the *current* revision that nevertheless fails the grammar
 stays non-JSONO in *recognition* — recognition runs over every struct in every
@@ -528,36 +546,78 @@ Two boundaries are known and not caught:
   and our own binders still refuse, since they do not depend on the optimizer.
 
 **Bump `body$N`** when a body blob column is added, removed, renamed or
-retyped. **Bump `shreds$M`** when the reserved field set inside `shreds`, the
-lane naming (the path → field-name codec), the lane shape, the canonical rank
-numbering, the marker semantics or the spill bit encoding change — including purely *semantic* changes the type cannot show.
+retyped — and equally when the **byte encoding inside** the blobs changes: slot
+tags, payload semantics, heap layout, navigation metadata, the shred-manifest
+framing, required header flags. The name versions the residual format whole;
+the bytes have no version of their own. **Bump `shreds$M`** when the reserved
+field set inside `shreds`, the lane naming (the path → field-name codec), the
+lane shape, the canonical rank numbering, the marker semantics or the spill bit
+encoding change — including purely *semantic* changes the type cannot show.
 Neither is bumped by the user's shred set or by the ⌈N/63⌉ spill column count:
 those are data under a fixed layout.
 
-Closing a revision is one commit with three parts:
+Closing a revision is one commit with four parts:
 
 1. bump the name (`JSONO_BODY_REVISION` / `JSONO_SHREDS_REVISION` in
    `src/include/jsono.hpp`);
-2. add a closed-revision fixture — a struct literal over a live body, as in
-   `test/sql/jsono_layout_revision.test` — asserting the loud refusal. Do **not**
-   carry the golden bytes into it: a foreign revision is decided by the field
-   *name* before a single blob is read, so bytes in a refusal fixture assert
-   nothing;
-3. add one row to the revision map below: the commit range that wrote the closed
+2. ship the compat reader for the revision being closed, plus a read-test over
+   that revision's own bytes — the golden bytes of
+   `test/sql/jsono_layout_golden.test` move into that read-fixture instead of
+   retiring into git history. This is the part where the deferred questions
+   above are answered: transcodability, per-row mixture handling, read-only vs
+   read+write;
+3. add a closed-revision fixture — a struct literal over a live body, as in
+   `test/sql/jsono_layout_revision.test` — pinning how this build classifies
+   the closed revision by its field names. Do **not** carry the golden bytes
+   into it: a revision is decided by the field *name* before a single blob is
+   read, so bytes in that fixture assert nothing;
+4. add one row to the revision map below: the commit range that wrote the closed
    shape, and how it differs from the new current one. Not its full layout — the
-   build that wrote it, and the golden bytes it wrote, are in git, and a second
-   copy here can only drift from them. What a user holding old files needs is the
-   way back: the commit range, plus the statement that moves the data forward
-   whenever a rebuild of the layout struct is enough.
+   build that wrote it is in git, its bytes are in the compat read-fixture, and
+   a second copy here can only drift from them. What a user holding old files
+   needs is the way back: the commit range, plus the statement that moves the
+   data forward whenever a rebuild of the layout struct is enough.
 
 ### Revision history
 
-There is no compat reader and none is planned: this build refuses old data, it
-does not upgrade it. So what follows is not an archive of closed layouts — those
-live in git, in the build that wrote them and in the golden bytes of
-`test/sql/jsono_layout_golden.test` at that commit. It is the way back to your
-bytes: which commit range wrote which shape, and what it takes to move it
-forward.
+Every revision below closed before the first published release, so no compat
+reader exists for any of them: this build refuses them, it does not upgrade
+them. (From the first published revision that stops being true — a bump ships a
+reader for the revision it closes; see the checklist above.) So what follows is
+not an archive of closed layouts — those live in git, in the build that wrote
+them and in the golden bytes of `test/sql/jsono_layout_golden.test` at that
+commit. It is the way back to your bytes: which commit range wrote which shape,
+and what it takes to move it forward.
+
+Because `body$<N>` now versions the bytes as well as the columns, every entry
+below states whether the closed revision's **bytes** differ from the current
+encoding, not only its columns — that statement is what decides between the
+[rebuild-in-place recipe](#rebuild-in-place) and an old build.
+
+**Body revision 1** (`bf99fb2`…`9422a72`) is the shape that carried the
+header's separate byte-version axis. Its residual *columns* are exactly
+revision 2's — six blobs, same names, same types — and revision 2 exists
+because that axis collapsed into the name: `body$<N>` has to vouch for the
+bytes now, and `body$1` cannot, because its window contains a byte-encoding
+change that was never reflected in the name. At `53401cb` (2026-07-27) the
+shred-manifest framing in `skips` was replaced (the two retired framings
+collapsed into the type-code one) while the field name stayed `body$1`; only
+the header byte recorded it, and that byte is no longer checked.
+
+Did the bytes change: **plain rows — no**, across the whole window (the header
+still stamps the retired version `04` or `05` in its now-reserved fifth byte,
+which readers ignore). **Shredded rows written at `53401cb` or later — no**
+(byte-identical residuals, same lane layout, `shreds$2`). **Shredded rows
+written before `53401cb` — yes**: the manifest tail uses a retired framing, and
+under the current name it would misread silently. The header stamp (`05` vs
+`04`) is what separates the last two cases — see the recipe's caveat for how to
+read it.
+
+A plain revision-1 value, and a shredded one whose stamp is `05`, rebuild in
+place under the current name ([recipe below](#rebuild-in-place); carry
+`shreds$2` over unchanged for the shredded case). A shredded value whose stamp
+is `04` must not be rebuilt: read it with a build from `bf99fb2`…`53401cb`~ and
+re-ingest through `jsono(value, shredding := …)`.
 
 **Shreds revision 1** (`bf99fb2`…`172d892`) named a lane by its **path spelled as
 text** — `gclid`, `$.commit.operation` — rather than by the encoding of the path.
@@ -568,6 +628,12 @@ JSON key (`gclid` / `GCLID`) collapsed into one lane on a type merge and the
 by-name cast then misfiled one key's values into the other's. The manifest of such
 a value additionally stored the lane's *physical* name, so `gclid` appears there
 where revision 2 writes `$.gclid`.
+
+Did the bytes change: **yes, in every shredded row** — the whole window predates
+`53401cb`, so the manifest tail in `skips` uses a retired framing on top of the
+physical-name entries above. A value carrying `shreds$1` never qualifies for the
+rebuild-in-place recipe; the re-ingest path below is the only way forward, and it
+covers the byte gap along with the naming one.
 
 Renaming the field to `shreds$2` is **not** an upgrade: every lane inside it must
 be re-spelled as the encoded path (see [Lane names](#lane-names)) and every row's
@@ -601,19 +667,19 @@ unrevisioned field names `body` and `shreds`. Four shapes shipped under it.
 Stored files overwhelmingly carry 0.d: it lived from `cc7d8cb` until revisions
 landed in `bf99fb2`.
 
-**0.d, 0.c and 0.b upgrade in place, in SQL — plain values only.** Nothing inside
-the blobs changed across them, so for a plain value the whole migration is a
-rebuild of the layout struct under the current field names:
+Did the bytes change: **plain rows written at `0f15004` or later — no** (that
+commit's `lengths`/`nums` streams encoding is still the current one for plain
+rows; the header stamps the retired `04`). **Plain rows written before
+`0f15004` — yes**: they predate the streams split, and the retired encodings
+before it kept payloads inside the slot words, which the current reader would
+misplace silently. **Shredded rows — yes, always**: text lane names and
+physical-name manifest entries (plus, for 0.a, a lane shape the current layout
+cannot spell at all).
 
-```sql
--- The extension optimizer refuses struct_extract over a foreign value — which is
--- exactly the read this rebuild needs — so it is off for this one statement.
-SET disabled_optimizers='extension';
-CREATE TABLE upgraded AS
-SELECT {'jsono': {'body$1': v.jsono.body}} AS v
-FROM old;
-RESET disabled_optimizers;
-```
+So a **plain** revision-0 value whose stamp is `04` rebuilds in place under the
+current field names ([recipe below](#rebuild-in-place), reading
+`v.jsono.body`); a plain value with an earlier stamp needs a build from its
+range, like every shredded one.
 
 A **shredded** revision-0 value carries text lane names and physical-name manifest
 entries, so it needs the same per-row work as shreds revision 1 above: read it
@@ -633,41 +699,55 @@ it — `git checkout ada4d30~`, build, `COPY … TO 'x.json'` — and re-ingest 
 `jsono(...)`. That old build is the compat reader, which is the other half of
 why closed layouts are not restated in this document.
 
-## Compatibility policy
+#### Rebuild in place
 
-The on-disk binary format is versioned by the `version` byte in `slots`.
-Current `JSONO` files use `version = 5`:
+For a value whose entry above says its bytes match the current encoding, the
+whole migration is a rebuild of the layout struct under the current field
+names — no per-row work:
 
-- version 2 added the per-object `shape_hash` field to `ContainerSpan` (see
-  [Navigation](#navigation-skips));
-- version 3 added the shred manifest tail to `skips` (see
-  [Shred manifest](#shred-manifest));
-- version 4 moved the variable slot payloads into the `lengths`/`nums` streams
-  (slots are pure tags), made `ContainerSpan`/`ObjectCursorCheckpoint` carry
-  per-stream counts/deltas, and made span storage *sparse*: non-empty arrays
-  and objects with `child_count > OBJECT_CHECKPOINT_STRIDE` store a span,
-  addressed through a sorted sparse container-id index;
-- version 5 made the shred manifest one framing instead of two (the full and
-  compact forms collapsed into the type-code form, and its `0xffffffff` marker
-  is gone), and gave an object-array lane its own type code whose entry spells
-  the element subfields out one by one instead of rendering the element struct
-  as a type string.
+```sql
+-- The extension optimizer refuses struct_extract over a foreign value — which is
+-- exactly the read this rebuild needs — so it is off for this one statement.
+SET disabled_optimizers='extension';
+CREATE TABLE upgraded AS
+SELECT {'jsono': {'body$2': v.jsono.body}} AS v   -- revision 0, plain
+FROM old;
+-- body revision 1: read v.jsono."body$1" instead. For a shredded body-revision-1
+-- value (stamp 05 only — see the caveat), carry the shred struct over unchanged:
+--   {'jsono': {'body$2': v.jsono."body$1", 'shreds$2': v.jsono."shreds$2"}}
+RESET disabled_optimizers;
+```
 
-This extension is still experimental, so compatibility is intentionally strict:
-an incompatible change to slot tags, payload semantics, heap layout, navigation
-metadata, or required header flags must bump `jsono::VERSION`. Readers accept
-only the current version and do not attempt a silent best-effort decode; the
-current version is also exposed in SQL as `jsono_version()`.
+**The recipe is valid only when the revision's entry says its bytes are the
+current encoding, and misusing it is silent.** The rebuild is exactly the
+operation that separates blob bytes from the name that vouches for them, and
+the check that used to catch the mismatch is gone: before the axes collapsed, a
+wrapper rebuilt around bytes of another encoding was refused loudly, per row,
+by the header's version byte. Nothing replaces that at read time. Rebuild a
+value whose bytes differ and the result *looks* current and misreads silently —
+a changed span size shifts every subsequent read — with no error anywhere
+downstream.
 
-Public helpers distinguish an *absent* value from a *corrupt* one. A slots blob
-too short to hold a header is an absent value and reads as SQL `NULL`. A present
-blob whose header is unreadable — wrong `magic`, a different `version`, misaligned
-slots, or a metadata blob shorter than its declared spans — is corruption or
-non-JSONO bytes bound to a jsono op, so extraction/serialization helpers raise an
-error rather than silently reading as `NULL`. `jsono_validate` recovers a boolean
-from these errors and returns `false`. Backward readers or migration functions
-should be added explicitly when persisted old JSONO files become a supported
-contract.
+What replaces the check is forensic, not automatic: pre-collapse values still
+carry the retired version stamp in the fifth byte of `slots`. Read it with
+`hex(v.jsono.body.slots)[9:10]` (spell the residual field as the value's type
+does — `body`, `"body$1"`): `02`, `03`, `04` or `05`; the entries above say
+which stamps qualify for the rebuild. A value the current writer produced has
+`00` there — the byte is reserved space now and ignored on read, which is
+precisely what lets a rebuilt old body keep its stamp and still read. After a
+rebuild, verify the outcome — `jsono_validate` over the rebuilt column, a
+`to_json` spot-check against the source — instead of waiting for an error that
+will not come.
+
+The stamps, for the record — each was a byte-encoding milestone under the
+retired axis: `02` gave `ContainerSpan` the per-object `shape_hash`
+([Navigation](#navigation-skips)); `03` added the shred-manifest tail to
+`skips` ([Shred manifest](#shred-manifest)); `04` (`0f15004`) moved the
+variable payloads out of the slots into the `lengths`/`nums` streams and made
+span storage sparse; `05` (`53401cb`) collapsed the shred manifest to its
+single type-code framing and gave object-array lanes their own type code. The
+`05` encoding is byte-identical to the current one — collapsing the version
+axis itself changed no bytes beyond zeroing the stamp.
 
 ## Data model
 
@@ -699,16 +779,20 @@ strings and keys. That is delegated to Parquet column-dictionary encoding — se
 | field | type | value |
 |---|---|---|
 | `magic` | u32 | `'JSNO'` = `0x4F4E534A` |
-| `version` | u8 | the current format version — see [Compatibility policy](#compatibility-policy) |
+| `reserved` | u8 | written `0`, **ignored on read**. Held the format version until the byte axis collapsed into `body$<N>`; a pre-collapse body still carries its stamp here — see [Revision history](#revision-history) |
 | `flags` | u8 | bit0 = `SORTED_KEYS` |
 | `reserved` | u16 | `0` |
 
-A slots blob too short to hold a header is an absent value (SQL `NULL`).
-Otherwise header parsing raises if `magic`/`version` do not match, if the slot
-length minus the Header is not a multiple of 8, if `lengths`/`nums` are not whole
-numbers of 4-/8-byte entries, or if the metadata blob is shorter than its
-declared spans — see the invalid blob behavior in
-[Compatibility policy](#compatibility-policy).
+Header parsing separates an *absent* value from a *corrupt* one. A slots blob
+too short to hold a header is an absent value and reads as SQL `NULL`. A
+present blob that is unreadable — wrong `magic`, a slot length minus the Header
+that is not a multiple of 8, `lengths`/`nums` blobs that are not whole numbers
+of 4-/8-byte entries, or a metadata blob shorter than its declared spans — is
+corruption or non-JSONO bytes bound to a jsono op, so extraction/serialization
+helpers raise an error rather than silently reading as `NULL`; `jsono_validate`
+recovers a boolean from these errors and returns `false`. Versioning is a
+different subject and is not the header's: a value of another revision is
+refused by its *name*, at bind — see [Layout revisions](#layout-revisions).
 
 ## Slot
 
@@ -720,8 +804,8 @@ TAG_SHIFT = 60
 PAYLOAD_MASK = (1 << 60) - 1
 ```
 
-Payload semantics depend on the tag. Since v4, value slots carry **no
-variable data**: lengths live in `lengths`, numeric words in `nums`, both
+Payload semantics depend on the tag. Value slots carry **no variable
+data**: lengths live in `lengths`, numeric words in `nums`, both
 consumed by walk-order cursors. This makes value slots shape-constant: two rows
 with the same JSON shape produce byte-identical slot words.
 
@@ -988,7 +1072,7 @@ the number falls through to NUMBER and is preserved byte-exact.
 Allocation principle: mass values on the text path → a hot tag; rare values →
 VAL_EXT. DOUBLE under VAL_EXT by default; promoting it to a hot tag is a
 benchmark-decidable decision (justified only for double-heavy data). The
-INT60/INT64 distinction is purely a tag-level classification since v4 (both
+INT60/INT64 distinction is purely a tag-level classification (both
 store a full 64-bit word in `nums`); the ladder is kept so the tag remains an
 honest type witness for readers and statistics.
 

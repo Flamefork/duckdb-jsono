@@ -35,17 +35,6 @@ void JsonoStorageTypeExecute(DataChunk &args, ExpressionState &state, Vector &re
 	result.SetValue(0, Value(JsonoRawStructType().ToString()));
 }
 
-// jsono_version() -> the binary format version this extension reads/writes. A format bump
-// leaves the physical STRUCT type unchanged, so a schema epoch derived from the type alone
-// cannot see it; folding this into a schema hash triggers re-materialization on a bump
-// before a version-mismatched read fails loud.
-void JsonoVersionExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	(void)args;
-	(void)state;
-	result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	result.SetValue(0, Value::INTEGER(int32_t(jsono::VERSION)));
-}
-
 // jsono_layout_diagnose(value) -> what the extension sees `value` as, and why not JSONO when it is
 // not. Purely a question about the argument's TYPE, so it is answered at bind and returned as a
 // constant; the value's bytes are never read. It exists because the "current revision, fails the
@@ -345,7 +334,7 @@ JsonoLayoutMatch RejectNotJsono(string *reason, const char *format, ARGS... args
 // field name `jsono` plus a field 0 named `body` or `body$<digits>` whose type is a STRUCT of pure
 // BLOBs; it is narrow enough that no user struct hits it by accident and permanent, so a value
 // written under a DIFFERENT revision is classified Foreign rather than silently passed over. Past
-// the anchor the current grammar is: the six-BLOB body struct at `body$1`, optionally a `shreds$2`
+// the anchor the current grammar is: the six-BLOB body struct at `body$2`, optionally a `shreds$2`
 // STRUCT sibling holding the shred-set marker, the spill bitmap columns and one field per shred.
 // The single, unrevisioned layout name (`jsono` for
 // plain and shredded) is deliberate: DuckDB reconciles set-operation branch types by field name
@@ -373,7 +362,7 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 	}
 	// Read every revisioned stem, not just the leading pair. Two stems of the same kind mean the type
 	// is a MIXTURE of revisions — a multi-file scan (`union_by_name`) merges per-file schemas by name,
-	// so an old file beside a current one yields `body$1, shreds$2, body, shreds` in whichever order
+	// so an old file beside a current one yields `body$2, shreds$2, body, shreds` in whichever order
 	// the files were listed. Without this the classification depended on that order: an old file first
 	// was refused, a current file first passed the anchor, failed the grammar and went silently
 	// NotJsono — the whole scan, current rows included, then read as NULL through core json. Naming a
@@ -846,11 +835,6 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 		set.AddFunction(ScalarFunction({}, LogicalType::VARCHAR, JsonoStorageTypeExecute));
 		set.AddFunction(
 		    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, JsonoStorageTypeWithShredsExecute));
-		loader.RegisterFunction(set);
-	}
-	{
-		ScalarFunctionSet set("jsono_version");
-		set.AddFunction(ScalarFunction({}, LogicalType::INTEGER, JsonoVersionExecute));
 		loader.RegisterFunction(set);
 	}
 	{

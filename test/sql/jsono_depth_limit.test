@@ -36,7 +36,7 @@ true
 # TRY_CAST(VARCHAR -> jsono struct) goes through the same parse path and must also yield NULL.
 query I
 SELECT TRY_CAST(repeat('[', 1500) || '1' || repeat(']', 1500)
-                AS STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB,
+                AS STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB,
                                                    skips BLOB, lengths BLOB, nums BLOB)))) IS NULL;
 ----
 true

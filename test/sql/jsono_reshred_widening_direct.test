@@ -5,7 +5,7 @@
 require jsono
 
 statement ok
-CREATE MACRO plain_jsono(v) AS CAST(v AS STRUCT(jsono STRUCT("body$1" STRUCT(
+CREATE MACRO plain_jsono(v) AS CAST(v AS STRUCT(jsono STRUCT("body$2" STRUCT(
   slots BLOB,
   key_heap BLOB,
   string_heap BLOB,
@@ -30,7 +30,7 @@ WITH source AS (
     jsono(plain_jsono(v), shredding := '{"a": "VARCHAR", "b": "VARCHAR", "c": "VARCHAR", "d": "BIGINT"}') AS generic
   FROM source
 )
-SELECT hash(fast) = hash(generic), fast.jsono."body$1" IS NOT DISTINCT FROM generic.jsono."body$1"
+SELECT hash(fast) = hash(generic), fast.jsono."body$2" IS NOT DISTINCT FROM generic.jsono."body$2"
 FROM compared;
 ----
 true	true
@@ -47,7 +47,7 @@ WITH source AS (
     jsono(plain_jsono(v), shredding := '{"a": "VARCHAR", "d": "BIGINT", "m": "VARCHAR"}') AS generic
   FROM source
 )
-SELECT hash(fast) = hash(generic), fast.jsono."body$1" IS NOT DISTINCT FROM generic.jsono."body$1"
+SELECT hash(fast) = hash(generic), fast.jsono."body$2" IS NOT DISTINCT FROM generic.jsono."body$2"
 FROM compared;
 ----
 true	true
@@ -82,7 +82,7 @@ WITH source AS (
     jsono(plain_jsono(v), shredding := '{"a": "VARCHAR", "n": "BIGINT"}') AS generic
   FROM source
 )
-SELECT hash(fast) = hash(generic), fast.jsono."body$1" IS NOT DISTINCT FROM generic.jsono."body$1"
+SELECT hash(fast) = hash(generic), fast.jsono."body$2" IS NOT DISTINCT FROM generic.jsono."body$2"
 FROM compared;
 ----
 true	true

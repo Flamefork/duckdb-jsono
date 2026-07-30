@@ -83,7 +83,7 @@ true
 # An absent body row stays NULL even if other body blobs contain bytes that a present row would parse.
 query I
 SELECT jsono_shred_manifest(
-  {'jsono': {'body$1': {'slots': '\x4A\x53'::BLOB,
+  {'jsono': {'body$2': {'slots': '\x4A\x53'::BLOB,
    'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': '\x01'::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}
 ) IS NULL;
 ----
@@ -172,23 +172,23 @@ SELECT to_json(v) FROM (
 # STRUCT is never empty), so a zero count is corruption or a hand-built blob.
 statement ok
 CREATE TABLE forged_zero_subfields AS
-SELECT {'jsono': {'body$1': {
-  'slots': v.jsono."body$1".slots,
-  'key_heap': v.jsono."body$1".key_heap,
-  'string_heap': v.jsono."body$1".string_heap,
+SELECT {'jsono': {'body$2': {
+  'slots': v.jsono."body$2".slots,
+  'key_heap': v.jsono."body$2".key_heap,
+  'string_heap': v.jsono."body$2".string_heap,
   -- the real tail is `$.items`, code 0x0B, two subfields; this rewrites it to code 0x0B, zero
-  'skips': unhex(replace(hex(v.jsono."body$1".skips),
+  'skips': unhex(replace(hex(v.jsono."body$2".skips),
                          '010000000700242E6974656D730B020002004E4D010200696402',
                          '010000000700242E6974656D730B0000')),
-  'lengths': v.jsono."body$1".lengths,
-  'nums': v.jsono."body$1".nums},
+  'lengths': v.jsono."body$2".lengths,
+  'nums': v.jsono."body$2".nums},
   'shreds$2': v.jsono."shreds$2"}} AS v
 FROM (SELECT jsono('{"items":[{"id":1,"NM":"z"}]}',
                    shredding := '{"$.items": "STRUCT(id BIGINT, NM VARCHAR)[]"}') AS v);
 
 # The rewrite landed (guards the fixture itself against a format change silently making it a no-op).
 query I
-SELECT hex(v.jsono."body$1".skips) LIKE '%0B0000' FROM forged_zero_subfields;
+SELECT hex(v.jsono."body$2".skips) LIKE '%0B0000' FROM forged_zero_subfields;
 ----
 true
 

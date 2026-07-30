@@ -16,7 +16,7 @@ require json
 statement ok
 CREATE MACRO jsono_residual(j) AS struct_pack(
     "jsono" := struct_pack(
-        "body$1" := struct_extract_at(struct_extract_at(j, 1), 1)));
+        "body$2" := struct_extract_at(struct_extract_at(j, 1), 1)));
 
 # jsono(j, shredding := spec) returns the shredded STRUCT: six blob residual + one shred per
 # spec path (named by the encoding of the path, typed by the spec). The read side reconstructs
@@ -314,7 +314,7 @@ invalid path
 # such a struct is not recognized as JSONO, so jsono functions refuse it at bind instead of reading
 # a read-copy lane. The same layout with the encoded object-key lane is recognized and binds.
 statement ok
-CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.arr[0]" BIGINT))));
+CREATE TABLE bad_lane_layout(x STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.arr[0]" BIGINT))));
 
 statement error
 SELECT jsono_array_length(x) FROM bad_lane_layout;
@@ -322,7 +322,7 @@ SELECT jsono_array_length(x) FROM bad_lane_layout;
 must be JSONO
 
 statement ok
-CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c5p74000 BIGINT))));
+CREATE TABLE good_lane_layout(x STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c5p74000 BIGINT))));
 
 query I
 SELECT count(*) FROM (SELECT jsono_array_length(x) FROM good_lane_layout);
@@ -414,20 +414,20 @@ row was shredded with shred '$.k VARCHAR'
 # document (overlay the shreds back onto the residual), it does not expose the stripped
 # residual (which jsono_residual above shows holds neither key).
 query I
-SELECT to_json(jsono({'name': 'x', 'k': 'y'})::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+SELECT to_json(jsono({'name': 'x', 'k': 'y'})::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 {"k":"y","name":"x"}
 
 # A nested-path shred round-trips through the reconstruct cast too.
 query I
-SELECT to_json(jsono('{"commit":{"operation":"create"},"kind":"k"}', shredding := '{"$.commit.operation": "VARCHAR", "$.kind": "VARCHAR"}')::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+SELECT to_json(jsono('{"commit":{"operation":"create"},"kind":"k"}', shredding := '{"$.commit.operation": "VARCHAR", "$.kind": "VARCHAR"}')::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 {"commit":{"operation":"create"},"kind":"k"}
 
 # Storing a shredded value into a plain jsono STRUCT column preserves the shred data (the
 # implicit cast reconstructs); the shreds must not be silently dropped.
 statement ok
-CREATE TABLE plain_store (params STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+CREATE TABLE plain_store (params STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 
 statement ok
 INSERT INTO plain_store SELECT jsono({'a': 'x', 'b': 5::BIGINT, 'c': 'y'});

@@ -83,7 +83,7 @@ CREATE TABLE sub_src AS SELECT jsono('{"items":[{"id":1,"nm":"a"}],"k":1}',
   shredding := '{"$.items": "STRUCT(id BIGINT, nm VARCHAR)[]"}') AS j;
 
 statement ok
-CREATE TABLE sub_bad AS SELECT CAST(j AS STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB,
+CREATE TABLE sub_bad AS SELECT CAST(j AS STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB,
   string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
   "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT,
   d5q6arbj0000 STRUCT(d5i0000 BIGINT, "nm!" VARCHAR)[])))) AS j FROM sub_src;
@@ -118,7 +118,7 @@ statement ok
 CREATE TABLE lane_src AS SELECT jsono('{"a":1,"b":"x"}', shredding := '{"$.a": "BIGINT"}') AS j;
 
 statement ok
-CREATE TABLE lane_bad AS SELECT CAST(j AS STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB,
+CREATE TABLE lane_bad AS SELECT CAST(j AS STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB,
   string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB),
   "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, "$.a" BIGINT)))) AS j FROM lane_src;
 

@@ -20,7 +20,7 @@ CREATE TABLE src AS SELECT jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"
 # (STRUCT(value, complete) pairs, no spill bitmap).
 statement ok
 CREATE TABLE rev0_shredded AS
-SELECT {'jsono': {'body': v.jsono."body$1",
+SELECT {'jsono': {'body': v.jsono."body$2",
                   'shreds': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
                              'a': {'value': v.jsono."shreds$2".c4000, 'complete': true}}}} AS v
 FROM src;
@@ -29,13 +29,13 @@ FROM src;
 # trap — without a revision in the name nothing distinguishes it, and every reader would happily read
 # a body whose encoding contract it does not actually know.
 statement ok
-CREATE TABLE rev0_plain AS SELECT {'jsono': {'body': v.jsono."body$1"}} AS v FROM src;
+CREATE TABLE rev0_plain AS SELECT {'jsono': {'body': v.jsono."body$2"}} AS v FROM src;
 
 # The intermediate plan-054 shapes: bare lanes with a single unordinal spill column, then an ordinal
 # family with a different spelling. Both were written by real builds between ada4d30 and cc7d8cb.
 statement ok
 CREATE TABLE rev0_bare_spill AS
-SELECT {'jsono': {'body': v.jsono."body$1",
+SELECT {'jsono': {'body': v.jsono."body$2",
                   'shreds': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
                              '$jsono$spill': v.jsono."shreds$2"."$jsono$spill$0",
                              'a': v.jsono."shreds$2".c4000}}} AS v
@@ -46,18 +46,31 @@ FROM src;
 # layout beside a current residual, and a future RESIDUAL layout beside current shreds.
 statement ok
 CREATE TABLE rev99 AS
-SELECT {'jsono': {'body$1': v.jsono."body$1",
+SELECT {'jsono': {'body$2': v.jsono."body$2",
                   'shreds$99': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
                                 '$jsono$spill$0': v.jsono."shreds$2"."$jsono$spill$0",
                                 'a': v.jsono."shreds$2".c4000}}} AS v
 FROM src;
 
 statement ok
-CREATE TABLE body_rev2 AS
-SELECT {'jsono': {'body$2': v.jsono."body$1",
-                  'shreds$1': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
+CREATE TABLE body_rev99 AS
+SELECT {'jsono': {'body$99': v.jsono."body$2",
+                  'shreds$2': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
                                '$jsono$spill$0': v.jsono."shreds$2"."$jsono$spill$0",
-                               'a': v.jsono."shreds$2".c4000}}} AS v
+                               'c4000': v.jsono."shreds$2".c4000}}} AS v
+FROM src;
+
+# Body revision 1, closed by plan 058: its residual COLUMNS are identical to revision 2 — the bump
+# retired the header's separate byte-version axis, so `body$N` versions the residual bytes since.
+# The name matters because revision 1's window (2026-07-25…27) stamped current field names on bodies
+# whose byte encoding predates the current one, and after the byte check went away the name is the
+# only thing that refuses them. Decided by the field NAME, before a blob is read, like every row here.
+statement ok
+CREATE TABLE body_rev1 AS
+SELECT {'jsono': {'body$1': v.jsono."body$2",
+                  'shreds$2': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
+                               '$jsono$spill$0': v.jsono."shreds$2"."$jsono$spill$0",
+                               'c4000': v.jsono."shreds$2".c4000}}} AS v
 FROM src;
 
 # Shreds revision 1, closed by plan 056: a current residual beside the shred layout that named a lane
@@ -67,7 +80,7 @@ FROM src;
 # decided by the field NAME, before any lane name is looked at.
 statement ok
 CREATE TABLE shreds_rev1 AS
-SELECT {'jsono': {'body$1': v.jsono."body$1",
+SELECT {'jsono': {'body$2': v.jsono."body$2",
                   'shreds$1': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
                                '$jsono$spill$0': v.jsono."shreds$2"."$jsono$spill$0",
                                'a': v.jsono."shreds$2".c4000}}} AS v
@@ -153,7 +166,7 @@ jsono(value, shredding := ...): JSONO value carries layout revision body=0 shred
 # Inserting a foreign value into a current-revision column: the by-name struct cast would drop the
 # whole document silently, so the cast's bind refuses.
 statement ok
-CREATE TABLE current_column (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+CREATE TABLE current_column (v STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 
 statement error
 INSERT INTO current_column SELECT v FROM rev0_plain;
@@ -170,7 +183,7 @@ layout revision body=0,
 statement error
 SELECT jsono_validate(v) FROM rev0_plain;
 ----
-this build reads body=1 shreds=2
+this build reads body=2 shreds=2
 
 statement error
 SELECT v ->> 'a' FROM rev0_bare_spill;
@@ -180,12 +193,23 @@ layout revision body=0 shreds=0
 statement error
 SELECT v ->> 'a' FROM rev99;
 ----
-layout revision body=1 shreds=99
+layout revision body=2 shreds=99
 
 statement error
-SELECT v ->> 'a' FROM body_rev2;
+SELECT v ->> 'a' FROM body_rev99;
 ----
-layout revision body=2 shreds=1
+layout revision body=99 shreds=2
+
+# The revision this plan closed: current columns under the closed name are refused by the name alone.
+statement error
+SELECT v ->> 'a' FROM body_rev1;
+----
+layout revision body=1 shreds=2
+
+statement error
+SELECT to_json(v) FROM body_rev1;
+----
+layout revision body=1 shreds=2
 
 # jsono_layout_lanes refuses a foreign revision too. Its answer would otherwise be `[]` — the same
 # answer a plain value gets — for a value that HAS lanes this build cannot name. Only
@@ -193,23 +217,23 @@ layout revision body=2 shreds=1
 statement error
 SELECT jsono_layout_lanes(v) FROM rev99;
 ----
-layout revision body=1 shreds=99
+layout revision body=2 shreds=99
 
 query IIII
 SELECT x.kind, x.reason, x.body_revision, x.shreds_revision
 FROM (SELECT jsono_layout_diagnose(v) AS x FROM rev99);
 ----
-foreign	layout revision body=1 shreds=99, this build reads body=1 shreds=2	1	99
+foreign	layout revision body=2 shreds=99, this build reads body=2 shreds=2	2	99
 
 statement error
 SELECT v ->> 'a' FROM shreds_rev1;
 ----
-layout revision body=1 shreds=1
+layout revision body=2 shreds=1
 
 statement error
 SELECT to_json(v) FROM shreds_rev1;
 ----
-layout revision body=1 shreds=1
+layout revision body=2 shreds=1
 
 # --- Split revisions: a value whose residual is current and whose shreds are foreign is refused,
 # while a current plain value beside it keeps reading. This is the point of versioning `body$N` and
@@ -275,7 +299,7 @@ layout revision body=0 shreds=0
 
 # --- Mixed revisions in one scan are refused, not silently emptied, IN EITHER FILE ORDER.
 # union_by_name merges the per-file schemas by name before the extension sees anything, so the merged
-# layout carries both revisions' stems ("body$1", "shreds$2", "body", "shreds") ordered by which file
+# layout carries both revisions' stems ("body$2", "shreds$2", "body", "shreds") ordered by which file
 # came first. Reading only the leading stem made the classification order-dependent: the old file
 # first was refused, the current file first passed the anchor, failed the grammar and went silently
 # NotJsono — the whole scan, current rows included, then read as NULL through core json. A compat
@@ -338,7 +362,7 @@ SELECT to_json({'jsono': {'a': 1}});
 # inlined-data flush narrows an all-NULL spill column to SQLNULL), and refusing that would break a
 # write path to catch a hand-built struct. Only a foreign REVISION is refused.
 statement error
-SELECT jsono_validate({'jsono': {'body$1': {'slots': ''::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB}}});
+SELECT jsono_validate({'jsono': {'body$2': {'slots': ''::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB}}});
 ----
 argument must be JSONO
 
@@ -366,8 +390,8 @@ SELECT ({'jsono': {'body': 42}}).jsono.body, to_json({'jsono': {'body': 42}});
 # own type, not the types nested inside it. Tightening it would refuse reads of the SIBLING fields.
 statement ok
 CREATE TABLE nested_foreign AS
-SELECT (ROW(ROW(ROW(ROW(v.jsono."body$1".slots, v.jsono."body$1".key_heap, v.jsono."body$1".string_heap,
-                        v.jsono."body$1".skips, v.jsono."body$1".lengths, v.jsono."body$1".nums))), 7))
+SELECT (ROW(ROW(ROW(ROW(v.jsono."body$2".slots, v.jsono."body$2".key_heap, v.jsono."body$2".string_heap,
+                        v.jsono."body$2".skips, v.jsono."body$2".lengths, v.jsono."body$2".nums))), 7))
        ::STRUCT(payload STRUCT(jsono STRUCT(body STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))), id INTEGER) AS x
 FROM src;
 
@@ -412,7 +436,7 @@ RESET disabled_optimizers;
 
 statement ok
 CREATE TABLE rev0_renameable AS
-SELECT {'jsono': {'body': jsono('{"a":1,"b":"x"}').jsono."body$1"}} AS v;
+SELECT {'jsono': {'body': jsono('{"a":1,"b":"x"}').jsono."body$2"}} AS v;
 
 statement error
 SELECT to_json(v) FROM rev0_renameable;
@@ -424,7 +448,7 @@ SET disabled_optimizers='extension';
 
 statement ok
 CREATE TABLE rev0_upgraded AS
-SELECT {'jsono': {'body$1': v.jsono.body}} AS v FROM rev0_renameable;
+SELECT {'jsono': {'body$2': v.jsono.body}} AS v FROM rev0_renameable;
 
 statement ok
 RESET disabled_optimizers;
@@ -442,7 +466,7 @@ SET disabled_optimizers='extension';
 
 statement ok
 CREATE TABLE shreds_rev1_renamed AS
-SELECT {'jsono': {'body$1': v.jsono."body$1",
+SELECT {'jsono': {'body$2': v.jsono."body$2",
                   'shreds$2': {'$jsono$set': v.jsono."shreds$2"."$jsono$set",
                                '$jsono$spill$0': v.jsono."shreds$2"."$jsono$spill$0",
                                'a': v.jsono."shreds$2".c4000}}} AS v
@@ -469,7 +493,7 @@ not jsono
 statement ok
 CREATE TABLE renamed_revision AS
 SELECT struct_pack("jsono" := struct_pack(
-    "body$1"   := v.jsono."body$1",
+    "body$2"   := v.jsono."body$2",
     "shreds$2" := struct_pack(
         "$jsono$set"     := v.jsono."shreds$2"."$jsono$set",
         "$jsono$spill$0" := v.jsono."shreds$2"."$jsono$spill$0",
@@ -484,7 +508,7 @@ SELECT x.kind, x.body_revision, x.shreds_revision,
        starts_with(x.reason, 'field ''gclid'' is not a shred lane')
 FROM (SELECT jsono_layout_diagnose(j) AS x FROM renamed_revision);
 ----
-not jsono	1	2	true
+not jsono	2	2	true
 
 # A JSON read of the renamed value is refused with the grammar's own reason instead of answering
 # NULL for every path.

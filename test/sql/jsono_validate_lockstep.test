@@ -14,17 +14,17 @@ require json
 statement ok
 CREATE TABLE lockstep AS
 SELECT struct_pack("jsono" := struct_pack(
-           "body$1" := j."jsono"."body$1",
+           "body$2" := j."jsono"."body$2",
            "shreds$2" := struct_pack("$jsono$set" := j."jsono"."shreds$2"."$jsono$set",
                                  "$jsono$spill$0" := j."jsono"."shreds$2"."$jsono$spill$0",
                                  c4000 := [1, 2]::BIGINT[]))) AS truncated,
        struct_pack("jsono" := struct_pack(
-           "body$1" := j."jsono"."body$1",
+           "body$2" := j."jsono"."body$2",
            "shreds$2" := struct_pack("$jsono$set" := j."jsono"."shreds$2"."$jsono$set",
                                  "$jsono$spill$0" := j."jsono"."shreds$2"."$jsono$spill$0",
                                  c4000 := [1, 2, 3, 4]::BIGINT[]))) AS extended,
        struct_pack("jsono" := struct_pack(
-           "body$1" := j."jsono"."body$1",
+           "body$2" := j."jsono"."body$2",
            "shreds$2" := struct_pack("$jsono$set" := j."jsono"."shreds$2"."$jsono$set",
                                  "$jsono$spill$0" := j."jsono"."shreds$2"."$jsono$spill$0",
                                  c4000 := j."jsono"."shreds$2".c4000))) AS intact
@@ -57,12 +57,12 @@ false	false	true
 statement ok
 CREATE TABLE lockstep_obj AS
 SELECT struct_pack("jsono" := struct_pack(
-           "body$1" := j."jsono"."body$1",
+           "body$2" := j."jsono"."body$2",
            "shreds$2" := struct_pack("$jsono$set" := j."jsono"."shreds$2"."$jsono$set",
                                  "$jsono$spill$0" := j."jsono"."shreds$2"."$jsono$spill$0",
                                  dk000qbkclmn6000 := [{'do000': 1::BIGINT}]::STRUCT(do000 BIGINT)[]))) AS truncated,
        struct_pack("jsono" := struct_pack(
-           "body$1" := j."jsono"."body$1",
+           "body$2" := j."jsono"."body$2",
            "shreds$2" := struct_pack("$jsono$set" := j."jsono"."shreds$2"."$jsono$set",
                                  "$jsono$spill$0" := j."jsono"."shreds$2"."$jsono$spill$0",
                                  dk000qbkclmn6000 := j."jsono"."shreds$2".dk000qbkclmn6000))) AS intact
@@ -77,7 +77,7 @@ false	true
 # value, exactly what readers use.
 query I
 SELECT jsono_validate(struct_pack("jsono" := struct_pack(
-           "body$1" := j."jsono"."body$1",
+           "body$2" := j."jsono"."body$2",
            "shreds$2" := struct_pack("$jsono$set" := j."jsono"."shreds$2"."$jsono$set",
                                  "$jsono$spill$0" := j."jsono"."shreds$2"."$jsono$spill$0",
                                  c4000 := NULL::BIGINT[]))))

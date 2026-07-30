@@ -1479,7 +1479,7 @@ bool RewriteProjectionProjector(OptimizerExtensionInput &input, LogicalProjectio
 // Shredded JSONO transparency
 //
 // A shredded JSONO column reaches the binder as a plain STRUCT: a `jsono` layout field wrapping a
-// six-blob `body$1` and a sibling `shreds$2` struct of typed columns, each named by the encoding of
+// six-blob `body$2` and a sibling `shreds$2` struct of typed columns, each named by the encoding of
 // its path (each a bare scalar lane or a LIST, with the per-row divert bits in the spill bitmap). No implicit cast
 // turns that struct into JSONO, so a bare `j->>'path'` / `to_json(j)` binds to core json's STRUCT->JSON path, which
 // serializes the raw struct (wrong: leaks the blobs, never reads the value). This pre-optimize pass rewrites those
@@ -2429,9 +2429,9 @@ private:
 		return function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(body_children));
 	}
 
-	// Read only the residual body of a shredded column as plain JSONO: extract its `body$1` struct
+	// Read only the residual body of a shredded column as plain JSONO: extract its `body$2` struct
 	// (layout field [1] -> body [1], already STRUCT(slots,key_heap,string_heap,skips,...)) and wrap it
-	// back into the plain layout STRUCT("jsono" STRUCT("body$1" ...)). The result type IS plain JSONO, so
+	// back into the plain layout STRUCT("jsono" STRUCT("body$2" ...)). The result type IS plain JSONO, so
 	// the cast is a no-op reinterpret rather than a reconstruction.
 	//
 	// `soft` selects which manifest discipline the residual carries. A hard residual (the default)

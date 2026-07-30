@@ -10,7 +10,7 @@ require json
 statement ok
 CREATE MACRO jsono_residual(j) AS struct_pack(
     "jsono" := struct_pack(
-        "body$1" := struct_extract_at(struct_extract_at(j, 1), 1)));
+        "body$2" := struct_extract_at(struct_extract_at(j, 1), 1)));
 
 # ---------------------------------------------------------------------------
 # Core: a regular array of scalars shreds into LIST<scalar>; every element
@@ -343,7 +343,7 @@ SELECT to_json(jsono_group_merge_max(j, k)) FROM (
 # ---------------------------------------------------------------------------
 query I
 SELECT to_json(jsono('{"a":[1,2,3],"t":"x"}',
-                     shredding := '{"$.a": "UBIGINT[]"}')::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+                     shredding := '{"$.a": "UBIGINT[]"}')::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 ----
 {"a":[1,2,3],"t":"x"}
 

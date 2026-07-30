@@ -13,12 +13,12 @@ require json
 query I
 SELECT jsono_storage_type();
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 # A column declared with that DDL is structurally a JSONO: jsono ops bind to it
 # without an explicit cast, so the round-trip from storage form works.
 statement ok
-CREATE TABLE t (props STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
+CREATE TABLE t (props STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))));
 
 statement ok
 INSERT INTO t SELECT jsono('{"a":1}');
@@ -262,7 +262,7 @@ FROM (VALUES (NULL::VARCHAR), (NULL::VARCHAR), (NULL::VARCHAR)) t(s);
 # value->SQL->value round-trip narrows lanes the same way; see docs/jsono_format.md "Layout
 # revisions"), so the answer is to declare storage columns with jsono_storage_type().
 statement ok
-CREATE TABLE hand_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 INTEGER))));
+CREATE TABLE hand_declared (v STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 INTEGER))));
 
 statement ok
 INSERT INTO hand_declared SELECT jsono('{"a":1,"b":"x"}', shredding := '{"a": "BIGINT"}');
@@ -274,14 +274,14 @@ NULL	NULL
 
 # The same bytes read back in full once the column type matches what the constructor produces.
 query I
-SELECT to_json(v::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
+SELECT to_json(v::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))))
 FROM hand_declared;
 ----
 {"a":1,"b":"x"}
 
 # Declared with the type the helper emits for the same shred set, the INSERT reads back as written.
 statement ok
-CREATE TABLE helper_declared (v STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))));
+CREATE TABLE helper_declared (v STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 BIGINT))));
 
 
 statement ok

@@ -161,7 +161,7 @@ SELECT
   typeof(jsono('{"a":1}')),
   try_jsono('{bad') IS NULL;
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))	true
+STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))	true
 
 statement error
 SELECT jsono('{bad');
@@ -186,15 +186,15 @@ SELECT jsono('{"a":1,"b":2}')::VARCHAR, jsono('{"a":1,"b":2}')::JSON;
 # absent value: it must fail loud, not silently read as NULL (same class as the bad metadata
 # case below). Only a slots blob too short to hold a header reads as NULL.
 statement error
-SELECT to_json({'jsono': {'body$1': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}});
+SELECT to_json({'jsono': {'body$2': {'slots': 'not jsono'::BLOB, 'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}});
 ----
 not a JSONO value
 
 # to_json on a structurally valid header with a missing container span (arrays always store
 # one) should fail, not crash.
 statement error
-SELECT to_json({'jsono': {'body$1': {
-  'slots': unhex('4A534E4F050100000000000000000020'),
+SELECT to_json({'jsono': {'body$2': {
+  'slots': unhex('4A534E4F000100000000000000000020'),
   'key_heap': ''::BLOB,
   'string_heap': ''::BLOB,
   'skips': ''::BLOB,
@@ -206,8 +206,8 @@ container span
 
 # to_json on a structurally valid header with truncated slot data should fail, not crash.
 statement error
-SELECT to_json({'jsono': {'body$1': {
-  'slots': unhex('4A534E4F050100000000000000000020'),
+SELECT to_json({'jsono': {'body$2': {
+  'slots': unhex('4A534E4F000100000000000000000020'),
   'key_heap': ''::BLOB,
   'string_heap': ''::BLOB,
   'skips': unhex('01000000000000000000000000000000010000000000000000000000000000000000000000000000'),
@@ -217,14 +217,91 @@ SELECT to_json({'jsono': {'body$1': {
 ----
 malformed JSONO
 
+# --- Header parsing: absent vs corrupt. Two outcomes only, and the line between them is whether
+# the slots blob is long enough to hold a header: too short is an absent value (SQL NULL), a
+# present-but-unparseable header is non-JSONO bytes bound to a jsono op (loud). The fifth header
+# byte is reserved and ignored on read — the rebuild-in-place recipe in the format spec depends on
+# that, so it is pinned here too. ---
+
+# Wrong magic on a present (header-sized) blob is non-JSONO bytes bound to a jsono op, not an
+# absent value. It must FAIL LOUD, not silently read as SQL NULL. (Only a slots blob too short
+# to hold a header reads as NULL: absent value.)
+statement error
+SELECT jsono_extract_string(
+  {'jsono': {'body$2': {'slots': '\xDE\xAD\xBE\xEF\x00\x00\x00\x00'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}, '$.a');
+----
+not a JSONO value
+
+# jsono_validate recovers a boolean from that throw (try/catch), so it still reports validity
+# rather than erroring: non-JSONO bytes -> false, not a raised error.
+query I
+SELECT jsono_validate(
+  {'jsono': {'body$2': {'slots': '\xDE\xAD\xBE\xEF\x00\x00\x00\x00'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}});
+----
+false
+
+# A header-only blob (correct magic, zero slots) is a well-formed *empty* value, so it reads as
+# SQL NULL: the value is absent, not corrupt.
+query I
+SELECT jsono_extract_string(
+  {'jsono': {'body$2': {'slots': '\x4A\x53\x4E\x4F\x00\x00\x00\x00'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}, '$.a');
+----
+NULL
+
+# A slots blob too short to even hold a header is an absent value, not corrupt, so it also reads
+# as SQL NULL.
+query I
+SELECT jsono_extract_string(
+  {'jsono': {'body$2': {'slots': '\x4A\x53'::BLOB,
+   'key_heap': ''::BLOB, 'string_heap': ''::BLOB, 'skips': ''::BLOB, 'lengths': ''::BLOB, 'nums': ''::BLOB}}}, '$.a');
+----
+NULL
+
+# The fifth header byte is reserved and IGNORED on read. It held the blob format version before
+# `body$N` took over versioning the residual bytes whole, so a body written before that collapse
+# still carries its old stamp there — and the rebuild-in-place recipe in docs/jsono_format.md
+# §Revision history rewraps exactly such bodies under the current name. A read that started
+# checking this byte again would break that documented path; this row pins the ignore.
+query I
+WITH src AS (SELECT jsono('{"a":1}').jsono."body$2" AS b)
+SELECT jsono_extract_string({'jsono': {'body$2': {'slots': b.slots[1:4] || '\x05'::BLOB || b.slots[6:],
+  'key_heap': b.key_heap, 'string_heap': b.string_heap, 'skips': b.skips, 'lengths': b.lengths,
+  'nums': b.nums}}}, '$.a')
+FROM src;
+----
+1
+
+# A non-empty skips blob shorter than the container-metadata header (1..11 bytes) cannot come
+# from the writer (it always emits the 12-byte header): it is corruption and must FAIL LOUD,
+# not silently read as "no spans / no manifest". Only a fully empty skips blob stays readable.
+statement error
+WITH src AS (SELECT jsono('{"a":1}').jsono."body$2" AS b)
+SELECT jsono_extract_string({'jsono': {'body$2': {'slots': b.slots, 'key_heap': b.key_heap,
+  'string_heap': b.string_heap, 'skips': '\x01'::BLOB, 'lengths': b.lengths, 'nums': b.nums}}}, '$.a')
+FROM src;
+----
+malformed JSONO
+
+# jsono_validate recovers false from the same corruption instead of erroring.
+query I
+WITH src AS (SELECT jsono('{"a":1}').jsono."body$2" AS b)
+SELECT jsono_validate({'jsono': {'body$2': {'slots': b.slots, 'key_heap': b.key_heap,
+  'string_heap': b.string_heap, 'skips': '\x01'::BLOB, 'lengths': b.lengths, 'nums': b.nums}}})
+FROM src;
+----
+false
+
 # Slots, heaps, and skips are non-empty for a valid document. The body blobs read directly
 # from the nested layout (jsono value -> "jsono" -> body -> blob).
 query IIII
 SELECT
-  octet_length(jsono('{"a":1,"b":"hi"}')."jsono"."body$1".slots) > 0,
-  octet_length(jsono('{"a":1,"b":"hi"}')."jsono"."body$1".key_heap) > 0,
-  octet_length(jsono('{"a":1,"b":"hi"}')."jsono"."body$1".string_heap) > 0,
-  octet_length(jsono('{"a":1,"b":"hi"}')."jsono"."body$1".skips) > 0;
+  octet_length(jsono('{"a":1,"b":"hi"}')."jsono"."body$2".slots) > 0,
+  octet_length(jsono('{"a":1,"b":"hi"}')."jsono"."body$2".key_heap) > 0,
+  octet_length(jsono('{"a":1,"b":"hi"}')."jsono"."body$2".string_heap) > 0,
+  octet_length(jsono('{"a":1,"b":"hi"}')."jsono"."body$2".skips) > 0;
 ----
 true	true	true	true
 
@@ -232,14 +309,14 @@ true	true	true	true
 # for spanned containers: here the non-empty array stores one, while the small root object
 # is skipped by a bounded walk.
 query I
-SELECT octet_length(jsono('{"a":"x","b":["yy"]}')."jsono"."body$1".skips);
+SELECT octet_length(jsono('{"a":"x","b":["yy"]}')."jsono"."body$2".skips);
 ----
 40
 
 # A 17-key object is spanned (id 4 B + span 24 B) and gets a checkpoint index entry (12 B)
 # with one 16-byte cursor checkpoint.
 query I
-SELECT octet_length(jsono('{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":"x"}')."jsono"."body$1".skips);
+SELECT octet_length(jsono('{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":"x"}')."jsono"."body$2".skips);
 ----
 68
 
@@ -247,7 +324,7 @@ SELECT octet_length(jsono('{"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06
 query I
 SELECT typeof(jsono('{"a":1}'));
 ----
-STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
+STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))
 
 # jsono() is exactly this STRUCT, so a bare STRUCT (e.g. read from Parquet, which carries no
 # alias) flows into to_json/transform unchanged.

@@ -13,13 +13,13 @@ query IIIII
 SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns
 FROM (SELECT jsono_layout_diagnose(jsono('{"a":1}')) AS x);
 ----
-plain	NULL	1	NULL	0
+plain	NULL	2	NULL	0
 
 query IIIII
 SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns
 FROM (SELECT jsono_layout_diagnose(jsono('{"a":1,"b":2}', shredding := '{"a": "BIGINT"}')) AS x);
 ----
-shredded	NULL	1	2	1
+shredded	NULL	2	2	1
 
 # Ordinary values: the reason names the first rule that failed, from the outside in, and nothing about
 # a layout is claimed.
@@ -41,7 +41,7 @@ WITH v AS (SELECT jsono('{"a":1}') AS c)
 SELECT x.kind, x.reason IS NULL FROM (
   SELECT unnest([jsono_layout_diagnose(jsono('{"a":1}')),
                  jsono_layout_diagnose(jsono('{"a":1}', shredding := '{"a": "BIGINT"}')),
-                 jsono_layout_diagnose(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))),
+                 jsono_layout_diagnose(struct_pack(jsono := struct_pack(body := c.jsono."body$2"))),
                  jsono_layout_diagnose(42)]) AS x
   FROM v);
 ----
@@ -56,7 +56,7 @@ query II
 WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}') AS c)
 SELECT x.kind, x.reason FROM (
   SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
-    "body$1" := c.jsono."body$1",
+    "body$2" := c.jsono."body$2",
     "shreds$2" := struct_pack(c4000 := c.jsono."shreds$2".c4000, c8000 := c.jsono."shreds$2".c8000)))) AS x
   FROM v);
 ----
@@ -66,7 +66,7 @@ query II
 WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}') AS c)
 SELECT x.kind, x.reason FROM (
   SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
-    "body$1" := c.jsono."body$1",
+    "body$2" := c.jsono."body$2",
     "shreds$2" := struct_pack(
       "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
       "$jsono$spill$0" := c.jsono."shreds$2"."$jsono$spill$0",
@@ -82,17 +82,17 @@ not jsono	shred 'c4000' is STRUCT(weird INTEGER), which is not a shred value typ
 query IIIII
 WITH v AS (SELECT jsono('{"a":1}') AS c)
 SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns FROM (
-  SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))) AS x FROM v);
+  SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(body := c.jsono."body$2"))) AS x FROM v);
 ----
-foreign	layout revision body=0, this build reads body=1 shreds=2	0	NULL	NULL
+foreign	layout revision body=0, this build reads body=2 shreds=2	0	NULL	NULL
 
 # The exemption is narrow: any OTHER consumer of the same foreign value still fails loud, and the
 # refusal quotes the same revision phrase the diagnosis does (JsonoDescribeForeignLayout).
 statement error
 WITH v AS (SELECT jsono('{"a":1}') AS c)
-SELECT to_json(struct_pack(jsono := struct_pack(body := c.jsono."body$1"))) FROM v;
+SELECT to_json(struct_pack(jsono := struct_pack(body := c.jsono."body$2"))) FROM v;
 ----
-JSONO value carries layout revision body=0, this build reads body=1 shreds=2
+JSONO value carries layout revision body=0, this build reads body=2 shreds=2
 
 # The reordered-reserved-fields shape a set-op merge produces IS recognised (it is read by name), so
 # it diagnoses as ordinary shredded jsono rather than as a broken struct.
@@ -100,7 +100,7 @@ query IIIII
 WITH v AS (SELECT jsono('{"a":"x","b":"y"}', shredding := '{"a": "VARCHAR", "b": "VARCHAR"}') AS c)
 SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns FROM (
   SELECT jsono_layout_diagnose(struct_pack(jsono := struct_pack(
-    "body$1" := c.jsono."body$1",
+    "body$2" := c.jsono."body$2",
     "shreds$2" := struct_pack(
       c4000 := c.jsono."shreds$2".c4000,
       "$jsono$set" := c.jsono."shreds$2"."$jsono$set",
@@ -108,7 +108,7 @@ SELECT x.kind, x.reason, x.body_revision, x.shreds_revision, x.spill_columns FRO
       c8000 := c.jsono."shreds$2".c8000)))) AS x
   FROM v);
 ----
-shredded	NULL	1	2	1
+shredded	NULL	2	2	1
 
 # The lane COUNT is deliberately not a field here: jsono_layout_lanes already pins it, and it is
 # answerable in exactly the cases this function reports a shredded kind.
@@ -121,7 +121,7 @@ SELECT len(jsono_layout_lanes(jsono('{"a":"x","b":"y"}', shredding := '{"a": "VA
 # the executor short-circuits a NULL argument and the answer blanks out on exactly the all-NULL
 # column someone is trying to explain.
 query II
-SELECT jsono_layout_diagnose(NULL::STRUCT(jsono STRUCT("body$1" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))).kind,
+SELECT jsono_layout_diagnose(NULL::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)))).kind,
        jsono_layout_diagnose(NULL::BIGINT).kind;
 ----
 plain	not jsono
