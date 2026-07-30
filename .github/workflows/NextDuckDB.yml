@@ -1,0 +1,43 @@
+#
+# Early warning that the next DuckDB release will need work on this extension. The community
+# auto-rebuild carries a published extension onto a new DuckDB release only while it still compiles
+# against it, and the extension is built against DuckDB's internal, unstable C++ API. A red run here
+# means the `ref_next` flow (community-extensions UPDATING.md) has to happen inside DuckDB's ~2-week
+# feature freeze, or the extension misses release day and drops out of the rebuild until fixed.
+#
+# Deliberately NOT on push, and deliberately its own workflow rather than a job in
+# MainDistributionPipeline.yml: this build targets three moving refs (duckdb main, ci-tools main, the
+# reusable workflow itself), so per-commit runs would go red for reasons that have nothing to do with
+# the commit under test — which trains ignoring red on the gate that does test it. The answer changes
+# when upstream changes, so upstream is what it samples: weekly, plus on demand around a feature
+# freeze.
+#
+# Caveat worth knowing before trusting the silence: GitHub disables scheduled workflows in a
+# repository with no activity for 60 days, which is exactly the quiet stretch during which a DuckDB
+# release could break us. A green history is evidence; an empty one is not.
+#
+name: Next DuckDB Compatibility
+on:
+  schedule:
+    # Weekly, Monday, off the top of the hour (scheduled runs queue behind the :00 stampede).
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  duckdb-next-build:
+    name: Build extension binaries (next DuckDB)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: main
+      ci_tools_version: main
+      extension_name: jsono
+      # Same platform set as the stable leg: this leg answers "does it still compile and pass",
+      # not "does it ship", so it does not need a wider matrix than the one we release.
+      exclude_archs: 'linux_amd64_musl;osx_amd64;windows_amd64;windows_amd64_mingw;wasm_eh;wasm_mvp;wasm_threads'
