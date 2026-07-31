@@ -21,12 +21,18 @@ jobs:
       duckdb_version: v1.5.5
       ci_tools_version: v1.5.5
       extension_name: jsono
-      # All: linux_amd64;linux_arm64;linux_amd64_musl;osx_amd64;osx_arm64;windows_amd64;windows_amd64_mingw;wasm_eh;wasm_mvp;wasm_threads
-      # linux_arm64 and osx_arm64 are "larger runners" (billed per-minute, never
-      # covered by free minutes); their billing was configured 2026-07-02, so all
-      # three of linux_amd64, linux_arm64, and osx_arm64 build. exclude_archs drops
-      # only the musl, Windows, wasm, and osx_amd64 targets.
-      exclude_archs: 'linux_amd64_musl;osx_amd64;windows_amd64;windows_amd64_mingw;wasm_eh;wasm_mvp;wasm_threads'
+      # Empty on purpose: build exactly the set the community pipeline builds by default — the nine
+      # platforms whose matrix entry is not `opt_in` (linux amd64/arm64, osx amd64/arm64, windows_amd64,
+      # windows_amd64_mingw, wasm mvp/eh/threads). The three opt-in targets (both musl builds,
+      # windows_arm64) stay out because the community build skips them too unless a descriptor asks.
+      #
+      # This costs macOS and arm64 runner minutes, which are billed per-minute here — accepted so that
+      # breakage on a platform we ship is found by our own CI rather than by the community rebuild.
+      # Four platform bugs shipped invisibly to this repo until the platforms were first built
+      # (2026-07-30, see docs/debugging.md and the v0.1.0 history); this is what keeps that from
+      # happening again. reduced_ci_mode is deliberately left at its default so the matrix keeps
+      # tracking whatever the community pipeline does with it.
+      exclude_archs: ''
 
   code-quality-check:
     name: Code Quality Check
