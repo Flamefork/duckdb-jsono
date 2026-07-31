@@ -187,6 +187,12 @@ struct DiffScratch {
 struct JsonoDiffLocalState : public FunctionLocalState {
 	JsonoBuilder builder;
 	DiffScratch scratch;
+	// Direct-path lane-patch scratch; lives here (not `static thread_local` in JsonoDiffExecuteDirect)
+	// so no TLS destructor is registered — see FoldIntoGroupState in jsono_group_merge.cpp for why TLS
+	// destructors are banned in this extension.
+	JsonoBuilder patch_builder;
+	OwnedJsonoBlob patch_blob;
+	OwnedJsonoBlob diff_blob;
 	// The empty-document identity (jsono('{}')), materialized once per execute and reused for every
 	// SQL-NULL cur argument (§7: NULL is the empty-document, not a propagated NULL). The backing
 	// strings outlive the row loop. prev-NULL needs no view — it is modeled by prev_present = false.
@@ -998,9 +1004,9 @@ void JsonoDiffExecuteDirect(DataChunk &args, JsonoDiffLocalState &lstate, const 
 	SelectionVector fallback_sel(count);
 	idx_t fallback_count = 0;
 	vector<idx_t> changed;
-	static thread_local JsonoBuilder patch_builder;
-	static thread_local OwnedJsonoBlob patch_blob;
-	static thread_local OwnedJsonoBlob diff_blob;
+	auto &patch_builder = lstate.patch_builder;
+	auto &patch_blob = lstate.patch_blob;
+	auto &diff_blob = lstate.diff_blob;
 
 	JsonoView prev_view;
 	JsonoView cur_view;

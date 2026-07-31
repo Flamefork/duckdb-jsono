@@ -4,7 +4,7 @@ One entry per tag. Each entry records the SQL-surface changes, whether the
 layout revisions (`body$N` / `shreds$M`) moved, and — for a moved revision —
 the migration note.
 
-## v0.1.0
+## v0.1.0 — 2026-07-31
 
 The first tagged release.
 

@@ -491,18 +491,22 @@ void SerializeLWWListValueToBlob(const LWWListValue &value, const LogicalType &t
 }
 
 int CompareLWWListValueTie(const LWWListValue &a, const LWWListValue &b, const LogicalType &type) {
-	static thread_local JsonoBuilder builder_a;
-	static thread_local JsonoBuilder builder_b;
-	static thread_local OwnedJsonoBlob blob_a;
-	static thread_local OwnedJsonoBlob blob_b;
+	// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState in
+	// jsono_group_merge.cpp.
+	static thread_local JsonoBuilder &builder_a = *(new JsonoBuilder());
+	static thread_local JsonoBuilder &builder_b = *(new JsonoBuilder());
+	static thread_local OwnedJsonoBlob &blob_a = *(new OwnedJsonoBlob());
+	static thread_local OwnedJsonoBlob &blob_b = *(new OwnedJsonoBlob());
 	SerializeLWWListValueToBlob(a, type, blob_a, builder_a);
 	SerializeLWWListValueToBlob(b, type, blob_b, builder_b);
 	return CompareBlobValueTie(blob_a, blob_b);
 }
 
 int CompareLWWListValueTie(const LWWListValue &a, const LogicalType &type, const OwnedJsonoBlob &b) {
-	static thread_local JsonoBuilder builder;
-	static thread_local OwnedJsonoBlob blob;
+	// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState in
+	// jsono_group_merge.cpp.
+	static thread_local JsonoBuilder &builder = *(new JsonoBuilder());
+	static thread_local OwnedJsonoBlob &blob = *(new OwnedJsonoBlob());
 	SerializeLWWListValueToBlob(a, type, blob, builder);
 	return CompareBlobValueTie(blob, b);
 }
@@ -862,8 +866,10 @@ void SerializeLWWScalarLaneToBlob(const LogicalType &type, uint64_t value_bits, 
 // serialize is cheaper than carrying a representation-specific comparator per lane shape.
 int CompareLWWScalarLaneValueTie(const LWWScalarLane &lane, nonstd::string_view lane_text, const LogicalType &type,
                                  uint64_t candidate_bits, nonstd::string_view candidate_text) {
-	static thread_local OwnedJsonoBlob lane_blob;
-	static thread_local OwnedJsonoBlob candidate_blob;
+	// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState in
+	// jsono_group_merge.cpp.
+	static thread_local OwnedJsonoBlob &lane_blob = *(new OwnedJsonoBlob());
+	static thread_local OwnedJsonoBlob &candidate_blob = *(new OwnedJsonoBlob());
 	SerializeLWWScalarLaneToBlob(type, lane.value_bits, lane_text, lane_blob);
 	SerializeLWWScalarLaneToBlob(type, candidate_bits, candidate_text, candidate_blob);
 	return CompareBlobValueTie(lane_blob, candidate_blob);
@@ -1051,7 +1057,9 @@ void EmitLWWTreeNode(const LWWTreeNode &node, JsonoBuilder &builder, size_t dept
 // IGNORE NULLS leaves; arrays/scalars are standalone leaves with a copied sort key.
 void FoldRowLWW(GroupMergeLWWState &state, const JsonoView &V, nonstd::string_view K,
                 const vector<nonstd::string_view> *root_skip_keys = nullptr) {
-	static thread_local LWWTreeScratch scratch;
+	// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState in
+	// jsono_group_merge.cpp.
+	static thread_local LWWTreeScratch &scratch = *(new LWWTreeScratch());
 	JsonoCursor cursor;
 	if (!state.has_input) {
 		state.root = new LWWTreeNode();
@@ -1461,7 +1469,9 @@ void FoldManifestedListShredsLWW(GroupMergeLWWState &state, const vector<ReconSh
 	if (shreds.empty()) {
 		return;
 	}
-	static thread_local LWWTreeScratch scratch;
+	// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState in
+	// jsono_group_merge.cpp.
+	static thread_local LWWTreeScratch &scratch = *(new LWWTreeScratch());
 	EnsureLWWListLanes(state, shreds.size());
 	uint32_t sort_key_id = LWW_INVALID_SORT_KEY_ID;
 	LWWListValue candidate;
@@ -1689,7 +1699,9 @@ int CompareLWWScalarLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWSca
 	if (key_cmp != 0) {
 		return key_cmp;
 	}
-	static thread_local OwnedJsonoBlob lane_blob;
+	// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState in
+	// jsono_group_merge.cpp.
+	static thread_local OwnedJsonoBlob &lane_blob = *(new OwnedJsonoBlob());
 	SerializeLWWScalarLaneToBlob(shred.type, lane.value_bits, LWWScalarTextView(lane_text), lane_blob);
 	return CompareBlobValueTie(lane_blob, node.value);
 }

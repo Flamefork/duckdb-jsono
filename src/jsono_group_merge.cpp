@@ -210,7 +210,15 @@ unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFu
 // jsono_merge_patch applies to a non-object patch. The merged builder is
 // re-serialized so the next fold can view the accumulator.
 void FoldIntoGroupState(GroupMergeState &state, const JsonoView &incoming) {
-	static thread_local JsonoBuilder scratch;
+	// Deliberately never destroyed (leaked once per thread). A plain `static thread_local` scratch
+	// registers a TLS destructor, and mingw's winpthreads runs those in a multi-pass loop at worker
+	// thread exit where the frees corrupted the heap (STATUS_HEAP_CORRUPTION on windows_amd64_mingw,
+	// backtrace: _pthread_cleanup_dest → ~JsonoBuilder → free). DuckDB gives aggregates no per-thread
+	// state to move this into (scalar functions use FunctionLocalState instead; AggregateInputData is
+	// only bind_data + arena), so aggregate scratch stays thread_local but binds a reference to a heap
+	// object: a reference has a trivial destructor, nothing is registered, thread exit frees nothing.
+	// Every never-destroyed scratch in this extension points at this comment.
+	static thread_local JsonoBuilder &scratch = *(new JsonoBuilder());
 	scratch.Reset();
 	JsonoCursor cursor;
 	bool incoming_is_object = SlotTag(incoming.SlotAt(0)) == tag::OBJ_START;
@@ -289,9 +297,10 @@ void DirectShadowDeletePath(DirectShreddedAcc &acc, const vector<PathStep> &step
 	}
 	// delete_depth is the whole path on Present and the prefix up to and including the non-object node
 	// on NonObjectPrefix — deleting that prefix lets the finalize overlay rebuild the object chain.
-	static thread_local JsonoBuilder patch_builder;
-	static thread_local OwnedJsonoBlob patch_blob;
-	static thread_local JsonoBuilder merged;
+	// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState.
+	static thread_local JsonoBuilder &patch_builder = *(new JsonoBuilder());
+	static thread_local OwnedJsonoBlob &patch_blob = *(new OwnedJsonoBlob());
+	static thread_local JsonoBuilder &merged = *(new JsonoBuilder());
 	patch_builder.Reset();
 	for (idx_t depth = 0; depth < delete_depth; depth++) {
 		patch_builder.EmitObjectStart(1);
@@ -314,7 +323,8 @@ void DirectShadowDeletePath(DirectShreddedAcc &acc, const vector<PathStep> &step
 // the direct accumulator, preserving FoldIntoGroupState's IgnoreNulls semantics case by case.
 void DirectFoldRow(DirectShreddedAcc &acc, const JsonoView &incoming, const GroupMergeBindData &bind_data,
                    const vector<UnifiedVectorFormat> &lane_fmt, idx_t row) {
-	static thread_local JsonoBuilder scratch;
+	// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState.
+	static thread_local JsonoBuilder &scratch = *(new JsonoBuilder());
 	bool incoming_is_object = SlotTag(incoming.SlotAt(0)) == tag::OBJ_START;
 	if (!incoming_is_object) {
 		// A non-object replaces the accumulator wholesale (jsono_merge_patch's non-object patch
@@ -428,7 +438,8 @@ void DirectFoldState(DirectShreddedAcc &target, const DirectShreddedAcc &source,
 		bool target_parsed = target_view.ParseHeader();
 		D_ASSERT(target_parsed);
 		(void)target_parsed;
-		static thread_local JsonoBuilder scratch;
+		// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState.
+		static thread_local JsonoBuilder &scratch = *(new JsonoBuilder());
 		scratch.Reset();
 		MergeTwoObjects(target_view, JsonoCursor(), source_view, JsonoCursor(), scratch, MergeMode::IgnoreNulls, 0);
 		SerializeBuilderToBlob(scratch, target.residual);

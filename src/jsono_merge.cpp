@@ -67,6 +67,10 @@ struct JsonoMergeLocalState : public FunctionLocalState {
 	// does not repeat on every call (see JsonoShredSignatures).
 	std::vector<JsonoShredSignatures> input_signatures;
 	MergeInputPlan input_plan;
+	// Accumulator blob for the left-to-right residual fold; lives here (not `static thread_local` in
+	// RunResidualFold) so no TLS destructor is registered — see FoldIntoGroupState in
+	// jsono_group_merge.cpp for why TLS destructors are banned in this extension.
+	OwnedJsonoBlob acc_storage;
 
 	static unique_ptr<FunctionLocalState> Init(ExpressionState &state, const BoundFunctionExpression &expr,
 	                                           FunctionData *bind_data) {
@@ -283,7 +287,7 @@ void RunResidualFold(MergeMode mode, vector<JsonoRowReader> &inputs, idx_t ncols
 	writer.Init(out);
 	// jsono_merge_patch folds left to right (RFC 7396): the first argument is the
 	// target document (kept verbatim — its nulls are values), the rest are patches.
-	static thread_local OwnedJsonoBlob acc_storage;
+	auto &acc_storage = lstate.acc_storage;
 	JsonoView acc_view;
 	JsonoView patch_view;
 	for (idx_t row = 0; row < count; row++) {
