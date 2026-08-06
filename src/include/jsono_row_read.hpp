@@ -200,18 +200,15 @@ inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathSt
 	}
 }
 
-// How a reader treats a row's shred manifest. One value per meaningful state — as two independent
-// flags (verify, prefetch) the state space had four combinations of which only three meant
-// anything — and every policy consumer switches over this enum, so a fourth policy fails
-// compilation (-Werror=switch) at each place that must decide for it instead of inheriting a
-// leftover flag combination.
+// How a reader treats a row's shred manifest. One value per meaningful state, and every policy
+// consumer switches over this enum, so a fourth policy fails compilation (-Werror=switch) at each
+// place that must decide for it instead of inheriting a leftover default.
 enum class ReadPolicy : uint8_t {
 	// Verify every manifested row whole-document (the default): each manifest entry must name a
 	// shred the input's type carries.
 	WholeDocument,
 	// No whole-document verify — the read checks only the two outcomes where a stripped value would
-	// silently change ITS result (CheckPathMiss / CheckContainerRead) — plus a per-row stream
-	// prefetch, since point walkers touch the streams densely anyway.
+	// silently change ITS result (CheckPathMiss / CheckContainerRead).
 	PointRead,
 	// No verification at all (jsono_overlay's fold: its residual was verified upstream).
 	Trusted,
@@ -338,9 +335,6 @@ private:
 
 	JSONO_ALWAYS_INLINE JsonoRowState ParseAndVerify(const JsonoBlobRow &blob, JsonoView &view) {
 		view = MakeJsonoView(blob);
-		if (policy_ == ReadPolicy::PointRead) {
-			PrefetchJsonoRowStreams(blob);
-		}
 		if (!view.ParseHeader() || view.Slots() == 0) {
 			return JsonoRowState::Empty;
 		}

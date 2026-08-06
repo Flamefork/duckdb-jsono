@@ -115,22 +115,6 @@ inline void ReadJsonoRowBlobs(const JsonoVectorData &data, idx_t row, JsonoBlobR
 	out.nums = data.nums_data[RowIndex(data.nums_fmt, row)];
 }
 
-// Issue prefetches for the first cache line of every stream a point read is about to walk.
-// A row's blobs are cold (the working set is the whole column), and the read path touches
-// them serially — slots in ParseHeader, then skips, key_heap, lengths, string_heap during
-// the locate — so each first touch stalls in turn. Prefetching them together at row start
-// overlaps those misses. Only the per-row point readers (extract / match / project) call
-// this; bulk walkers touch the streams densely anyway.
-inline void PrefetchJsonoRowStreams(const JsonoBlobRow &blob) {
-#if defined(__GNUC__) || defined(__clang__)
-	__builtin_prefetch(blob.slots.GetData());
-	__builtin_prefetch(blob.key_heap.GetData());
-	__builtin_prefetch(blob.string_heap.GetData());
-	__builtin_prefetch(blob.skips.GetData());
-	__builtin_prefetch(blob.lengths.GetData());
-#endif
-}
-
 [[noreturn]] inline void ThrowCorruptJsonoRow(const char *field) {
 	throw InvalidInputException(
 	    "corrupt JSONO storage: top-level row is valid but %s is NULL; this can be produced by an unsafe "
