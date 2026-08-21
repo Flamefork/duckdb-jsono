@@ -1322,7 +1322,8 @@ void PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
 	// merged type is not even canonically ordered, so sort explicitly rather than inherit the field
 	// order.
 	auto by_manifest_path = [](const ReconShred &a, const ReconShred &b) {
-		return a.manifest_path < b.manifest_path;
+		return CompareJsonoKeys(nonstd::string_view(a.manifest_path.data(), a.manifest_path.size()),
+		                        nonstd::string_view(b.manifest_path.data(), b.manifest_path.size())) < 0;
 	};
 	std::sort(scalar_shreds.begin(), scalar_shreds.end(), by_manifest_path);
 	std::sort(list_shreds.begin(), list_shreds.end(), by_manifest_path);
@@ -1355,8 +1356,10 @@ void FoldManifestedScalarShredsLWW(GroupMergeLWWState &state, const vector<Recon
 	string candidate_text;
 	idx_t shred_idx = 0;
 	for (auto &entry : manifest) {
-		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
-		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+		while (shred_idx < shreds.size() &&
+		       CompareJsonoKeys(
+		           nonstd::string_view(shreds[shred_idx].manifest_path.data(), shreds[shred_idx].manifest_path.size()),
+		           entry.path) < 0) {
 			shred_idx++;
 		}
 		if (shred_idx >= shreds.size()) {
@@ -1389,8 +1392,10 @@ bool CanSkipManifestedScalarShredsLWW(const GroupMergeLWWState &state, const vec
 	bool saw_scalar = false;
 	idx_t shred_idx = 0;
 	for (auto &entry : manifest) {
-		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
-		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+		while (shred_idx < shreds.size() &&
+		       CompareJsonoKeys(
+		           nonstd::string_view(shreds[shred_idx].manifest_path.data(), shreds[shred_idx].manifest_path.size()),
+		           entry.path) < 0) {
 			shred_idx++;
 		}
 		if (shred_idx >= shreds.size()) {
@@ -1417,8 +1422,10 @@ bool DirectListShredManifestRowComplete(const vector<ReconShred> &shreds, vector
                                         const std::vector<ShredManifestEntry> &manifest, idx_t row) {
 	idx_t shred_idx = 0;
 	for (auto &entry : manifest) {
-		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
-		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+		while (shred_idx < shreds.size() &&
+		       CompareJsonoKeys(
+		           nonstd::string_view(shreds[shred_idx].manifest_path.data(), shreds[shred_idx].manifest_path.size()),
+		           entry.path) < 0) {
 			shred_idx++;
 		}
 		if (shred_idx >= shreds.size()) {
@@ -1477,8 +1484,10 @@ void FoldManifestedListShredsLWW(GroupMergeLWWState &state, const vector<ReconSh
 	LWWListValue candidate;
 	idx_t shred_idx = 0;
 	for (auto &entry : manifest) {
-		while (shred_idx < shreds.size() && nonstd::string_view(shreds[shred_idx].manifest_path.data(),
-		                                                        shreds[shred_idx].manifest_path.size()) < entry.path) {
+		while (shred_idx < shreds.size() &&
+		       CompareJsonoKeys(
+		           nonstd::string_view(shreds[shred_idx].manifest_path.data(), shreds[shred_idx].manifest_path.size()),
+		           entry.path) < 0) {
 			shred_idx++;
 		}
 		if (shred_idx >= shreds.size()) {
