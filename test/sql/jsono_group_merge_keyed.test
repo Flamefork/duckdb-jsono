@@ -539,8 +539,13 @@ CREATE TABLE lww_utf8_manifest AS SELECT * FROM (VALUES
          shredding := '{"s":"VARCHAR","t":"BIGINT[]","ключ":"VARCHAR","массив":"BIGINT[]"}'), 2)
 ) v(j, ts);
 
-query II
-SELECT to_json(jsono_group_merge_max(j, ts))::VARCHAR, to_json(jsono_group_merge_min(j, ts))::VARCHAR
-FROM lww_utf8_manifest;
+query IIIIIIII
+WITH merged AS (
+  SELECT jsono_group_merge_max(j, ts) AS newest, jsono_group_merge_min(j, ts) AS oldest
+  FROM lww_utf8_manifest
+)
+SELECT newest ->> '$.s', newest ->> '$.t', newest ->> '$.ключ', newest ->> '$.массив',
+       oldest ->> '$.s', oldest ->> '$.t', oldest ->> '$.ключ', oldest ->> '$.массив'
+FROM merged;
 ----
-{"r":1,"s":"snew","t":[2],"ключ":"knew","массив":[20]}	{"r":1,"s":"sold","t":[1],"ключ":"kold","массив":[10]}
+snew	[2]	knew	[20]	sold	[1]	kold	[10]
