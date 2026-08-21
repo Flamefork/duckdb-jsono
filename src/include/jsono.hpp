@@ -1528,54 +1528,70 @@ inline std::string DescribeShredManifestEntry(const ShredManifestEntry &entry) {
 	return described;
 }
 
+inline std::vector<uint32_t> BuildShredSignatureOrder(const std::vector<JsonoShredSignature> &shred_signatures) {
+	std::vector<uint32_t> order(shred_signatures.size());
+	for (uint32_t i = 0; i < order.size(); i++) {
+		order[i] = i;
+	}
+	std::sort(order.begin(), order.end(), [&](uint32_t left, uint32_t right) {
+		return shred_signatures[left].path < shred_signatures[right].path;
+	});
+	return order;
+}
+
 inline void VerifyShredManifestEntries(const std::vector<ShredManifestEntry> &manifest,
-                                       const std::vector<JsonoShredSignature> &shred_signatures) {
+                                       const std::vector<JsonoShredSignature> &shred_signatures,
+                                       const std::vector<uint32_t> &signature_order) {
 	for (auto &entry : manifest) {
-		bool found = false;
-		for (auto &shred : shred_signatures) {
-			if (entry.path != nonstd::string_view(shred.path.data(), shred.path.size())) {
-				continue;
+		auto position = std::lower_bound(signature_order.begin(), signature_order.end(), entry.path,
+		                                 [&](uint32_t index, nonstd::string_view path) {
+			                                 auto &candidate = shred_signatures[index].path;
+			                                 return nonstd::string_view(candidate.data(), candidate.size()) < path;
+		                                 });
+		const JsonoShredSignature *shred = nullptr;
+		if (position != signature_order.end()) {
+			auto &candidate = shred_signatures[*position];
+			if (entry.path == nonstd::string_view(candidate.path.data(), candidate.path.size())) {
+				shred = &candidate;
 			}
-			bool same_type;
-			if (entry.subfields.empty()) {
-				same_type = entry.type == nonstd::string_view(shred.type.data(), shred.type.size());
-			} else {
-				// An object-array lane matches when every subfield the row STRIPPED is still carried,
-				// under the same name and type. A subfield the reading type carries beyond them is a
-				// widening — `read_parquet(union_by_name := true)` unions the element structs of two
-				// files and NULL-fills the difference — and a NULL subfield means exactly "not in the
-				// lane", which is where every reader already falls back to the residual skeleton. A
-				// subfield MISSING here is the real narrowing the manifest exists to catch.
-				same_type = !shred.subfields.empty();
-				WalkShredManifestSubfields(entry.subfields, [&](nonstd::string_view key, uint8_t code) {
-					if (!same_type) {
-						return;
-					}
-					auto type_name = ShredManifestCompactTypeName(code);
-					bool carried = false;
-					for (auto &subfield : shred.subfields) {
-						if (key == nonstd::string_view(subfield.first.data(), subfield.first.size())) {
-							carried = type_name == nonstd::string_view(subfield.second.data(), subfield.second.size());
-							break;
-						}
-					}
-					same_type = carried;
-				});
-			}
-			if (!same_type) {
-				throw InvalidInputException(
-				    "JSONO: row was shredded with shred '%s %s' but the column carries it as a different type; "
-				    "the shred value was converted by a raw struct cast and the original cannot be reproduced",
-				    std::string(entry.path).c_str(), DescribeShredManifestEntry(entry).c_str());
-			}
-			found = true;
-			break;
 		}
-		if (!found) {
+		if (!shred) {
 			throw InvalidInputException(
 			    "JSONO: row was shredded with shred '%s %s' but the column no longer carries that shred; the value "
 			    "was narrowed by a raw struct cast and cannot be read losslessly. Reshred through "
 			    "jsono(value, shredding := '{...}') (the extension optimizer does this automatically)",
+			    std::string(entry.path).c_str(), DescribeShredManifestEntry(entry).c_str());
+		}
+		bool same_type;
+		if (entry.subfields.empty()) {
+			same_type = entry.type == nonstd::string_view(shred->type.data(), shred->type.size());
+		} else {
+			// An object-array lane matches when every subfield the row STRIPPED is still carried,
+			// under the same name and type. A subfield the reading type carries beyond them is a
+			// widening — `read_parquet(union_by_name := true)` unions the element structs of two
+			// files and NULL-fills the difference — and a NULL subfield means exactly "not in the
+			// lane", which is where every reader already falls back to the residual skeleton. A
+			// subfield MISSING here is the real narrowing the manifest exists to catch.
+			same_type = !shred->subfields.empty();
+			WalkShredManifestSubfields(entry.subfields, [&](nonstd::string_view key, uint8_t code) {
+				if (!same_type) {
+					return;
+				}
+				auto type_name = ShredManifestCompactTypeName(code);
+				bool carried = false;
+				for (auto &subfield : shred->subfields) {
+					if (key == nonstd::string_view(subfield.first.data(), subfield.first.size())) {
+						carried = type_name == nonstd::string_view(subfield.second.data(), subfield.second.size());
+						break;
+					}
+				}
+				same_type = carried;
+			});
+		}
+		if (!same_type) {
+			throw InvalidInputException(
+			    "JSONO: row was shredded with shred '%s %s' but the column carries it as a different type; "
+			    "the shred value was converted by a raw struct cast and the original cannot be reproduced",
 			    std::string(entry.path).c_str(), DescribeShredManifestEntry(entry).c_str());
 		}
 	}

@@ -70,6 +70,7 @@ public:
 		ResetMemo();
 		external_.reset();
 		JsonoBuildShredSignatures(type, owned_);
+		order_ = BuildShredSignatureOrder(owned_);
 	}
 
 	// Signatures shared with a longer-lived cache, HELD: JsonoShredSignatures::For allocates a new
@@ -80,6 +81,7 @@ public:
 		ResetMemo();
 		owned_.clear();
 		external_ = std::move(signatures);
+		order_ = BuildShredSignatureOrder(*external_);
 	}
 
 	// Signatures supplied by the caller (__jsono_internal_checked_residual receives them as plan
@@ -88,6 +90,7 @@ public:
 		ResetMemo();
 		external_.reset();
 		owned_ = std::move(signatures);
+		order_ = BuildShredSignatureOrder(owned_);
 	}
 
 	// The hot path is a row without a manifest (a plain residual, the overwhelming majority):
@@ -139,7 +142,7 @@ private:
 		verified_ = false;
 		tail_.assign(tail.data(), tail.size());
 		ParseShredManifestBytes(tail_.data(), tail_.size(), entries_);
-		VerifyShredManifestEntries(entries_, Signatures());
+		VerifyShredManifestEntries(entries_, Signatures(), order_);
 		verified_ = true;
 	}
 
@@ -149,6 +152,7 @@ private:
 
 	shared_ptr<const std::vector<JsonoShredSignature>> external_;
 	std::vector<JsonoShredSignature> owned_;
+	std::vector<uint32_t> order_;
 	std::string tail_;
 	std::vector<ShredManifestEntry> entries_;
 	bool verified_ = false;
@@ -198,6 +202,38 @@ inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathSt
 			    path.c_str());
 		}
 	}
+}
+
+inline void ThrowManifestCoversPath(nonstd::string_view manifest_path) {
+	throw InvalidInputException(
+	    "JSONO: path '%s' was shredded into a shred this value no longer carries (the row was narrowed "
+	    "by a raw struct cast) and cannot be read losslessly",
+	    std::string(manifest_path).c_str());
+}
+
+inline void ThrowIfManifestCoversPathText(const JsonoView &view, const std::string &read_text, bool found_container) {
+	struct CoverSink {
+		const std::string &read_text;
+		bool found_container;
+		void OnEntry(const ShredManifestEntry &entry) {
+			if (entry.path.size() < read_text.size()) {
+				return;
+			}
+			if (entry.path.size() == read_text.size()) {
+				if (!found_container && entry.path == nonstd::string_view(read_text.data(), read_text.size())) {
+					ThrowManifestCoversPath(entry.path);
+				}
+				return;
+			}
+			if (std::memcmp(entry.path.data(), read_text.data(), read_text.size()) == 0 &&
+			    entry.path[read_text.size()] == '.') {
+				ThrowManifestCoversPath(entry.path);
+			}
+		}
+	};
+	auto tail = view.ManifestTail();
+	CoverSink sink {read_text, found_container};
+	WalkShredManifestBytes(tail.data(), tail.size(), sink);
 }
 
 // How a reader treats a row's shred manifest. One value per meaningful state, and every policy
@@ -319,6 +355,8 @@ public:
 private:
 	struct CoverMemo {
 		const vector<PathStep> *steps = nullptr;
+		std::string read_text;
+		bool renderable = false;
 		std::string tail;
 		bool ok = false;
 	};
@@ -354,8 +392,15 @@ private:
 			return;
 		}
 		memo.ok = false;
-		ThrowIfManifestCoversPath(view, steps, found_container, manifest_scratch_, steps_scratch_);
-		memo.steps = &steps;
+		if (memo.steps != &steps) {
+			memo.steps = &steps;
+			memo.renderable = TryStepsToJsonPath(steps, memo.read_text);
+		}
+		if (memo.renderable) {
+			ThrowIfManifestCoversPathText(view, memo.read_text, found_container);
+		} else {
+			ThrowIfManifestCoversPath(view, steps, found_container, manifest_scratch_, steps_scratch_);
+		}
 		memo.tail.assign(tail.data(), tail.size());
 		memo.ok = true;
 	}
