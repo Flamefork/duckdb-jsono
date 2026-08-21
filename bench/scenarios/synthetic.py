@@ -791,3 +791,33 @@ SCENARIOS += [
         ("whole_json", "ecom_shred_whole"),
     )
 ]
+
+WIDE_FLAT_ALTERNATING_MANIFEST_JSON = (
+    "case when (row_number() over ()) % 2 = 0 then json_merge_patch(json_wide_flat, "
+    "'{\"custom_param_01\":null,\"custom_param_03\":null}') else json_wide_flat end"
+)
+
+SCENARIOS += [
+    {
+        "operation": "extract_string",
+        "scenario": "wide_flat_shred_absent_key",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": WIDE_FLAT_ALTERNATING_MANIFEST_JSON,
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "path": "absent_key_bench",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "entries",
+        "scenario": "wide_flat_shred_whole",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": WIDE_FLAT_ALTERNATING_MANIFEST_JSON,
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "array_style": "whole_json",
+        "targets": ["jsono"],
+    },
+]
