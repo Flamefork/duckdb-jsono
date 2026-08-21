@@ -161,6 +161,15 @@ SELECT to_json(jsono(MAP {'b': 2, 'a': 1}))::VARCHAR;
 ----
 {"a":1,"b":2}
 
+# ASCII sorts before UTF-8 by unsigned bytes. Direct lookup relies on the stored keys using that
+# same order.
+query III
+SELECT to_json(jsono(MAP {'ключ': 2, 's': 1}))::VARCHAR,
+       jsono(MAP {'ключ': 2, 's': 1})->>'$.s',
+       jsono(MAP {'ключ': 2, 's': 1})->>'$.ключ';
+----
+{"s":1,"ключ":2}	1	2
+
 # Nested MAP fields sit next to ordinary fields; MAP values recurse into any supported type.
 query IIII
 SELECT to_json(jsono({'m': MAP {'k': 1}, 'z': 2}))::VARCHAR,
