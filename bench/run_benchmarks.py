@@ -1146,6 +1146,35 @@ def build_jsono_entries_query(scenario_config: dict, data_path: Path) -> Benchma
     )
 
 
+def build_jsono_reporter_keys_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT k, count() AS c FROM (
+                SELECT unnest(list_transform(list_filter(
+                    jsono_entries(t, key_style := 'dotted', array_style := 'whole_json'),
+                    lambda kv: kv.value IS NOT NULL), lambda kv: kv.key)) AS k
+                FROM _bench_in
+            ) GROUP BY k
+        """,
+    )
+
+
+def build_jsono_reporter_dump_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT '{' || array_to_string(list_transform(list_filter(
+                jsono_entries(t, key_style := 'dotted', array_style := 'whole_json'),
+                lambda kv: kv.value IS NOT NULL),
+                lambda kv: to_json(kv.key) || ':' || to_json(kv.value)), ',') || '}' AS r
+            FROM _bench_in
+        """,
+    )
+
+
 def build_jsono_extract_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     spec = scenario_config["spec"]
     return BenchmarkQuery(
@@ -1302,6 +1331,10 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_reshred_query(scenario_config, data_path)
         case "entries":
             return build_jsono_entries_query(scenario_config, data_path)
+        case "reporter_keys":
+            return build_jsono_reporter_keys_query(scenario_config, data_path)
+        case "reporter_dump":
+            return build_jsono_reporter_dump_query(scenario_config, data_path)
         case "extract":
             return build_jsono_extract_query(scenario_config, data_path)
         case "extract_jsono":
