@@ -605,3 +605,57 @@ statement error
 SELECT __jsono_internal_checked_residual(jsono('{"a":1}'), NULL);
 ----
 Invalid Input Error
+
+# --- A path read of a narrowed row is judged against the path it reads, not the whole manifest ---
+#
+# The optimizer rewrites `->>` into a residual read whose narrowing verdict comes from the reader's
+# point-read guard, so a read whose answer the narrowing cannot change is answered. This is the same
+# verdict jsono_extract_string(e, path) has always given for the same read.
+
+statement ok
+CREATE TABLE narrow_scoped AS SELECT jsono('{}', shredding := '{"a": "VARCHAR"}') AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO narrow_scoped SELECT jsono(
+  '{"a":"v1","b":"v2","c":"v3","nest":{"deep":"v4"}}',
+  shredding := '{"a": "VARCHAR", "b": "VARCHAR", "$.nest.deep": "VARCHAR"}');
+
+statement ok
+RESET disabled_optimizers;
+
+# A key the narrowing never touched reads, spelled either way.
+query I
+SELECT e ->> 'c' FROM narrow_scoped;
+----
+v3
+
+query I
+SELECT jsono_extract_string(e, '$.c') FROM narrow_scoped;
+----
+v3
+
+# The dropped shred's own path still fails loud.
+statement error
+SELECT e ->> 'b' FROM narrow_scoped;
+----
+narrowed by a raw struct cast
+
+# So does a container read holding a dropped shred beneath it — the result would be missing it.
+statement error
+SELECT e -> 'nest' FROM narrow_scoped;
+----
+narrowed by a raw struct cast
+
+# Whole-value readers still refuse the row outright: their answer is the whole document.
+statement error
+SELECT to_json(e)::VARCHAR FROM narrow_scoped;
+----
+narrowed by a raw struct cast
+
+statement error
+SELECT jsono_entries(e) FROM narrow_scoped;
+----
+narrowed by a raw struct cast

@@ -2354,7 +2354,7 @@ private:
 				return;
 			}
 		}
-		expr.children[0] = ResidualReinterpret(*shredded_cast->child);
+		expr.children[0] = ResidualReinterpret(*shredded_cast->child, ResidualPolicy::PathScoped);
 	}
 
 	// struct_extract_at(child, one_based): 1-based positional struct field read.
@@ -2434,20 +2434,33 @@ private:
 	// back into the plain layout STRUCT("jsono" STRUCT("body$2" ...)). The result type IS plain JSONO, so
 	// the cast is a no-op reinterpret rather than a reconstruction.
 	//
-	// `soft` selects which manifest discipline the residual carries. A hard residual (the default)
-	// wraps the reinterpret in __jsono_internal_checked_residual against the column type's shreds, so
-	// a row narrowed by a raw struct cast fails loud on every residual read instead of silently
-	// reading an incomplete residual — the right policy for whole-value reads and non-shred-path
-	// extracts (a narrowed lane reads as a missing residual path there). A soft residual instead
-	// strips the per-row manifest: it backs the COALESCE fallback of a shred-lane read, where the
-	// path IS a lane in the type (so narrowing is impossible) and an absent residual path must read as
-	// plain NULL — the lane holds the value. Stripping makes the fallback safe under EAGER evaluation
-	// (the projector fuse, any hoist out of the COALESCE), which the point-read guard would otherwise
-	// turn into a narrowing throw on every row whose value lives in its lane.
-	unique_ptr<Expression> ResidualReinterpret(const Expression &column, bool soft = false) {
+	// `policy` selects which manifest discipline the residual carries.
+	//
+	// Checked wraps the reinterpret in __jsono_internal_checked_residual against the column type's
+	// shreds, so a row narrowed by a raw struct cast fails loud on every residual read instead of
+	// silently reading an incomplete residual. It is the policy for whole-value reads, which consume
+	// the whole document and are wrong about it the moment any path was stripped.
+	//
+	// PathScoped keeps the manifest in the residual but leaves the verdict to the reader's own
+	// point-read guard (CheckPathMiss / CheckContainerRead), which throws exactly when the narrowing
+	// reaches the path being read. A path read is answered correctly whenever the loss is elsewhere in
+	// the document, so verifying the whole manifest per row rejects reads whose answer is right — and
+	// pays the manifest walk on every row of every scan to do it. This is what makes an optimizer-
+	// rewritten `->>` agree with the same read spelled as jsono_extract_string, which was always
+	// point-read.
+	//
+	// Stripped removes the per-row manifest: it backs the COALESCE fallback of a shred-lane read,
+	// where the path IS a lane in the type (so narrowing is impossible) and an absent residual path
+	// must read as plain NULL — the lane holds the value. Stripping makes the fallback safe under
+	// EAGER evaluation (the projector fuse, any hoist out of the COALESCE), which the point-read guard
+	// would otherwise turn into a narrowing throw on every row whose value lives in its lane.
+	enum class ResidualPolicy : uint8_t { Checked, PathScoped, Stripped };
+
+	unique_ptr<Expression> ResidualReinterpret(const Expression &column,
+	                                           ResidualPolicy policy = ResidualPolicy::Checked) {
 		FunctionBinder function_binder(context);
 		auto body_struct = StructExtractAt(StructExtractAt(column.Copy(), 1), 1);
-		auto body = soft ? StripManifestBody(*body_struct) : std::move(body_struct);
+		auto body = policy == ResidualPolicy::Stripped ? StripManifestBody(*body_struct) : std::move(body_struct);
 		body->SetAlias(JsonoBodyName());
 		vector<unique_ptr<Expression>> inner_children;
 		inner_children.push_back(std::move(body));
@@ -2458,7 +2471,8 @@ private:
 		auto outer = function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(outer_children));
 		auto residual = BoundCastExpression::AddCastToType(context, std::move(outer), JsonoType());
 		JsonoLayoutType layout;
-		if (!soft && TryParseJsonoLayoutType(column.return_type, layout) && !layout.shreds.empty()) {
+		if (policy == ResidualPolicy::Checked && TryParseJsonoLayoutType(column.return_type, layout) &&
+		    !layout.shreds.empty()) {
 			// The signatures the residual check verifies each row's manifest against, derived from the
 			// column's own type through the one builder every other reader uses.
 			std::vector<JsonoShredSignature> signatures;
@@ -2481,8 +2495,8 @@ private:
 	// value, and a json-valued read overlapping a stripped shred already reconstructed.
 	unique_ptr<Expression> MakeResidualExtract(BoundCastExpression &shredded_cast, unique_ptr<Expression> path,
 	                                           const LogicalType &value_type, bool string_fn, const string &alias) {
-		return MakeNativeExtractOver(context, ResidualReinterpret(*shredded_cast.child), std::move(path), value_type,
-		                             string_fn, alias);
+		return MakeNativeExtractOver(context, ResidualReinterpret(*shredded_cast.child, ResidualPolicy::PathScoped),
+		                             std::move(path), value_type, string_fn, alias);
 	}
 
 	// A shredded read whose value the residual alone cannot serve — its leaf is stripped into a
@@ -2548,7 +2562,7 @@ private:
 		// Soft residual: this fallback only runs for rows whose value diverted into the residual (the
 		// lane is NULL). A non-diverted row's lane already won the COALESCE, so a residual miss here
 		// must read as NULL, not a narrowing throw — see ResidualReinterpret.
-		auto residual = ResidualReinterpret(column, /*soft=*/true);
+		auto residual = ResidualReinterpret(column, ResidualPolicy::Stripped);
 		vector<unique_ptr<Expression>> ext_children;
 		ext_children.push_back(std::move(residual));
 		ext_children.push_back(std::move(path));

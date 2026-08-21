@@ -327,10 +327,26 @@ the checkpoints, which reads as zero entries.
 The manifest is what makes a raw by-name struct cast safe to detect: if a cast
 drops a shred (the target type carries fewer shreds) or converts one to a
 different type, the residual cannot reproduce the value — and the manifest
-proves it. Every reader of a shredded residual verifies the row's manifest
-against the shreds actually available and fails loud on a mismatch instead of
-silently returning partial data. Extra shreds beyond the manifest are legal (a
-widening cast `NULL`-fills them; readers fall back to the residual).
+proves it. Every reader of a shredded residual checks the row's manifest against
+the shreds actually available and fails loud instead of silently returning
+partial data. Extra shreds beyond the manifest are legal (a widening cast
+`NULL`-fills them; readers fall back to the residual).
+
+What the check compares depends on how much of the document the read answers
+with, because that is what decides when the loss can reach the answer. A read of
+the whole value — a reconstruct, a render, a flatten — is wrong the moment any
+path was stripped, so it verifies **every** manifest entry against the reading
+type's shreds. A read of one path is wrong only when the loss reaches that path,
+so it checks exactly the two outcomes that would change its own result: a path
+miss whose manifest entry names the path or a prefix of it (the value was
+stripped, and a silent `NULL` would be the loss), and a returned container with a
+manifest entry strictly inside it (the result would be missing that leaf). A
+scalar found at the read path was never stripped, so it needs no check at all.
+The two disciplines are the same rule read at different widths, not a strict and
+a lax mode: each fails exactly when its own answer would be wrong. `->>` rewritten
+by the optimizer and the same read spelled as `jsono_extract_string` therefore
+give the same verdict on the same row, which is what
+`test/sql/jsono_shredded_cast_guard.test` pins.
 
 ### Array shreds (`LIST<STRUCT>`)
 
