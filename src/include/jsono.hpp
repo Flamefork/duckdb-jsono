@@ -1534,7 +1534,10 @@ inline std::vector<uint32_t> BuildShredSignatureOrder(const std::vector<JsonoShr
 		order[i] = i;
 	}
 	std::sort(order.begin(), order.end(), [&](uint32_t left, uint32_t right) {
-		return shred_signatures[left].path < shred_signatures[right].path;
+		auto &left_path = shred_signatures[left].path;
+		auto &right_path = shred_signatures[right].path;
+		return CompareJsonoKeys(nonstd::string_view(left_path.data(), left_path.size()),
+		                        nonstd::string_view(right_path.data(), right_path.size())) < 0;
 	});
 	return order;
 }
@@ -1543,11 +1546,11 @@ inline void VerifyShredManifestEntries(const std::vector<ShredManifestEntry> &ma
                                        const std::vector<JsonoShredSignature> &shred_signatures,
                                        const std::vector<uint32_t> &signature_order) {
 	for (auto &entry : manifest) {
-		auto position = std::lower_bound(signature_order.begin(), signature_order.end(), entry.path,
-		                                 [&](uint32_t index, nonstd::string_view path) {
-			                                 auto &candidate = shred_signatures[index].path;
-			                                 return nonstd::string_view(candidate.data(), candidate.size()) < path;
-		                                 });
+		auto position = std::lower_bound(
+		    signature_order.begin(), signature_order.end(), entry.path, [&](uint32_t index, nonstd::string_view path) {
+			    auto &candidate = shred_signatures[index].path;
+			    return CompareJsonoKeys(nonstd::string_view(candidate.data(), candidate.size()), path) < 0;
+		    });
 		const JsonoShredSignature *shred = nullptr;
 		if (position != signature_order.end()) {
 			auto &candidate = shred_signatures[*position];
