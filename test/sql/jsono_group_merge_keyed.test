@@ -525,3 +525,22 @@ SELECT DISTINCT to_json(jsono_group_merge_max(j, ts)
 FROM lww_divergent;
 ----
 {"a":{"b":"bnew"},"a-c":"new","r":1}
+
+# std::string and string-view-lite disagree on UTF-8 byte order under MSVC. The direct walkers sort
+# their lane vectors once and then merge-join the row manifest against them; both sides must use the
+# same order. Cover scalar and scalar-array walkers together: in each pair the ASCII lane sorts
+# before the UTF-8 lane, and losing either UTF-8 match drops its value because it was stripped from
+# the residual.
+statement ok
+CREATE TABLE lww_utf8_manifest AS SELECT * FROM (VALUES
+  (jsono('{"s":"sold","t":[1],"ключ":"kold","массив":[10],"r":1}',
+         shredding := '{"s":"VARCHAR","t":"BIGINT[]","ключ":"VARCHAR","массив":"BIGINT[]"}'), 1),
+  (jsono('{"s":"snew","t":[2],"ключ":"knew","массив":[20]}',
+         shredding := '{"s":"VARCHAR","t":"BIGINT[]","ключ":"VARCHAR","массив":"BIGINT[]"}'), 2)
+) v(j, ts);
+
+query II
+SELECT to_json(jsono_group_merge_max(j, ts))::VARCHAR, to_json(jsono_group_merge_min(j, ts))::VARCHAR
+FROM lww_utf8_manifest;
+----
+{"r":1,"s":"snew","t":[2],"ключ":"knew","массив":[20]}	{"r":1,"s":"sold","t":[1],"ключ":"kold","массив":[10]}
