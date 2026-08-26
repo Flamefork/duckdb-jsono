@@ -46,7 +46,7 @@ and a handful of latent fragilities and test gaps — the plans below.
 | 025 | Avoid per-patch accumulator serialization in variadic `jsono_merge_patch` | P2 | M | — | REJECTED (benchmark-only evidence; no C++ change) — Patch-count benchmark scenarios now exist (`wide_flat_patch_count_1/2/4`). Reviewer rerun: `t1 341.5/605.5/1072.2ms`, `t8 365.9/618.6/1160.5ms`. Samply profile for 4-patch does not support the plan's root-cause hypothesis: `JsonoView::ParseHeader` is only `0.4%` self and top self time is builder/copy/merge work. Do not implement the proposed in-memory accumulator unless a new profile shows serialization/parse as material. |
 | 026 | Benchmark and design recovery for the trie shape-plan cache | P3 | M | — | DONE (uncommitted worker diff) — Added `shape_plan_recovery_transform` benchmark and bounded recovery: disabled cache waits through cooldown, runs sample-only probe windows, and re-enables only after stable-shape hits. Reviewer rerun: `flood_tail` `18.1/21.6ms`, stats `lookups=94881 hits=89760 builds=5121 disabled=0`; `flood_only` `23.0/26.6ms`, stats `lookups=5120 hits=0 builds=5120 disabled=1`; `stable_only` `15.7/19.4ms`. `uv run make verify` passed (1869 assertions / 51 test cases + format-check). |
 | 027 | Split shredded `merge_patch` fast and fallback work by row | P2 | L | 023 evidence | DONE (`f94d620`) — Per-row split keeps fast shredded `merge_patch` output for non-conflicting rows and runs reshred fallback only on compact conflict rows. Reviewer rerun: `uv run make verify` passed (1869 assertions / 51 test cases + format-check). Focused benchmark after fix: poisoned `663.0/974.3ms`, plain control `691.6/969.9ms`, shredded control `605.9/899.6ms`; executor before numbers were poisoned `3914.6/4210.8ms`, plain `699.3/965.5ms`, shredded `630.5/907.3ms`. |
-| 028 | Design a sequential shredded accumulator for non-keyed `jsono_group_merge` | P2 | L | 024 evidence | DONE (design checkpoint only; no source change) — Benchmark/profile re-captured: `wide_shredded_few_groups` `1097.9/1142.0ms`, `wide_shredded_many_groups` `1396.2/1225.2ms`; profile still shows reconstruct/reshred hotspot (`ReconstructShreddedToPlainImpl` 50.0% inclusive, `JsonoShredFromSpec` 17.2% inclusive). Maintainer rejected partial-subset implementation: continue only with a full direct accumulator covering all shred kinds and `Combine`, or do not implement. |
+| 028 | Design a sequential shredded accumulator for non-keyed `jsono_group_merge` | P2 | L | 024 evidence | DONE (full implementation, 2026-07-02) — The design checkpoint was followed by the complete direct fold in `e724635` and native finalize in `9402534`, covering the accepted all-shred/`Combine` contract. The implementation later moved without semantic change to `DirectShreddedAcc` in `src/jsono_group_merge.cpp` during the domain split in `9dc574e`. |
 | 029 | Fix nested-struct / array-shred reconstruction blow-up that kills projection over wide shredded values | P2 | L | — | DONE (uncommitted) — Two compounding defects, both confirmed by a five-shape `micro_nested_lane.py` baseline (300k×90 flat shreds). **A** (super-linear nested reconstruct) was `ReconstructShreddedToPlainImpl`'s `all_top_level` flag: one nested shred demoted EVERY flat shred onto a per-shred re-serialize loop. Fix is hybrid, branched ONCE per type off the hot path: flat-only types keep the direct two-pass flat patch (no per-row index vector, no grouping); a type carrying a nested shred folds all present object-key shreds into ONE patch tree (`EmitShredPatchObject`) applied in a single overlay. A/B vs the original build (interleaved, drift-controlled): flat `::varchar` 1035→1048ms (+1.2%, noise — the hot path is NOT regressed); nested 15689→1555ms (10×), both 16258→1840ms (8.9×). nested is ≈1.49× flat (the genuine linear cost; an earlier "1.1×" was an artifact of a regressed flat baseline before the hybrid). **B** (array shred defeats `jsono_transform` fast path) was a global `reconstruct_shredded` on any list shred in `JsonoTransformBind`. Fix: per-field gate (`PathStepsMayShareBranch`) forcing reconstruct only when a read field could touch the array. transform `.f0` scalar-array 7.9×→1.1×, object-array 8.1×→1.1×, both 124×→1.1×. `->>` was already per-path correct (stays a lane on every shape) — the optimizer was NOT touched (plan's Step 4 mis-targeted it). **A2 (`to_json`) was NOT a defect** — `ReconstructShreddedToJson`'s cheap overlay path already runs (14× faster than `::varchar`). New `test/sql/jsono_029_wide_reconstruct.test` (21 assertions: byte-identical reconstruct, sibling-scalar fast path, array-descent, plan-lock, manifest fail-loud). `uv run make verify` passed; debug/ASan green on all reconstruct/transform/shred suites. |
 | 030 | `jsono_diff` — structural diff with selectable array semantics (`atomic`/`counts`/`elements`) | P1 | L | — | DONE (`535b6de`, 2026-06-27) — shipped: cur-type-driven ops chain in `src/jsono_diff.cpp`, `arrays := 'atomic'|'counts'|'elements'`, shredded input via reconstruct-cast, NULL = empty-doc. Reconciled 2026-07-11 (row was stale TODO). |
 | 031 | `jsono_entries` — selectable array rendering (`array_style := 'indexed_elements'`/`'whole_json'`) | P1 | M | — | DONE (`f83471d`, 2026-06-29) — shipped: additive named param, default reproduces old output; `whole_json` renders an array as one JSON leaf through the validated read-path; NULL named-arg fails loud (SPECIAL_HANDLING). Reconciled 2026-07-11 (row was stale TODO). |
@@ -75,13 +75,19 @@ and a handful of latent fragilities and test gaps — the plans below.
 | 054 | Bare-lane shreds: drop `complete` columns, add `$jsono$spill` bitmap columns | P1 | XL | — | DONE |
 | 055 | Versioned layout revisions — fail loud on a foreign JSONO layout | P1 | M–L | — | DONE |
 | 056 | Lane names collide case-insensitively (`gclid` vs `GCLID`) — set-op merge drops one, rows carrying it fail loud | P1 | M | — | DONE (`a5a0d0c`, 2026-07-27) — lane name = base32hex over an order-preserving serialization of the path steps, so case-colliding keys keep distinct lanes; `shreds$1` → `shreds$2` (`JSONO_SHREDS_REVISION = 2`); manifest stores logical paths. Row was stale until 2026-07-30. |
-| 057 | Publish as a DuckDB community extension — the repository work before the descriptor PR | P2 | M | 044 (spike) | **Steps 1-7 DONE, Step 8 DEFERRED (2026-07-31)** — `v0.1.0` tagged and pushed (`9438d16`). Gate flip, yyjson loadable link, LICENSE/README/CHANGELOG, weekly next-DuckDB canary, and the platform probe all landed; plan 058 (axis collapse) landed before the tag. The probe turned into a bug hunt: all nine default community platforms are green, so `excluded_platforms` is empty — but only after four platform bugs were found and fixed (see memory `windows-platform-bugs-2026-07-31`): compiler-dependent `HashMix64`, signed key order in the writer, the same in the read-side binary search, and mingw heap corruption from TLS destructors. Step 8 (descriptor PR to `duckdb/community-extensions`) deliberately deferred by the maintainer; the read-compat commitment attaches to publication, not to the tag. Before submitting: re-verify that community's stable DuckDB is still v1.5.5, else bump the submodule first. |
+| 057 | Publish as a DuckDB community extension — the repository work before the descriptor PR | P2 | M | 044 (spike) | DONE (2026-08-11) — Repository work and publication are complete. Community extension PR `duckdb/community-extensions#2458` merged as `efc2270c8661fc89867023cee4863067f6028ea6`; the descriptor publishes version/ref `v0.1.1`. The read-compat commitment is active from this published revision. |
 | 058 | Collapse three version axes into two — remove `jsono::VERSION`, let `body$N` version the residual format whole | P1 | M–L | blocks 057 Step 7 | DONE (2026-07-30) — byte axis removed (header byte 5 = reserved, written 0, ignored on read) and `body$1` → `body$2` in the same change, closing the 2026-07-25…27 window that wrote current field names with v4 bytes. `jsono_version()` deleted; `jsono_version.test` dissolved into `jsono_roundtrip.test` (magic/absent/corrupt cases + a pin that the reserved byte is ignored). §Revision history now states per row whether the closed revision's BYTES differ, and the rebuild-in-place recipe carries the hard caveat (misuse is silent since the byte check is gone; the retired stamp in old blobs is the forensic tell). |
 | 059 | Allocate DOM shape caches on first use and remove per-slot reservation | P1 | — | — | DONE (`1f24aa8`, 2026-08-26) — **KEEP**: default/size-1 RSS fell from 50,839,552/25,657,344 B to 25,739,264/25,493,504 B, removing 99.02% of the cache-attributable gap with identical ten-expression checksums. Worst accepted required timing deltas were +3.07% AB and +1.55% BA; the sole field-sample outlier was repeated once and passed at +0.69%/+1.34%. Gates: benchmark harness 25 tests; `uv run --frozen make verify` (release + relassert: 3,887 assertions/98 cases each, constructor matrix/Parquet, format checks); structural `rg` (two insert-time resizes, zero per-slot reserves). |
 | 060 | Answer whole-document `jsono_keys` from residual keys plus the shred manifest | P1 | — | — | DONE (`130287e`, 2026-08-26) — KEEP: field-sample shredded-root improved 57.2% AB / 57.5% BA with identical checksums; plain control had no material regression. The 107-lane synthetic wide case is output-bound diagnostic evidence (−2.9% AB / +0.4% BA), not a 30% acceptance gate. Release + relassert suites: 3916 assertions/98 cases each; format check passed. |
 | 061 | Answer shredded `jsono_array_length` from the verified residual skeleton | P1 | — | 060 | DONE (`db23ae2`, 2026-08-26) — KEEP: wide materialized improved 93.14% AB / 93.15% BA and e-commerce shredded improved 92.31% / 92.46%; plain control was +1.76% / -0.12%. Field-sample improved 95.85% / 95.88%, direct Parquet diagnostic 87.31% / 87.51%, with identical checksums and identical direct-scan schema/rows/compression/row groups. Candidate plan uses `__jsono_internal_shredded_array_length` without reconstruct; DuckDB still projects full `j`. Release + relassert: 3,964 assertions/98 suites each; property and format gates passed. |
 | 062 | Retain the one-pass text-shred parser and DOM writer state across chunks | P2 | — | 059 | REJECTED (characterization `8983a0a`, experimental implementation/revert collapsed out of final history, 2026-08-26) — repeated primary AB regressed 2.41%; repeated BA improved only 4.51%, below the 5% keep threshold. Widening reshred regressed 30.83% AB / 31.30% BA; other controls stayed within 5%. Checksums were identical (`245760`, `2265287782386176543464656`, `1381819034`); RSS was 6,153,895,936 → 6,258,802,688 B (+1.70%). Native executor/writer/parser symbols remained present and allocator/free share fell, confirming that the removed work was too small. Final harness: 31 tests; `make verify`: release + relassert 3,964 assertions/98 cases each, constructor/Parquet and format gates passed. |
 | 063 | Document foldable intermediate JSON inspection over shredded literals | P2 | — | — | DONE (`c1b15e6`, 2026-08-26) — DuckDB v1.5.5 with extension `86051a4`: literal `NULL,NULL,NULL`; bound/native `OBJECT,2,[x]`. README now names chained operators and the three verified core inspection calls. It states the bound-value boundary and working full-path alternatives. No test pins the incorrect NULL result. |
+| 064 | Reconcile completed plan outcomes and the push-only distribution decision | P2 | — | — | DONE (2026-08-26) — plans 028/057 and their historical records now match the implemented/published state; push-only distribution CI is recorded as a maintainer decision. |
+| 065 | Pin the Python DuckDB package to the extension ABI target | P1 | — | — | DONE (`180ba8b`, 2026-08-26) — `duckdb==1.5.5`, narrow lock refresh, version/smoke/verify gates green. |
+| 066 | Remove build/test commands that can exercise stale binaries | P1 | — | — | DONE (`180ba8b`, 2026-08-26) — live docs use frozen commands, test recipes build before execution, and README names only the canonical `verify` gate. |
+| 067 | Add a focused weekly Valgrind memcheck | P2 | — | — | IN PROGRESS (`180ba8b`) — target/workflow/docs implemented and local dry-run/selection/verify gates are green; Linux Valgrind workflow result pending. |
+| 068 | Benchmark large fused `IN` membership lookup | P2 | — | — | REJECTED (`e68070c`) — binary search improved `in_miss_1024` by 48.6%/52.1% but regressed 1/32-literal controls beyond the 5% gate in both AB/BA orders. Benchmark and optimization map retained; C++ patch removed. |
+| 069 | Validate manifest order and replace reshred's repeated manifest scans | P1 | — | — | BLOCKED (`a341df3`) — strict order/duplicate validation implemented and verified. Two-pointer optimization stopped before implementation because validation-only regressed the wide absent-key reader by 8.4% AB / 7.1% BA; maintainer decision required. |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED
 (one-line rationale).
@@ -142,8 +148,8 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED
   findings still exist.
 - Execution request 2026-06-23 completed for 025, 027, 026, 028. 025 was
   rejected after benchmark/profile disproved the root-cause hypothesis; 027
-  landed in `f94d620`; 026 remains an accepted uncommitted diff; 028 stopped at
-  the design checkpoint with no source change.
+  landed in `f94d620`; 026 remains an accepted uncommitted diff. Plan 028's
+  checkpoint was later implemented in full by `e724635` and `9402534`.
 
 ## Dependency notes
 
@@ -180,22 +186,19 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED
 - 023 and 024 are historical benchmark-only outcomes now superseded by 027 and
   028. Do not execute 023/024 as implementation plans; use their measurements as
   evidence.
-- 028 completed as a design checkpoint only. Maintainer decision: do not build
-  a partial direct subset. Future work is all-or-nothing: full direct accumulator
-  covering scalar, scalar-array, object-array shreds and `Combine`, or no
-  implementation.
+- 028's full direct accumulator landed in `e724635` and `9402534`; its current
+  implementation is `DirectShreddedAcc` in `src/jsono_group_merge.cpp` after
+  the `9dc574e` domain split.
 - 025 is rejected: the new patch-count benchmark is retained as negative
   evidence, but the planned C++ optimization should not be executed.
-- 026 is complete as an uncommitted worker diff; commit it separately from any
-  later plan-028 source change if the maintainer wants a clean history.
+- 026 is complete as an uncommitted worker diff.
 - 027 is complete in `f94d620`; future merge work should preserve selected-row
   fallback and avoid returning to vector-wide reshred on sparse conflicts.
 - 027 depends on 023's recorded poisoned-row benchmark evidence and must implement a real
   selected-row fallback. A patch that runs full fallback on the whole vector and
   copies only conflict rows is not acceptable.
-- 028 depends on 024's recorded benchmark/profile evidence and must first write an
-  accumulator design. Do not copy keyed LWW aggregate logic into non-keyed
-  `jsono_group_merge` without proving sequential merge and Combine semantics.
+- Future changes to the plan-028 implementation must preserve its sequential
+  merge and `Combine` semantics; keyed LWW aggregate rules do not apply.
 - Plans 001–007 are independent. Recommended order is by priority: **001 first**
   (memory-safety), then 002 (trivial, and it fixes the format description that
   001's executor relies on), then 003 (investigate), then 004 (test coverage),
@@ -242,6 +245,11 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED
   production-shaped gate ends the plan with benchmark evidence only.
 
 ## Findings considered and rejected
+
+- **Add `pull_request` to `MainDistributionPipeline.yml`**: rejected by
+  maintainer decision. This repository develops directly on `main`; the stable
+  distribution and quality workflow remains push-only. Sanitizer workflows keep
+  their existing event policy.
 
 - **Upstream issue for constant-folded intermediate JSON inspection**: not
   planned by maintainer decision. Plan 063 documents the verified local behavior
