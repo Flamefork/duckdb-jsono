@@ -112,6 +112,16 @@ SELECT count(*) FROM docs WHERE jsono_array_length(plain -> 'arr') = 2;
 ----
 3000
 
+query I
+SELECT count(*) FROM docs WHERE jsono_array_length(shred_list, '$.tags') = 2;
+----
+3000
+
+query I
+SELECT count(*) FROM docs WHERE jsono_array_length(shred_list, '$.items') = 1;
+----
+3000
+
 # jsono_merge_patch across two shredded inputs
 query I
 SELECT count(jsono_merge_patch(shred, shred2)) FROM docs;
@@ -219,6 +229,16 @@ SELECT count(jsono_diff(plain, shred)) FROM docs;
 
 query I
 SELECT count(*) FROM (SELECT jsono_array_elements(plain -> 'arr') FROM docs);
+----
+3000
+
+query I
+SELECT count(*) FROM docs WHERE jsono_array_length(shred_list, '$.tags') = 2;
+----
+3000
+
+query I
+SELECT count(*) FROM docs WHERE jsono_array_length(shred_list, '$.items') = 1;
 ----
 3000
 

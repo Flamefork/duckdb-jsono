@@ -641,6 +641,14 @@ def test_fuzz_validish_blob_no_crash(text: str, mutation: str, reader: str) -> N
 shred_keys = st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=8)
 shred_documents = st.dictionaries(shred_keys, json_scalars, min_size=1, max_size=6)
 shred_types = st.sampled_from(["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN"])
+array_length_documents = st.fixed_dictionaries(
+    {
+        "arr": st.lists(json_scalars, max_size=6),
+        "nested": st.fixed_dictionaries({"arr": st.lists(json_scalars, max_size=6)}),
+        "other": json_scalars,
+    }
+)
+array_length_shred_types = st.sampled_from(["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN", "BIGINT[]", "STRUCT(x BIGINT)[]"])
 
 
 def shred_spec_sql(spec: dict[str, str]) -> str:
@@ -682,6 +690,36 @@ def test_shred_keys_parity(doc: dict[str, Any], data: Any) -> None:
     plain = SESSION.value(f"jsono_keys(jsono({sql_literal(text)}))")
     shredded = SESSION.value(f"jsono_keys(jsono({sql_literal(text)}, shredding := {shred_spec_sql(spec)}))")
     assert plain == shredded, f"jsono_keys drifted: {text!r} spec {spec!r}: {plain!r} -> {shredded!r}"
+
+
+@settings(PROPERTY_SETTINGS)
+@given(doc=array_length_documents, data=st.data())
+def test_shred_array_length_parity(doc: dict[str, Any], data: Any) -> None:
+    text = json_dumps(doc)
+    paths = data.draw(
+        st.lists(
+            st.sampled_from(["$.arr", "$.nested.arr", "$.other", "$.missing"]),
+            min_size=1,
+            max_size=4,
+            unique=True,
+        )
+    )
+    spec = {path: data.draw(array_length_shred_types) for path in paths}
+    plain = f"jsono({sql_literal(text)})"
+    shredded = f"jsono({sql_literal(text)}, shredding := {shred_spec_sql(spec)})"
+    calls = [
+        (f"jsono_array_length({plain})", f"jsono_array_length({shredded})"),
+        *[
+            (
+                f"jsono_array_length({plain}, {sql_literal(path)})",
+                f"jsono_array_length({shredded}, {sql_literal(path)})",
+            )
+            for path in ["$.arr", "$.nested.arr", "$.arr[0]", "$.missing"]
+        ],
+    ]
+    for plain_call, shredded_call in calls:
+        equal = SESSION.value(f"{plain_call} IS NOT DISTINCT FROM {shredded_call}")
+        assert equal == "true", f"jsono_array_length drifted: {text!r} spec {spec!r}: {plain_call} vs {shredded_call}"
 
 
 @settings(PROPERTY_SETTINGS)
@@ -1978,6 +2016,7 @@ PROPERTIES = [
     test_keys_sorted,
     test_shred_lossless,
     test_shred_keys_parity,
+    test_shred_array_length_parity,
     test_reshred_lossless,
     test_parquet_round_trip_to_json_parity,
     test_merge_patch_shredded_plain_parity,

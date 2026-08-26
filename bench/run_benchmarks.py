@@ -1157,6 +1157,44 @@ def build_jsono_keys_query(scenario_config: dict, data_path: Path) -> BenchmarkQ
     )
 
 
+def build_jsono_array_length_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {scenario_config["expression"]} AS r
+            FROM _bench_in
+        """,
+    )
+
+
+def build_jsono_array_length_scan_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    copy_path = scenario_config["copy_path"]
+    return BenchmarkQuery(
+        prepare_sql=(
+            f"""
+            COPY (
+                SELECT {jsono_value_sql(scenario_config)} AS j
+                FROM {table_sql(data_path)}
+            )
+            TO {sql_string(str(copy_path))}
+            (
+                FORMAT parquet,
+                COMPRESSION {scenario_config["copy_compression"]},
+                COMPRESSION_LEVEL {scenario_config["copy_compression_level"]},
+                ROW_GROUP_SIZE {scenario_config["copy_row_group_size"]},
+                OVERWRITE_OR_IGNORE true
+            )
+            """,
+        ),
+        timed_sql=f"""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT {scenario_config["expression"]} AS r
+            FROM {table_sql(copy_path)}
+        """,
+    )
+
+
 def build_jsono_reporter_keys_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
@@ -1344,6 +1382,10 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_entries_query(scenario_config, data_path)
         case "keys":
             return build_jsono_keys_query(scenario_config, data_path)
+        case "array_length":
+            return build_jsono_array_length_query(scenario_config, data_path)
+        case "array_length_scan":
+            return build_jsono_array_length_scan_query(scenario_config, data_path)
         case "reporter_keys":
             return build_jsono_reporter_keys_query(scenario_config, data_path)
         case "reporter_dump":
@@ -1613,6 +1655,19 @@ def collect_keys_checksum(conn: duckdb.DuckDBPyConnection) -> dict:
     }
 
 
+def collect_array_length_checksum(conn: duckdb.DuckDBPyConnection) -> dict:
+    row = conn.execute("""
+        SELECT count(*), count(r), sum(r)::VARCHAR, sum(hash(r))::VARCHAR
+        FROM _bench_out
+        """).fetchone()
+    return {
+        "rows": row[0],
+        "non_null_rows": row[1],
+        "result_sum": row[2],
+        "hash_sum": row[3],
+    }
+
+
 def target_metadata(target: Target) -> dict:
     build_type = "unknown"
     path_text = str(target.extension_path)
@@ -1694,6 +1749,8 @@ def run_benchmarks(
                     result_checksum = collect_json_render_checksum(conn)
                 elif operation == "keys":
                     result_checksum = collect_keys_checksum(conn)
+                elif operation in {"array_length", "array_length_scan"}:
+                    result_checksum = collect_array_length_checksum(conn)
                 rows_per_second = None
                 if row_count is not None and timing["min_ms"] > 0:
                     rows_per_second = round(row_count / (timing["min_ms"] / 1000))

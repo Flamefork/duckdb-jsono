@@ -72,6 +72,47 @@ SELECT jsono_keys(jsono(NULL::VARCHAR, shredding := '{"a":"BIGINT"}')),
 ----
 NULL	NULL	[]
 
+query IIIII
+SELECT jsono_array_length(jsono('[1,{"x":2},null]', shredding := '{"missing":"BIGINT"}')),
+       jsono_array_length(jsono('{"arr":[1,2],"other":3}', shredding := '{"other":"BIGINT"}'), '$.arr'),
+       jsono_array_length(jsono('{"arr":[1,2],"other":3}', shredding := '{"other":"BIGINT"}')),
+       jsono_array_length(jsono('{"arr":[1,2],"other":3}', shredding := '{"other":"BIGINT"}'), '$.missing'),
+       jsono_array_length(jsono(NULL::VARCHAR, shredding := '{"other":"BIGINT"}'), '$.arr');
+----
+3	2	NULL	NULL	NULL
+
+query IIII
+SELECT jsono_array_length(jsono('1', shredding := '{"missing":"BIGINT"}')),
+       jsono_array_length(jsono('null', shredding := '{"missing":"BIGINT"}')),
+       jsono_array_length(jsono('{"arr":{},"other":3}', shredding := '{"other":"BIGINT"}'), '$.arr'),
+       jsono_array_length(jsono('{"arr":null,"other":3}', shredding := '{"other":"BIGINT"}'), '$.arr');
+----
+NULL	NULL	NULL	NULL
+
+query III
+SELECT jsono_array_length(jsono('{"arr":[1,2,3]}', shredding := '{"arr":"BIGINT"}'), '$.arr'),
+       jsono_array_length(jsono('{"arr":[1,2,null]}', shredding := '{"$.arr":"BIGINT[]"}'), '$.arr'),
+       jsono_array_length(jsono('{"arr":[1,2,null]}', shredding := '{"$.arr":"BIGINT[]"}'), '$.arr[0]');
+----
+3	3	NULL
+
+query IIIIII
+SELECT jsono_array_length(jsono('{"items":[{"x":1},{"x":2}]}', shredding := '{"$.items":"STRUCT(x BIGINT)[]"}'), '$.items'),
+       jsono_array_length(jsono('{"items":[{"x":1},{"x":2}]}', shredding := '{"$.items":"STRUCT(x BIGINT)[]"}'), '$.items[0]'),
+       jsono_array_length(jsono('{"items":[{"x":1},{"x":2}]}', shredding := '{"$.items":"STRUCT(x BIGINT)[]"}'), '$.items[0].x'),
+       jsono_array_length(jsono('{"arr":[]}', shredding := '{"$.arr":"BIGINT[]"}'), '$.arr'),
+       jsono_array_length(jsono('{"items":[]}', shredding := '{"$.items":"STRUCT(x BIGINT)[]"}'), '$.items'),
+       jsono_array_length(jsono('{"arr":[1,2]}', shredding := '{"other":"BIGINT"}'), '$.arr') IS NOT DISTINCT FROM jsono_array_length(jsono('{"arr":[1,2]}'), '$.arr');
+----
+2	NULL	NULL	0	0	true
+
+query I
+SELECT jsono_array_length(jsono(
+  '{"arr":[1,2,3],"k00":0,"k01":1,"k02":2,"k03":3,"k04":4,"k05":5,"k06":6,"k07":7,"k08":8,"k09":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,"k16":16,"k17":17,"k18":18,"k19":19,"k20":20,"k21":21,"k22":22,"k23":23,"k24":24,"k25":25,"k26":26,"k27":27,"k28":28,"k29":29,"k30":30,"k31":31,"k32":32,"k33":33,"k34":34,"k35":35,"k36":36,"k37":37,"k38":38,"k39":39,"k40":40,"k41":41,"k42":42,"k43":43,"k44":44,"k45":45,"k46":46,"k47":47,"k48":48,"k49":49,"k50":50,"k51":51,"k52":52,"k53":53,"k54":54,"k55":55,"k56":56,"k57":57,"k58":58,"k59":59,"k60":60,"k61":61,"k62":62,"k63":63}',
+  shredding := '{"k00":"BIGINT","k01":"BIGINT","k02":"BIGINT","k03":"BIGINT","k04":"BIGINT","k05":"BIGINT","k06":"BIGINT","k07":"BIGINT","k08":"BIGINT","k09":"BIGINT","k10":"BIGINT","k11":"BIGINT","k12":"BIGINT","k13":"BIGINT","k14":"BIGINT","k15":"BIGINT","k16":"BIGINT","k17":"BIGINT","k18":"BIGINT","k19":"BIGINT","k20":"BIGINT","k21":"BIGINT","k22":"BIGINT","k23":"BIGINT","k24":"BIGINT","k25":"BIGINT","k26":"BIGINT","k27":"BIGINT","k28":"BIGINT","k29":"BIGINT","k30":"BIGINT","k31":"BIGINT","k32":"BIGINT","k33":"BIGINT","k34":"BIGINT","k35":"BIGINT","k36":"BIGINT","k37":"BIGINT","k38":"BIGINT","k39":"BIGINT","k40":"BIGINT","k41":"BIGINT","k42":"BIGINT","k43":"BIGINT","k44":"BIGINT","k45":"BIGINT","k46":"BIGINT","k47":"BIGINT","k48":"BIGINT","k49":"BIGINT","k50":"BIGINT","k51":"BIGINT","k52":"BIGINT","k53":"BIGINT","k54":"BIGINT","k55":"BIGINT","k56":"BIGINT","k57":"BIGINT","k58":"BIGINT","k59":"BIGINT","k60":"BIGINT","k61":"BIGINT","k62":"BIGINT","k63":"BIGINT"}'), '$.arr');
+----
+3
+
 # Shredded operations require the extension optimizer: without it, core DuckDB can route
 # differently-shredded values through generic STRUCT casts.
 statement ok

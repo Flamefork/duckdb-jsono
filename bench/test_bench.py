@@ -59,6 +59,56 @@ class FieldSampleJSONOMetadataTest(unittest.TestCase):
 
 
 class ProfileDriverCaseResolutionTest(unittest.TestCase):
+    def test_jsono_array_length_query_materializes_shredding_outside_timing(self) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "array_length",
+                "scenario": "ecom_object_array_shredded",
+                "json_column": "json_ecom",
+                "shredding": {"$.products": "STRUCT(id BIGINT)[]"},
+                "expression": "jsono_array_length(t, '$.products')",
+                "targets": ["jsono"],
+            },
+            Path("ecom_100k.parquet"),
+        )
+
+        self.assertIn("shredding", query.prepare_sql[0])
+        self.assertIn("SELECT jsono_array_length(t, '$.products') AS r", query.timed_sql)
+        self.assertNotIn("shredding", query.timed_sql)
+
+    def test_jsono_array_length_scan_materializes_parquet_outside_timing(self) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "array_length_scan",
+                "scenario": "wide_root_shredded",
+                "json_column": "json_wide_flat",
+                "shredding": {"event_name": "VARCHAR"},
+                "expression": "jsono_array_length(j)",
+                "copy_path": Path("array_length.parquet"),
+                "copy_compression": "zstd",
+                "copy_compression_level": 8,
+                "copy_row_group_size": 32_768,
+                "targets": ["jsono"],
+            },
+            Path("wide_flat_100k.parquet"),
+        )
+
+        self.assertIn("COPY", query.prepare_sql[0])
+        self.assertIn("shredding", query.prepare_sql[0])
+        self.assertIn("COMPRESSION zstd", query.prepare_sql[0])
+        self.assertIn("ROW_GROUP_SIZE 32768", query.prepare_sql[0])
+        self.assertIn("SELECT jsono_array_length(j) AS r", query.timed_sql)
+        self.assertNotIn("COPY", query.timed_sql)
+
+    def test_jsono_array_length_checksum_contains_scalar_fields(self) -> None:
+        conn = Mock()
+        conn.execute.return_value.fetchone.return_value = (4, 3, "9", "12")
+
+        self.assertEqual(
+            run_benchmarks.collect_array_length_checksum(conn),
+            {"rows": 4, "non_null_rows": 3, "result_sum": "9", "hash_sum": "12"},
+        )
+
     def test_jsono_keys_query_materializes_shredding_outside_timing(self) -> None:
         query = run_benchmarks.build_jsono_query(
             {

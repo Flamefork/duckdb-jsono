@@ -150,6 +150,7 @@ mismatch:
   `to_json(jsono(json_merge_patch(...)::VARCHAR))`;
 - `entries`: per-row `list_sort` of the key/value entries, comparing the (key, value) set order-independently;
 - `keys`: per-row root-key lists with row count, non-NULL result count, key-list hash sum, and total list length in the checksum.
+- `array_length`: materialized JSONO array cardinality with row count, non-NULL result count, result sum, and result hash sum in the checksum; `array_length_scan` writes current-revision shredded Parquet during prepare and times the direct scan.
 - `extract`: per-row struct compared field-by-field (`IS DISTINCT FROM`).
 - `extract_jsono`: per-row extracted JSON compared as core JSON;
 - `extract_string`: per-row extracted string compared directly.

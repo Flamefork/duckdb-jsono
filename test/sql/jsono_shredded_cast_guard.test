@@ -157,6 +157,63 @@ SELECT jsono_array_length(e, '$.tags') FROM narrow_arr;
 ----
 narrowed by a raw struct cast
 
+statement ok
+CREATE TABLE narrow_array_length_target_retyped AS
+SELECT jsono('{}', shredding := '{"tags":"VARCHAR[]"}') AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO narrow_array_length_target_retyped
+SELECT jsono('{"tags":[1,2]}', shredding := '{"tags":"BIGINT[]"}');
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT jsono_array_length(e, '$.tags') FROM narrow_array_length_target_retyped;
+----
+different type
+
+statement ok
+CREATE TABLE narrow_array_length_unrelated AS
+SELECT jsono('{}', shredding := '{"visible":"VARCHAR"}') AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO narrow_array_length_unrelated
+SELECT jsono('{"arr":[1,2],"hidden":"h","visible":"v"}', shredding := '{"hidden":"VARCHAR","visible":"VARCHAR"}');
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT jsono_array_length(e, '$.arr') FROM narrow_array_length_unrelated;
+----
+narrowed by a raw struct cast
+
+statement ok
+CREATE TABLE narrow_array_length_unrelated_retyped AS
+SELECT jsono('{}', shredding := '{"typed":"VARCHAR"}') AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO narrow_array_length_unrelated_retyped
+SELECT jsono('{"arr":[1,2],"typed":7}', shredding := '{"typed":"BIGINT"}');
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT jsono_array_length(e, '$.arr') FROM narrow_array_length_unrelated_retyped;
+----
+different type
+
 statement error
 SELECT jsono_array_elements(e, '$.tags') FROM narrow_arr;
 ----
