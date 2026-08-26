@@ -627,6 +627,31 @@ EXPLAIN (FORMAT json) SELECT jsono_keys(j) FROM jsono_plain_introspect;
 ----
 physical_plan	<!REGEX>:.*__jsono_internal_shredded_keys.*
 
+query II
+EXPLAIN (FORMAT json) SELECT jsono_array_length(j) FROM jsono_introspect_shredded;
+----
+physical_plan	<REGEX>:.*__jsono_internal_shredded_array_length.*
+
+query II
+EXPLAIN (FORMAT json) SELECT jsono_array_length(j) FROM jsono_introspect_shredded;
+----
+physical_plan	<!REGEX>:.*jsono_array_length.CAST.*
+
+query II
+EXPLAIN (FORMAT json) SELECT jsono_array_length(j, '$.b') FROM jsono_introspect_shredded;
+----
+physical_plan	<REGEX>:.*__jsono_internal_shredded_array_length.*
+
+query II
+EXPLAIN (FORMAT json) SELECT jsono_array_length(j, '$.b') FROM jsono_introspect_shredded;
+----
+physical_plan	<!REGEX>:.*jsono_array_length.CAST.*
+
+query II
+EXPLAIN (FORMAT json) SELECT jsono_array_length(j) FROM jsono_plain_introspect;
+----
+physical_plan	<!REGEX>:.*__jsono_internal_shredded_array_length.*
+
 statement ok
 PRAGMA explain_output='all';
 
