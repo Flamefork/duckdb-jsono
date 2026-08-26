@@ -1530,6 +1530,193 @@ vector<JsonoShred> CollectShreddedShreds(const LogicalType &shredded) {
 	return shreds;
 }
 
+struct JsonoShreddedKeysEntry {
+	idx_t signature_index;
+	string key;
+};
+
+struct JsonoShreddedKeysBindData : public FunctionData {
+	shared_ptr<const vector<JsonoShredSignature>> signatures;
+	vector<JsonoShreddedKeysEntry> top_level_scalar_shreds;
+	vector<idx_t> manifest_order;
+	vector<idx_t> key_order;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<JsonoShreddedKeysBindData>();
+		result->signatures = signatures;
+		result->top_level_scalar_shreds = top_level_scalar_shreds;
+		result->manifest_order = manifest_order;
+		result->key_order = key_order;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<JsonoShreddedKeysBindData>();
+		if ((signatures == nullptr) != (other.signatures == nullptr)) {
+			return false;
+		}
+		if (top_level_scalar_shreds.size() != other.top_level_scalar_shreds.size() ||
+		    manifest_order != other.manifest_order || key_order != other.key_order) {
+			return false;
+		}
+		for (idx_t i = 0; i < top_level_scalar_shreds.size(); i++) {
+			if (top_level_scalar_shreds[i].signature_index != other.top_level_scalar_shreds[i].signature_index ||
+			    top_level_scalar_shreds[i].key != other.top_level_scalar_shreds[i].key) {
+				return false;
+			}
+		}
+		if (signatures == nullptr) {
+			return true;
+		}
+		if (signatures->size() != other.signatures->size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < signatures->size(); i++) {
+			auto &left = (*signatures)[i];
+			auto &right = (*other.signatures)[i];
+			if (left.path != right.path || left.type != right.type || left.subfields != right.subfields) {
+				return false;
+			}
+		}
+		return true;
+	}
+};
+
+unique_ptr<JsonoShreddedKeysBindData> BuildJsonoShreddedKeysBindData(const LogicalType &shredded) {
+	auto result = make_uniq<JsonoShreddedKeysBindData>();
+	auto signatures = make_shared_ptr<vector<JsonoShredSignature>>();
+	JsonoBuildShredSignatures(shredded, *signatures);
+	result->signatures = std::move(signatures);
+	for (auto &shred : CollectShreddedShreds(shredded)) {
+		if (shred.steps.size() == 1 && shred.steps[0].kind == PathStepKind::Key && !IsShredListType(shred.type)) {
+			result->top_level_scalar_shreds.push_back(JsonoShreddedKeysEntry {shred.child_index, shred.steps[0].key});
+		}
+	}
+	result->manifest_order.resize(result->top_level_scalar_shreds.size());
+	result->key_order.resize(result->top_level_scalar_shreds.size());
+	for (idx_t i = 0; i < result->top_level_scalar_shreds.size(); i++) {
+		result->manifest_order[i] = i;
+		result->key_order[i] = i;
+	}
+	std::sort(result->manifest_order.begin(), result->manifest_order.end(), [&](idx_t left, idx_t right) {
+		auto &left_path = (*result->signatures)[result->top_level_scalar_shreds[left].signature_index].path;
+		auto &right_path = (*result->signatures)[result->top_level_scalar_shreds[right].signature_index].path;
+		return CompareJsonoKeys(nonstd::string_view(left_path.data(), left_path.size()),
+		                        nonstd::string_view(right_path.data(), right_path.size())) < 0;
+	});
+	std::sort(result->key_order.begin(), result->key_order.end(), [&](idx_t left, idx_t right) {
+		auto &left_key = result->top_level_scalar_shreds[left].key;
+		auto &right_key = result->top_level_scalar_shreds[right].key;
+		return CompareJsonoKeys(nonstd::string_view(left_key.data(), left_key.size()),
+		                        nonstd::string_view(right_key.data(), right_key.size())) < 0;
+	});
+	return result;
+}
+
+void AppendJsonoShreddedKey(Vector &result, idx_t &length, nonstd::string_view key) {
+	auto child_row = ListVector::GetListSize(result) + length;
+	EnsureListCapacity(result, child_row + 1);
+	auto &child = ListVector::GetEntry(result);
+	FlatVector::GetData<string_t>(child)[child_row] = StringVector::AddString(child, key.data(), key.size());
+	length++;
+}
+
+void JsonoInternalShreddedKeysExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = expr.bind_info->Cast<JsonoShreddedKeysBindData>();
+	auto count = args.size();
+	JsonoRowReader reader;
+	reader.Init(args.data[0], count, bind_data.signatures);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	ListVector::SetListSize(result, 0);
+	vector<bool> active(bind_data.top_level_scalar_shreds.size());
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		JsonoBlobRow blob;
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			SetListRowNull(result, row);
+			continue;
+		}
+		if (SlotTag(view.SlotAt(0)) != tag::OBJ_START) {
+			SetListRowNull(result, row);
+			continue;
+		}
+
+		std::fill(active.begin(), active.end(), false);
+		auto &manifest = reader.RowManifest(view);
+		for (auto &entry : manifest) {
+			auto position = std::lower_bound(
+			    bind_data.manifest_order.begin(), bind_data.manifest_order.end(), entry.path,
+			    [&](idx_t index, nonstd::string_view path) {
+				    auto &candidate =
+				        (*bind_data.signatures)[bind_data.top_level_scalar_shreds[index].signature_index].path;
+				    return CompareJsonoKeys(nonstd::string_view(candidate.data(), candidate.size()), path) < 0;
+			    });
+			if (position != bind_data.manifest_order.end()) {
+				auto index = *position;
+				auto &candidate =
+				    (*bind_data.signatures)[bind_data.top_level_scalar_shreds[index].signature_index].path;
+				if (entry.path == nonstd::string_view(candidate.data(), candidate.size())) {
+					active[index] = true;
+				}
+			}
+		}
+
+		auto layout = ReadObjectLayout(view, 0);
+		auto start = ListVector::GetListSize(result);
+		idx_t length = 0;
+		idx_t residual_index = 0;
+		idx_t shred_index = 0;
+		while (residual_index < layout.key_count || shred_index < bind_data.key_order.size()) {
+			while (shred_index < bind_data.key_order.size() && !active[bind_data.key_order[shred_index]]) {
+				shred_index++;
+			}
+			if (residual_index == layout.key_count && shred_index == bind_data.key_order.size()) {
+				break;
+			}
+			nonstd::string_view residual_key;
+			if (residual_index < layout.key_count) {
+				auto key_slot = view.SlotAt(layout.key_start + residual_index);
+				if (SlotTag(key_slot) != tag::KEY) {
+					throw InvalidInputException("malformed JSONO: object key slot expected");
+				}
+				residual_key = view.KeyAt(SlotPayload(key_slot));
+			}
+			nonstd::string_view shred_key;
+			if (shred_index < bind_data.key_order.size()) {
+				auto &key = bind_data.top_level_scalar_shreds[bind_data.key_order[shred_index]].key;
+				shred_key = nonstd::string_view(key.data(), key.size());
+			}
+			if (residual_index == layout.key_count ||
+			    (shred_index < bind_data.key_order.size() && CompareJsonoKeys(shred_key, residual_key) < 0)) {
+				AppendJsonoShreddedKey(result, length, shred_key);
+				shred_index++;
+			} else {
+				AppendJsonoShreddedKey(result, length, residual_key);
+				residual_index++;
+				if (shred_index < bind_data.key_order.size() && CompareJsonoKeys(shred_key, residual_key) == 0) {
+					shred_index++;
+				}
+			}
+		}
+		FinishListRow(result, row, start, length);
+	}
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
+ScalarFunction MakeJsonoInternalShreddedKeysFunction() {
+	ScalarFunction fun("__jsono_internal_shredded_keys", {JsonoType()}, LogicalType::LIST(LogicalType::VARCHAR),
+	                   JsonoInternalShreddedKeysExecute);
+	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	return fun;
+}
+
 // True when an extract `read` cannot be served against `shred` from the residual and must reconstruct:
 //   - an exact json-valued extract, or an exact array shred (whose LIST<STRUCT>/LIST<scalar> column is
 //     not the JSON array text a `->>` expects) — only a scalar shred under a string-valued extract is
@@ -2135,7 +2322,10 @@ protected:
 		// Introspection (jsono_type / jsono_keys) off a shredded value: feed the residual natively
 		// instead of reconstructing when that is value-equivalent (mutates the argument in place).
 		if (expr.function.name == "jsono_type" || expr.function.name == "jsono_keys") {
-			ResidualizeIntrospect(expr);
+			auto rewritten = ResidualizeIntrospect(expr);
+			if (rewritten) {
+				return rewritten;
+			}
 		}
 		return nullptr;
 	}
@@ -2328,33 +2518,42 @@ private:
 	// jsono_type / jsono_keys over a shredded value: replace the reconstruct cast on the argument
 	// with a native residual read when that is value-equivalent, so the scan reads the residual
 	// blobs instead of materializing the whole document per row.
-	//   - jsono_type(shredded): the root container type is what shredding never changes, so the
-	//     residual alone answers it (a 1-arg jsono_keys is NOT residual-equivalent — it would miss
-	//     top-level shred keys — so it is left to reconstruct).
+	//   - jsono_type/jsono_keys(shredded): the root container type and keys are read from the residual
+	//     and verified shred manifest.
 	//   - jsono_type/jsono_keys(shredded, path): residual-equivalent when the path resolves to no
 	//     shred and holds no shred beneath it, since only shred leaves are stripped from the residual.
-	void ResidualizeIntrospect(BoundFunctionExpression &expr) {
+	unique_ptr<Expression> ResidualizeIntrospect(BoundFunctionExpression &expr) {
 		auto shredded_cast = ShreddedJsonCast(*expr.children[0]);
 		if (!shredded_cast) {
-			return;
+			return nullptr;
 		}
 		if (expr.children.size() == 1) {
 			if (expr.function.name == "jsono_type") {
 				expr.children[0] = ResidualReinterpret(*shredded_cast->child);
+			} else if (expr.function.name == "jsono_keys") {
+				auto bind_data = BuildJsonoShreddedKeysBindData(shredded_cast->child->return_type);
+				vector<unique_ptr<Expression>> children;
+				children.push_back(ResidualReinterpret(*shredded_cast->child, ResidualPolicy::PathScoped));
+				auto result =
+				    make_uniq<BoundFunctionExpression>(expr.return_type, MakeJsonoInternalShreddedKeysFunction(),
+				                                       std::move(children), std::move(bind_data));
+				result->SetAlias(expr.GetAlias());
+				return result;
 			}
-			return;
+			return nullptr;
 		}
 		JsonoPathSpec path;
 		if (!TryReadExtractPath(context, *expr.children[1], path)) {
-			return;
+			return nullptr;
 		}
 		for (auto &shred : CollectShreddedShreds(shredded_cast->child->return_type)) {
 			if (PathStepsEqual(shred.steps, path.steps) || PathStepsObjectKeyPrefix(path.steps, shred.steps) ||
 			    ReadDescendsIntoArrayShred(shred.type, shred.steps, path.steps)) {
-				return;
+				return nullptr;
 			}
 		}
 		expr.children[0] = ResidualReinterpret(*shredded_cast->child, ResidualPolicy::PathScoped);
+		return nullptr;
 	}
 
 	// struct_extract_at(child, one_based): 1-based positional struct field read.

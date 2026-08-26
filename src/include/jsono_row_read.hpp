@@ -274,6 +274,12 @@ public:
 		verifier_.InitSignaturesRef(cache.For(input.GetType()));
 	}
 
+	void Init(Vector &input, idx_t count, shared_ptr<const std::vector<JsonoShredSignature>> signatures) {
+		Reset(ReadPolicy::WholeDocument);
+		InitJsonoVectorData(input, count, data_);
+		verifier_.InitSignaturesRef(std::move(signatures));
+	}
+
 	// Whole-document policy with caller-supplied signatures
 	// (__jsono_internal_checked_residual receives them as plan constants).
 	void Init(Vector &input, idx_t count, std::vector<JsonoShredSignature> signatures) {
