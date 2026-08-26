@@ -147,7 +147,7 @@ requires-dist = [
     { name = "clang-format", specifier = "==11.0.1" },
     { name = "clang-tidy", specifier = ">=22.1.0.1" },
     { name = "cmake-format", specifier = ">=0.6.13" },
-    { name = "duckdb", specifier = ">=1.5.5" },
+    { name = "duckdb", specifier = "==1.5.5" },
     { name = "hypothesis", specifier = ">=6.100" },
 ]
 

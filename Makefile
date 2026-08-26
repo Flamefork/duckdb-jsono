@@ -81,6 +81,13 @@ verify:
 	$(MAKE) test_constructor_matrix_relassert
 	$(MAKE) format-check-all
 
+.PHONY: memcheck
+memcheck:
+	$(MAKE) reldebug
+	valgrind --tool=memcheck --track-origins=yes --leak-check=no --error-exitcode=99 \
+		./build/reldebug/test/unittest \
+		'test/sql/jsono_optimizer.test,test/sql/jsono_group_merge*,test/sql/jsono_collect*,test/sql/jsono_advisor*'
+
 # DuckLake verification, deliberately OUTSIDE `verify` and CI: DuckLake cannot be vendored here
 # (INSTALL needs the network), so a hermetic gate cannot own it. Run it by hand after touching layout
 # recognition (MatchJsonoLayoutType and friends) or shred totality — DuckLake's inlined-data flush

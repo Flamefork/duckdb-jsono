@@ -10,7 +10,7 @@ Run each against a build of the current tree; every one of them was worth its ru
 ## AddressSanitizer + UndefinedBehaviorSanitizer
 
 ```bash
-uv run make debug && ./build/debug/test/unittest "test/*"
+uv run --frozen make debug && ./build/debug/test/unittest "test/*"
 ```
 
 Use-after-free, out-of-bounds on an *allocation*, and undefined behaviour. This is the leg CI runs
@@ -20,7 +20,7 @@ container's `size()` that stays inside its `capacity()`.
 ## ThreadSanitizer
 
 ```bash
-THREADSAN=1 uv run make debug && TSAN_OPTIONS=halt_on_error=0 ./build/debug/test/unittest "test/*"
+THREADSAN=1 uv run --frozen make debug && TSAN_OPTIONS=halt_on_error=0 ./build/debug/test/unittest "test/*"
 ```
 
 Data races — the class the parallel aggregate paths (`group_merge`, `collect`, the advisor) can
@@ -38,7 +38,7 @@ dying two thirds of the way through.
 ```bash
 rm -rf build/debug
 EXT_DEBUG_FLAGS='-DCMAKE_CXX_FLAGS=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG' \
-  uv run make debug && ./build/debug/test/unittest "test/*"
+  uv run --frozen make debug && ./build/debug/test/unittest "test/*"
 ```
 
 Container bounds against `size()` (not just the allocation), iterator invalidation, and — the
@@ -79,9 +79,10 @@ fatal on another — into a wrong answer here.
 
 Neither ASan nor the hardening modes detect a *read* of uninitialised memory; that needs
 MemorySanitizer (which requires every dependency, including the standard library, rebuilt
-instrumented) or Valgrind's memcheck under Linux (no rebuild, tens of times slower). Nothing in this
-repository covers that class today, and at least one past bug in the extrema aggregate was exactly
-it — caught only because the uninitialised value was later freed.
+instrumented) or Valgrind's memcheck under Linux. The weekly and on-demand `memcheck` job runs the
+optimizer, group-merge, collect, and advisor SQLLogic files under Valgrind. Run the same focused
+selection locally on Linux with `uv run --frozen make memcheck`. This is not whole-suite coverage;
+new high-risk aggregate or optimizer files must be added to the target explicitly.
 
 ## Compiler-conditional code
 

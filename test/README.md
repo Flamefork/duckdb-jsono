@@ -7,8 +7,11 @@ related cluster of behavior.
 Run them from the repo root:
 
 ```bash
-uv run make test          # release build
-uv run make test_debug    # debug build
+uv run --frozen make release
+uv run --frozen make test
+
+uv run --frozen make debug
+uv run --frozen make test_debug
 ```
 
 Each SQLLogic file must start with `# group: [sql]` and `require jsono`

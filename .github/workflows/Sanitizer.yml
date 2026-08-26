@@ -146,6 +146,37 @@ jobs:
       - name: SQLLogic tests under TSan
         run: make test_debug
 
+  memcheck:
+    name: Valgrind Memcheck (linux_amd64)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GEN: ninja
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build valgrind
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03
+        with:
+          key: sanitizer-valgrind
+          max-size: 1G
+
+      - name: Focused aggregate and optimizer memcheck
+        env:
+          EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        run: uv run --frozen make memcheck
+
   # Release-build fuzz leg. The property/fuzz harness is env-pointable at any build, so this runs the
   # same corrupt-blob sweep against an -O2 optimizer-enabled build: release codegen inlines and
   # reorders the reader's bound checks differently than the sanitizer Debug build, and if that single

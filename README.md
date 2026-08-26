@@ -846,7 +846,7 @@ Build and load (CLI):
 1. Build the release extension:
 
    ```bash
-   uv run make release
+   uv run --frozen make release
    ```
 
 2. Start DuckDB with unsigned extensions permitted:
@@ -875,23 +875,15 @@ con.execute("LOAD './build/release/extension/jsono/jsono.duckdb_extension'")
 Run the full local pre-PR gate with one command. The gate does the release build and its tests, the assert-enabled build with its tests and the constructor matrix, and the format check:
 
 ```bash
-uv run make verify
-```
-
-Or run the gates one at a time:
-
-```bash
-uv run make release
-uv run make test
-uv run --frozen black --check bench
+uv run --frozen make verify
 ```
 
 Useful commands:
 
 ```bash
-uv run make debug
-uv run make reldebug
-uv run make clean
+uv run --frozen make debug
+uv run --frozen make reldebug
+uv run --frozen make clean
 uv run --frozen python bench/run_benchmarks.py --list
 uv run --frozen python bench/compare_results.py --save-baseline
 uv run --frozen python bench/compare_results.py
@@ -915,7 +907,7 @@ Contributions and feedback are welcome. Please:
 
 1. Open an issue first to discuss the changes.
 2. Add or update SQLLogic tests in `test/sql/` for new behavior.
-3. Run `uv run make verify` before you send a pull request. The command does the release build and its tests, the assert-enabled build with its tests and the constructor matrix, and the format check. CI also runs `uv run make tidy-check`, which requires a local clang-tidy and compile-database setup.
+3. Run `uv run --frozen make verify` before you send a pull request. The command does the release build and its tests, the assert-enabled build with its tests and the constructor matrix, and the format check. CI also runs `uv run --frozen make tidy-check`, which requires a local clang-tidy and compile-database setup.
 
 See [GitHub Issues](https://github.com/Flamefork/duckdb-jsono/issues) for current tasks and feature requests.
 

@@ -12,6 +12,8 @@ each place that participates in local builds or CI:
 - Bump versions in `.github/workflows/MainDistributionPipeline.yml`
   - reusable workflow refs for `duckdb-stable-build` and `code-quality-check`.
   - `duckdb_version` and `ci_tools_version` inputs in both jobs.
+- Pin the Python package to the same exact DuckDB version in `pyproject.toml`
+  and refresh `uv.lock` in the same change.
 
 `.github/workflows/NextDuckDB.yml` needs no bump: it tracks DuckDB `main` on
 purpose, and a red run there is the signal that the next release will need the
