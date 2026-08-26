@@ -608,6 +608,25 @@ EXPLAIN SELECT jsono_keys(j, '$.b') AS r FROM jsono_introspect_shredded;
 ----
 physical_plan	<REGEX>:.*Projections: j.*
 
+query II
+EXPLAIN SELECT jsono_keys(j) AS r FROM jsono_introspect_shredded;
+----
+physical_plan	<REGEX>:.*__jsono_internal_shredded_keys.*
+
+query II
+EXPLAIN SELECT jsono_keys(j) AS r FROM jsono_introspect_shredded;
+----
+physical_plan	<!REGEX>:.*__jsono_reconstruct.*
+
+statement ok
+CREATE TABLE jsono_plain_introspect AS
+SELECT jsono('{"a":1,"b":{"c":2},"name":"x"}') AS j;
+
+query II
+EXPLAIN SELECT jsono_keys(j) AS r FROM jsono_plain_introspect;
+----
+physical_plan	<!REGEX>:.*__jsono_internal_shredded_keys.*
+
 statement ok
 PRAGMA explain_output='all';
 
