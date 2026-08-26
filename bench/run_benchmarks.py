@@ -1743,7 +1743,7 @@ def run_benchmarks(
 
                 timing = run_single_benchmark(conn, query, runs)
                 result_checksum = None
-                if operation in {"parse_struct", "parse_struct_plain"}:
+                if operation in {"parse_shred", "parse_struct", "parse_struct_plain"}:
                     result_checksum = collect_struct_constructor_checksum(conn)
                 elif operation in {"render_struct_json", "render_struct_plain_json"}:
                     result_checksum = collect_json_render_checksum(conn)

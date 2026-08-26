@@ -467,6 +467,50 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
 
 
 class RunBenchmarksDataPathTest(unittest.TestCase):
+    def test_parse_shred_result_stores_struct_constructor_checksum(self) -> None:
+        target = run_benchmarks.Target("current", "jsono", Path("jsono.duckdb_extension"))
+        checksum = {"rows": 4, "hash_sum": "12", "json_bytes": 34}
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(run_benchmarks, "create_connection", return_value=Mock()),
+            patch.object(run_benchmarks, "build_query", return_value=Mock()),
+            patch.object(
+                run_benchmarks,
+                "run_single_benchmark",
+                return_value={"min_ms": 1.0, "median_ms": 1.0, "max_ms": 1.0},
+            ),
+            patch.object(
+                run_benchmarks,
+                "collect_struct_constructor_checksum",
+                return_value=checksum,
+            ),
+        ):
+            data_path = Path(temp_dir) / "events_nested.parquet"
+            data_path.touch()
+            results = run_benchmarks.run_benchmarks(
+                [target],
+                [
+                    (
+                        target,
+                        "245760",
+                        {
+                            "operation": "parse_shred",
+                            "scenario": "field_sample_nested",
+                            "row_count": 245_760,
+                            "data_file": data_path,
+                            "json_column": "event_properties",
+                            "shredding": {"clientID": "VARCHAR"},
+                            "targets": ["jsono"],
+                        },
+                    )
+                ],
+                runs=1,
+                thread_modes=[1],
+            )
+
+        self.assertEqual(results[0]["result_checksum"], checksum)
+
     def test_closes_previous_target_connection_before_opening_next(self) -> None:
         first = run_benchmarks.Target("first", "jsono", Path("first.duckdb_extension"))
         second = run_benchmarks.Target("second", "jsono", Path("second.duckdb_extension"))
