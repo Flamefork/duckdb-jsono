@@ -799,6 +799,25 @@ WIDE_FLAT_ALTERNATING_MANIFEST_JSON = (
 
 SCENARIOS += [
     {
+        "operation": "keys",
+        "scenario": "wide_root_plain",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "targets": ["jsono"],
+    },
+    {
+        "operation": "keys",
+        "scenario": "wide_root_shredded",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "shredding": WIDE_FLAT_SHREDDING_SPEC,
+        "targets": ["jsono"],
+    },
+    {
         "operation": "extract_string",
         "scenario": "wide_flat_shred_absent_key",
         "size": "100k",

@@ -149,6 +149,7 @@ mismatch:
 - `merge_patch`: per-row `to_json(jsono_merge_patch(jsono(base), jsono(STRUCT patch)))` vs
   `to_json(jsono(json_merge_patch(...)::VARCHAR))`;
 - `entries`: per-row `list_sort` of the key/value entries, comparing the (key, value) set order-independently;
+- `keys`: per-row root-key lists with row count, non-NULL result count, key-list hash sum, and total list length in the checksum.
 - `extract`: per-row struct compared field-by-field (`IS DISTINCT FROM`).
 - `extract_jsono`: per-row extracted JSON compared as core JSON;
 - `extract_string`: per-row extracted string compared directly.

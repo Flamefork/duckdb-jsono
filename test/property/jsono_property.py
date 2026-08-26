@@ -674,6 +674,18 @@ def test_shred_lossless(doc: dict[str, Any], data: Any) -> None:
 
 @settings(PROPERTY_SETTINGS)
 @given(doc=shred_documents, data=st.data())
+def test_shred_keys_parity(doc: dict[str, Any], data: Any) -> None:
+    text = json_dumps(doc)
+    keys = sorted(doc.keys())
+    paths = data.draw(st.lists(st.sampled_from(keys + ["missing_path"]), min_size=1, max_size=4, unique=True))
+    spec = {path: data.draw(shred_types) for path in paths}
+    plain = SESSION.value(f"jsono_keys(jsono({sql_literal(text)}))")
+    shredded = SESSION.value(f"jsono_keys(jsono({sql_literal(text)}, shredding := {shred_spec_sql(spec)}))")
+    assert plain == shredded, f"jsono_keys drifted: {text!r} spec {spec!r}: {plain!r} -> {shredded!r}"
+
+
+@settings(PROPERTY_SETTINGS)
+@given(doc=shred_documents, data=st.data())
 def test_reshred_lossless(doc: dict[str, Any], data: Any) -> None:
     # Reshredding a shredded value to another spec (the single-pass superset path and the
     # reconstruct fallback alike) must preserve the logical value.
@@ -1965,6 +1977,7 @@ PROPERTIES = [
     test_value_parity,
     test_keys_sorted,
     test_shred_lossless,
+    test_shred_keys_parity,
     test_reshred_lossless,
     test_parquet_round_trip_to_json_parity,
     test_merge_patch_shredded_plain_parity,

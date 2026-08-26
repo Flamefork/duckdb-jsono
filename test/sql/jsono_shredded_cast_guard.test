@@ -244,6 +244,44 @@ SELECT jsono_keys(p) FROM plain_narrowed;
 ----
 narrowed by a raw struct cast
 
+statement ok
+CREATE TABLE narrow_keys_unrelated AS
+SELECT jsono('{}', shredding := '{"visible":"VARCHAR"}') AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO narrow_keys_unrelated
+SELECT jsono('{"hidden":"h","visible":"v"}', shredding := '{"hidden":"VARCHAR","visible":"VARCHAR"}');
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT jsono_keys(e) FROM narrow_keys_unrelated;
+----
+narrowed by a raw struct cast
+
+statement ok
+CREATE TABLE narrow_keys_retyped AS
+SELECT jsono('{}', shredding := '{"typed":"VARCHAR"}') AS e WHERE false;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+INSERT INTO narrow_keys_retyped
+SELECT jsono('{"typed":7}', shredding := '{"typed":"BIGINT"}');
+
+statement ok
+RESET disabled_optimizers;
+
+statement error
+SELECT jsono_keys(e) FROM narrow_keys_retyped;
+----
+different type
+
 # A path the manifest covers reads as a silent NULL without the check.
 statement error
 SELECT jsono_type(p, '$.a') FROM plain_narrowed;

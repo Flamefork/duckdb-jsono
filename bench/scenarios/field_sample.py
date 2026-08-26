@@ -459,6 +459,16 @@ FIELD_SAMPLE_SCENARIOS = [
         "targets": ["jsono"],
     },
     {
+        "operation": "keys",
+        "scenario": "field_sample_shredded_root",
+        "size": "245760",
+        "row_count": FIELD_SAMPLE_ROW_COUNT,
+        "data_file": FIELD_SAMPLE_EVENTS_NESTED_PATH,
+        "json_column": "event_properties",
+        "shredding": FIELD_SAMPLE_SHREDDING_SPEC,
+        "targets": ["jsono"],
+    },
+    {
         "operation": "reporter_keys",
         "scenario": "field_sample_reporter",
         "size": "245760",

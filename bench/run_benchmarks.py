@@ -1146,6 +1146,17 @@ def build_jsono_entries_query(scenario_config: dict, data_path: Path) -> Benchma
     )
 
 
+def build_jsono_keys_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
+    return BenchmarkQuery(
+        prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
+        timed_sql="""
+            CREATE OR REPLACE TEMP TABLE _bench_out AS
+            SELECT jsono_keys(t) AS r
+            FROM _bench_in
+        """,
+    )
+
+
 def build_jsono_reporter_keys_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
     return BenchmarkQuery(
         prepare_sql=(jsono_prepare_jsono(scenario_config, data_path),),
@@ -1331,6 +1342,8 @@ def build_jsono_query(scenario_config: dict, data_path: Path) -> BenchmarkQuery:
             return build_jsono_reshred_query(scenario_config, data_path)
         case "entries":
             return build_jsono_entries_query(scenario_config, data_path)
+        case "keys":
+            return build_jsono_keys_query(scenario_config, data_path)
         case "reporter_keys":
             return build_jsono_reporter_keys_query(scenario_config, data_path)
         case "reporter_dump":
@@ -1587,6 +1600,19 @@ def collect_json_render_checksum(conn: duckdb.DuckDBPyConnection) -> dict:
     }
 
 
+def collect_keys_checksum(conn: duckdb.DuckDBPyConnection) -> dict:
+    row = conn.execute("""
+        SELECT count(*), count(r), sum(hash(r))::VARCHAR, sum(len(r))
+        FROM _bench_out
+        """).fetchone()
+    return {
+        "rows": row[0],
+        "non_null_rows": row[1],
+        "hash_sum": row[2],
+        "list_length": row[3],
+    }
+
+
 def target_metadata(target: Target) -> dict:
     build_type = "unknown"
     path_text = str(target.extension_path)
@@ -1666,6 +1692,8 @@ def run_benchmarks(
                     result_checksum = collect_struct_constructor_checksum(conn)
                 elif operation in {"render_struct_json", "render_struct_plain_json"}:
                     result_checksum = collect_json_render_checksum(conn)
+                elif operation == "keys":
+                    result_checksum = collect_keys_checksum(conn)
                 rows_per_second = None
                 if row_count is not None and timing["min_ms"] > 0:
                     rows_per_second = round(row_count / (timing["min_ms"] / 1000))

@@ -59,6 +59,31 @@ class FieldSampleJSONOMetadataTest(unittest.TestCase):
 
 
 class ProfileDriverCaseResolutionTest(unittest.TestCase):
+    def test_jsono_keys_query_materializes_shredding_outside_timing(self) -> None:
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "keys",
+                "scenario": "wide_root_shredded",
+                "json_column": "json_wide_flat",
+                "shredding": {"event_name": "VARCHAR"},
+                "targets": ["jsono"],
+            },
+            Path("wide_flat_100k.parquet"),
+        )
+
+        self.assertIn("shredding", query.prepare_sql[0])
+        self.assertIn("SELECT jsono_keys(t) AS r", query.timed_sql)
+        self.assertNotIn("shredding", query.timed_sql)
+
+    def test_jsono_keys_checksum_contains_list_cardinality_fields(self) -> None:
+        conn = Mock()
+        conn.execute.return_value.fetchone.return_value = (4, 3, "12", 9)
+
+        self.assertEqual(
+            run_benchmarks.collect_keys_checksum(conn),
+            {"rows": 4, "non_null_rows": 3, "hash_sum": "12", "list_length": 9},
+        )
+
     def test_resolves_exact_core_case(self) -> None:
         target = profile_driver.Target("current", "jsono", Path("jsono.duckdb_extension"))
 

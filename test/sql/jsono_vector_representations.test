@@ -83,6 +83,11 @@ SELECT count(*) FROM docs WHERE len(jsono_keys(plain)) = 4;
 ----
 3000
 
+query I
+SELECT count(*) FROM docs WHERE jsono_keys(shred) = ['name', 'x'];
+----
+3000
+
 # jsono_type
 query I
 SELECT count(*) FROM docs WHERE jsono_type(plain) = 'OBJECT';
@@ -182,6 +187,11 @@ SELECT count(*) FROM (SELECT jsono_entries(shred_list) FROM docs);
 ----
 3000
 
+query I
+SELECT count(*) FROM docs WHERE jsono_keys(shred_list) = ['items', 'tags', 'u'];
+----
+3000
+
 # --- Child-shuffled nested vectors: focused on the nested-navigation paths ---
 
 statement ok
@@ -252,6 +262,11 @@ SELECT count(*) FROM (SELECT jsono_group_merge_max(shred_list, i) AS g FROM docs
 
 query I
 SELECT count(*) FROM (SELECT jsono_entries(shred_list) FROM docs);
+----
+3000
+
+query I
+SELECT count(*) FROM docs WHERE jsono_keys(shred) = ['name', 'x'];
 ----
 3000
 
