@@ -202,14 +202,69 @@ SELECT to_json(v) FROM forged_zero_subfields;
 ----
 object-array manifest entry declares no subfields
 
+statement ok
+CREATE TABLE forged_reversed_manifest AS
+SELECT {'jsono': {'body$2': {
+  'slots': v.jsono."body$2".slots,
+  'key_heap': v.jsono."body$2".key_heap,
+  'string_heap': v.jsono."body$2".string_heap,
+  'skips': unhex(replace(hex(v.jsono."body$2".skips),
+                         '020000000500242E612D63010500242E612E6201',
+                         '020000000500242E612E62010500242E612D6301')),
+  'lengths': v.jsono."body$2".lengths,
+  'nums': v.jsono."body$2".nums},
+  'shreds$2': v.jsono."shreds$2"}} AS v
+FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}',
+                   shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS v);
+
+query I
+SELECT hex(v.jsono."body$2".skips) LIKE '%020000000500242E612E62010500242E612D6301'
+FROM forged_reversed_manifest;
+----
+true
+
+query I
+SELECT jsono_validate(v) FROM forged_reversed_manifest;
+----
+false
+
+statement error
+SELECT to_json(v) FROM forged_reversed_manifest;
+----
+shred manifest entries are not strictly sorted
+
+statement ok
+CREATE TABLE forged_duplicate_manifest AS
+SELECT {'jsono': {'body$2': {
+  'slots': v.jsono."body$2".slots,
+  'key_heap': v.jsono."body$2".key_heap,
+  'string_heap': v.jsono."body$2".string_heap,
+  'skips': unhex(replace(hex(v.jsono."body$2".skips),
+                         '020000000500242E612D63010500242E612E6201',
+                         '020000000500242E612D63010500242E612D6301')),
+  'lengths': v.jsono."body$2".lengths,
+  'nums': v.jsono."body$2".nums},
+  'shreds$2': v.jsono."shreds$2"}} AS v
+FROM (SELECT jsono('{"a-c":"x","a":{"b":"y"}}',
+                   shredding := '{"$.\"a-c\"": "VARCHAR", "$.a.b": "VARCHAR"}') AS v);
+
+query I
+SELECT hex(v.jsono."body$2".skips) LIKE '%020000000500242E612D63010500242E612D6301'
+FROM forged_duplicate_manifest;
+----
+true
+
+query I
+SELECT jsono_validate(v) FROM forged_duplicate_manifest;
+----
+false
+
+statement error
+SELECT to_json(v) FROM forged_duplicate_manifest;
+----
+shred manifest entries are not strictly sorted
+
 # --- The manifest's emission order is a fact about every WRITER, not just the constructor ---
-#
-# Four producers emit a shred manifest, and all four walk the same bind-time permutation
-# (JsonoShredWriteModel::manifest_order) rather than their own lane loop. Pinned only for the
-# constructor, a producer that emitted its manifest in FIELD order would pass the whole suite: every
-# verifying reader is order-independent, and the one consumer that is not (the keyed group_merge
-# walkers) had no divergent-order case either. The `$.a-c` / `$.a.b` pair is what tells the two
-# orders apart, so each producer is read here WITHOUT a sort.
 
 statement ok
 CREATE TABLE manifest_order_src AS

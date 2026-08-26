@@ -964,8 +964,13 @@ inline void WalkShredManifestBytes(const char *data, size_t size, SINK &sink) {
 		cursor += len;
 		return value;
 	};
+	nonstd::string_view previous_path;
 	for (uint32_t i = 0; i < entry_count; i++) {
 		auto path = read_lv();
+		if (i > 0 && CompareJsonoKeys(previous_path, path) >= 0) {
+			throw InvalidInputException("malformed JSONO: shred manifest entries are not strictly sorted");
+		}
+		previous_path = path;
 		uint8_t type_code;
 		read_bytes(&type_code, sizeof(type_code));
 		if (type_code != SHRED_MANIFEST_TYPE_OBJECT_ARRAY) {
