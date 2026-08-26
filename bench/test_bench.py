@@ -447,6 +447,29 @@ class ExtractBenchmarkQueryTest(unittest.TestCase):
         self.assertIn("MIN(CAST(t->>'$.event_ts' AS BIGINT))", query.timed_sql)
         self.assertIn("GROUP BY user_id", query.timed_sql)
 
+    def test_jsono_filter_paths_query_keeps_wide_miss_first(self) -> None:
+        missing_values = [f"__jsono_missing_{index:04d}__" for index in range(1024)]
+        query = run_benchmarks.build_jsono_query(
+            {
+                "operation": "filter_paths",
+                "scenario": "in_miss_1024",
+                "json_column": "json_nested",
+                "predicates": [
+                    {"path": "$.event_name", "values": missing_values},
+                    {"path": "$.device_type", "values": ["mobile", "desktop", "tablet"]},
+                ],
+                "targets": ["jsono"],
+            },
+            Path("events.parquet"),
+        )
+
+        event_predicate = query.timed_sql.index("t->>'$.event_name' IN")
+        device_predicate = query.timed_sql.index("t->>'$.device_type' IN")
+        self.assertLess(event_predicate, device_predicate)
+        self.assertEqual(query.timed_sql.count("__jsono_missing_"), 1024)
+        self.assertIn("'__jsono_missing_0000__'", query.timed_sql)
+        self.assertIn("'__jsono_missing_1023__'", query.timed_sql)
+
     def test_core_extract_string_query_uses_core_json_baseline(self) -> None:
         query = run_benchmarks.build_json_query(
             {
@@ -501,6 +524,88 @@ class RunBenchmarksDataPathTest(unittest.TestCase):
                             "data_file": data_path,
                             "json_column": "event_properties",
                             "shredding": {"clientID": "VARCHAR"},
+                            "targets": ["jsono"],
+                        },
+                    )
+                ],
+                runs=1,
+                thread_modes=[1],
+            )
+
+        self.assertEqual(results[0]["result_checksum"], checksum)
+
+    def test_filter_paths_result_stores_matched_checksum(self) -> None:
+        target = run_benchmarks.Target("current", "jsono", Path("jsono.duckdb_extension"))
+        checksum = {"matched": 0}
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(run_benchmarks, "create_connection", return_value=Mock()),
+            patch.object(run_benchmarks, "build_query", return_value=Mock()),
+            patch.object(
+                run_benchmarks,
+                "run_single_benchmark",
+                return_value={"min_ms": 1.0, "median_ms": 1.0, "max_ms": 1.0},
+            ),
+            patch.object(run_benchmarks, "collect_filter_paths_checksum", return_value=checksum),
+        ):
+            data_path = Path(temp_dir) / "events.parquet"
+            data_path.touch()
+            results = run_benchmarks.run_benchmarks(
+                [target],
+                [
+                    (
+                        target,
+                        "100k",
+                        {
+                            "operation": "filter_paths",
+                            "scenario": "in_miss_1024",
+                            "data_file": data_path,
+                            "json_column": "json_nested",
+                            "predicates": [
+                                {"path": "$.event_name", "values": ["missing"]},
+                                {"path": "$.device_type", "values": ["mobile"]},
+                            ],
+                            "targets": ["jsono"],
+                        },
+                    )
+                ],
+                runs=1,
+                thread_modes=[1],
+            )
+
+        self.assertEqual(results[0]["result_checksum"], checksum)
+
+    def test_reshred_result_stores_struct_constructor_checksum(self) -> None:
+        target = run_benchmarks.Target("current", "jsono", Path("jsono.duckdb_extension"))
+        checksum = {"rows": 4, "hash_sum": "12", "json_bytes": 34}
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(run_benchmarks, "create_connection", return_value=Mock()),
+            patch.object(run_benchmarks, "build_query", return_value=Mock()),
+            patch.object(
+                run_benchmarks,
+                "run_single_benchmark",
+                return_value={"min_ms": 1.0, "median_ms": 1.0, "max_ms": 1.0},
+            ),
+            patch.object(run_benchmarks, "collect_struct_constructor_checksum", return_value=checksum),
+        ):
+            data_path = Path(temp_dir) / "events.parquet"
+            data_path.touch()
+            results = run_benchmarks.run_benchmarks(
+                [target],
+                [
+                    (
+                        target,
+                        "100k",
+                        {
+                            "operation": "reshred",
+                            "scenario": "widening",
+                            "data_file": data_path,
+                            "json_column": "json_flat",
+                            "source_spec": {"event_name": "VARCHAR"},
+                            "target_spec": {"event_name": "VARCHAR", "user_id": "VARCHAR"},
                             "targets": ["jsono"],
                         },
                     )

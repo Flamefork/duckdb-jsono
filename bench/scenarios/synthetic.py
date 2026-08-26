@@ -887,4 +887,50 @@ SCENARIOS += [
         "array_style": "whole_json",
         "targets": ["jsono"],
     },
+    {
+        "operation": "reshred",
+        "scenario": "wide_widen_one_absent",
+        "size": "100k",
+        "row_count": WIDE_FLAT_SIZES["100k"],
+        "data_file": DATA_DIR / "wide_flat_100k.parquet",
+        "json_column": "json_wide_flat",
+        "source_spec": WIDE_FLAT_SHREDDING_SPEC,
+        "target_spec": {**WIDE_FLAT_SHREDDING_SPEC, "absent_reshred_path": "VARCHAR"},
+        "targets": ["jsono"],
+    },
+]
+
+SCENARIOS += [
+    {
+        "operation": "filter_paths",
+        "scenario": f"in_miss_{literal_count}",
+        "size": "100k",
+        "json_column": "json_nested",
+        "predicates": [
+            {
+                "path": "$.event_name",
+                "values": [f"__jsono_missing_{index:04d}__" for index in range(literal_count)],
+            },
+            {"path": "$.device_type", "values": ["mobile", "desktop", "tablet"]},
+        ],
+        "targets": ["jsono"],
+    }
+    for literal_count in (1, 32, 1024)
+]
+
+SCENARIOS += [
+    {
+        "operation": "filter_paths",
+        "scenario": "in_hit_last_1024",
+        "size": "100k",
+        "json_column": "json_nested",
+        "predicates": [
+            {
+                "path": "$.event_name",
+                "values": [f"__jsono_missing_{index:04d}__" for index in range(1023)] + ["page_view"],
+            },
+            {"path": "$.device_type", "values": ["mobile", "desktop", "tablet"]},
+        ],
+        "targets": ["jsono"],
+    }
 ]

@@ -1668,6 +1668,11 @@ def collect_array_length_checksum(conn: duckdb.DuckDBPyConnection) -> dict:
     }
 
 
+def collect_filter_paths_checksum(conn: duckdb.DuckDBPyConnection) -> dict:
+    row = conn.execute("SELECT matched FROM _bench_out").fetchone()
+    return {"matched": row[0]}
+
+
 def target_metadata(target: Target) -> dict:
     build_type = "unknown"
     path_text = str(target.extension_path)
@@ -1743,7 +1748,7 @@ def run_benchmarks(
 
                 timing = run_single_benchmark(conn, query, runs)
                 result_checksum = None
-                if operation in {"parse_shred", "parse_struct", "parse_struct_plain"}:
+                if operation in {"parse_shred", "parse_struct", "parse_struct_plain", "reshred"}:
                     result_checksum = collect_struct_constructor_checksum(conn)
                 elif operation in {"render_struct_json", "render_struct_plain_json"}:
                     result_checksum = collect_json_render_checksum(conn)
@@ -1751,6 +1756,8 @@ def run_benchmarks(
                     result_checksum = collect_keys_checksum(conn)
                 elif operation in {"array_length", "array_length_scan"}:
                     result_checksum = collect_array_length_checksum(conn)
+                elif operation == "filter_paths":
+                    result_checksum = collect_filter_paths_checksum(conn)
                 rows_per_second = None
                 if row_count is not None and timing["min_ms"] > 0:
                     rows_per_second = round(row_count / (timing["min_ms"] / 1000))

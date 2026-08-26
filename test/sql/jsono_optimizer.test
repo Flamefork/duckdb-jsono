@@ -716,6 +716,44 @@ WHERE (jsono_extract_string(j, '$.city') IN ['sea', 'nyc'])
 ----
 physical_plan	<REGEX>:.*__jsono_internal_match.*
 
+statement ok
+CREATE TABLE jsono_matcher_membership AS
+SELECT jsono(payload) AS j
+FROM (
+  VALUES
+    ('{"city":"á","os":"mac"}'),
+    ('{"city":"sea","os":"win"}'),
+    ('{"city":null,"os":"mac"}'),
+    ('{"os":"mac"}')
+) t(payload);
+
+query II
+EXPLAIN SELECT count(*) FROM jsono_matcher_membership
+WHERE (jsono_extract_string(j, '$.city') IN ['zzz', 'sea', 'á', 'sea'])
+  AND contains(['win', 'mac', 'mac'], jsono_extract_string(j, '$.os'));
+----
+physical_plan	<REGEX>:.*__jsono_internal_match.*
+
+query I
+SELECT count(*) FROM jsono_matcher_membership
+WHERE (jsono_extract_string(j, '$.city') IN ['zzz', 'sea', 'á', 'sea'])
+  AND contains(['win', 'mac', 'mac'], jsono_extract_string(j, '$.os'));
+----
+2
+
+statement ok
+SET disabled_optimizers='extension';
+
+query I
+SELECT count(*) FROM jsono_matcher_membership
+WHERE (jsono_extract_string(j, '$.city') IN ['zzz', 'sea', 'á', 'sea'])
+  AND contains(['win', 'mac', 'mac'], jsono_extract_string(j, '$.os'));
+----
+2
+
+statement ok
+RESET disabled_optimizers;
+
 # Range comparisons fuse as well — the canonical analytics filter shape mixes one equality with a
 # range, which alone would leave the group below the >=2 threshold. Also with the constant on the
 # left (the comparison flips).
