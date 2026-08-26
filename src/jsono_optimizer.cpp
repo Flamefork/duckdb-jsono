@@ -6,6 +6,7 @@
 #include "jsono_number.hpp"
 #include "jsono_path.hpp"
 #include "jsono_path_bind.hpp"
+#include "jsono_path_function.hpp"
 #include "jsono_projection.hpp"
 #include "jsono_reader.hpp"
 #include "jsono_reconstruct.hpp"
@@ -1535,6 +1536,41 @@ struct JsonoShreddedKeysEntry {
 	string key;
 };
 
+struct JsonoShreddedArrayLengthBindData : public FunctionData {
+	shared_ptr<const vector<JsonoShredSignature>> signatures;
+	unique_ptr<JsonoPathSpec> path;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<JsonoShreddedArrayLengthBindData>();
+		result->signatures = signatures;
+		if (path) {
+			result->path = make_uniq<JsonoPathSpec>(*path);
+		}
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<JsonoShreddedArrayLengthBindData>();
+		if (bool(path) != bool(other.path)) {
+			return false;
+		}
+		if (path && !JsonoPathSpecEqual(*path, *other.path)) {
+			return false;
+		}
+		if (signatures->size() != other.signatures->size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < signatures->size(); i++) {
+			auto &left = (*signatures)[i];
+			auto &right = (*other.signatures)[i];
+			if (left.path != right.path || left.type != right.type || left.subfields != right.subfields) {
+				return false;
+			}
+		}
+		return true;
+	}
+};
+
 struct JsonoShreddedKeysBindData : public FunctionData {
 	shared_ptr<const vector<JsonoShredSignature>> signatures;
 	vector<JsonoShreddedKeysEntry> top_level_scalar_shreds;
@@ -1710,6 +1746,51 @@ void JsonoInternalShreddedKeysExecute(DataChunk &args, ExpressionState &state, V
 ScalarFunction MakeJsonoInternalShreddedKeysFunction() {
 	ScalarFunction fun("__jsono_internal_shredded_keys", {JsonoType()}, LogicalType::LIST(LogicalType::VARCHAR),
 	                   JsonoInternalShreddedKeysExecute);
+	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	return fun;
+}
+
+void JsonoInternalShreddedArrayLengthExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = expr.bind_info->Cast<JsonoShreddedArrayLengthBindData>();
+	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoSinglePathLocalState>();
+	auto count = args.size();
+	JsonoRowReader reader;
+	reader.Init(args.data[0], count, bind_data.signatures);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data = FlatVector::GetData<int64_t>(result);
+	JsonoView view;
+	for (idx_t row = 0; row < count; row++) {
+		lstate.locate_state.NextRow();
+		JsonoBlobRow blob;
+		if (reader.Read(row, blob, view) != JsonoRowState::Value) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		JsonoCursor cursor;
+		if (bind_data.path && !LocatePathSteps(lstate.locate_state, 0, bind_data.path->steps, view, cursor)) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		if (SlotTag(view.SlotAt(cursor.pos)) != tag::ARR_START) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		result_data[row] = CountArrayElements(view, cursor);
+	}
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
+ScalarFunction MakeJsonoInternalShreddedArrayLengthFunction() {
+	ScalarFunction fun("__jsono_internal_shredded_array_length", {JsonoType()}, LogicalType::BIGINT,
+	                   JsonoInternalShreddedArrayLengthExecute, nullptr, nullptr, nullptr,
+	                   JsonoSinglePathLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
 	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
@@ -2327,6 +2408,9 @@ protected:
 				return rewritten;
 			}
 		}
+		if (expr.function.name == "jsono_array_length") {
+			return ResidualizeShreddedArrayLength(expr);
+		}
 		return nullptr;
 	}
 
@@ -2554,6 +2638,27 @@ private:
 		}
 		expr.children[0] = ResidualReinterpret(*shredded_cast->child, ResidualPolicy::PathScoped);
 		return nullptr;
+	}
+
+	unique_ptr<Expression> ResidualizeShreddedArrayLength(BoundFunctionExpression &expr) {
+		auto shredded_cast = ShreddedJsonCast(*expr.children[0]);
+		if (!shredded_cast) {
+			return nullptr;
+		}
+		auto bind_data = make_uniq<JsonoShreddedArrayLengthBindData>();
+		auto signatures = make_shared_ptr<vector<JsonoShredSignature>>();
+		JsonoBuildShredSignatures(shredded_cast->child->return_type, *signatures);
+		bind_data->signatures = std::move(signatures);
+		if (expr.children.size() == 2) {
+			bind_data->path = make_uniq<JsonoPathSpec>(expr.bind_info->Cast<JsonoSinglePathBindData>().path);
+		}
+		vector<unique_ptr<Expression>> children;
+		children.push_back(ResidualReinterpret(*shredded_cast->child, ResidualPolicy::PathScoped));
+		auto result =
+		    make_uniq<BoundFunctionExpression>(expr.return_type, MakeJsonoInternalShreddedArrayLengthFunction(),
+		                                       std::move(children), std::move(bind_data));
+		result->SetAlias(expr.GetAlias());
+		return result;
 	}
 
 	// struct_extract_at(child, one_based): 1-based positional struct field read.
