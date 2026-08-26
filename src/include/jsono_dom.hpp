@@ -48,8 +48,6 @@ struct ShapeCacheEntry {
 	uint64_t hash = 0;
 	uint32_t n_keys = 0;
 	// perm[i] tells emit-pass-i which kvs[kv_offset + perm[i]] to use.
-	// Reserved on JsonoBuilder construction so steady-state operation
-	// doesn't churn the allocator across LRU evictions.
 	std::vector<uint32_t> perm;
 	// Fingerprint of the post-dedup sorted key sequence — what
 	// HashObjectKeySlots computes from the emitted KEY slots. Cached by the
@@ -129,15 +127,6 @@ struct DomJsonoBuilder : public JsonoBuilder {
 	// Salts the LOOKUP fingerprint only (never the persisted hash) — see MakeShapeSalt().
 	uint64_t shape_salt = MakeShapeSalt();
 
-	DomJsonoBuilder() {
-		size_t sz = ShapeCacheSize();
-		shape_cache.resize(sz);
-		shape_cache_mask = uint64_t(sz - 1);
-		for (auto &entry : shape_cache) {
-			entry.perm.reserve(64); // typical N for analytics JSON
-		}
-	}
-
 	void Reset() {
 		JsonoBuilder::Reset();
 		kvs.clear();
@@ -150,6 +139,9 @@ struct DomJsonoBuilder : public JsonoBuilder {
 	// Direct-mapped lookup. One memory access; check hash + n_keys to guard
 	// against collisions (different schemas mapping to same slot).
 	const ShapeCacheEntry *ShapeCacheFind(uint64_t hash, uint32_t n_keys) const {
+		if (shape_cache.empty()) {
+			return nullptr;
+		}
 		const auto &slot = shape_cache[hash & shape_cache_mask];
 		if (slot.hash == hash && slot.n_keys == n_keys) {
 			return &slot;
@@ -161,6 +153,11 @@ struct DomJsonoBuilder : public JsonoBuilder {
 	// reused (assign keeps reserved capacity), no allocator churn in
 	// steady state.
 	void ShapeCacheInsert(uint64_t hash, uint32_t n_keys, const uint32_t *perm_src, uint32_t perm_n) {
+		if (shape_cache.empty()) {
+			auto size = ShapeCacheSize();
+			shape_cache.resize(size);
+			shape_cache_mask = uint64_t(size - 1);
+		}
 		auto &slot = shape_cache[hash & shape_cache_mask];
 		slot.hash = hash;
 		slot.n_keys = n_keys;
@@ -243,15 +240,6 @@ struct DomDirectState {
 	// Salts the LOOKUP fingerprint only (never the persisted hash) — see MakeShapeSalt().
 	uint64_t shape_salt = MakeShapeSalt();
 
-	DomDirectState() {
-		size_t cache_size = ShapeCacheSize();
-		shape_cache.resize(cache_size);
-		shape_cache_mask = uint64_t(cache_size - 1);
-		for (auto &entry : shape_cache) {
-			entry.perm.reserve(64); // typical N for analytics JSON
-		}
-	}
-
 	void ResetRow() {
 		kvs.clear();
 		indices.clear();
@@ -261,6 +249,9 @@ struct DomDirectState {
 	}
 
 	const ShapeCacheEntry *ShapeCacheFind(uint64_t hash, uint32_t n_keys) const {
+		if (shape_cache.empty()) {
+			return nullptr;
+		}
 		const auto &slot = shape_cache[hash & shape_cache_mask];
 		if (slot.hash == hash && slot.n_keys == n_keys) {
 			return &slot;
@@ -270,6 +261,11 @@ struct DomDirectState {
 
 	void ShapeCacheInsert(uint64_t hash, uint32_t n_keys, const uint32_t *perm_src, uint32_t perm_n,
 	                      uint64_t sorted_hash) {
+		if (shape_cache.empty()) {
+			auto size = ShapeCacheSize();
+			shape_cache.resize(size);
+			shape_cache_mask = uint64_t(size - 1);
+		}
 		auto &slot = shape_cache[hash & shape_cache_mask];
 		slot.hash = hash;
 		slot.n_keys = n_keys;
