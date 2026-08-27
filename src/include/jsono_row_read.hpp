@@ -169,7 +169,10 @@ private:
 inline void ThrowIfManifestCoversPath(const JsonoView &view, const vector<PathStep> &read_steps, bool found_container,
                                       std::vector<ShredManifestEntry> &manifest_scratch,
                                       vector<PathStep> &steps_scratch) {
-	view.ReadShredManifest(manifest_scratch);
+	manifest_scratch.clear();
+	ShredManifestCollectSink sink {manifest_scratch};
+	auto tail = view.ManifestTail();
+	WalkShredManifestFramingBytes(tail.data(), tail.size(), sink);
 	for (auto &entry : manifest_scratch) {
 		// A manifest path is the lane's logical path in the project's one text form (`$.`-always), so
 		// it parses back to steps with the shared grammar — keeping the manifest logical is what buys
@@ -233,7 +236,7 @@ inline void ThrowIfManifestCoversPathText(const JsonoView &view, const std::stri
 	};
 	auto tail = view.ManifestTail();
 	CoverSink sink {read_text, found_container};
-	WalkShredManifestBytes(tail.data(), tail.size(), sink);
+	WalkShredManifestFramingBytes(tail.data(), tail.size(), sink);
 }
 
 // How a reader treats a row's shred manifest. One value per meaningful state, and every policy

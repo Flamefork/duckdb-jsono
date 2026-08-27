@@ -930,6 +930,25 @@ inline void WalkShredManifestSubfields(nonstd::string_view block, FN &&fn) {
 	}
 }
 
+template <class SINK>
+struct StrictShredManifestSink {
+	explicit StrictShredManifestSink(SINK &sink_p) : sink(sink_p) {
+	}
+
+	void OnEntry(ShredManifestEntry entry) {
+		if (has_previous && CompareJsonoKeys(previous_path, entry.path) >= 0) {
+			throw InvalidInputException("malformed JSONO: shred manifest entries are not strictly sorted");
+		}
+		previous_path = entry.path;
+		has_previous = true;
+		sink.OnEntry(entry);
+	}
+
+	SINK &sink;
+	nonstd::string_view previous_path;
+	bool has_previous = false;
+};
+
 // The shred-manifest framing walker, shared by the parse (ParseShredManifestBytes) and validate
 // (ValidateShredManifestBytes) paths via a sink — the same pattern as DecodeScalarSlot's decode/skip
 // twins. The walker owns how the tail's bytes frame into entries; the sink decides what to do with
@@ -940,7 +959,7 @@ inline void WalkShredManifestSubfields(nonstd::string_view block, FN &&fn) {
 // path allocation-free (jsono_validate catches only InvalidInputException; a reserve(entry_count) on
 // a bogus huge count would std::bad_alloc and crash instead of reporting corruption as `false`).
 template <class SINK>
-inline void WalkShredManifestBytes(const char *data, size_t size, SINK &sink) {
+inline void WalkShredManifestFramingBytes(const char *data, size_t size, SINK &sink) {
 	if (size == 0) {
 		return;
 	}
@@ -964,13 +983,8 @@ inline void WalkShredManifestBytes(const char *data, size_t size, SINK &sink) {
 		cursor += len;
 		return value;
 	};
-	nonstd::string_view previous_path;
 	for (uint32_t i = 0; i < entry_count; i++) {
 		auto path = read_lv();
-		if (i > 0 && CompareJsonoKeys(previous_path, path) >= 0) {
-			throw InvalidInputException("malformed JSONO: shred manifest entries are not strictly sorted");
-		}
-		previous_path = path;
 		uint8_t type_code;
 		read_bytes(&type_code, sizeof(type_code));
 		if (type_code != SHRED_MANIFEST_TYPE_OBJECT_ARRAY) {
@@ -1004,6 +1018,12 @@ inline void WalkShredManifestBytes(const char *data, size_t size, SINK &sink) {
 	if (cursor != size) {
 		throw InvalidInputException("malformed JSONO: shred manifest has trailing bytes");
 	}
+}
+
+template <class SINK>
+inline void WalkShredManifestBytes(const char *data, size_t size, SINK &sink) {
+	StrictShredManifestSink<SINK> strict_sink(sink);
+	WalkShredManifestFramingBytes(data, size, strict_sink);
 }
 
 // Collecting sink: grows `entries` incrementally with push_back (never reserve(entry_count)), so the
