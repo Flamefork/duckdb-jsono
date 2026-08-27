@@ -233,6 +233,35 @@ SELECT to_json(v) FROM forged_reversed_manifest;
 ----
 shred manifest entries are not strictly sorted
 
+query I
+SELECT jsono_extract_string(v, '$.missing') IS NULL FROM forged_reversed_manifest;
+----
+true
+
+statement error
+SELECT jsono_shred_manifest(v) FROM forged_reversed_manifest;
+----
+shred manifest entries are not strictly sorted
+
+statement error
+SELECT jsono_group_merge_max(v, 1) FROM forged_reversed_manifest;
+----
+shred manifest entries are not strictly sorted
+
+statement error
+SELECT jsono(v, shredding := '{"$.\"a-c\"":"VARCHAR","$.a.b":"VARCHAR","$.missing":"VARCHAR"}')
+FROM forged_reversed_manifest;
+----
+shred manifest entries are not strictly sorted
+
+statement error
+SELECT jsono_extract_string(
+  struct_pack("jsono" := struct_pack("body$2" := v.jsono."body$2")),
+  '$.a.b')
+FROM forged_reversed_manifest;
+----
+narrowed by a raw struct cast
+
 statement ok
 CREATE TABLE forged_duplicate_manifest AS
 SELECT {'jsono': {'body$2': {
@@ -263,6 +292,24 @@ statement error
 SELECT to_json(v) FROM forged_duplicate_manifest;
 ----
 shred manifest entries are not strictly sorted
+
+query I
+SELECT jsono_extract_string(v, '$.missing') IS NULL FROM forged_duplicate_manifest;
+----
+true
+
+statement error
+SELECT jsono_shred_manifest(v) FROM forged_duplicate_manifest;
+----
+shred manifest entries are not strictly sorted
+
+statement error
+SELECT jsono_extract_string(
+  struct_pack("jsono" := struct_pack("body$2" := v.jsono."body$2")),
+  '$."a-c"')
+FROM forged_duplicate_manifest;
+----
+narrowed by a raw struct cast
 
 # --- The manifest's emission order is a fact about every WRITER, not just the constructor ---
 

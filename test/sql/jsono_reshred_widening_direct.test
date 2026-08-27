@@ -70,6 +70,38 @@ WHERE jsono(v, shredding := '{"a": "VARCHAR", "n": "BIGINT"}')
 ----
 3
 
+statement ok
+CREATE TABLE widening_manifest_order_input AS
+SELECT row_id,
+       jsono(text, shredding := '{"$.\"a-c\"":"VARCHAR","$.a.b":"VARCHAR","$.z":"BIGINT"}') AS v
+FROM (VALUES
+  (1, '{"a-c":"dash","a":{"b":"nested"},"z":1,"m":"new"}'),
+  (2, '{"a-c":"dash","a":{"b":7},"z":2,"m":"new"}'),
+  (3, '{"a":{"b":"nested"},"z":"not-bigint","m":"new"}')
+) input(row_id, text);
+
+query I
+SELECT count(*)
+FROM widening_manifest_order_input
+WHERE jsono(v, shredding := '{"$.\"a-c\"":"VARCHAR","$.a.b":"VARCHAR","$.m":"VARCHAR","$.z":"BIGINT"}')
+      IS NOT DISTINCT FROM
+      jsono(plain_jsono(v),
+            shredding := '{"$.\"a-c\"":"VARCHAR","$.a.b":"VARCHAR","$.m":"VARCHAR","$.z":"BIGINT"}');
+----
+3
+
+query II
+SELECT row_id,
+       [entry.path FOR entry IN jsono_shred_manifest(
+         jsono(v, shredding := '{"$.\"a-c\"":"VARCHAR","$.a.b":"VARCHAR","$.m":"VARCHAR","$.z":"BIGINT"}')
+       )]
+FROM widening_manifest_order_input
+ORDER BY row_id;
+----
+1	[$.a-c, $.a.b, $.m, $.z]
+2	[$.a-c, $.m, $.z]
+3	[$.a.b, $.m]
+
 # A surviving container keeps the recursive fallback and exact output.
 query II
 WITH source AS (
