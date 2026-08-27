@@ -1392,13 +1392,17 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 				continue;
 			}
 			auto path = nonstd::string_view(field_paths[f].data(), field_paths[f].size());
-			while (old_manifest_index < old_manifest->size() &&
-			       CompareJsonoKeys((*old_manifest)[old_manifest_index].path, path) < 0) {
-				old_manifest_index++;
-			}
-			if (old_manifest_index < old_manifest->size() &&
-			    CompareJsonoKeys((*old_manifest)[old_manifest_index].path, path) == 0) {
-				stripped_lanes.Mark(f);
+			while (old_manifest_index < old_manifest->size()) {
+				auto comparison = CompareJsonoKeys((*old_manifest)[old_manifest_index].path, path);
+				if (comparison < 0) {
+					old_manifest_index++;
+					continue;
+				}
+				if (comparison == 0) {
+					stripped_lanes.Mark(f);
+					old_manifest_index++;
+				}
+				break;
 			}
 		}
 		for (idx_t f = 0; f < fields.size(); f++) {

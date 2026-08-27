@@ -324,6 +324,12 @@ actually stripped from this row (a value kept in the residual by the lossless
 gate is not listed). A plain value writes no manifest — its `skips` blob ends at
 the checkpoints, which reads as zero entries.
 
+Consumers that materialize, expose, merge, validate, or carry manifest state
+into reshred reject entries that are not in strictly ascending order, including
+duplicates. A point read validates every entry's framing and checks whether any
+entry covers its answer. It does not reject an unrelated ordering defect because
+the global order does not affect that answer.
+
 The manifest is what makes a raw by-name struct cast safe to detect: if a cast
 drops a shred (the target type carries fewer shreds) or converts one to a
 different type, the residual cannot reproduce the value — and the manifest

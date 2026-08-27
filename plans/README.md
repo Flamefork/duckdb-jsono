@@ -87,7 +87,7 @@ and a handful of latent fragilities and test gaps — the plans below.
 | 066 | Remove build/test commands that can exercise stale binaries | P1 | — | — | DONE (`180ba8b`, 2026-08-26) — live docs use frozen commands, test recipes build before execution, and README names only the canonical `verify` gate. |
 | 067 | Add a focused weekly Valgrind memcheck | P2 | — | — | IN PROGRESS (`180ba8b`) — target/workflow/docs implemented and local dry-run/selection/verify gates are green; Linux Valgrind workflow result pending. |
 | 068 | Benchmark large fused `IN` membership lookup | P2 | — | — | REJECTED (`e68070c`) — binary search improved `in_miss_1024` by 48.6%/52.1% but regressed 1/32-literal controls beyond the 5% gate in both AB/BA orders. Benchmark and optimization map retained; C++ patch removed. |
-| 069 | Validate manifest order and replace reshred's repeated manifest scans | P1 | — | — | BLOCKED (`a341df3`) — strict order/duplicate validation implemented and verified. Two-pointer optimization stopped before implementation because validation-only regressed the wide absent-key reader by 8.4% AB / 7.1% BA; maintainer decision required. |
+| 069 | Validate manifest order and replace reshred's repeated manifest scans | P1 | — | — | DONE — point reads validate framing without paying for unrelated global order, strict consumers reject reversed/duplicate manifests, and the sorted reshred walk improves wide widening by 39–41% with controls inside the 5% gate. |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED
 (one-line rationale).
