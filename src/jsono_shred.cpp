@@ -1342,14 +1342,6 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 
 	const std::vector<ShredManifestEntry> *old_manifest = nullptr;
 	std::vector<ShredManifestEntry> src_manifest;
-	auto manifest_has_path = [&](const string &path) {
-		for (auto &entry : *old_manifest) {
-			if (entry.path == nonstd::string_view(path.data(), path.size())) {
-				return true;
-			}
-		}
-		return false;
-	};
 
 	auto null_row = [&](idx_t row) {
 		writer.SetRowNull(row);
@@ -1394,6 +1386,21 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 		lstate.strip_paths.clear();
 		lstate.flat_strip_positions.clear();
 		stripped_lanes.Clear();
+		idx_t old_manifest_index = 0;
+		for (auto f : model.manifest_order) {
+			if (bind_data.keep_src[f] == DConstants::INVALID_INDEX) {
+				continue;
+			}
+			auto path = nonstd::string_view(field_paths[f].data(), field_paths[f].size());
+			while (old_manifest_index < old_manifest->size() &&
+			       CompareJsonoKeys((*old_manifest)[old_manifest_index].path, path) < 0) {
+				old_manifest_index++;
+			}
+			if (old_manifest_index < old_manifest->size() &&
+			    CompareJsonoKeys((*old_manifest)[old_manifest_index].path, path) == 0) {
+				stripped_lanes.Mark(f);
+			}
+		}
 		for (idx_t f = 0; f < fields.size(); f++) {
 			if (bind_data.keep_src[f] != DConstants::INVALID_INDEX) {
 				// The kept shred's stripped-or-not state carries over from the input row (the manifest);
@@ -1417,9 +1424,6 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 					if (bit) {
 						stamp.SetBit(out_ranks[f]);
 					}
-				}
-				if (manifest_has_path(field_paths[f])) {
-					stripped_lanes.Mark(f);
 				}
 				continue;
 			}
