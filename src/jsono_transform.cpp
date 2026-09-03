@@ -19,6 +19,9 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -319,7 +322,7 @@ unique_ptr<TransformBindData> ParseTransformSpec(const Value &spec) {
 	auto bind_data = make_uniq<TransformBindData>();
 	child_list_t<LogicalType> children;
 	for (idx_t i = 0; i < child_types.size(); i++) {
-		auto &name = child_types[i].first;
+		auto &name = child_types[i].first.GetIdentifierName();
 		auto value = child_values[i];
 		TransformField transform_field;
 		if (value.type().id() == LogicalTypeId::STRUCT) {
@@ -357,7 +360,7 @@ void AssignShreddedShreds(TransformBindData &bind_data, const LogicalType &input
 			// residual, where the value remains.
 			continue;
 		}
-		auto &name = layout.shreds[i].first;
+		auto &name = layout.shreds[i].first.GetIdentifierName();
 		auto steps = ShredNamePath(name, "jsono_transform");
 		for (idx_t field_index = 0; field_index < bind_data.fields.size(); field_index++) {
 			auto &field = bind_data.fields[field_index];
@@ -376,8 +379,10 @@ void AssignShreddedShreds(TransformBindData &bind_data, const LogicalType &input
 	}
 }
 
-unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFunction &bound_function,
-                                            vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoTransformBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	if (arguments[1]->HasParameter()) {
 		throw ParameterNotResolvedException();
 	}
@@ -393,7 +398,7 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 		if (!arguments[2]->IsFoldable()) {
 			throw BinderException("jsono_transform: on_type_mismatch must be constant");
 		}
-		if (arguments[2]->HasAlias() && !StringUtil::CIEquals(arguments[2]->GetAlias(), "on_type_mismatch")) {
+		if (arguments[2]->HasAlias() && arguments[2]->GetAlias() != "on_type_mismatch") {
 			throw BinderException("jsono_transform: unknown named parameter '%s'; expected on_type_mismatch",
 			                      arguments[2]->GetAlias());
 		}
@@ -403,7 +408,7 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 	// expression caching — return_type alone is insufficient since a field's path may differ
 	// from its name.
 	bind_data->spec = spec_value.ToString() + ":" + std::to_string(uint8_t(bind_data->mismatch_mode));
-	auto &input_type = arguments[0]->return_type;
+	auto &input_type = arguments[0]->GetReturnType();
 	// An array shred (object or scalar) lifts element values out of the residual into a LIST column the
 	// transform's residual navigation cannot read. Only a field that could touch that array — read it,
 	// descend into it, or sit on a container subtree that holds it — needs the whole value reconstructed;
@@ -418,7 +423,7 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 			if (!IsShredListType(shred.second)) {
 				continue;
 			}
-			auto &name = shred.first;
+			auto &name = shred.first.GetIdentifierName();
 			auto shred_steps = ShredNamePath(name, "jsono_transform");
 			for (auto &field : bind_data->fields) {
 				if (PathStepsMayShareBranch(field.path.steps, shred_steps)) {
@@ -431,7 +436,7 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 			}
 		}
 	}
-	bound_function.arguments[0] =
+	bound_function.GetArguments()[0] =
 	    JsonoResolveJsonoArgument(context, *arguments[0], "jsono_transform", reconstruct_shredded);
 	if (IsShreddedJsonoType(input_type) && !reconstruct_shredded) {
 		AssignShreddedShreds(*bind_data, input_type);
@@ -444,7 +449,7 @@ unique_ptr<FunctionData> JsonoTransformBind(ClientContext &context, ScalarFuncti
 	}
 	bind_data->shape_plan_eligible =
 	    bind_data->mismatch_mode != TransformMismatchMode::Fail && scalar_fields >= SHAPE_PLAN_MIN_SCALAR_FIELDS;
-	bound_function.return_type = bind_data->return_type;
+	bound_function.SetReturnType(bind_data->return_type);
 	// A field descending into an array shred forces the whole value to be reconstructed to plain
 	// JSONO. Wrap the argument in __jsono_reconstruct so that reconstruct is a visible operator in
 	// EXPLAIN rather than an anonymous cast the binder would otherwise insert (arguments[0] is now
@@ -649,27 +654,26 @@ void WriteScalarField(const TransformField &field, const JsonoView &view, const 
 struct TypedValuePolicy {
 	static JSONO_ALWAYS_INLINE void WriteScalarLeaf(const TransformBindData &bind_data, idx_t field_index,
 	                                                const JsonoView &view, const JsonoCursor &cursor,
-	                                                vector<unique_ptr<Vector>> &children, idx_t row) {
-		WriteScalarField(bind_data.fields[field_index], view, JsonoPathLocation {cursor, true}, *children[field_index],
+	                                                vector<Vector> &children, idx_t row) {
+		WriteScalarField(bind_data.fields[field_index], view, JsonoPathLocation {cursor, true}, children[field_index],
 		                 row, bind_data.mismatch_mode);
 	}
 
-	static JSONO_ALWAYS_INLINE void NullScalarLeaf(vector<unique_ptr<Vector>> &children, idx_t field_index, idx_t row) {
-		FlatVector::SetNull(*children[field_index], row, true);
+	static JSONO_ALWAYS_INLINE void NullScalarLeaf(vector<Vector> &children, idx_t field_index, idx_t row) {
+		FlatVector::SetNull(children[field_index], row, true);
 	}
 };
 
 template <class LEAF>
-JSONO_ALWAYS_INLINE void NullTransformNodeLeaves(vector<unique_ptr<Vector>> &children, const JsonoTrieNode &node,
-                                                 idx_t row) {
+JSONO_ALWAYS_INLINE void NullTransformNodeLeaves(vector<Vector> &children, const JsonoTrieNode &node, idx_t row) {
 	for (auto field_index : node.scalar_leaves) {
 		LEAF::NullScalarLeaf(children, field_index, row);
 	}
 	for (auto field_index : node.list_leaves) {
-		SetListRowNull(*children[field_index], row);
+		SetListRowNull(children[field_index], row);
 	}
 	for (auto field_index : node.join_leaves) {
-		FlatVector::SetNull(*children[field_index], row, true);
+		FlatVector::SetNull(children[field_index], row, true);
 	}
 }
 
@@ -723,7 +727,7 @@ bool TryGetJoinText(const TransformField &field, TransformMismatchMode mode, con
 // stay a positional NULL in list mode and are skipped by join mode; present containers are
 // scalar mismatches for leaves at this exact wildcard node.
 void MaterializeTransformWildcardLeaves(const TransformBindData &bind_data, idx_t node_index, const JsonoView &view,
-                                        const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children, idx_t row,
+                                        const JsonoCursor &cursor, vector<Vector> &children, idx_t row,
                                         vector<string> &join_buffers, vector<idx_t> &join_counts) {
 	auto &node = bind_data.trie.nodes[node_index];
 	auto slot_tag = SlotTag(view.SlotAt(cursor.pos));
@@ -731,7 +735,7 @@ void MaterializeTransformWildcardLeaves(const TransformBindData &bind_data, idx_
 		auto value_cursor = cursor;
 		auto scalar = DecodeScalarAt(view, value_cursor);
 		for (auto field_index : node.list_leaves) {
-			AppendListElementScalar(bind_data.fields[field_index], bind_data.mismatch_mode, *children[field_index], row,
+			AppendListElementScalar(bind_data.fields[field_index], bind_data.mismatch_mode, children[field_index], row,
 			                        scalar);
 		}
 		for (auto field_index : node.join_leaves) {
@@ -752,7 +756,7 @@ void MaterializeTransformWildcardLeaves(const TransformBindData &bind_data, idx_
 		if (bind_data.mismatch_mode == TransformMismatchMode::Fail) {
 			ThrowTransformMismatch(bind_data.fields[field_index], slot_tag == tag::OBJ_START ? "OBJECT" : "ARRAY");
 		}
-		AppendListElementNull(*children[field_index], row);
+		AppendListElementNull(children[field_index], row);
 	}
 	for (auto field_index : node.join_leaves) {
 		if (bind_data.mismatch_mode == TransformMismatchMode::Fail) {
@@ -764,7 +768,7 @@ void MaterializeTransformWildcardLeaves(const TransformBindData &bind_data, idx_
 template <class LEAF>
 struct TransformTrieWalkState {
 	const TransformBindData &bind_data;
-	vector<unique_ptr<Vector>> &children;
+	vector<Vector> &children;
 	vector<string> &join_buffers;
 	vector<idx_t> &join_counts;
 };
@@ -794,7 +798,7 @@ struct TransformTrieWalkPolicy {
 	                                                            const JsonoView &view, idx_t row) {
 		(void)view;
 		for (auto field_index : node.list_leaves) {
-			AppendListElementNull(*state.children[field_index], row);
+			AppendListElementNull(state.children[field_index], row);
 		}
 	}
 
@@ -807,7 +811,7 @@ struct TransformTrieWalkPolicy {
 
 template <class LEAF>
 void ApplyTrieNode(TransformLocalState &lstate, const TransformBindData &bind_data, idx_t node_index,
-                   const JsonoView &view, const JsonoCursor &cursor, vector<unique_ptr<Vector>> &children, idx_t row,
+                   const JsonoView &view, const JsonoCursor &cursor, vector<Vector> &children, idx_t row,
                    vector<string> &join_buffers, vector<idx_t> &join_counts) {
 	using WalkPolicy = TransformTrieWalkPolicy<LEAF>;
 	typename WalkPolicy::State state {bind_data, children, join_buffers, join_counts};
@@ -815,13 +819,12 @@ void ApplyTrieNode(TransformLocalState &lstate, const TransformBindData &bind_da
 	JsonoTrieApplyNode<WalkPolicy>(ctx, node_index, view, cursor, row);
 }
 
-void SetTransformRowNull(const vector<TransformField> &fields, Vector &result, vector<unique_ptr<Vector>> &children,
-                         idx_t row) {
+void SetTransformRowNull(const vector<TransformField> &fields, Vector &result, vector<Vector> &children, idx_t row) {
 	FlatVector::SetNull(result, row, true);
 	for (idx_t col = 0; col < fields.size(); col++) {
-		FlatVector::SetNull(*children[col], row, true);
+		FlatVector::SetNull(children[col], row, true);
 		if (fields[col].mode == TransformMode::List) {
-			ListVector::GetData(*children[col])[row] = {0, 0};
+			ListVector::GetData(children[col])[row] = {0, 0};
 		}
 	}
 }
@@ -892,9 +895,8 @@ unique_ptr<ShapePlan> BuildShapePlan(TransformLocalState &lstate, const Transfor
 }
 
 void ApplyShapePlan(TransformLocalState &lstate, const TransformBindData &bind_data, const ShapePlan &plan,
-                    const JsonoView &view, vector<unique_ptr<Vector>> &children, idx_t row,
-                    vector<string> &join_buffers, vector<idx_t> &join_counts,
-                    const vector<UnifiedVectorFormat> &shred_fmt) {
+                    const JsonoView &view, vector<Vector> &children, idx_t row, vector<string> &join_buffers,
+                    vector<idx_t> &join_counts, const vector<UnifiedVectorFormat> &shred_fmt) {
 	// One pass over the lengths stream produces the byte offsets of every needed string
 	// position (offset before needed index i = sum of lengths[0, i)).
 	JsonoTrieShapePlanScanLengthOffsets(plan, view, lstate.shape_offsets);
@@ -905,7 +907,7 @@ void ApplyShapePlan(TransformLocalState &lstate, const TransformBindData &bind_d
 	typename WalkPolicy::State walk_state {bind_data, children, join_buffers, join_counts};
 
 	for (auto field_index : plan.null_fields) {
-		FlatVector::SetNull(*children[field_index], row, true);
+		FlatVector::SetNull(children[field_index], row, true);
 	}
 	JsonoTrieShapePlanApplyNullSubtrees<WalkPolicy>(bind_data.trie.nodes, walk_state, plan, view, row);
 	for (auto &action : plan.scalars) {
@@ -947,7 +949,7 @@ void ApplyShapePlan(TransformLocalState &lstate, const TransformBindData &bind_d
 			break;
 		}
 		WriteScalarValue(bind_data.fields[action.field_index], bind_data.mismatch_mode, scalar,
-		                 *children[action.field_index], row);
+		                 children[action.field_index], row);
 	}
 	JsonoTrieShapePlanApplyWalks<WalkPolicy>(bind_data.trie.nodes, lstate.rank_cache, walk_state, plan, view, offsets,
 	                                         row);
@@ -958,16 +960,16 @@ void ApplyShapePlan(TransformLocalState &lstate, const TransformBindData &bind_d
 		auto idx = RowIndex(fmt, row);
 		if (fmt.validity.RowIsValid(idx)) {
 			auto scalar = JsonoScalarFromPrimitiveVector(field.shred_primitive, fmt, idx);
-			WriteScalarValue(field, bind_data.mismatch_mode, scalar, *children[field_index], row);
+			WriteScalarValue(field, bind_data.mismatch_mode, scalar, children[field_index], row);
 		} else {
-			FlatVector::SetNull(*children[field_index], row, true);
+			FlatVector::SetNull(children[field_index], row, true);
 		}
 	}
 }
 
 void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<TransformBindData>();
+	auto &bind_data = expr.BindInfo()->Cast<TransformBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<TransformLocalState>();
 	auto count = args.size();
 
@@ -980,9 +982,9 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &children = StructVector::GetEntries(result);
 	for (idx_t col = 0; col < bind_data.fields.size(); col++) {
-		children[col]->SetVectorType(VectorType::FLAT_VECTOR);
+		children[col].SetVectorType(VectorType::FLAT_VECTOR);
 		if (bind_data.fields[col].mode == TransformMode::List) {
-			ListVector::SetListSize(*children[col], 0);
+			ListVector::SetListSize(children[col], 0);
 		}
 	}
 
@@ -1005,13 +1007,13 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 			SetTransformRowNull(bind_data.fields, result, children, row);
 			continue;
 		}
-		FlatVector::Validity(result).SetValid(row);
+		FlatVector::ValidityMutable(result).SetValid(row);
 		for (idx_t field_index = 0; field_index < bind_data.fields.size(); field_index++) {
 			auto &field = bind_data.fields[field_index];
 			if (field.mode == TransformMode::List) {
-				auto start = ListVector::GetListSize(*children[field_index]);
-				ListVector::GetData(*children[field_index])[row] = {start, 0};
-				FlatVector::Validity(*children[field_index]).SetValid(row);
+				auto start = ListVector::GetListSize(children[field_index]);
+				ListVector::GetData(children[field_index])[row] = {start, 0};
+				FlatVector::ValidityMutable(children[field_index]).SetValid(row);
 			} else if (field.mode == TransformMode::Join) {
 				join_buffers[field_index].clear();
 				join_counts[field_index] = 0;
@@ -1042,16 +1044,16 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 				auto location = LocatePath(view, field.path.steps);
 				if (location.found) {
 					// The residual is authoritative: a value the shred writer kept wins over the shred.
-					WriteScalarField(field, view, location, *children[field_index], row, bind_data.mismatch_mode);
+					WriteScalarField(field, view, location, children[field_index], row, bind_data.mismatch_mode);
 					continue;
 				}
 				auto &fmt = shred_fmt[k];
 				auto idx = RowIndex(fmt, row);
 				if (fmt.validity.RowIsValid(idx)) {
 					auto scalar = JsonoScalarFromPrimitiveVector(field.shred_primitive, fmt, idx);
-					WriteScalarValue(field, bind_data.mismatch_mode, scalar, *children[field_index], row);
+					WriteScalarValue(field, bind_data.mismatch_mode, scalar, children[field_index], row);
 				} else {
-					FlatVector::SetNull(*children[field_index], row, true);
+					FlatVector::SetNull(children[field_index], row, true);
 				}
 			}
 		}
@@ -1061,10 +1063,10 @@ void JsonoTransformExecute(DataChunk &args, ExpressionState &state, Vector &resu
 			}
 			auto &buffer = join_buffers[field_index];
 			if (join_counts[field_index] == 0) {
-				FlatVector::SetNull(*children[field_index], row, true);
+				FlatVector::SetNull(children[field_index], row, true);
 				continue;
 			}
-			WriteJsonoStringLane(*children[field_index], row, nonstd::string_view(buffer.data(), buffer.size()));
+			WriteJsonoStringLane(children[field_index], row, nonstd::string_view(buffer.data(), buffer.size()));
 			buffer.clear();
 		}
 	}
@@ -1080,15 +1082,15 @@ void RegisterJsonoTransform(ExtensionLoader &loader) {
 	// bind validates it is a plain or shredded JSONO and maps shred columns to scalar fields.
 	ScalarFunctionSet set("jsono_transform");
 	ScalarFunction binary({LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, JsonoTransformExecute,
-	                      JsonoTransformBind, nullptr, nullptr, TransformLocalState::Init);
+	                      JsonoTransformBind, nullptr, TransformLocalState::Init);
 	binary.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	binary.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	binary.SetFallible();
 	set.AddFunction(std::move(binary));
 
 	ScalarFunction ternary({LogicalType::ANY, LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::ANY,
-	                       JsonoTransformExecute, JsonoTransformBind, nullptr, nullptr, TransformLocalState::Init);
+	                       JsonoTransformExecute, JsonoTransformBind, nullptr, TransformLocalState::Init);
 	ternary.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	ternary.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	ternary.SetFallible();
 	set.AddFunction(std::move(ternary));
 	loader.RegisterFunction(set);
 }

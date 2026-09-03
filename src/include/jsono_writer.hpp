@@ -5,6 +5,10 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 
 #include "string_view.hpp"
 
@@ -407,8 +411,8 @@ inline string_t WriteNumsBlobInto(Vector &vec, const JsonoBuilder &builder) {
 // The body struct vector of a jsono result vector (plain or shredded): top-level layout field [0]
 // -> body [0]. The six blob vectors are its children.
 inline Vector &JsonoBodyVector(Vector &result) {
-	auto &layout = *StructVector::GetEntries(result)[0];
-	return *StructVector::GetEntries(layout)[0];
+	auto &layout = StructVector::GetEntries(result)[0];
+	return StructVector::GetEntries(layout)[0];
 }
 
 // A self-owned JSONO blob: a complete document (header + metadata framing) serialized into six
@@ -482,8 +486,8 @@ inline JsonoView ViewOfBlob(const OwnedJsonoBlob &b) {
 
 // The `shreds` STRUCT vector of a shredded jsono result: layout field [0] -> shreds [1] (after body).
 inline Vector &JsonoShredsStructVector(Vector &result) {
-	auto &layout = *StructVector::GetEntries(result)[0];
-	return *StructVector::GetEntries(layout)[1];
+	auto &layout = StructVector::GetEntries(result)[0];
+	return StructVector::GetEntries(layout)[1];
 }
 
 // The `shreds` STRUCT type of a shredded jsono type: layout field [0] -> shreds [1] (after body).
@@ -509,7 +513,7 @@ inline idx_t JsonoSpillColumnsOf(const Vector &result) {
 	auto &fields = JsonoShredsStructFields(result.GetType());
 	idx_t columns = 0;
 	for (auto &field : fields) {
-		if (JsonoIsShredSpillName(field.first)) {
+		if (JsonoIsShredSpillName(field.first.GetIdentifierName())) {
 			columns++;
 		}
 	}
@@ -526,11 +530,12 @@ inline Vector &JsonoShredVector(Vector &result, idx_t shred_index) {
 	auto &fields = JsonoShredsStructFields(result.GetType());
 	idx_t seen = 0;
 	for (idx_t i = 0; i < fields.size(); i++) {
-		if (fields[i].first == JsonoShredSetName() || JsonoIsShredSpillName(fields[i].first)) {
+		if (fields[i].first.GetIdentifierName() == JsonoShredSetName() ||
+		    JsonoIsShredSpillName(fields[i].first.GetIdentifierName())) {
 			continue;
 		}
 		if (seen == shred_index) {
-			return *entries[i];
+			return entries[i];
 		}
 		seen++;
 	}
@@ -550,7 +555,7 @@ inline Vector &JsonoShredFieldVector(Vector &result, idx_t field_index) {
 		throw InternalException("JsonoShredFieldVector: shreds field index %llu out of range (%llu fields)",
 		                        (unsigned long long)field_index, (unsigned long long)entries.size());
 	}
-	return *entries[field_index];
+	return entries[field_index];
 }
 
 // The shred-set marker vector (BIGINT) of a shredded jsono result: the `shreds` field named
@@ -561,7 +566,7 @@ inline Vector &JsonoShredSetVector(Vector &result) {
 	auto &fields = JsonoShredsStructFields(result.GetType());
 	for (idx_t i = 0; i < fields.size(); i++) {
 		if (fields[i].first == JsonoShredSetName()) {
-			return *entries[i];
+			return entries[i];
 		}
 	}
 	throw InternalException("JsonoShredSetVector: no marker field in shreds struct");
@@ -576,7 +581,7 @@ inline Vector &JsonoShredSpillVector(Vector &result, idx_t column) {
 	auto name = JsonoShredSpillName(column);
 	for (idx_t i = 0; i < fields.size(); i++) {
 		if (fields[i].first == name) {
-			return *entries[i];
+			return entries[i];
 		}
 	}
 	throw InternalException("JsonoShredSpillVector: no spill column %llu in shreds struct", column);
@@ -596,7 +601,7 @@ struct JsonoSpillStamp {
 		layout_hash = JsonoLayoutHashOf(result.GetType());
 		auto &set_vec = JsonoShredSetVector(result);
 		set_vec.SetVectorType(VectorType::FLAT_VECTOR);
-		set_data = FlatVector::GetData<int64_t>(set_vec);
+		set_data = FlatVector::GetDataMutable<int64_t>(set_vec);
 		auto columns = JsonoSpillColumnsOf(result);
 		spill_columns.clear();
 		for (idx_t column = 0; column < columns; column++) {
@@ -630,8 +635,8 @@ struct JsonoSpillStamp {
 		}
 		set_data[row] = int64_t(layout_hash ^ JSONO_DIRTY_HASH_FLIP);
 		for (idx_t column = 0; column < spill_columns.size(); column++) {
-			FlatVector::Validity(*spill_columns[column]).SetValid(row);
-			FlatVector::GetData<int64_t>(*spill_columns[column])[row] = int64_t(row_masks[column]);
+			FlatVector::ValidityMutable(*spill_columns[column]).SetValid(row);
+			FlatVector::GetDataMutable<int64_t>(*spill_columns[column])[row] = int64_t(row_masks[column]);
 		}
 	}
 };
@@ -665,7 +670,7 @@ inline void JsonoSetRowMarkerNull(Vector &result, idx_t row) {
 	FlatVector::SetNull(shreds, row, true);
 	auto &shred_fields = StructVector::GetEntries(shreds);
 	for (auto &field : shred_fields) {
-		FlatVector::SetNull(*field, row, true);
+		FlatVector::SetNull(field, row, true);
 	}
 }
 
@@ -686,17 +691,17 @@ struct JsonoBodyWriter {
 	void Init(Vector &result_p) {
 		result = &result_p;
 		result_p.SetVectorType(VectorType::FLAT_VECTOR);
-		auto &layout = *StructVector::GetEntries(result_p)[0];
-		auto &body = *StructVector::GetEntries(layout)[0];
-		null_masks[0] = &FlatVector::Validity(result_p);
-		null_masks[1] = &FlatVector::Validity(layout);
-		null_masks[2] = &FlatVector::Validity(body);
+		auto &layout = StructVector::GetEntries(result_p)[0];
+		auto &body = StructVector::GetEntries(layout)[0];
+		null_masks[0] = &FlatVector::ValidityMutable(result_p);
+		null_masks[1] = &FlatVector::ValidityMutable(layout);
+		null_masks[2] = &FlatVector::ValidityMutable(body);
 		auto &blobs = StructVector::GetEntries(body);
 		for (idx_t i = 0; i < BODY_BLOB_COUNT; i++) {
-			blobs[i]->SetVectorType(VectorType::FLAT_VECTOR);
-			vec[i] = blobs[i].get();
-			data[i] = FlatVector::GetData<string_t>(*blobs[i]);
-			null_masks[3 + i] = &FlatVector::Validity(*blobs[i]);
+			blobs[i].SetVectorType(VectorType::FLAT_VECTOR);
+			vec[i] = &blobs[i];
+			data[i] = FlatVector::GetDataMutable<string_t>(blobs[i]);
+			null_masks[3 + i] = &FlatVector::ValidityMutable(blobs[i]);
 		}
 	}
 

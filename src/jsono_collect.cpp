@@ -10,6 +10,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -110,14 +111,16 @@ struct CollectArrayFunction {
 	}
 };
 
-unique_ptr<FunctionData> JsonoGroupArrayBind(ClientContext &context, AggregateFunction &function,
-                                             vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoGroupArrayBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	if (arguments.size() != 1) {
 		throw BinderException("jsono_group_array() requires a single JSONO argument");
 	}
 	// reconstruct=true: a shredded input is cast to plain JSONO by the binder, so Update reads whole
 	// plain documents. The return type is always plain, so there is no sticky-shredded re-bind hazard.
-	function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_group_array", true);
+	function.GetArguments()[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_group_array", true);
 	return make_uniq<JsonoCollectBindData>(BufferManager::GetBufferManager(context));
 }
 
@@ -198,7 +201,7 @@ void JsonoGroupArrayCombine(Vector &source, Vector &target, AggregateInputData &
 	}
 }
 
-void JsonoGroupArrayFinalize(Vector &states, AggregateInputData &, Vector &result, idx_t count, idx_t offset) {
+void JsonoGroupArrayFinalize(Vector &states, AggregateFinalizeInputData &, Vector &result, idx_t count, idx_t offset) {
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<CollectArrayState *>(state_fmt);
@@ -261,13 +264,15 @@ struct CollectObjectFunction {
 	}
 };
 
-unique_ptr<FunctionData> JsonoGroupObjectBind(ClientContext &context, AggregateFunction &function,
-                                              vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoGroupObjectBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	if (arguments.size() != 2) {
 		throw BinderException("jsono_group_object() requires a (key, value) argument pair");
 	}
-	function.arguments[0] = LogicalType::VARCHAR;
-	function.arguments[1] = JsonoResolveJsonoArgument(context, *arguments[1], "jsono_group_object", true);
+	function.GetArguments()[0] = LogicalType::VARCHAR;
+	function.GetArguments()[1] = JsonoResolveJsonoArgument(context, *arguments[1], "jsono_group_object", true);
 	return make_uniq<JsonoCollectBindData>(BufferManager::GetBufferManager(context));
 }
 
@@ -361,7 +366,7 @@ void JsonoGroupObjectCombine(Vector &source, Vector &target, AggregateInputData 
 	}
 }
 
-void JsonoGroupObjectFinalize(Vector &states, AggregateInputData &, Vector &result, idx_t count, idx_t offset) {
+void JsonoGroupObjectFinalize(Vector &states, AggregateFinalizeInputData &, Vector &result, idx_t count, idx_t offset) {
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<CollectObjectState *>(state_fmt);
@@ -406,13 +411,12 @@ void JsonoGroupObjectFinalize(Vector &states, AggregateInputData &, Vector &resu
 void RegisterJsonoCollect(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
 	{
-		AggregateFunction fun("jsono_group_array", {LogicalType::ANY}, jsono_type,
-		                      AggregateFunction::StateSize<CollectArrayState>,
-		                      AggregateFunction::StateInitialize<CollectArrayState, CollectArrayFunction>,
-		                      JsonoGroupArrayUpdate, JsonoGroupArrayCombine, JsonoGroupArrayFinalize,
-		                      FunctionNullHandling::SPECIAL_HANDLING, JsonoGroupArraySimpleUpdate, JsonoGroupArrayBind,
-		                      AggregateFunction::StateDestroy<CollectArrayState, CollectArrayFunction>);
-		fun.order_dependent = AggregateOrderDependent::ORDER_DEPENDENT;
+		AggregateFunction fun(
+		    "jsono_group_array", {LogicalType::ANY}, jsono_type, AggregateFunction::StateSize<CollectArrayState>,
+		    AggregateFunction::StateInitialize<CollectArrayState, CollectArrayFunction>, JsonoGroupArrayUpdate,
+		    JsonoGroupArrayCombine, JsonoGroupArrayFinalize, FunctionNullHandling::SPECIAL_HANDLING, nullptr,
+		    JsonoGroupArrayBind, AggregateFunction::StateDestroy<CollectArrayState, CollectArrayFunction>);
+		fun.SetOrderDependent(AggregateOrderDependent::ORDER_DEPENDENT);
 		loader.RegisterFunction(std::move(fun));
 	}
 	{
@@ -420,10 +424,9 @@ void RegisterJsonoCollect(ExtensionLoader &loader) {
 		                      AggregateFunction::StateSize<CollectObjectState>,
 		                      AggregateFunction::StateInitialize<CollectObjectState, CollectObjectFunction>,
 		                      JsonoGroupObjectUpdate, JsonoGroupObjectCombine, JsonoGroupObjectFinalize,
-		                      FunctionNullHandling::SPECIAL_HANDLING, JsonoGroupObjectSimpleUpdate,
-		                      JsonoGroupObjectBind,
+		                      FunctionNullHandling::SPECIAL_HANDLING, nullptr, JsonoGroupObjectBind,
 		                      AggregateFunction::StateDestroy<CollectObjectState, CollectObjectFunction>);
-		fun.order_dependent = AggregateOrderDependent::ORDER_DEPENDENT;
+		fun.SetOrderDependent(AggregateOrderDependent::ORDER_DEPENDENT);
 		loader.RegisterFunction(std::move(fun));
 	}
 }

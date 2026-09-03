@@ -8,6 +8,8 @@
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -35,7 +37,7 @@ void WriteJsonoAsJson(Vector &input, idx_t count, Vector &result) {
 	row_reader.Init(input, count);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<string_t>(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 
 	std::string buf;
 
@@ -117,7 +119,7 @@ void RegisterJsonoToJson(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
 	{
 		ScalarFunction f("to_json", {jsono_type}, LogicalType::JSON(), JsonoToJsonExecute);
-		f.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+		f.SetFallible();
 		loader.RegisterFunction(f);
 	}
 	// json_quote is a core json alias of to_json, so a plain JSONO value must serialize to the logical
@@ -125,7 +127,7 @@ void RegisterJsonoToJson(ExtensionLoader &loader) {
 	// (Shredded json_quote stays the optimizer's job — its type is not jsono_type, so this never matches.)
 	{
 		ScalarFunction f("json_quote", {jsono_type}, LogicalType::JSON(), JsonoToJsonExecute);
-		f.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+		f.SetFallible();
 		loader.RegisterFunction(f);
 	}
 	for (auto &target : {LogicalType::JSON(), LogicalType(LogicalType::VARCHAR)}) {

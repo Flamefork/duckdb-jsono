@@ -7,6 +7,8 @@
 #include "jsono_render.hpp"
 
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 #include "string_view.hpp"
 
@@ -491,11 +493,11 @@ struct JsonoExtractStringSink {
 	idx_t row;
 
 	void OnInlineText(nonstd::string_view text) {
-		FlatVector::Validity(result).SetValid(row);
+		FlatVector::ValidityMutable(result).SetValid(row);
 		result_data[row] = ZeroCopyHeapText(text);
 	}
 	void OnRenderedText(nonstd::string_view text) {
-		FlatVector::Validity(result).SetValid(row);
+		FlatVector::ValidityMutable(result).SetValid(row);
 		result_data[row] = StringVector::AddString(result, text.data(), text.size());
 	}
 	void OnNull() {

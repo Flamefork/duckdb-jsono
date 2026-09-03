@@ -13,6 +13,9 @@
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/create_sort_key.hpp"
@@ -1730,28 +1733,28 @@ int CompareLWWListLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWListL
 void WriteLWWScalarLaneValue(const LWWScalarValue &value, nonstd::string_view text, const LogicalType &type,
                              Vector &out, idx_t rid) {
 	auto primitive = JsonoScalarPrimitiveFromType(type, "jsono_group_merge direct finalize");
-	FlatVector::Validity(out).SetValid(rid);
+	FlatVector::ValidityMutable(out).SetValid(rid);
 	switch (primitive) {
 	case JsonoScalarPrimitive::Varchar:
-		FlatVector::GetData<string_t>(out)[rid] = StringVector::AddString(out, text.data(), text.size());
+		FlatVector::GetDataMutable<string_t>(out)[rid] = StringVector::AddString(out, text.data(), text.size());
 		return;
 	case JsonoScalarPrimitive::Bigint: {
 		int64_t v;
 		std::memcpy(&v, &value.num, sizeof(v));
-		FlatVector::GetData<int64_t>(out)[rid] = v;
+		FlatVector::GetDataMutable<int64_t>(out)[rid] = v;
 		return;
 	}
 	case JsonoScalarPrimitive::Ubigint:
-		FlatVector::GetData<uint64_t>(out)[rid] = value.num;
+		FlatVector::GetDataMutable<uint64_t>(out)[rid] = value.num;
 		return;
 	case JsonoScalarPrimitive::Double: {
 		double v;
 		std::memcpy(&v, &value.num, sizeof(v));
-		FlatVector::GetData<double>(out)[rid] = v;
+		FlatVector::GetDataMutable<double>(out)[rid] = v;
 		return;
 	}
 	case JsonoScalarPrimitive::Boolean:
-		FlatVector::GetData<bool>(out)[rid] = SlotTag(value.slot) == tag::VAL_TRUE;
+		FlatVector::GetDataMutable<bool>(out)[rid] = SlotTag(value.slot) == tag::VAL_TRUE;
 		return;
 	}
 }
@@ -1763,7 +1766,7 @@ void WriteLWWScalarLaneValue(const LWWScalarLane &lane, const string *lane_text,
 }
 
 void WriteLWWListLaneValue(const LWWListLane &lane, const ReconShred &shred, Vector &out, idx_t rid) {
-	FlatVector::Validity(out).SetValid(rid);
+	FlatVector::ValidityMutable(out).SetValid(rid);
 	auto start = ListVector::GetListSize(out);
 	EnsureListCapacity(out, start + lane.value.elements.size());
 	auto &child = ListVector::GetEntry(out);
@@ -1812,8 +1815,9 @@ bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, 
 			diverted = scalar.kind != JsonoScalarKind::Null;
 			return false;
 		}
-		FlatVector::Validity(out).SetValid(rid);
-		FlatVector::GetData<string_t>(out)[rid] = StringVector::AddString(out, scalar.text.data(), scalar.text.size());
+		FlatVector::ValidityMutable(out).SetValid(rid);
+		FlatVector::GetDataMutable<string_t>(out)[rid] =
+		    StringVector::AddString(out, scalar.text.data(), scalar.text.size());
 		return true;
 	}
 	if (!JsonoScalarFitsPrimitive(scalar, primitive)) {
@@ -1822,20 +1826,20 @@ bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, 
 		diverted = scalar.kind != JsonoScalarKind::Null;
 		return false;
 	}
-	FlatVector::Validity(out).SetValid(rid);
+	FlatVector::ValidityMutable(out).SetValid(rid);
 	switch (primitive) {
 	case JsonoScalarPrimitive::Bigint:
-		FlatVector::GetData<int64_t>(out)[rid] = scalar.int_value;
+		FlatVector::GetDataMutable<int64_t>(out)[rid] = scalar.int_value;
 		return true;
 	case JsonoScalarPrimitive::Ubigint:
-		FlatVector::GetData<uint64_t>(out)[rid] =
+		FlatVector::GetDataMutable<uint64_t>(out)[rid] =
 		    scalar.kind == JsonoScalarKind::UInt64 ? scalar.uint_value : uint64_t(scalar.int_value);
 		return true;
 	case JsonoScalarPrimitive::Double:
-		FlatVector::GetData<double>(out)[rid] = scalar.double_value;
+		FlatVector::GetDataMutable<double>(out)[rid] = scalar.double_value;
 		return true;
 	case JsonoScalarPrimitive::Boolean:
-		FlatVector::GetData<bool>(out)[rid] = scalar.bool_value;
+		FlatVector::GetDataMutable<bool>(out)[rid] = scalar.bool_value;
 		return true;
 	case JsonoScalarPrimitive::Varchar:
 		break;
@@ -2004,16 +2008,18 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	return true;
 }
 
-unique_ptr<FunctionData> JsonoGroupMergeLWWBind(ClientContext &context, AggregateFunction &function,
-                                                vector<unique_ptr<Expression>> &arguments, OrderType direction) {
+unique_ptr<FunctionData> JsonoGroupMergeLWWBind(BindAggregateFunctionInput &input, OrderType direction) {
+	auto &context = input.GetClientContext();
+	auto &function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	if (arguments.size() != 2) {
-		throw BinderException("%s requires a JSONO value and an order key argument", function.name);
+		throw BinderException("%s requires a JSONO value and an order key argument", function.GetName());
 	}
 	if (arguments[0]->HasParameter() || arguments[1]->HasParameter()) {
 		throw ParameterNotResolvedException();
 	}
-	auto &type = arguments[0]->return_type;
-	JsonoRequireExtensionOptimizerForShredded(context, type, function.name);
+	auto &type = arguments[0]->GetReturnType();
+	JsonoRequireExtensionOptimizerForShredded(context, type, function.GetName().GetIdentifierName());
 	auto bind_data = make_uniq<GroupMergeLWWBindData>(OrderModifiers(direction, OrderByNullType::NULLS_FIRST),
 	                                                  BufferManager::GetBufferManager(context));
 	if (IsShreddedJsonoType(type)) {
@@ -2026,27 +2032,25 @@ unique_ptr<FunctionData> JsonoGroupMergeLWWBind(ClientContext &context, Aggregat
 			bind_data->shreds.emplace_back(shred.first, shred.second);
 		}
 		bind_data->BuildShredPlan();
-		function.arguments[0] = type;
-		function.return_type = type;
+		function.GetArguments()[0] = type;
+		function.SetReturnType(type);
 	} else if (type.id() == LogicalTypeId::SQLNULL || IsJsonoType(type)) {
-		function.arguments[0] = JsonoType();
+		function.GetArguments()[0] = JsonoType();
 	} else {
-		JsonoRejectForeignLayout(type, function.name);
-		throw BinderException("%s value argument must be JSONO", function.name);
+		JsonoRejectForeignLayout(type, function.GetName().GetIdentifierName());
+		throw BinderException("%s value argument must be JSONO", function.GetName());
 	}
 	// arguments[1] (order key) stays its own type (function.arguments[1] is ANY → no cast) so
 	// CreateSortKey sees the real values in Update.
 	return std::move(bind_data);
 }
 
-unique_ptr<FunctionData> JsonoGroupMergeMaxBind(ClientContext &context, AggregateFunction &function,
-                                                vector<unique_ptr<Expression>> &arguments) {
-	return JsonoGroupMergeLWWBind(context, function, arguments, OrderType::ASCENDING);
+unique_ptr<FunctionData> JsonoGroupMergeMaxBind(BindAggregateFunctionInput &input) {
+	return JsonoGroupMergeLWWBind(input, OrderType::ASCENDING);
 }
 
-unique_ptr<FunctionData> JsonoGroupMergeMinBind(ClientContext &context, AggregateFunction &function,
-                                                vector<unique_ptr<Expression>> &arguments) {
-	return JsonoGroupMergeLWWBind(context, function, arguments, OrderType::DESCENDING);
+unique_ptr<FunctionData> JsonoGroupMergeMinBind(BindAggregateFunctionInput &input) {
+	return JsonoGroupMergeLWWBind(input, OrderType::DESCENDING);
 }
 
 // Encode each row's order key into a memcmp-comparable sort-key blob, with the direction baked in
@@ -2257,8 +2261,8 @@ void FinalizeLWWPlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMe
 	}
 }
 
-void JsonoGroupMergeLWWFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
-                                idx_t offset) {
+void JsonoGroupMergeLWWFinalize(Vector &states, AggregateFinalizeInputData &aggr_input_data, Vector &result,
+                                idx_t count, idx_t offset) {
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<GroupMergeLWWState *>(state_fmt);
@@ -2280,12 +2284,11 @@ void JsonoGroupMergeLWWFinalize(Vector &states, AggregateInputData &aggr_input_d
 }
 
 AggregateFunction JsonoGroupMergeKeyedFunction(const char *name, bind_aggregate_function_t bind) {
-	AggregateFunction fun(name, {LogicalType::ANY, LogicalType::ANY}, JsonoType(),
-	                      AggregateFunction::StateSize<GroupMergeLWWState>,
-	                      AggregateFunction::StateInitialize<GroupMergeLWWState, GroupMergeLWWFunction>,
-	                      JsonoGroupMergeLWWUpdate, JsonoGroupMergeLWWCombine, JsonoGroupMergeLWWFinalize,
-	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, JsonoGroupMergeLWWSimpleUpdate, bind,
-	                      AggregateFunction::StateDestroy<GroupMergeLWWState, GroupMergeLWWFunction>);
+	AggregateFunction fun(
+	    name, {LogicalType::ANY, LogicalType::ANY}, JsonoType(), AggregateFunction::StateSize<GroupMergeLWWState>,
+	    AggregateFunction::StateInitialize<GroupMergeLWWState, GroupMergeLWWFunction>, JsonoGroupMergeLWWUpdate,
+	    JsonoGroupMergeLWWCombine, JsonoGroupMergeLWWFinalize, FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr,
+	    bind, AggregateFunction::StateDestroy<GroupMergeLWWState, GroupMergeLWWFunction>);
 	// Per-leaf conflict resolution by the key argument is commutative and associative: declaring it
 	// not-order-dependent lets DuckDB stream rows into Update (no ordered-aggregate row buffer).
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);

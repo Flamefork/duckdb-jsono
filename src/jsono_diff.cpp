@@ -97,7 +97,7 @@ bool TryBuildDiffLanePlan(const LogicalType &type, vector<DiffLanePlan> &lanes) 
 		DiffLanePlan plan;
 		plan.shred_index = f;
 		plan.prim = jsono::JsonoScalarPrimitiveFromType(layout.shreds[f].second, "jsono_diff shred");
-		auto &name = layout.shreds[f].first;
+		auto &name = layout.shreds[f].first.GetIdentifierName();
 		plan.steps = ShredNamePath(name, "jsono_diff shred");
 		for (auto &step : plan.steps) {
 			if (step.kind != PathStepKind::Key) {
@@ -769,8 +769,10 @@ void EmitDiffValue(bool prev_present, const JsonoView &pv, const JsonoCursor &pc
 	EmitScalarVerbatim(cv, c, builder);
 }
 
-unique_ptr<FunctionData> JsonoDiffBind(ClientContext &context, ScalarFunction &bound_function,
-                                       vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoDiffBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	auto mode = DiffArrayMode::Atomic;
 	if (arguments.size() >= 3) {
 		auto &arrays_arg = arguments[2];
@@ -802,8 +804,8 @@ unique_ptr<FunctionData> JsonoDiffBind(ClientContext &context, ScalarFunction &b
 		}
 	}
 	auto bind_data = make_uniq<JsonoDiffBindData>(mode);
-	auto &prev_type = arguments[0]->return_type;
-	auto &cur_type = arguments[1]->return_type;
+	auto &prev_type = arguments[0]->GetReturnType();
+	auto &cur_type = arguments[1]->GetReturnType();
 	if (IsShreddedJsonoType(prev_type) && prev_type == cur_type && TryBuildDiffLanePlan(prev_type, bind_data->lanes)) {
 		// Both sides share one all-scalar shredded type: diff directly — pairwise typed lanes plus a
 		// residual walk. A set lane always means the path is stripped from the residual (a value is
@@ -812,16 +814,16 @@ unique_ptr<FunctionData> JsonoDiffBind(ClientContext &context, ScalarFunction &b
 		// values place identically and lane-vs-lane plus residual-vs-residual comparisons are complete;
 		// a row whose lane presence differs on any path (fitting <-> diverted/absent/null transitions)
 		// falls back to per-row reconstruct inside the executor.
-		bound_function.arguments[0] = prev_type;
-		bound_function.arguments[1] = cur_type;
+		bound_function.GetArguments()[0] = prev_type;
+		bound_function.GetArguments()[1] = cur_type;
 		return std::move(bind_data);
 	}
 	bind_data->lanes.clear();
 	// Both document arguments are reconstructed to plain JSONO at bind (the binder inserts the
 	// lossless reconstruct cast for a shredded input), so the executor reads whole logical values and
 	// never touches shred lanes — sidestepping the shredded-array read path entirely.
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_diff", true);
-	bound_function.arguments[1] = JsonoResolveJsonoArgument(context, *arguments[1], "jsono_diff", true);
+	bound_function.GetArguments()[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_diff", true);
+	bound_function.GetArguments()[1] = JsonoResolveJsonoArgument(context, *arguments[1], "jsono_diff", true);
 	return std::move(bind_data);
 }
 
@@ -1104,7 +1106,7 @@ void JsonoDiffExecuteDirect(DataChunk &args, JsonoDiffLocalState &lstate, const 
 
 void JsonoDiffExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoDiffLocalState>();
-	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoDiffBindData>();
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<JsonoDiffBindData>();
 	if (!bind_data.lanes.empty()) {
 		JsonoDiffExecuteDirect(args, lstate, bind_data, result);
 		if (args.AllConstant()) {
@@ -1162,10 +1164,10 @@ void JsonoDiffExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 }
 
 ScalarFunction MakeJsonoDiffFunction(const vector<LogicalType> &arguments) {
-	ScalarFunction fun("jsono_diff", arguments, JsonoType(), JsonoDiffExecute, JsonoDiffBind, nullptr, nullptr,
+	ScalarFunction fun("jsono_diff", arguments, JsonoType(), JsonoDiffExecute, JsonoDiffBind, nullptr,
 	                   JsonoDiffLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetFallible();
 	return fun;
 }
 

@@ -7,6 +7,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 #include "string_view.hpp"
 
@@ -232,28 +234,28 @@ inline uint64_t JsonoPrimitiveVectorValueBits(JsonoScalarPrimitive primitive, co
 }
 
 inline void WriteJsonoStringLane(Vector &out, idx_t row, nonstd::string_view value) {
-	FlatVector::Validity(out).SetValid(row);
-	FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, value.data(), value.size());
+	FlatVector::ValidityMutable(out).SetValid(row);
+	FlatVector::GetDataMutable<string_t>(out)[row] = StringVector::AddString(out, value.data(), value.size());
 }
 
 inline void WriteJsonoBigintLane(Vector &out, idx_t row, int64_t value) {
-	FlatVector::Validity(out).SetValid(row);
-	FlatVector::GetData<int64_t>(out)[row] = value;
+	FlatVector::ValidityMutable(out).SetValid(row);
+	FlatVector::GetDataMutable<int64_t>(out)[row] = value;
 }
 
 inline void WriteJsonoUbigintLane(Vector &out, idx_t row, uint64_t value) {
-	FlatVector::Validity(out).SetValid(row);
-	FlatVector::GetData<uint64_t>(out)[row] = value;
+	FlatVector::ValidityMutable(out).SetValid(row);
+	FlatVector::GetDataMutable<uint64_t>(out)[row] = value;
 }
 
 inline void WriteJsonoDoubleLane(Vector &out, idx_t row, double value) {
-	FlatVector::Validity(out).SetValid(row);
-	FlatVector::GetData<double>(out)[row] = value;
+	FlatVector::ValidityMutable(out).SetValid(row);
+	FlatVector::GetDataMutable<double>(out)[row] = value;
 }
 
 inline void WriteJsonoBooleanLane(Vector &out, idx_t row, bool value) {
-	FlatVector::Validity(out).SetValid(row);
-	FlatVector::GetData<bool>(out)[row] = value;
+	FlatVector::ValidityMutable(out).SetValid(row);
+	FlatVector::GetDataMutable<bool>(out)[row] = value;
 }
 
 inline void WriteJsonoRenderedTextLane(Vector &out, idx_t row, const JsonoScalar &scalar, std::string &scratch) {

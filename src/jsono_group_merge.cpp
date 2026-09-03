@@ -12,6 +12,8 @@
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -160,8 +162,10 @@ struct GroupMergeFunction {
 	}
 };
 
-unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFunction &function,
-                                             vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoGroupMergeBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	if (arguments.size() != 1) {
 		throw BinderException("jsono_group_merge() requires a single JSONO argument");
 	}
@@ -169,7 +173,7 @@ unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFu
 	if (arg.HasParameter()) {
 		throw ParameterNotResolvedException();
 	}
-	auto &type = arg.return_type;
+	auto &type = arg.GetReturnType();
 	JsonoRequireExtensionOptimizerForShredded(context, type, "jsono_group_merge");
 	auto bind_data = make_uniq<GroupMergeBindData>(MergeMode::IgnoreNulls, BufferManager::GetBufferManager(context));
 	if (IsShreddedJsonoType(type)) {
@@ -190,10 +194,10 @@ unique_ptr<FunctionData> JsonoGroupMergeBind(ClientContext &context, AggregateFu
 		// argument type and its sticky shredded return type disagree, so a plan serialize→deserialize
 		// re-bind (debug verification) would re-derive a plain return and fail to reconcile it back to
 		// the shredded type. Arg type == return type makes the re-bind reproduce the same shredded type.
-		function.arguments[0] = type;
-		function.return_type = type;
+		function.GetArguments()[0] = type;
+		function.SetReturnType(type);
 	} else if (type.id() == LogicalTypeId::SQLNULL || IsJsonoType(type)) {
-		function.arguments[0] = JsonoType();
+		function.GetArguments()[0] = JsonoType();
 	} else {
 		JsonoRejectForeignLayout(type, "jsono_group_merge()");
 		throw BinderException("jsono_group_merge() input must be JSONO");
@@ -636,7 +640,7 @@ void FinalizePlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMerge
 	}
 }
 
-void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
+void JsonoGroupMergeFinalize(Vector &states, AggregateFinalizeInputData &aggr_input_data, Vector &result, idx_t count,
                              idx_t offset) {
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
@@ -741,19 +745,19 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 				auto &out = *lane_out[f];
 				switch (plan.prim) {
 				case jsono::JsonoScalarPrimitive::Varchar:
-					FlatVector::GetData<string_t>(out)[rid] = StringVector::AddStringOrBlob(out, lane.s);
+					FlatVector::GetDataMutable<string_t>(out)[rid] = StringVector::AddStringOrBlob(out, lane.s);
 					break;
 				case jsono::JsonoScalarPrimitive::Bigint:
-					FlatVector::GetData<int64_t>(out)[rid] = lane.i;
+					FlatVector::GetDataMutable<int64_t>(out)[rid] = lane.i;
 					break;
 				case jsono::JsonoScalarPrimitive::Ubigint:
-					FlatVector::GetData<uint64_t>(out)[rid] = lane.u;
+					FlatVector::GetDataMutable<uint64_t>(out)[rid] = lane.u;
 					break;
 				case jsono::JsonoScalarPrimitive::Double:
-					FlatVector::GetData<double>(out)[rid] = lane.d;
+					FlatVector::GetDataMutable<double>(out)[rid] = lane.d;
 					break;
 				case jsono::JsonoScalarPrimitive::Boolean:
-					FlatVector::GetData<bool>(out)[rid] = lane.b;
+					FlatVector::GetDataMutable<bool>(out)[rid] = lane.b;
 					break;
 				}
 				stripped_lanes.Mark(f);
@@ -780,13 +784,12 @@ void JsonoGroupMergeFinalize(Vector &states, AggregateInputData &aggr_input_data
 } // namespace
 
 void RegisterJsonoGroupMerge(ExtensionLoader &loader) {
-	AggregateFunction fun("jsono_group_merge", {LogicalType::ANY}, JsonoType(),
-	                      AggregateFunction::StateSize<GroupMergeState>,
-	                      AggregateFunction::StateInitialize<GroupMergeState, GroupMergeFunction>,
-	                      JsonoGroupMergeUpdate, JsonoGroupMergeCombine, JsonoGroupMergeFinalize,
-	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, JsonoGroupMergeSimpleUpdate, JsonoGroupMergeBind,
-	                      AggregateFunction::StateDestroy<GroupMergeState, GroupMergeFunction>);
-	fun.order_dependent = AggregateOrderDependent::ORDER_DEPENDENT;
+	AggregateFunction fun(
+	    "jsono_group_merge", {LogicalType::ANY}, JsonoType(), AggregateFunction::StateSize<GroupMergeState>,
+	    AggregateFunction::StateInitialize<GroupMergeState, GroupMergeFunction>, JsonoGroupMergeUpdate,
+	    JsonoGroupMergeCombine, JsonoGroupMergeFinalize, FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr,
+	    JsonoGroupMergeBind, AggregateFunction::StateDestroy<GroupMergeState, GroupMergeFunction>);
+	fun.SetOrderDependent(AggregateOrderDependent::ORDER_DEPENDENT);
 	loader.RegisterFunction(std::move(fun));
 }
 

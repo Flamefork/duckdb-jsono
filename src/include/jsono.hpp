@@ -126,7 +126,7 @@ inline LogicalType JsonoLaneLogicalType(const LogicalType &lane_type) {
 	}
 	child_list_t<LogicalType> children;
 	for (auto &sub : StructType::GetChildTypes(element)) {
-		children.emplace_back(JsonoLaneSubfieldKey(sub.first, "jsono lane subfield"), sub.second);
+		children.emplace_back(JsonoLaneSubfieldKey(sub.first.GetIdentifierName(), "jsono lane subfield"), sub.second);
 	}
 	return LogicalType::LIST(LogicalType::STRUCT(std::move(children)));
 }
@@ -829,7 +829,7 @@ inline void JsonoBuildShredSignatures(const LogicalType &type, std::vector<Jsono
 	out.reserve(layout.shreds.size());
 	for (auto &shred : layout.shreds) {
 		JsonoShredSignature signature;
-		signature.path = JsonoLaneLogicalPath(shred.first);
+		signature.path = JsonoLaneLogicalPath(shred.first.GetIdentifierName());
 		auto logical = JsonoLaneLogicalType(shred.second);
 		if (logical.id() == LogicalTypeId::LIST && ListType::GetChildType(logical).id() == LogicalTypeId::STRUCT) {
 			// An object-array lane is compared subfield by subfield, so it carries them rather than one

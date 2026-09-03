@@ -15,6 +15,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -45,9 +47,11 @@ struct ExtractLocalState : public JsonoSinglePathLocalState {
 	}
 };
 
-unique_ptr<FunctionData> JsonoExtractBind(ClientContext &context, ScalarFunction &bound_function,
-                                          vector<unique_ptr<Expression>> &arguments) {
-	return BindJsonoSinglePath(context, *arguments[1], bound_function.name.c_str(), JsonoPathDialect::Extract);
+unique_ptr<FunctionData> JsonoExtractBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	return BindJsonoSinglePath(context, *arguments[1], bound_function.GetName().c_str(), JsonoPathDialect::Extract);
 }
 
 // Copy the container subtree at `start` into `builder` as a standalone value. The subtree
@@ -370,7 +374,7 @@ struct JsonoExtractStringPolicy {
 
 void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<JsonoSinglePathBindData>();
+	auto &bind_data = expr.BindInfo()->Cast<JsonoSinglePathBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ExtractLocalState>();
 	auto count = args.size();
 
@@ -389,7 +393,7 @@ void JsonoExtractExecute(DataChunk &args, ExpressionState &state, Vector &result
 
 void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<JsonoSinglePathBindData>();
+	auto &bind_data = expr.BindInfo()->Cast<JsonoSinglePathBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ExtractLocalState>();
 	auto count = args.size();
 
@@ -397,7 +401,7 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 	reader.InitPointRead(args.data[0], count);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<string_t>(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 	// Zero-copy text values point into the input string_heap; keep its buffer alive for them.
 	StringVector::AddHeapReference(result, reader.StringHeapVector());
 	std::string scratch;
@@ -412,27 +416,30 @@ void JsonoExtractStringExecute(DataChunk &args, ExpressionState &state, Vector &
 // value reaches bind: redeclare arg0 to plain JSONO (the binder inserts the lossless reconstruct
 // cast) and reject non-JSONO loudly, then run the constant-path bind. The core-named "json_extract"
 // and "->>" sets stay hard-typed on plain JSONO and use JsonoExtractBind directly.
-unique_ptr<FunctionData> JsonoExtractBindAny(ClientContext &context, ScalarFunction &bound_function,
-                                             vector<unique_ptr<Expression>> &arguments) {
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, true);
-	return JsonoExtractBind(context, bound_function, arguments);
+unique_ptr<FunctionData> JsonoExtractBindAny(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	bound_function.GetArguments()[0] =
+	    JsonoResolveJsonoArgument(context, *arguments[0], bound_function.GetName().GetIdentifierName(), true);
+	return JsonoExtractBind(input);
 }
 
 ScalarFunction MakeExtractFunction(string name, LogicalType path_type, LogicalType arg0_type = JsonoType(),
                                    bind_scalar_function_t bind = JsonoExtractBind) {
-	ScalarFunction fun(std::move(name), {std::move(arg0_type), std::move(path_type)}, JsonoType(), JsonoExtractExecute,
-	                   bind, nullptr, nullptr, ExtractLocalState::Init);
+	ScalarFunction fun(Identifier(std::move(name)), {std::move(arg0_type), std::move(path_type)}, JsonoType(),
+	                   JsonoExtractExecute, bind, nullptr, ExtractLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetFallible();
 	return fun;
 }
 
 ScalarFunction MakeExtractStringFunction(string name, LogicalType path_type, LogicalType arg0_type = JsonoType(),
                                          bind_scalar_function_t bind = JsonoExtractBind) {
-	ScalarFunction fun(std::move(name), {std::move(arg0_type), std::move(path_type)}, LogicalType::VARCHAR,
-	                   JsonoExtractStringExecute, bind, nullptr, nullptr, ExtractLocalState::Init);
+	ScalarFunction fun(Identifier(std::move(name)), {std::move(arg0_type), std::move(path_type)}, LogicalType::VARCHAR,
+	                   JsonoExtractStringExecute, bind, nullptr, ExtractLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetFallible();
 	return fun;
 }
 

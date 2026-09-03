@@ -23,14 +23,14 @@ inline bool TryReadJsonoPathSpec(ClientContext &context, Expression &expr, const
 	// vector under a declared LIST(VARCHAR) type that crashes materialization. Decline so the list
 	// extract is left to core json's list overload (its STRUCT->JSON arg cast is reconstructed
 	// independently, exactly like a non-constant scalar path).
-	if (expr.return_type.id() == LogicalTypeId::LIST) {
+	if (expr.GetReturnType().id() == LogicalTypeId::LIST) {
 		return false;
 	}
 	auto value = ExpressionExecutor::EvaluateScalar(context, expr);
 	if (value.IsNull()) {
 		return false;
 	}
-	if (dialect == JsonoPathDialect::Extract && expr.return_type.IsIntegral()) {
+	if (dialect == JsonoPathDialect::Extract && expr.GetReturnType().IsIntegral()) {
 		if (!value.DefaultTryCastAs(LogicalType::BIGINT)) {
 			return false;
 		}
@@ -76,7 +76,7 @@ inline JsonoPathSpec BindJsonoPathSpec(ClientContext &context, Expression &expr,
 	if (value.IsNull()) {
 		throw BinderException("%s: path must not be NULL", function_name);
 	}
-	if (dialect == JsonoPathDialect::Extract && expr.return_type.IsIntegral()) {
+	if (dialect == JsonoPathDialect::Extract && expr.GetReturnType().IsIntegral()) {
 		if (!value.DefaultTryCastAs(LogicalType::BIGINT)) {
 			throw BinderException("%s: path must be BIGINT", function_name);
 		}

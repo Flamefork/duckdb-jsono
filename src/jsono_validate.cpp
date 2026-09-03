@@ -11,6 +11,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression.hpp"
@@ -391,14 +392,14 @@ void InitSpillChecker(Vector &input, idx_t count, SpillChecker &checker) {
 	vector<string> names;
 	names.reserve(layout.shreds.size());
 	for (auto &shred : layout.shreds) {
-		names.push_back(shred.first);
+		names.push_back(shred.first.GetIdentifierName());
 	}
 	// Spill-bit numbering: ranked over the encoded lane names.
 	auto ranks = JsonoRanksInByteOrder(names);
 	checker.lanes.resize(layout.shreds.size());
 	for (idx_t f = 0; f < layout.shreds.size(); f++) {
 		auto &lane = checker.lanes[f];
-		lane.steps = ShredNamePath(layout.shreds[f].first, "jsono_validate shred");
+		lane.steps = ShredNamePath(layout.shreds[f].first.GetIdentifierName(), "jsono_validate shred");
 		lane.rank = ranks[f];
 		lane.scalar = ClassifyShredKind(layout.shreds[f].second) == ShredKind::Scalar;
 		JsonoShredVector(input, f).ToUnifiedFormat(count, lane.fmt);
@@ -489,7 +490,7 @@ void InitLockstepLanes(Vector &input, idx_t count, vector<LockstepLane> &lanes) 
 			continue;
 		}
 		LockstepLane lane;
-		auto &name = layout.shreds[f].first;
+		auto &name = layout.shreds[f].first.GetIdentifierName();
 		lane.steps = ShredNamePath(name, "jsono_validate shred");
 		auto &lane_vec = JsonoShredVector(input, f);
 		lane_vec.ToUnifiedFormat(count, lane.fmt);
@@ -539,7 +540,7 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 	InitSpillChecker(args.data[0], count, spill_checker);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<bool>(result);
+	auto result_data = FlatVector::GetDataMutable<bool>(result);
 
 	for (idx_t row = 0; row < count; row++) {
 		JsonoBlobRow blob;
@@ -564,9 +565,12 @@ void JsonoValidateExecute(DataChunk &args, ExpressionState &state, Vector &resul
 // so Execute validates the residual blobs directly plus the array-lane lockstep against the
 // residual skeleton. The typed lane VALUES stay DuckDB-native; only the framing readers enforce
 // (manifest, lockstep lengths) is jsono's to assert.
-unique_ptr<FunctionData> JsonoValidateBind(ClientContext &context, ScalarFunction &bound_function,
-                                           vector<unique_ptr<Expression>> &arguments) {
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, false);
+unique_ptr<FunctionData> JsonoValidateBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	bound_function.GetArguments()[0] =
+	    JsonoResolveJsonoArgument(context, *arguments[0], bound_function.GetName().GetIdentifierName(), false);
 	return nullptr;
 }
 

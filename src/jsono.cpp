@@ -8,6 +8,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -54,8 +55,10 @@ struct JsonoLayoutDiagnoseBindData : public FunctionData {
 	}
 };
 
-unique_ptr<FunctionData> JsonoLayoutDiagnoseBind(ClientContext &context, ScalarFunction &bound_function,
-                                                 vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoLayoutDiagnoseBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	(void)context;
 	(void)bound_function;
 	if (arguments[0]->HasParameter()) {
@@ -63,12 +66,12 @@ unique_ptr<FunctionData> JsonoLayoutDiagnoseBind(ClientContext &context, ScalarF
 		// parameter would answer about UNKNOWN and keep answering that after the parameter arrives.
 		throw ParameterNotResolvedException();
 	}
-	return make_uniq<JsonoLayoutDiagnoseBindData>(JsonoDiagnoseLayoutMatch(arguments[0]->return_type));
+	return make_uniq<JsonoLayoutDiagnoseBindData>(JsonoDiagnoseLayoutMatch(arguments[0]->GetReturnType()));
 }
 
 void JsonoLayoutDiagnoseExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)args;
-	auto &info = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoLayoutDiagnoseBindData>();
+	auto &info = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<JsonoLayoutDiagnoseBindData>();
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	result.SetValue(0, info.diagnosis);
 }
@@ -106,8 +109,10 @@ LogicalType JsonoLayoutLanesResultType() {
 	return LogicalType::LIST(LogicalType::STRUCT(std::move(lane)));
 }
 
-unique_ptr<FunctionData> JsonoLayoutLanesBind(ClientContext &context, ScalarFunction &bound_function,
-                                              vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoLayoutLanesBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	(void)context;
 	(void)bound_function;
 	if (arguments[0]->HasParameter()) {
@@ -115,7 +120,7 @@ unique_ptr<FunctionData> JsonoLayoutLanesBind(ClientContext &context, ScalarFunc
 		// re-bind once it has one rather than be classified as "not JSONO".
 		throw ParameterNotResolvedException();
 	}
-	auto &argument_type = arguments[0]->return_type;
+	auto &argument_type = arguments[0]->GetReturnType();
 	JsonoLayoutType layout;
 	string reason;
 	auto match = MatchJsonoLayoutType(argument_type, layout, &reason);
@@ -126,7 +131,7 @@ unique_ptr<FunctionData> JsonoLayoutLanesBind(ClientContext &context, ScalarFunc
 	vector<Value> lanes;
 	for (auto &shred : layout.shreds) {
 		child_list_t<Value> lane;
-		lane.emplace_back("path", Value(JsonoLaneLogicalPath(shred.first)));
+		lane.emplace_back("path", Value(JsonoLaneLogicalPath(shred.first.GetIdentifierName())));
 		// The lane type is reported logically too: an object-array lane's element subfields are
 		// encoded one-step paths in the stored type, and printing those would both hide the JSON
 		// keys and break pasting the answer back into a shredding spec.
@@ -139,7 +144,7 @@ unique_ptr<FunctionData> JsonoLayoutLanesBind(ClientContext &context, ScalarFunc
 
 void JsonoLayoutLanesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)args;
-	auto &info = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoLayoutLanesBindData>();
+	auto &info = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<JsonoLayoutLanesBindData>();
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	result.SetValue(0, info.lanes);
 }
@@ -290,7 +295,7 @@ bool ShredSubfieldNamesAreCanonical(const LogicalType &type) {
 	}
 	for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(type))) {
 		vector<PathStep> steps;
-		if (!JsonoTryDecodeLaneName(sub.first, steps) || steps.size() != 1) {
+		if (!JsonoTryDecodeLaneName(sub.first.GetIdentifierName(), steps) || steps.size() != 1) {
 			return false;
 		}
 	}
@@ -353,7 +358,8 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		return RejectNotJsono(reason, "the '%s' field is %s, not a named STRUCT", JSONO_LAYOUT, layout_type.ToString());
 	}
 	auto &fields = StructType::GetChildTypes(layout_type);
-	if (fields.empty() || !TryReadRevisionedName(fields[0].first, JSONO_BODY_STEM, out.body_revision) ||
+	if (fields.empty() ||
+	    !TryReadRevisionedName(fields[0].first.GetIdentifierName(), JSONO_BODY_STEM, out.body_revision) ||
 	    !IsBlobStruct(fields[0].second)) {
 		return RejectNotJsono(reason,
 		                      "field 0 of '%s' is not the residual anchor: it must be named '%s' (optionally "
@@ -371,12 +377,12 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 	idx_t shreds_stems = 0;
 	for (auto &field : fields) {
 		idx_t revision;
-		if (TryReadRevisionedName(field.first, JSONO_BODY_STEM, revision)) {
+		if (TryReadRevisionedName(field.first.GetIdentifierName(), JSONO_BODY_STEM, revision)) {
 			body_stems++;
 			if (revision != JSONO_BODY_REVISION) {
 				out.body_revision = revision;
 			}
-		} else if (TryReadRevisionedName(field.first, JSONO_SHREDS_STEM, revision)) {
+		} else if (TryReadRevisionedName(field.first.GetIdentifierName(), JSONO_SHREDS_STEM, revision)) {
 			shreds_stems++;
 			if (out.shreds_revision == DConstants::INVALID_INDEX || revision != JSONO_SHREDS_REVISION) {
 				out.shreds_revision = revision;
@@ -452,7 +458,7 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 			continue;
 		}
 		idx_t column;
-		if (TryParseSpillColumnName(shred_fields[i].first, column)) {
+		if (TryParseSpillColumnName(shred_fields[i].first.GetIdentifierName(), column)) {
 			spill_columns++;
 		}
 	}
@@ -475,7 +481,7 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 			continue;
 		}
 		idx_t column;
-		if (TryParseSpillColumnName(shred_fields[i].first, column)) {
+		if (TryParseSpillColumnName(shred_fields[i].first.GetIdentifierName(), column)) {
 			if (column >= spill_columns || spill_seen[column]) {
 				return RejectNotJsono(reason, "spill column '%s' breaks the dense 0..%llu numbering every writer emits",
 				                      shred_fields[i].first, (unsigned long long)(spill_columns - 1));
@@ -492,7 +498,7 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		// hand-built value rather than a JSONO one. Canonicity subsumes the old object-key-path check
 		// (a decode yields nothing but a non-empty chain of keys) and the old reserved-prefix check
 		// (the alphabet `0-9a-v` cannot spell `$jsono$…`).
-		if (!JsonoLaneNameIsCanonical(shred_fields[i].first)) {
+		if (!JsonoLaneNameIsCanonical(shred_fields[i].first.GetIdentifierName())) {
 			out.lane_name_malformed = true;
 			return RejectNotJsono(reason,
 			                      "field '%s' is not a shred lane: a lane is named by the base32hex encoding of "
@@ -549,7 +555,7 @@ JsonoLayoutMatch MatchJsonoLayoutType(const LogicalType &type, JsonoLayoutType &
 		                      "layout field)",
 		                      (unsigned long long)children.size(), JSONO_LAYOUT);
 	}
-	return MatchJsonoLayoutField(children[0].first, children[0].second, out, reason);
+	return MatchJsonoLayoutField(children[0].first.GetIdentifierName(), children[0].second, out, reason);
 }
 
 LogicalType JsonoLayoutDiagnoseResultType() {
@@ -684,7 +690,7 @@ LogicalType JsonoResolveJsonoArgument(ClientContext &context, const Expression &
 	if (arg.HasParameter()) {
 		throw ParameterNotResolvedException();
 	}
-	auto &type = arg.return_type;
+	auto &type = arg.GetReturnType();
 	JsonoRejectForeignLayout(type, function_name);
 	JsonoRequireExtensionOptimizerForShredded(context, type, function_name);
 	if (IsShreddedJsonoType(type)) {

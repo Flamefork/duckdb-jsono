@@ -15,6 +15,11 @@
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/map_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/function.hpp"
@@ -224,9 +229,9 @@ struct JsonoStructLocalState : public FunctionLocalState {
 		auto state = make_uniq<JsonoStructLocalState>();
 		if (parameters.cast_data) {
 			auto &cast_data = parameters.cast_data->Cast<JsonoStructCastData>();
-			if (cast_data.source_cast && cast_data.source_cast->init_local_state) {
-				CastLocalStateParameters child_parameters(parameters, cast_data.source_cast->cast_data);
-				state->source_cast_state = cast_data.source_cast->init_local_state(child_parameters);
+			if (cast_data.source_cast && cast_data.source_cast->HasInitLocalState()) {
+				CastLocalStateParameters child_parameters(parameters, cast_data.source_cast->GetCastData());
+				state->source_cast_state = cast_data.source_cast->InitLocalState(child_parameters);
 			}
 		}
 		return std::move(state);
@@ -237,9 +242,9 @@ struct JsonoStructLocalState : public FunctionLocalState {
 		(void)expr;
 		auto result = make_uniq<JsonoStructLocalState>();
 		auto &patch_data = bind_data->Cast<JsonoShredPatchBindData>();
-		if (patch_data.patch_cast && patch_data.patch_cast->init_local_state) {
-			CastLocalStateParameters parameters(state.GetContext(), patch_data.patch_cast->cast_data);
-			result->source_cast_state = patch_data.patch_cast->init_local_state(parameters);
+		if (patch_data.patch_cast && patch_data.patch_cast->HasInitLocalState()) {
+			CastLocalStateParameters parameters(state.GetContext(), patch_data.patch_cast->GetCastData());
+			result->source_cast_state = patch_data.patch_cast->InitLocalState(parameters);
 		}
 		return std::move(result);
 	}
@@ -396,7 +401,7 @@ JsonoStructPlan BuildStructConstructorPlan(const LogicalType &source_type, const
 				plan.one_list_flat_scalar_object = false;
 			}
 			bound_children.emplace_back(children[i].first, child_plan.bound_type);
-			plan.field_names.push_back(children[i].first);
+			plan.field_names.push_back(children[i].first.GetIdentifierName());
 			plan.field_perm.push_back(uint32_t(i));
 			plan.children.push_back(std::move(child_plan));
 		}
@@ -529,7 +534,7 @@ void InitStructConstructorVectorData(Vector &input, idx_t count, const JsonoStru
 		data.children.reserve(plan.children.size());
 		for (idx_t i = 0; i < plan.children.size(); i++) {
 			data.children.emplace_back();
-			InitStructConstructorVectorData(*struct_children[i], count, plan.children[i], data.children.back());
+			InitStructConstructorVectorData(struct_children[i], count, plan.children[i], data.children.back());
 		}
 		break;
 	}
@@ -1305,16 +1310,18 @@ void ReferenceShredPatch(Vector &patch, Vector &input, const JsonoShredPatchNode
 	for (idx_t i = 0; i < node.children.size(); i++) {
 		auto &child = node.children[i].second;
 		if (child.children.empty()) {
-			patch_children[i]->Reference(JsonoShredVector(input, child.shred));
+			patch_children[i].Reference(JsonoShredVector(input, child.shred));
 		} else {
-			ReferenceShredPatch(*patch_children[i], input, child);
+			ReferenceShredPatch(patch_children[i], input, child);
 		}
 	}
 }
 
-unique_ptr<FunctionData> JsonoShredPatchBind(ClientContext &context, ScalarFunction &bound_function,
-                                             vector<unique_ptr<Expression>> &arguments) {
-	auto input_type = arguments[0]->return_type;
+unique_ptr<FunctionData> JsonoShredPatchBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	auto input_type = arguments[0]->GetReturnType();
 	JsonoLayoutType layout;
 	if (!TryParseJsonoLayoutType(input_type, layout) || layout.shreds.empty()) {
 		throw InternalException("__jsono_shred_patch requires a shredded JSONO input");
@@ -1324,7 +1331,7 @@ unique_ptr<FunctionData> JsonoShredPatchBind(ClientContext &context, ScalarFunct
 		if (IsShredListType(layout.shreds[i].second)) {
 			throw InternalException("__jsono_shred_patch does not accept list shreds");
 		}
-		auto steps = ShredNamePath(layout.shreds[i].first, "__jsono_shred_patch");
+		auto steps = ShredNamePath(layout.shreds[i].first.GetIdentifierName(), "__jsono_shred_patch");
 		auto *node = &root;
 		for (auto &step : steps) {
 			if (step.kind != PathStepKind::Key) {
@@ -1350,14 +1357,14 @@ unique_ptr<FunctionData> JsonoShredPatchBind(ClientContext &context, ScalarFunct
 		patch_cast = make_uniq<BoundCastInfo>(
 		    CastFunctionSet::Get(context).GetCastFunction(patch_type, plan.bound_type, cast_input));
 	}
-	bound_function.arguments[0] = input_type;
+	bound_function.GetArguments()[0] = input_type;
 	return make_uniq<JsonoShredPatchBindData>(std::move(input_type), std::move(patch_type), std::move(root),
 	                                          std::move(plan), std::move(patch_cast));
 }
 
 void JsonoShredPatchExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoStructLocalState>();
-	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoShredPatchBindData>();
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<JsonoShredPatchBindData>();
 	auto count = args.size();
 	Vector patch(bind_data.patch_type, count);
 	ReferenceShredPatch(patch, args.data[0], bind_data.root);
@@ -1365,9 +1372,9 @@ void JsonoShredPatchExecute(DataChunk &args, ExpressionState &state, Vector &res
 	unique_ptr<Vector> casted;
 	if (bind_data.patch_cast) {
 		casted = make_uniq<Vector>(bind_data.plan.bound_type, count);
-		CastParameters parameters(bind_data.patch_cast->cast_data.get(), false, nullptr,
+		CastParameters parameters(bind_data.patch_cast->GetCastData().get(), false, nullptr,
 		                          lstate.source_cast_state.get());
-		if (!bind_data.patch_cast->function(patch, *casted, count, parameters)) {
+		if (!bind_data.patch_cast->Cast(patch, *casted, count, parameters)) {
 			throw InternalException("__jsono_shred_patch cast failed");
 		}
 		constructor_input = casted.get();
@@ -1430,7 +1437,8 @@ bool TryBuildAutoShredLaneType(const JsonoStructPlan &plan, const LogicalType &s
 			if (!TryBuildAutoShredLaneType(plan.children[i], source_children[i].second, child_lane)) {
 				return false;
 			}
-			lane_children.emplace_back(JsonoEncodeLaneSubfieldName(source_children[i].first), std::move(child_lane));
+			lane_children.emplace_back(JsonoEncodeLaneSubfieldName(source_children[i].first.GetIdentifierName()),
+			                           std::move(child_lane));
 		}
 		lane_type = LogicalType::STRUCT(std::move(lane_children));
 		return true;
@@ -1479,7 +1487,7 @@ void CollectAutoShreds(const LogicalType &struct_type, const JsonoStructPlan &st
 			continue;
 		}
 		fields.push_back(field);
-		path.push_back(PathStep {PathStepKind::Key, child.first, 0});
+		path.push_back(PathStep {PathStepKind::Key, child.first.GetIdentifierName(), 0});
 		LogicalType shred_type;
 		// A scalar leaf, or a regular array shred — fixed-shape objects (LIST<STRUCT<scalars>>) lifting
 		// their element subfields, or scalars (LIST<UBIGINT>, LIST<VARCHAR>, …) lifting each whole
@@ -1516,10 +1524,12 @@ void ClearStructConstructorKeyCacheIndexes(JsonoStructPlan &plan) {
 	}
 }
 
-unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction &bound_function,
-                                         vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoStructBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	(void)context;
-	auto &input_type = arguments[0]->return_type;
+	auto &input_type = arguments[0]->GetReturnType();
 	// A foreign-layout value is a JSONO value we cannot read, not an ordinary struct to wrap into a
 	// document — refuse it instead of building a document out of its blob columns. Same for a
 	// misnamed-lane value of the current revision: it would fall through to
@@ -1535,7 +1545,7 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 	// would flip shred eligibility on re-bind, producing a different shred manifest than the serialized
 	// return type and a fatal STRUCT cast. The promotion the plan's strategies need is applied inside
 	// execution instead (JsonoStructExecute), mirroring the cast entry point.
-	bound_function.arguments[0] = input_type;
+	bound_function.GetArguments()[0] = input_type;
 	auto bind_data = make_uniq<JsonoStructBindData>(std::move(plan));
 	vector<AutoShredCandidate> auto_shreds;
 	// Shredding lifts named top-level object fields, which only a struct root has: a MAP root's keys
@@ -1559,7 +1569,7 @@ unique_ptr<FunctionData> JsonoStructBind(ClientContext &context, ScalarFunction 
 			bind_data->shred_fields.push_back(std::move(shred.fields));
 			lanes.push_back(JsonoLaneSpec {std::move(shred.path), shred.type});
 		}
-		bound_function.return_type = JsonoShreddedStructType(lanes);
+		bound_function.SetReturnType(JsonoShreddedStructType(lanes));
 		bind_data->write = JsonoBuildShredWriteSet(bind_data->shreds);
 		JsonoAppendFullShredManifest(bind_data->hot_manifest, bind_data->write.Model());
 
@@ -1732,7 +1742,7 @@ bool EmitListShredResidual(const JsonoStructVectorData &data, idx_t row, DomJson
 Vector &StructVectorAtPath(Vector &root, const vector<idx_t> &fields) {
 	auto input = &root;
 	for (auto field : fields) {
-		input = StructVector::GetEntries(*input)[field].get();
+		input = &StructVector::GetEntries(*input)[field];
 	}
 	return *input;
 }
@@ -1901,35 +1911,35 @@ void ExecuteStructConstructorNestedShredded(Vector &raw_input, Vector &casted_in
 			stripped_lanes.Mark(f);
 			if (source.raw_uint) {
 				auto idx = source.raw_fmt.sel->get_index(row);
-				FlatVector::GetData<uint64_t>(*shred_out[f])[row] = source.uint_data[idx];
+				FlatVector::GetDataMutable<uint64_t>(*shred_out[f])[row] = source.uint_data[idx];
 				continue;
 			}
 			auto idx = RowIndex(source.data->fmt, row);
 			switch (source.data->plan->strategy) {
 			case StructValueStrategy::String:
 			case StructValueStrategy::StringDefaultCast:
-				FlatVector::GetData<string_t>(*shred_out[f])[row] = source.data->string_data[idx];
+				FlatVector::GetDataMutable<string_t>(*shred_out[f])[row] = source.data->string_data[idx];
 				break;
 			case StructValueStrategy::Int:
-				FlatVector::GetData<int64_t>(*shred_out[f])[row] = source.data->int_data[idx];
+				FlatVector::GetDataMutable<int64_t>(*shred_out[f])[row] = source.data->int_data[idx];
 				break;
 			case StructValueStrategy::Double: {
 				auto value = source.data->double_data[idx];
 				if (!std::isfinite(value)) {
 					throw InvalidInputException("jsono: cannot store non-finite double value (NaN/Infinity)");
 				}
-				FlatVector::GetData<double>(*shred_out[f])[row] = value;
+				FlatVector::GetDataMutable<double>(*shred_out[f])[row] = value;
 				break;
 			}
 			case StructValueStrategy::Bool:
-				FlatVector::GetData<bool>(*shred_out[f])[row] = source.data->bool_data[idx];
+				FlatVector::GetDataMutable<bool>(*shred_out[f])[row] = source.data->bool_data[idx];
 				break;
 			default:
 				throw InternalException("jsono constructor: unexpected nested shred field strategy");
 			}
 		}
 
-		FlatVector::Validity(result).SetValid(row);
+		FlatVector::ValidityMutable(result).SetValid(row);
 		builder.Reset();
 		EmitNestedStructShredResidual(input_data, row, bind_data.shred_plan, sources, stripped, stripped_lanes, lstate,
 		                              builder);
@@ -1969,7 +1979,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		auto &src = sources[f];
 		shred_out[f] = &JsonoShredVector(result, f);
 		shred_out[f]->SetVectorType(VectorType::FLAT_VECTOR);
-		auto &child = *casted_children[field_idx];
+		auto &child = casted_children[field_idx];
 		if (IsShredListType(shreds[f].second)) {
 			auto &lane_source = PrepareListShredLaneSource(child, shreds[f].second, count, src.rendered);
 			has_list_shreds = true;
@@ -1979,7 +1989,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			continue;
 		}
 		if (shreds[f].second.id() == LogicalTypeId::UBIGINT) {
-			auto &raw_child = *StructVector::GetEntries(raw_input)[field_idx];
+			auto &raw_child = StructVector::GetEntries(raw_input)[field_idx];
 			raw_child.ToUnifiedFormat(count, src.fmt);
 			src.uint_data = UnifiedVectorFormat::GetData<uint64_t>(src.fmt);
 			src.raw_uint = true;
@@ -2023,7 +2033,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 		casted_input.ToUnifiedFormat(count, residual_data.fmt);
 		residual_data.children.resize(bind_data.residual_fields.size());
 		for (idx_t j = 0; j < bind_data.residual_fields.size(); j++) {
-			InitStructConstructorVectorData(*casted_children[bind_data.residual_fields[j]], count,
+			InitStructConstructorVectorData(casted_children[bind_data.residual_fields[j]], count,
 			                                bind_data.residual_plan.children[j], residual_data.children[j]);
 		}
 	}
@@ -2087,16 +2097,16 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 			stripped_count++;
 			stripped_lanes.Mark(f);
 			if (src.raw_uint) {
-				FlatVector::GetData<uint64_t>(*shred_out[f])[row] = src.uint_data[idx];
+				FlatVector::GetDataMutable<uint64_t>(*shred_out[f])[row] = src.uint_data[idx];
 				continue;
 			}
 			switch (src.strategy) {
 			case StructValueStrategy::String:
 			case StructValueStrategy::StringDefaultCast:
-				FlatVector::GetData<string_t>(*shred_out[f])[row] = src.string_data[idx];
+				FlatVector::GetDataMutable<string_t>(*shred_out[f])[row] = src.string_data[idx];
 				break;
 			case StructValueStrategy::Int:
-				FlatVector::GetData<int64_t>(*shred_out[f])[row] = src.int_data[idx];
+				FlatVector::GetDataMutable<int64_t>(*shred_out[f])[row] = src.int_data[idx];
 				break;
 			case StructValueStrategy::Double: {
 				auto value = src.double_data[idx];
@@ -2105,17 +2115,17 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 				if (!std::isfinite(value)) {
 					throw InvalidInputException("jsono: cannot store non-finite double value (NaN/Infinity)");
 				}
-				FlatVector::GetData<double>(*shred_out[f])[row] = value;
+				FlatVector::GetDataMutable<double>(*shred_out[f])[row] = value;
 				break;
 			}
 			case StructValueStrategy::Bool:
-				FlatVector::GetData<bool>(*shred_out[f])[row] = src.bool_data[idx];
+				FlatVector::GetDataMutable<bool>(*shred_out[f])[row] = src.bool_data[idx];
 				break;
 			default:
 				throw InternalException("jsono constructor: unexpected shred field strategy");
 			}
 		}
-		FlatVector::Validity(result).SetValid(row);
+		FlatVector::ValidityMutable(result).SetValid(row);
 
 		if (has_list_shreds) {
 			builder.Reset();
@@ -2218,7 +2228,7 @@ void ExecuteStructConstructorShredded(Vector &raw_input, Vector &casted_input, i
 void JsonoStructExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoStructLocalState>();
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = func_expr.bind_info->Cast<JsonoStructBindData>();
+	auto &bind_data = func_expr.BindInfo()->Cast<JsonoStructBindData>();
 	auto count = args.size();
 
 	// The argument keeps the raw input struct type (see JsonoStructBindShared); promote it to the
@@ -2258,8 +2268,8 @@ bool JsonoStructCastToJsono(Vector &source, Vector &result, idx_t count, CastPar
 	auto &lstate = parameters.local_state->Cast<JsonoStructLocalState>();
 	if (cast_data.source_cast) {
 		Vector casted(cast_data.plan.bound_type, count);
-		CastParameters child_parameters(parameters, cast_data.source_cast->cast_data, lstate.source_cast_state);
-		if (!cast_data.source_cast->function(source, casted, count, child_parameters)) {
+		CastParameters child_parameters(parameters, cast_data.source_cast->GetCastData(), lstate.source_cast_state);
+		if (!cast_data.source_cast->Cast(source, casted, count, child_parameters)) {
 			return false;
 		}
 		ExecuteStructConstructor(casted, count, result, cast_data.plan, lstate);
@@ -2338,9 +2348,9 @@ BoundCastInfo JsonoStructCastBind(BindCastInput &input, const LogicalType &sourc
 
 ScalarFunction JsonoShreddedPatchFunction(const LogicalType &input_type) {
 	ScalarFunction fun("__jsono_shred_patch", {input_type}, JsonoType(), JsonoShredPatchExecute, JsonoShredPatchBind,
-	                   nullptr, nullptr, JsonoStructLocalState::InitShredPatch);
+	                   nullptr, JsonoStructLocalState::InitShredPatch);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetFallible();
 	return fun;
 }
 
@@ -2349,9 +2359,9 @@ void RegisterJsonoStructConstructor(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet set("jsono");
 		ScalarFunction struct_ctor({LogicalTypeId::STRUCT}, jsono_type, JsonoStructExecute, JsonoStructBind, nullptr,
-		                           nullptr, JsonoStructLocalState::Init);
+		                           JsonoStructLocalState::Init);
 		struct_ctor.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-		struct_ctor.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+		struct_ctor.SetFallible();
 		set.AddFunction(struct_ctor);
 
 		// A document root need not be an object: a MAP, LIST or ARRAY root builds a plain value.
@@ -2359,10 +2369,10 @@ void RegisterJsonoStructConstructor(ExtensionLoader &loader) {
 		for (auto &root_type :
 		     {LogicalType::MAP(LogicalType::ANY, LogicalType::ANY), LogicalType::LIST(LogicalType::ANY),
 		      LogicalType::ARRAY(LogicalType::ANY, optional_idx())}) {
-			ScalarFunction root_ctor({root_type}, jsono_type, JsonoStructExecute, JsonoStructBind, nullptr, nullptr,
+			ScalarFunction root_ctor({root_type}, jsono_type, JsonoStructExecute, JsonoStructBind, nullptr,
 			                         JsonoStructLocalState::Init);
 			root_ctor.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-			root_ctor.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+			root_ctor.SetFallible();
 			set.AddFunction(root_ctor);
 		}
 

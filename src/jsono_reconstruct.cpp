@@ -15,6 +15,10 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -277,7 +281,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		if (shred_filter && std::find(shred_filter->begin(), shred_filter->end(), i) == shred_filter->end()) {
 			continue;
 		}
-		auto &name = layout.shreds[i].first;
+		auto &name = layout.shreds[i].first.GetIdentifierName();
 		vector<PathStep> steps = ShredNamePath(name, "jsono reconstruct");
 		if (IsShredArrayType(layout.shreds[i].second)) {
 			ArrayReconShred ars;
@@ -287,8 +291,8 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 			auto &element = ListType::GetChildType(layout.shreds[i].second);
 			for (auto &sub : StructType::GetChildTypes(element)) {
 				// The element field name is encoded like a lane name; the overlay emits the JSON key.
-				ars.subfields.push_back(
-				    ReconArraySubfield {JsonoLaneSubfieldKey(sub.first, "jsono reconstruct"), sub.second});
+				ars.subfields.push_back(ReconArraySubfield {
+				    JsonoLaneSubfieldKey(sub.first.GetIdentifierName(), "jsono reconstruct"), sub.second});
 			}
 			array_shreds.push_back(std::move(ars));
 			continue;
@@ -358,7 +362,7 @@ void ReconstructShreddedToPlainImpl(Vector &input, idx_t count, Vector &result,
 		auto &subs = StructVector::GetEntries(struct_vec);
 		ars.sub_fmt.resize(subs.size());
 		for (idx_t j = 0; j < subs.size(); j++) {
-			subs[j]->ToUnifiedFormat(child_size, ars.sub_fmt[j]);
+			subs[j].ToUnifiedFormat(child_size, ars.sub_fmt[j]);
 		}
 		ars.sorted_subfields.resize(ars.subfields.size());
 		for (idx_t j = 0; j < ars.subfields.size(); j++) {
@@ -681,7 +685,7 @@ void RenderShreddedListsToJsonImpl(Vector &input, idx_t count, Vector &result) {
 			scalar_shreds.push_back(f);
 			continue;
 		}
-		auto steps = ShredNamePath(layout.shreds[f].first, "__jsono_shredded_lists_to_json");
+		auto steps = ShredNamePath(layout.shreds[f].first.GetIdentifierName(), "__jsono_shredded_lists_to_json");
 		if (steps.size() != 1) {
 			throw InternalException("__jsono_shredded_lists_to_json requires top-level list shred paths");
 		}
@@ -691,7 +695,8 @@ void RenderShreddedListsToJsonImpl(Vector &input, idx_t count, Vector &result) {
 			for (auto &field : StructType::GetChildTypes(ListType::GetChildType(shred_type))) {
 				// Decoded: these keys are both emitted as JSON and sort-merged against the residual's
 				// byte-sorted document keys, so they must be the logical names.
-				shred.subfield_keys.push_back(JsonoLaneSubfieldKey(field.first, "__jsono_shredded_lists_to_json"));
+				shred.subfield_keys.push_back(
+				    JsonoLaneSubfieldKey(field.first.GetIdentifierName(), "__jsono_shredded_lists_to_json"));
 			}
 			shred.sorted_subfields.resize(shred.subfield_keys.size());
 			for (idx_t field = 0; field < shred.sorted_subfields.size(); field++) {
@@ -720,7 +725,7 @@ void RenderShreddedListsToJsonImpl(Vector &input, idx_t count, Vector &result) {
 	JsonoRowReader reader;
 	reader.Init(*source, count);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<string_t>(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 	std::string out;
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
@@ -797,14 +802,14 @@ ScalarFunction JsonoCheckedResidualFunction() {
 	ScalarFunction fun("__jsono_internal_checked_residual", {JsonoType(), LogicalType::LIST(JsonoShredSignatureType())},
 	                   JsonoType(), JsonoCheckedResidualExecute);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetFallible();
 	return fun;
 }
 
 ScalarFunction JsonoStripManifestFunction() {
 	ScalarFunction fun("__jsono_internal_strip_manifest", {LogicalType::BLOB}, LogicalType::BLOB,
 	                   JsonoStripManifestExecute);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetFallible();
 	return fun;
 }
 

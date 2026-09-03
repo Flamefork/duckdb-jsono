@@ -20,6 +20,10 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -366,7 +370,7 @@ bool FillShredFieldFromType(const LogicalType &type, ShredField &field, NameSubf
 		auto &element = ListType::GetChildType(type);
 		for (auto &sub : StructType::GetChildTypes(element)) {
 			ShredArraySubfield subfield;
-			name_subfield(sub.first, subfield);
+			name_subfield(sub.first.GetIdentifierName(), subfield);
 			subfield.primitive = JsonoScalarPrimitiveFromType(sub.second, "jsono shred bind");
 			field.subfields.push_back(std::move(subfield));
 		}
@@ -516,8 +520,8 @@ unique_ptr<ShredBindData> BuildShredBindDataFromLayout(const LogicalType &target
 	vector<ShredField> fields;
 	for (auto &shred : layout.shreds) {
 		ShredField field;
-		field.lane_name = shred.first;
-		field.steps = ShredNamePath(shred.first, "jsono reshred");
+		field.lane_name = shred.first.GetIdentifierName();
+		field.steps = ShredNamePath(shred.first.GetIdentifierName(), "jsono reshred");
 		if (!FillShredFieldFromLayoutType(shred.second, field)) {
 			throw BinderException("__jsono_internal_reshred: lane '%s' carries an unsupported shred type", shred.first);
 		}
@@ -551,9 +555,9 @@ unique_ptr<ShredBindData> ParseShredSpec(const Value &spec, ClientContext &conte
 // Plan the value argument against the settled target lanes, and redeclare it so the executor knows
 // which shape it will receive. Shared by both binds: how the lanes were declared says nothing about
 // what the input is.
-void BindShredSourcePlan(ScalarFunction &bound_function, Expression &value, ShredBindData &bind_data,
+void BindShredSourcePlan(BoundScalarFunction &bound_function, Expression &value, ShredBindData &bind_data,
                          const char *context_name) {
-	auto &arg_type = value.return_type;
+	auto &arg_type = value.GetReturnType();
 	if (arg_type.id() != LogicalTypeId::STRUCT) {
 		return;
 	}
@@ -567,7 +571,7 @@ void BindShredSourcePlan(ScalarFunction &bound_function, Expression &value, Shre
 	// scalar target paths extract from that residual. Array shreds can ride this path only when
 	// they survive unchanged: their residual skeleton and list lane are copied as a pair.
 	if (src_layout.kind != JsonoLayoutKind::Shredded) {
-		bound_function.arguments[0] = JsonoType();
+		bound_function.GetArguments()[0] = JsonoType();
 		return;
 	}
 	bind_data.keep_src.assign(bind_data.write.Fields().size(), DConstants::INVALID_INDEX);
@@ -598,7 +602,7 @@ void BindShredSourcePlan(ScalarFunction &bound_function, Expression &value, Shre
 	}
 	if (!can_single_pass) {
 		bind_data.keep_src.clear();
-		bound_function.arguments[0] = JsonoType();
+		bound_function.GetArguments()[0] = JsonoType();
 		return;
 	}
 	for (idx_t k = 0; k < src_layout.shreds.size(); k++) {
@@ -607,7 +611,7 @@ void BindShredSourcePlan(ScalarFunction &bound_function, Expression &value, Shre
 		}
 	}
 	bind_data.reshred_active = true;
-	bound_function.arguments[0] = arg_type;
+	bound_function.GetArguments()[0] = arg_type;
 }
 
 // __jsono_internal_reshred(value, target): reshred `value` to the lane set of `target`'s type. The
@@ -616,20 +620,24 @@ void BindShredSourcePlan(ScalarFunction &bound_function, Expression &value, Shre
 // LogicalType structurally through plan (de)serialization, and the re-bind decodes the same lanes it
 // was built from. Rendering the lanes to spec text instead would lose exactly what the lane-name
 // codec protects: DuckDB's type parser folds an element struct's `id` and `ID` into one subfield.
-unique_ptr<FunctionData> JsonoReshredBind(ClientContext &context, ScalarFunction &bound_function,
-                                          vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoReshredBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	(void)context;
 	if (arguments[0]->HasParameter() || arguments[1]->HasParameter()) {
 		throw ParameterNotResolvedException();
 	}
-	auto bind_data = BuildShredBindDataFromLayout(arguments[1]->return_type);
-	bound_function.return_type = bind_data->return_type;
+	auto bind_data = BuildShredBindDataFromLayout(arguments[1]->GetReturnType());
+	bound_function.SetReturnType(bind_data->return_type);
 	BindShredSourcePlan(bound_function, *arguments[0], *bind_data, "__jsono_internal_reshred");
 	return std::move(bind_data);
 }
 
-unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &bound_function,
-                                        vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoShredBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	if (arguments[1]->GetAlias() != "shredding") {
 		throw BinderException("jsono(): unknown argument '%s' (pass shredding := '{\"<path>\": \"<type>\", ...}')",
 		                      arguments[1]->GetAlias());
@@ -645,7 +653,7 @@ unique_ptr<FunctionData> JsonoShredBind(ClientContext &context, ScalarFunction &
 	}
 	auto spec_value = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
 	auto bind_data = ParseShredSpec(spec_value, context);
-	bound_function.return_type = bind_data->return_type;
+	bound_function.SetReturnType(bind_data->return_type);
 	BindShredSourcePlan(bound_function, *arguments[0], *bind_data, "jsono(value, shredding := ...)");
 	return std::move(bind_data);
 }
@@ -748,7 +756,7 @@ bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Jsono
 	    [&]() {
 		    struct_vec.SetVectorType(VectorType::FLAT_VECTOR);
 		    for (auto &sub : subfield_vecs) {
-			    sub->SetVectorType(VectorType::FLAT_VECTOR);
+			    sub.SetVectorType(VectorType::FLAT_VECTOR);
 		    }
 	    },
 	    [&](JsonoCursor elem, idx_t child) -> bool {
@@ -756,11 +764,11 @@ bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Jsono
 			    // Non-object element (null/scalar/array): no subfields, a NULL struct row.
 			    FlatVector::SetNull(struct_vec, child, true);
 			    for (auto &sub : subfield_vecs) {
-				    FlatVector::SetNull(*sub, child, true);
+				    FlatVector::SetNull(sub, child, true);
 			    }
 			    return false;
 		    }
-		    FlatVector::Validity(struct_vec).SetValid(child);
+		    FlatVector::ValidityMutable(struct_vec).SetValid(child);
 		    bool stripped = false;
 		    for (idx_t j = 0; j < field.subfields.size(); j++) {
 			    auto &sub = field.subfields[j];
@@ -772,7 +780,7 @@ bool WriteArrayShred(const ShredField &field, const JsonoView &view, const Jsono
 			    if (LocatePathStep(nullptr, 0, view, subfield.steps[0], probe)) {
 				    subloc = JsonoPathLocation {probe, true};
 			    }
-			    stripped |= WriteShred(subfield, view, subloc, *subfield_vecs[j], child, scratch);
+			    stripped |= WriteShred(subfield, view, subloc, subfield_vecs[j], child, scratch);
 		    }
 		    return stripped;
 	    });
@@ -916,7 +924,7 @@ void ApplyShredFields(Vector &input_vec, idx_t count, const ShredWriteSet &write
 			continue;
 		}
 
-		FlatVector::Validity(result).SetValid(row);
+		FlatVector::ValidityMutable(result).SetValid(row);
 		stamp.ResetRow();
 		lstate.strip_paths.clear();
 		stripped_lanes.Clear();
@@ -1314,7 +1322,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 	vector<string> src_names;
 	src_names.reserve(src_layout.shreds.size());
 	for (auto &shred : src_layout.shreds) {
-		src_names.push_back(shred.first);
+		src_names.push_back(shred.first.GetIdentifierName());
 	}
 	// Spill-bit numbering of the INPUT type: ranked over its encoded lane names.
 	auto in_ranks = JsonoRanksInByteOrder(src_names);
@@ -1322,13 +1330,13 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 	Vector &in_set_vec = JsonoShredSetVector(input_vec);
 	bool in_mask_readable = in_set_vec.GetType().id() == LogicalTypeId::BIGINT;
 	vector<Vector *> in_spill_vecs;
-	vector<int64_t *> in_spill_data;
+	vector<const int64_t *> in_spill_data;
 	for (idx_t column = 0; column < src_layout.spill_columns; column++) {
 		auto &spill_vec = JsonoShredSpillVector(input_vec, column);
 		in_mask_readable = in_mask_readable && spill_vec.GetType().id() == LogicalTypeId::BIGINT;
 		in_spill_vecs.push_back(&spill_vec);
 	}
-	int64_t *in_set_data = nullptr;
+	const int64_t *in_set_data = nullptr;
 	if (in_mask_readable) {
 		in_set_data = FlatVector::GetData<int64_t>(in_set_vec);
 		for (auto *spill_vec : in_spill_vecs) {
@@ -1378,7 +1386,7 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 			old_manifest = &src_manifest;
 		}
 
-		FlatVector::Validity(result).SetValid(row);
+		FlatVector::ValidityMutable(result).SetValid(row);
 		bool row_identity = in_mask_readable && !FlatVector::IsNull(in_set_vec, row) &&
 		                    (in_set_data[row] == in_type_hash ||
 		                     in_set_data[row] == int64_t(uint64_t(in_type_hash) ^ JSONO_DIRTY_HASH_FLIP));
@@ -1489,9 +1497,10 @@ void ApplyReshredShredded(Vector &input_vec, idx_t count, const ShredBindData &b
 
 void JsonoShredExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<ShredBindData>();
+	auto &bind_data = expr.BindInfo()->Cast<ShredBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ShredLocalState>();
-	bool input_constant = args.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR || expr.children[0]->IsFoldable();
+	bool input_constant =
+	    args.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR || expr.GetChildren()[0]->IsFoldable();
 	if (bind_data.reshred_active) {
 		ApplyReshredShredded(args.data[0], args.size(), bind_data, result, lstate);
 	} else {
@@ -1510,10 +1519,11 @@ void JsonoShredExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 // itself as a diverted lane value; nothing is filled after the fact.
 void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<ShredBindData>();
+	auto &bind_data = expr.BindInfo()->Cast<ShredBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<ShredLocalState>();
 	auto count = args.size();
-	bool input_constant = args.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR || expr.children[0]->IsFoldable();
+	bool input_constant =
+	    args.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR || expr.GetChildren()[0]->IsFoldable();
 	if (!bind_data.one_pass_text) {
 		Vector plain(JsonoType(), count);
 		JsonoParseTextVector(args.data[0], count, plain);
@@ -1575,7 +1585,7 @@ void JsonoShredFromTextExecute(DataChunk &args, ExpressionState &state, Vector &
 		}
 		try {
 			jsono_dom::EmitDomRowDirect(yyjson_doc_get_root(doc), dom, writer, row, &ctx);
-			FlatVector::Validity(result).SetValid(row);
+			FlatVector::ValidityMutable(result).SetValid(row);
 			stamp.ResetRow();
 			for (idx_t f = 0; f < fields.size(); f++) {
 				auto &cap = ctx.captures[f];
@@ -1753,7 +1763,7 @@ JsonoShredWriteModel JsonoBuildShredWriteModel(const vector<std::pair<string, Lo
 		entry.push_back(char(jsono::SHRED_MANIFEST_TYPE_OBJECT_ARRAY));
 		vector<std::pair<string, uint8_t>> subfields;
 		for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(shreds[f].second))) {
-			subfields.emplace_back(JsonoLaneSubfieldKey(sub.first, "jsono shred manifest"),
+			subfields.emplace_back(JsonoLaneSubfieldKey(sub.first.GetIdentifierName(), "jsono shred manifest"),
 			                       ShredManifestCompactTypeCode(sub.second.ToString()));
 		}
 		std::sort(
@@ -1915,9 +1925,9 @@ void JsonoShredFromLayout(Vector &input, idx_t count, const ShredWriteSet &write
 // case-colliding element struct.)
 ScalarFunction JsonoShredFromJsonoFunction() {
 	ScalarFunction from_jsono("jsono", {LogicalTypeId::STRUCT, LogicalType::ANY}, LogicalType::ANY, JsonoShredExecute,
-	                          JsonoShredBind, nullptr, nullptr, ShredLocalState::Init);
+	                          JsonoShredBind, nullptr, ShredLocalState::Init);
 	from_jsono.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	from_jsono.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	from_jsono.SetFallible();
 	return from_jsono;
 }
 
@@ -1926,9 +1936,9 @@ ScalarFunction JsonoShredFromJsonoFunction() {
 // is the point: a type survives the trip, its rendering does not.
 ScalarFunction JsonoReshredFunction() {
 	ScalarFunction reshred("__jsono_internal_reshred", {LogicalTypeId::STRUCT, LogicalType::ANY}, LogicalType::ANY,
-	                       JsonoShredExecute, JsonoReshredBind, nullptr, nullptr, ShredLocalState::Init);
+	                       JsonoShredExecute, JsonoReshredBind, nullptr, ShredLocalState::Init);
 	reshred.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	reshred.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	reshred.SetFallible();
 	return reshred;
 }
 
@@ -1942,9 +1952,9 @@ void RegisterJsonoShred(ExtensionLoader &loader) {
 
 	// jsono(text, shredding := spec) — the primary entry point: parse + shred.
 	ScalarFunction from_text({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, JsonoShredFromTextExecute,
-	                         JsonoShredBind, nullptr, nullptr, ShredLocalState::Init);
+	                         JsonoShredBind, nullptr, ShredLocalState::Init);
 	from_text.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	from_text.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	from_text.SetFallible();
 	set.AddFunction(from_text);
 
 	// jsono(jsono, shredding := spec) — shred a value that is already plain jsono.

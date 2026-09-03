@@ -12,6 +12,10 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -88,8 +92,10 @@ struct JsonoEntriesBindData : public FunctionData {
 // through the same builders so a shredded value keys identically to a plain parse.
 void AppendKeySegment(std::string &path, nonstd::string_view key, JsonoEntriesKeyStyle style);
 
-unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction &bound_function,
-                                          vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoEntriesBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	auto style = JsonoEntriesKeyStyle::JsonPath;
 	auto array_style = JsonoEntriesArrayStyle::IndexedElements;
 	// key_style and array_style are named-only and order-independent: a call places them positionally in
@@ -134,14 +140,14 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 			}
 		}
 	}
-	auto &input_type = arguments[0]->return_type;
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_entries", false);
+	auto &input_type = arguments[0]->GetReturnType();
+	bound_function.GetArguments()[0] = JsonoResolveJsonoArgument(context, *arguments[0], "jsono_entries", false);
 	vector<EntriesShred> shreds;
 	if (IsShreddedJsonoType(input_type)) {
 		JsonoLayoutType layout;
 		TryParseJsonoLayoutType(input_type, layout);
 		for (idx_t i = 0; i < layout.shreds.size(); i++) {
-			auto &name = layout.shreds[i].first;
+			auto &name = layout.shreds[i].first.GetIdentifierName();
 			EntriesShred shred {i, layout.shreds[i].second, "", "", {}};
 			// Rebuild both key styles segment-by-segment through the walk's builders (via ShredNamePath),
 			// so a quotable object key (containing . [ ] ") keys exactly as a plain parse does — jsonpath
@@ -156,7 +162,7 @@ unique_ptr<FunctionData> JsonoEntriesBind(ClientContext &context, ScalarFunction
 			if (ClassifyShredKind(shred.type) == ShredKind::Array) {
 				for (auto &sub : StructType::GetChildTypes(ListType::GetChildType(shred.type))) {
 					// An element field name is encoded like a lane name; the entry key is the JSON key.
-					shred.subfield_keys.push_back(JsonoLaneSubfieldKey(sub.first, "jsono_entries"));
+					shred.subfield_keys.push_back(JsonoLaneSubfieldKey(sub.first.GetIdentifierName(), "jsono_entries"));
 				}
 			}
 			shreds.push_back(std::move(shred));
@@ -210,19 +216,19 @@ struct EntriesSink {
 
 	explicit EntriesSink(Vector &list_p) : list(list_p), next_child(ListVector::GetListSize(list_p)) {
 		auto &struct_entries = StructVector::GetEntries(ListVector::GetEntry(list_p));
-		key_vec = struct_entries[0].get();
-		value_vec = struct_entries[1].get();
+		key_vec = &struct_entries[0];
+		value_vec = &struct_entries[1];
 		capacity = ListVector::GetListCapacity(list_p);
-		key_data = FlatVector::GetData<string_t>(*key_vec);
-		value_data = FlatVector::GetData<string_t>(*value_vec);
+		key_data = FlatVector::GetDataMutable<string_t>(*key_vec);
+		value_data = FlatVector::GetDataMutable<string_t>(*value_vec);
 	}
 
 	void Append(nonstd::string_view key, const JsonoScalar &scalar) {
 		if (next_child >= capacity) {
 			EnsureListCapacity(list, next_child + 1);
 			capacity = ListVector::GetListCapacity(list);
-			key_data = FlatVector::GetData<string_t>(*key_vec);
-			value_data = FlatVector::GetData<string_t>(*value_vec);
+			key_data = FlatVector::GetDataMutable<string_t>(*key_vec);
+			value_data = FlatVector::GetDataMutable<string_t>(*value_vec);
 		}
 		auto child_row = next_child;
 		key_data[child_row] = StringVector::AddString(*key_vec, key.data(), key.size());
@@ -250,8 +256,8 @@ struct EntriesSink {
 		if (next_child >= capacity) {
 			EnsureListCapacity(list, next_child + 1);
 			capacity = ListVector::GetListCapacity(list);
-			key_data = FlatVector::GetData<string_t>(*key_vec);
-			value_data = FlatVector::GetData<string_t>(*value_vec);
+			key_data = FlatVector::GetDataMutable<string_t>(*key_vec);
+			value_data = FlatVector::GetDataMutable<string_t>(*value_vec);
 		}
 		auto child_row = next_child;
 		key_data[child_row] = StringVector::AddString(*key_vec, key.data(), key.size());
@@ -413,7 +419,7 @@ void JsonoEntriesExecuteWholeJson(DataChunk &args, const JsonoEntriesBindData &b
 
 void JsonoEntriesExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = func_expr.bind_info->Cast<JsonoEntriesBindData>();
+	auto &bind_data = func_expr.BindInfo()->Cast<JsonoEntriesBindData>();
 	if (bind_data.array_style == JsonoEntriesArrayStyle::WholeJson) {
 		JsonoEntriesExecuteWholeJson(args, bind_data, result);
 		return;
@@ -594,7 +600,7 @@ void RegisterJsonoEntries(ExtensionLoader &loader) {
 	     {vector<LogicalType> {LogicalType::ANY}, vector<LogicalType> {LogicalType::ANY, LogicalType::VARCHAR},
 	      vector<LogicalType> {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
 		ScalarFunction f(signature, entry_type, JsonoEntriesExecute, JsonoEntriesBind);
-		f.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+		f.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		set.AddFunction(f);
 	}
 	loader.RegisterFunction(set);

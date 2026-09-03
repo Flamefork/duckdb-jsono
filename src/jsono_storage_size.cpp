@@ -8,6 +8,10 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression.hpp"
@@ -77,18 +81,19 @@ StorageSizeResult InitStorageSizeResult(Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &children = StructVector::GetEntries(result);
 	for (auto &child : children) {
-		child->SetVectorType(VectorType::FLAT_VECTOR);
+		child.SetVectorType(VectorType::FLAT_VECTOR);
 	}
-	return StorageSizeResult {FlatVector::GetData<uint64_t>(*children[0]), FlatVector::GetData<uint64_t>(*children[1]),
-	                          FlatVector::GetData<uint64_t>(*children[2]), FlatVector::GetData<uint64_t>(*children[3]),
-	                          FlatVector::GetData<uint64_t>(*children[4]), FlatVector::GetData<uint64_t>(*children[5]),
-	                          FlatVector::GetData<uint64_t>(*children[6]), FlatVector::GetData<uint64_t>(*children[7])};
+	return StorageSizeResult {
+	    FlatVector::GetDataMutable<uint64_t>(children[0]), FlatVector::GetDataMutable<uint64_t>(children[1]),
+	    FlatVector::GetDataMutable<uint64_t>(children[2]), FlatVector::GetDataMutable<uint64_t>(children[3]),
+	    FlatVector::GetDataMutable<uint64_t>(children[4]), FlatVector::GetDataMutable<uint64_t>(children[5]),
+	    FlatVector::GetDataMutable<uint64_t>(children[6]), FlatVector::GetDataMutable<uint64_t>(children[7])};
 }
 
 void SetStorageSizeRowNull(Vector &result, idx_t row) {
 	FlatVector::SetNull(result, row, true);
 	for (auto &child : StructVector::GetEntries(result)) {
-		FlatVector::SetNull(*child, row, true);
+		FlatVector::SetNull(child, row, true);
 	}
 }
 
@@ -144,10 +149,12 @@ void JsonoStorageSizeExecute(DataChunk &args, ExpressionState &state, Vector &re
 // Accept ANY so a shredded value reaches bind; keep its shredded type (reconstruct_shredded=false)
 // so Execute measures the real on-disk footprint — residual blobs plus shred payload — rather than a
 // reconstructed plain blob.
-unique_ptr<FunctionData> JsonoStorageSizeBind(ClientContext &context, ScalarFunction &bound_function,
-                                              vector<unique_ptr<Expression>> &arguments) {
-	bound_function.arguments[0] =
-	    JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, /*reconstruct_shredded=*/false);
+unique_ptr<FunctionData> JsonoStorageSizeBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	bound_function.GetArguments()[0] = JsonoResolveJsonoArgument(
+	    context, *arguments[0], bound_function.GetName().GetIdentifierName(), /*reconstruct_shredded=*/false);
 	return nullptr;
 }
 
@@ -167,8 +174,8 @@ void JsonoShredManifestExecute(DataChunk &args, ExpressionState &state, Vector &
 	ListVector::SetListSize(result, 0);
 	auto &child = ListVector::GetEntry(result);
 	auto &child_entries = StructVector::GetEntries(child);
-	auto &path_vector = *child_entries[0];
-	auto &type_vector = *child_entries[1];
+	auto &path_vector = child_entries[0];
+	auto &type_vector = child_entries[1];
 
 	std::vector<ShredManifestEntry> entries;
 	JsonoView view;
@@ -192,8 +199,8 @@ void JsonoShredManifestExecute(DataChunk &args, ExpressionState &state, Vector &
 			WalkShredManifestBytes(tail.data(), tail.size(), sink);
 			length = entries.size();
 			EnsureListCapacity(result, start + length);
-			auto path_data = FlatVector::GetData<string_t>(path_vector);
-			auto type_data = FlatVector::GetData<string_t>(type_vector);
+			auto path_data = FlatVector::GetDataMutable<string_t>(path_vector);
+			auto type_data = FlatVector::GetDataMutable<string_t>(type_vector);
 			for (idx_t i = 0; i < length; i++) {
 				auto child_row = start + i;
 				path_data[child_row] =

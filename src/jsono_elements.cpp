@@ -10,6 +10,7 @@
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -26,19 +27,25 @@ using namespace jsono;
 // Bind for the 1-argument overload: accept a shredded value by redeclaring arg0 to plain JSONO (the
 // binder inserts the lossless reconstruct cast), so the executor reads whole logical values via the
 // validated read-path and never touches shred lanes. Reject a non-JSONO argument loudly.
-unique_ptr<FunctionData> JsonoArrayElementsArgOnlyBind(ClientContext &context, ScalarFunction &bound_function,
-                                                       vector<unique_ptr<Expression>> &arguments) {
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, true);
+unique_ptr<FunctionData> JsonoArrayElementsArgOnlyBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	bound_function.GetArguments()[0] =
+	    JsonoResolveJsonoArgument(context, *arguments[0], bound_function.GetName().GetIdentifierName(), true);
 	return nullptr;
 }
 
 // Bind for the 2-argument overloads (VARCHAR JSONPath / literal key, or BIGINT index): resolve arg0
 // to plain JSONO and parse the constant path with the Extract dialect (same path grammar as
 // jsono_extract, so a bare key is a literal top-level key and a non-negative integer is an index).
-unique_ptr<FunctionData> JsonoArrayElementsPathBind(ClientContext &context, ScalarFunction &bound_function,
-                                                    vector<unique_ptr<Expression>> &arguments) {
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, true);
-	return BindJsonoSinglePath(context, *arguments[1], bound_function.name.c_str(), JsonoPathDialect::Extract);
+unique_ptr<FunctionData> JsonoArrayElementsPathBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	bound_function.GetArguments()[0] =
+	    JsonoResolveJsonoArgument(context, *arguments[0], bound_function.GetName().GetIdentifierName(), true);
+	return BindJsonoSinglePath(context, *arguments[1], bound_function.GetName().c_str(), JsonoPathDialect::Extract);
 }
 
 const vector<PathStep> *PathStepsFromState(ExpressionState &state, idx_t column_count) {
@@ -46,7 +53,7 @@ const vector<PathStep> *PathStepsFromState(ExpressionState &state, idx_t column_
 		return nullptr;
 	}
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	return &func_expr.bind_info->Cast<JsonoSinglePathBindData>().path.steps;
+	return &func_expr.BindInfo()->Cast<JsonoSinglePathBindData>().path.steps;
 }
 
 // Output sink for jsono_array_elements: appends one plain JSONO document per array element into the
@@ -131,11 +138,11 @@ void RegisterJsonoArrayElements(ExtensionLoader &loader) {
 	// path: VARCHAR (JSONPath / literal key) or BIGINT (array index), like jsono_extract.
 	ScalarFunctionSet set("jsono_array_elements");
 	set.AddFunction(ScalarFunction({LogicalType::ANY}, element_list, JsonoArrayElementsExecute,
-	                               JsonoArrayElementsArgOnlyBind, nullptr, nullptr, JsonoSinglePathLocalState::Init));
+	                               JsonoArrayElementsArgOnlyBind, nullptr, JsonoSinglePathLocalState::Init));
 	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, element_list, JsonoArrayElementsExecute,
-	                               JsonoArrayElementsPathBind, nullptr, nullptr, JsonoSinglePathLocalState::Init));
+	                               JsonoArrayElementsPathBind, nullptr, JsonoSinglePathLocalState::Init));
 	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::BIGINT}, element_list, JsonoArrayElementsExecute,
-	                               JsonoArrayElementsPathBind, nullptr, nullptr, JsonoSinglePathLocalState::Init));
+	                               JsonoArrayElementsPathBind, nullptr, JsonoSinglePathLocalState::Init));
 	loader.RegisterFunction(set);
 }
 

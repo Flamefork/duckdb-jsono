@@ -4,6 +4,8 @@
 #include "jsono_number.hpp"
 
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 
 #include "string_view.hpp"
 
@@ -80,18 +82,18 @@ inline bool RowIsValid(const UnifiedVectorFormat &fmt, idx_t row) {
 // which it is.
 inline void InitJsonoVectorData(Vector &input, idx_t count, JsonoVectorData &data) {
 	input.ToUnifiedFormat(count, data.struct_fmt);
-	auto &layout = *StructVector::GetEntries(input)[0];
+	auto &layout = StructVector::GetEntries(input)[0];
 	layout.ToUnifiedFormat(count, data.layout_fmt);
-	auto &body = *StructVector::GetEntries(layout)[0];
+	auto &body = StructVector::GetEntries(layout)[0];
 	body.ToUnifiedFormat(count, data.body_fmt);
 	auto &blobs = StructVector::GetEntries(body);
-	blobs[0]->ToUnifiedFormat(count, data.slots_fmt);
-	blobs[1]->ToUnifiedFormat(count, data.key_heap_fmt);
-	blobs[2]->ToUnifiedFormat(count, data.string_heap_fmt);
-	blobs[3]->ToUnifiedFormat(count, data.skips_fmt);
-	blobs[4]->ToUnifiedFormat(count, data.lengths_fmt);
-	blobs[5]->ToUnifiedFormat(count, data.nums_fmt);
-	data.string_heap_vec = blobs[2].get();
+	blobs[0].ToUnifiedFormat(count, data.slots_fmt);
+	blobs[1].ToUnifiedFormat(count, data.key_heap_fmt);
+	blobs[2].ToUnifiedFormat(count, data.string_heap_fmt);
+	blobs[3].ToUnifiedFormat(count, data.skips_fmt);
+	blobs[4].ToUnifiedFormat(count, data.lengths_fmt);
+	blobs[5].ToUnifiedFormat(count, data.nums_fmt);
+	data.string_heap_vec = &blobs[2];
 	data.slots_data = UnifiedVectorFormat::GetData<string_t>(data.slots_fmt);
 	data.key_heap_data = UnifiedVectorFormat::GetData<string_t>(data.key_heap_fmt);
 	data.string_heap_data = UnifiedVectorFormat::GetData<string_t>(data.string_heap_fmt);

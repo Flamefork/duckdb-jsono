@@ -9,6 +9,9 @@
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -33,7 +36,7 @@ void AppendListString(Vector &result, idx_t &length, const char *data, size_t si
 	auto child_row = ListVector::GetListSize(result) + length;
 	EnsureListCapacity(result, child_row + 1);
 	auto &child = ListVector::GetEntry(result);
-	FlatVector::GetData<string_t>(child)[child_row] = StringVector::AddString(child, data, size);
+	FlatVector::GetDataMutable<string_t>(child)[child_row] = StringVector::AddString(child, data, size);
 	length++;
 }
 
@@ -45,16 +48,22 @@ unique_ptr<FunctionData> JsonoPathBind(ClientContext &context, vector<unique_ptr
 // Bind for the 1-argument jsono_type/jsono_keys overloads (ANY arg0): accept a shredded value by
 // redeclaring arg0 to plain JSONO (the binder inserts the lossless reconstruct cast) and reject a
 // non-JSONO argument loudly. Carries no path data.
-unique_ptr<FunctionData> JsonoArgOnlyBind(ClientContext &context, ScalarFunction &bound_function,
-                                          vector<unique_ptr<Expression>> &arguments) {
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, true);
+unique_ptr<FunctionData> JsonoArgOnlyBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	bound_function.GetArguments()[0] =
+	    JsonoResolveJsonoArgument(context, *arguments[0], bound_function.GetName().GetIdentifierName(), true);
 	return nullptr;
 }
 
-unique_ptr<FunctionData> JsonoPathOnlyBind(ClientContext &context, ScalarFunction &bound_function,
-                                           vector<unique_ptr<Expression>> &arguments) {
-	bound_function.arguments[0] = JsonoResolveJsonoArgument(context, *arguments[0], bound_function.name, true);
-	return JsonoPathBind(context, arguments, bound_function.name.c_str());
+unique_ptr<FunctionData> JsonoPathOnlyBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	bound_function.GetArguments()[0] =
+	    JsonoResolveJsonoArgument(context, *arguments[0], bound_function.GetName().GetIdentifierName(), true);
+	return JsonoPathBind(context, arguments, bound_function.GetName().c_str());
 }
 
 const vector<PathStep> *PathStepsFromState(ExpressionState &state, idx_t column_count) {
@@ -62,7 +71,7 @@ const vector<PathStep> *PathStepsFromState(ExpressionState &state, idx_t column_
 		return nullptr;
 	}
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	return &func_expr.bind_info->Cast<JsonoSinglePathBindData>().path.steps;
+	return &func_expr.BindInfo()->Cast<JsonoSinglePathBindData>().path.steps;
 }
 
 const char *JsonoTypeName(const JsonoView &view, JsonoCursor cursor) {
@@ -162,7 +171,7 @@ void JsonoTypeExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	reader.InitPointRead(args.data[0], count);
 	auto steps = PathStepsFromState(state, args.ColumnCount());
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<string_t>(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 	JsonoTypePolicy policy {result, result_data};
 	JsonoPointReadRows(reader, count, steps, lstate.locate_state, policy);
 	if (args.AllConstant()) {
@@ -203,7 +212,7 @@ void JsonoArrayLengthExecute(DataChunk &args, ExpressionState &state, Vector &re
 	reader.InitPointRead(args.data[0], count);
 	auto steps = PathStepsFromState(state, args.ColumnCount());
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<int64_t>(result);
+	auto result_data = FlatVector::GetDataMutable<int64_t>(result);
 
 	const vector<PathStep> root_steps;
 	JsonoArrayLengthPolicy policy {result, result_data, root_steps};
@@ -219,7 +228,7 @@ void JsonoArrayLengthExecute(DataChunk &args, ExpressionState &state, Vector &re
 // ScalarFunction must register JsonoSinglePathLocalState::Init in its init_local_state slot.
 ScalarFunction MakePathOpFunction(vector<LogicalType> arguments, LogicalType return_type, scalar_function_t function,
                                   bind_scalar_function_t bind) {
-	return ScalarFunction(std::move(arguments), std::move(return_type), std::move(function), bind, nullptr, nullptr,
+	return ScalarFunction(std::move(arguments), std::move(return_type), std::move(function), bind, nullptr,
 	                      JsonoSinglePathLocalState::Init);
 }
 

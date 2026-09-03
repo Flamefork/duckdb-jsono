@@ -141,15 +141,15 @@ void RegisterJsonoParse(ExtensionLoader &loader) {
 	auto jsono_type = JsonoType();
 	{
 		ScalarFunctionSet set("jsono");
-		ScalarFunction text_parse({LogicalType::VARCHAR}, jsono_type, JsonoParseExecute, nullptr, nullptr, nullptr,
+		ScalarFunction text_parse({LogicalType::VARCHAR}, jsono_type, JsonoParseExecute, nullptr, nullptr,
 		                          JsonoParseLocalState::Init);
-		text_parse.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+		text_parse.SetFallible();
 		set.AddFunction(text_parse);
 		loader.RegisterFunction(set);
 	}
 	{
 		ScalarFunctionSet set("try_jsono");
-		ScalarFunction text_parse({LogicalType::VARCHAR}, jsono_type, JsonoTryParseExecute, nullptr, nullptr, nullptr,
+		ScalarFunction text_parse({LogicalType::VARCHAR}, jsono_type, JsonoTryParseExecute, nullptr, nullptr,
 		                          JsonoParseLocalState::Init);
 		set.AddFunction(text_parse);
 		loader.RegisterFunction(set);

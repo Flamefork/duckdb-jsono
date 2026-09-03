@@ -14,6 +14,10 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function_set.hpp"
@@ -144,13 +148,13 @@ struct SuggestBindData : public FunctionData {
 // (min_presence :=, min_fit :=) do not survive expression serialization — the re-bind then fails
 // loud on "unknown argument ''" under debug plan verification.
 void SuggestSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-                      const AggregateFunction &function) {
+                      const BoundAggregateFunction &function) {
 	auto &data = bind_data->Cast<SuggestBindData>();
 	serializer.WriteProperty(100, "min_presence", data.min_presence);
 	serializer.WriteProperty(101, "min_fit", data.min_fit);
 }
 
-unique_ptr<FunctionData> SuggestDeserialize(Deserializer &deserializer, AggregateFunction &function) {
+unique_ptr<FunctionData> SuggestDeserialize(Deserializer &deserializer, BoundAggregateFunction &function) {
 	auto min_presence = deserializer.ReadProperty<double>(100, "min_presence");
 	auto min_fit = deserializer.ReadProperty<double>(101, "min_fit");
 	auto &context = deserializer.Get<ClientContext &>();
@@ -531,8 +535,10 @@ struct SuggestAggregate {
 	}
 };
 
-unique_ptr<FunctionData> JsonoSuggestBind(ClientContext &context, AggregateFunction &function,
-                                          vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoSuggestBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	double min_presence = 0.5;
 	double min_fit = 1.0;
 	bool seen_min_presence = false;
@@ -570,7 +576,7 @@ unique_ptr<FunctionData> JsonoSuggestBind(ClientContext &context, AggregateFunct
 			min_fit = fraction;
 		}
 	}
-	auto &type = arguments[0]->return_type;
+	auto &type = arguments[0]->GetReturnType();
 	if (arguments[0]->HasParameter()) {
 		throw ParameterNotResolvedException();
 	}
@@ -582,7 +588,7 @@ unique_ptr<FunctionData> JsonoSuggestBind(ClientContext &context, AggregateFunct
 		JsonoRejectForeignLayout(type, "jsono_suggest_shredding");
 		throw BinderException("jsono_suggest_shredding: input must be plain JSONO");
 	}
-	function.arguments[0] = JsonoType();
+	function.GetArguments()[0] = JsonoType();
 	return make_uniq<SuggestBindData>(min_presence, min_fit, BufferManager::GetBufferManager(context));
 }
 
@@ -686,13 +692,13 @@ void JsonoSuggestCombine(Vector &source, Vector &target, AggregateInputData &agg
 	    [](const SuggestState &s) { return SuggestFootprint(s); });
 }
 
-void JsonoSuggestFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
+void JsonoSuggestFinalize(Vector &states, AggregateFinalizeInputData &aggr_input_data, Vector &result, idx_t count,
                           idx_t offset) {
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<SuggestState *>(state_fmt);
 	auto &bind_data = aggr_input_data.bind_data->Cast<SuggestBindData>();
-	auto result_data = FlatVector::GetData<string_t>(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 	for (idx_t i = 0; i < count; i++) {
 		auto rid = offset + i;
 		auto &state = *state_data[state_fmt.sel->get_index(i)];
@@ -814,15 +820,17 @@ LogicalType ShredStatsResultType() {
 	                                              {"divert_rate", LogicalType::DOUBLE}}));
 }
 
-unique_ptr<FunctionData> JsonoShredStatsBind(ClientContext &context, AggregateFunction &function,
-                                             vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoShredStatsBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	if (arguments.size() != 1) {
 		throw BinderException("jsono_shred_stats() requires a single shredded JSONO argument");
 	}
 	if (arguments[0]->HasParameter()) {
 		throw ParameterNotResolvedException();
 	}
-	auto &type = arguments[0]->return_type;
+	auto &type = arguments[0]->GetReturnType();
 	JsonoRequireExtensionOptimizerForShredded(context, type, "jsono_shred_stats");
 	if (!IsShreddedJsonoType(type)) {
 		JsonoRejectForeignLayout(type, "jsono_shred_stats");
@@ -834,16 +842,16 @@ unique_ptr<FunctionData> JsonoShredStatsBind(ClientContext &context, AggregateFu
 	auto bind_data = make_uniq<ShredStatsBindData>(BufferManager::GetBufferManager(context));
 	for (auto &shred : layout.shreds) {
 		ShredStatDescriptor descriptor;
-		descriptor.lane_name = shred.first;
-		descriptor.path = JsonoLaneLogicalPath(shred.first);
+		descriptor.lane_name = shred.first.GetIdentifierName();
+		descriptor.path = JsonoLaneLogicalPath(shred.first.GetIdentifierName());
 		// Logical, like `path`: an object-array lane's element subfields are encoded one-step paths in
 		// the stored type, and the stats row is read by a human deciding on a shredding spec.
 		descriptor.type_name = JsonoLaneLogicalType(shred.second).ToString();
 		descriptor.kind = ClassifyShredKind(shred.second);
-		descriptor.steps = ShredNamePath(shred.first, "jsono_shred_stats shred");
+		descriptor.steps = ShredNamePath(shred.first.GetIdentifierName(), "jsono_shred_stats shred");
 		bind_data->shreds.push_back(std::move(descriptor));
 	}
-	function.arguments[0] = type;
+	function.GetArguments()[0] = type;
 	return std::move(bind_data);
 }
 
@@ -1030,7 +1038,7 @@ void JsonoShredStatsCombine(Vector &source, Vector &target, AggregateInputData &
 	    [](const ShredStatsState &s) { return ShredStatsFootprint(s); });
 }
 
-void JsonoShredStatsFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
+void JsonoShredStatsFinalize(Vector &states, AggregateFinalizeInputData &aggr_input_data, Vector &result, idx_t count,
                              idx_t offset) {
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
@@ -1048,16 +1056,16 @@ void JsonoShredStatsFinalize(Vector &states, AggregateInputData &aggr_input_data
 		EnsureListCapacity(result, start + nshreds);
 		auto &entry = ListVector::GetEntry(result);
 		auto &child = StructVector::GetEntries(entry);
-		auto path_data = FlatVector::GetData<string_t>(*child[0]);
-		auto type_data = FlatVector::GetData<string_t>(*child[1]);
-		auto lane_data = FlatVector::GetData<double>(*child[2]);
-		auto divert_data = FlatVector::GetData<double>(*child[3]);
+		auto path_data = FlatVector::GetDataMutable<string_t>(child[0]);
+		auto type_data = FlatVector::GetDataMutable<string_t>(child[1]);
+		auto lane_data = FlatVector::GetDataMutable<double>(child[2]);
+		auto divert_data = FlatVector::GetDataMutable<double>(child[3]);
 		double denom = double(state.non_null_rows);
 		for (idx_t f = 0; f < nshreds; f++) {
 			auto idx = start + f;
 			auto &counters = (*state.counters)[f];
-			path_data[idx] = StringVector::AddString(*child[0], bind_data.shreds[f].path);
-			type_data[idx] = StringVector::AddString(*child[1], bind_data.shreds[f].type_name);
+			path_data[idx] = StringVector::AddString(child[0], bind_data.shreds[f].path);
+			type_data[idx] = StringVector::AddString(child[1], bind_data.shreds[f].type_name);
 			lane_data[idx] = double(counters.lane_present) / denom;
 			divert_data[idx] = double(counters.divert) / denom;
 		}
@@ -1078,21 +1086,20 @@ void RegisterJsonoAdvisor(ExtensionLoader &loader) {
 		                          JsonoSuggestUpdate, JsonoSuggestCombine, JsonoSuggestFinalize,
 		                          // SPECIAL_HANDLING so a NULL min_presence/min_fit constant reaches the bind validator
 		                          // instead of folding the whole aggregate call to NULL (the named-arg NULL-fold trap).
-		                          FunctionNullHandling::SPECIAL_HANDLING, JsonoSuggestSimpleUpdate, JsonoSuggestBind,
+		                          FunctionNullHandling::SPECIAL_HANDLING, nullptr, JsonoSuggestBind,
 		                          AggregateFunction::StateDestroy<SuggestState, SuggestAggregate>);
-		suggest.serialize = SuggestSerialize;
-		suggest.deserialize = SuggestDeserialize;
+		suggest.SetSerializeCallback(SuggestSerialize);
+		suggest.SetDeserializeCallback(SuggestDeserialize);
 		suggest_set.AddFunction(suggest);
 	}
 	loader.RegisterFunction(suggest_set);
 
 	// jsono_shred_stats(shredded) -> LIST<STRUCT(path, type, lane_rate, divert_rate)>
-	AggregateFunction stats("jsono_shred_stats", {LogicalType::ANY}, ShredStatsResultType(),
-	                        AggregateFunction::StateSize<ShredStatsState>,
-	                        AggregateFunction::StateInitialize<ShredStatsState, ShredStatsAggregate>,
-	                        JsonoShredStatsUpdate, JsonoShredStatsCombine, JsonoShredStatsFinalize,
-	                        FunctionNullHandling::DEFAULT_NULL_HANDLING, JsonoShredStatsSimpleUpdate,
-	                        JsonoShredStatsBind, AggregateFunction::StateDestroy<ShredStatsState, ShredStatsAggregate>);
+	AggregateFunction stats(
+	    "jsono_shred_stats", {LogicalType::ANY}, ShredStatsResultType(), AggregateFunction::StateSize<ShredStatsState>,
+	    AggregateFunction::StateInitialize<ShredStatsState, ShredStatsAggregate>, JsonoShredStatsUpdate,
+	    JsonoShredStatsCombine, JsonoShredStatsFinalize, FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr,
+	    JsonoShredStatsBind, AggregateFunction::StateDestroy<ShredStatsState, ShredStatsAggregate>);
 	loader.RegisterFunction(stats);
 }
 

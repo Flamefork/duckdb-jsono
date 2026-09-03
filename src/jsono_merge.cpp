@@ -12,6 +12,8 @@
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -150,10 +152,12 @@ bool ShredPathsStructurallyConflict(const vector<PathStep> &a, const vector<Path
 	return true;
 }
 
-unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunction &bound_function,
-                                             vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> JsonoMergePatchBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	if (arguments.empty()) {
-		throw BinderException(bound_function.name + "() requires at least one argument");
+		throw BinderException(bound_function.GetName() + "() requires at least one argument");
 	}
 	// Union the shreds of any shredded inputs (later inputs win a name conflict, matching
 	// the patch-wins fold). A shredded input keeps its type so the executor can read its
@@ -164,10 +168,10 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 		if (argument->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
-		auto &type = argument->return_type;
-		JsonoRequireExtensionOptimizerForShredded(context, type, bound_function.name);
+		auto &type = argument->GetReturnType();
+		JsonoRequireExtensionOptimizerForShredded(context, type, bound_function.GetName().GetIdentifierName());
 		if (type.id() == LogicalTypeId::SQLNULL) {
-			bound_function.arguments.push_back(JsonoType());
+			bound_function.GetArguments().push_back(JsonoType());
 			continue;
 		}
 		// One layout parse decides both branches: IsShreddedJsonoType/IsJsonoType would each re-parse
@@ -175,12 +179,12 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 		JsonoLayoutType layout;
 		if (TryParseJsonoLayoutType(type, layout)) {
 			if (layout.kind != JsonoLayoutKind::Shredded) {
-				bound_function.arguments.push_back(JsonoType());
+				bound_function.GetArguments().push_back(JsonoType());
 				continue;
 			}
 			for (auto &layout_shred : layout.shreds) {
 				// Union by the shred path (the inputs may carry different shred sets).
-				auto &shred_name = layout_shred.first;
+				auto &shred_name = layout_shred.first.GetIdentifierName();
 				bool found = false;
 				for (auto &merge_shred : shreds) {
 					if (merge_shred.name == shred_name) {
@@ -193,19 +197,19 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 					MergeShred merge_shred;
 					merge_shred.name = shred_name;
 					merge_shred.type = layout_shred.second;
-					merge_shred.steps = ShredNamePath(shred_name, bound_function.name.c_str());
+					merge_shred.steps = ShredNamePath(shred_name, bound_function.GetName().GetIdentifierName().c_str());
 					shreds.push_back(std::move(merge_shred));
 				}
 			}
-			bound_function.arguments.push_back(type);
+			bound_function.GetArguments().push_back(type);
 			continue;
 		}
 		// The bind is shared with jsono_overlay, so both diagnostics name the function actually called.
-		JsonoRejectForeignLayout(type, bound_function.name + "()");
-		throw BinderException(bound_function.name + "() arguments must be JSONO");
+		JsonoRejectForeignLayout(type, bound_function.GetName() + "()");
+		throw BinderException(bound_function.GetName() + "() arguments must be JSONO");
 	}
 	if (shreds.empty()) {
-		bound_function.return_type = JsonoType();
+		bound_function.SetReturnType(JsonoType());
 		return std::move(bind_data);
 	}
 	// Canonical shred order (sorted by physical name) so the merged type is a pure function of the
@@ -234,13 +238,13 @@ unique_ptr<FunctionData> JsonoMergePatchBind(ClientContext &context, ScalarFunct
 		manifest_shreds.emplace_back(shred.name, shred.type);
 	}
 	bind_data->write = JsonoBuildShredWriteSet(manifest_shreds);
-	bound_function.return_type = JsonoShreddedStructType(lanes);
-	auto &result_shreds_type = JsonoShredsStructType(bound_function.return_type);
+	bound_function.SetReturnType(JsonoShreddedStructType(lanes));
+	auto &result_shreds_type = JsonoShredsStructType(bound_function.GetReturnType());
 	for (auto &shred : shreds) {
 		shred.result_field_index = JsonoFindShredsFieldIndex(result_shreds_type, shred.name);
 		if (shred.result_field_index == DConstants::INVALID_INDEX) {
 			throw InternalException("%s: shred lane '%s' is missing from the result type built from these lanes",
-			                        bound_function.name, shred.name);
+			                        bound_function.GetName(), shred.name);
 		}
 	}
 	// The fast path's shape preconditions. An array shred merges multiple subfield lanes per element
@@ -454,7 +458,7 @@ const MergeInputPlan &ResolveInputPlan(DataChunk &args, const vector<MergeShred>
 				}
 				LaneSource source;
 				source.arg = i;
-				source.field = JsonoFindShredsFieldIndex(shreds_type, lane.first);
+				source.field = JsonoFindShredsFieldIndex(shreds_type, lane.first.GetIdentifierName());
 				plan.lane_sources[k].push_back(source);
 				// A shred name declared with different types across inputs has incompatible lane
 				// layouts, so the per-row lane copy cannot stage its candidates together. The reshred
@@ -486,7 +490,7 @@ void FastCopyShred(DataChunk &args, idx_t count, MergeMode mode, const vector<La
 	}
 	dst.SetVectorType(VectorType::FLAT_VECTOR);
 	if (lanes.empty()) {
-		auto &dv = FlatVector::Validity(dst);
+		auto &dv = FlatVector::ValidityMutable(dst);
 		for (idx_t row = 0; row < count; row++) {
 			dv.SetInvalid(row);
 		}
@@ -527,7 +531,7 @@ void FastCopyShred(DataChunk &args, idx_t count, MergeMode mode, const vector<La
 	}
 	if (!result_validity.AllValid()) {
 		dst.Flatten(count);
-		auto &dv = FlatVector::Validity(dst);
+		auto &dv = FlatVector::ValidityMutable(dst);
 		for (idx_t row = 0; row < count; row++) {
 			if (!result_validity.RowIsValid(row)) {
 				dv.SetInvalid(row);
@@ -538,7 +542,7 @@ void FastCopyShred(DataChunk &args, idx_t count, MergeMode mode, const vector<La
 
 void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, MergeMode mode) {
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoMergeLocalState>();
-	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<JsonoMergeBindData>();
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<JsonoMergeBindData>();
 	auto count = args.size();
 	idx_t ncols = args.ColumnCount();
 	bool has_shreds = !bind_data.shreds.empty();
@@ -788,12 +792,12 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 			// an absent path (case A), never a diversion — the zero spill bitmap is exact.
 			JsonoFillShredMarker(result, count);
 			auto &fr_blobs = StructVector::GetEntries(JsonoBodyVector(fast_residual));
-			FlatVector::Validity(result) = FlatVector::Validity(fast_residual);
+			FlatVector::ValidityMutable(result) = FlatVector::Validity(fast_residual);
 			for (idx_t b = 0; b < BODY_BLOB_COUNT; b++) {
 				if (b == BODY_SKIPS) {
 					continue;
 				}
-				VectorOperations::Copy(*fr_blobs[b], *writer.vec[b], count, 0, 0);
+				VectorOperations::Copy(fr_blobs[b], *writer.vec[b], count, 0, 0);
 			}
 			auto &result_validity = FlatVector::Validity(result);
 			for (idx_t row = 0; row < count; row++) {
@@ -818,8 +822,8 @@ void JsonoFoldExecute(DataChunk &args, ExpressionState &state, Vector &result, M
 				JsonoShredFieldVector(result, bind_data.shreds[k].result_field_index)
 				    .ToUnifiedFormat(count, shred_fmt[k]);
 			}
-			auto fr_skips = FlatVector::GetData<string_t>(*fr_blobs[BODY_SKIPS]);
-			auto &fr_skips_validity = FlatVector::Validity(*fr_blobs[BODY_SKIPS]);
+			auto fr_skips = FlatVector::GetData<string_t>(fr_blobs[BODY_SKIPS]);
+			auto &fr_skips_validity = FlatVector::Validity(fr_blobs[BODY_SKIPS]);
 			auto &r_skips = writer.Skips();
 			auto skips_out = writer.data[BODY_SKIPS];
 			std::string skips_buf;
@@ -911,10 +915,10 @@ void JsonoOverlayExecute(DataChunk &args, ExpressionState &state, Vector &result
 // file. Nothing outside it needs the factory — the optimizer folds shred patches with jsono_overlay.
 ScalarFunction JsonoMergePatchFunction() {
 	ScalarFunction fun("jsono_merge_patch", {}, JsonoType(), JsonoMergePatchExecute, JsonoMergePatchBind, nullptr,
-	                   nullptr, JsonoMergeLocalState::Init);
-	fun.varargs = LogicalType::ANY;
+	                   JsonoMergeLocalState::Init);
+	fun.SetVarArgs(LogicalType::ANY);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetFallible();
 	return fun;
 }
 
@@ -927,11 +931,11 @@ ScalarFunction JsonoMergePatchFunction() {
 // RegisterJsonoMerge) only so the optimizer-injected reconstruction expression survives
 // plan (de)serialization via a name lookup; it is intentionally left out of the docs.
 ScalarFunction JsonoOverlayFunction() {
-	ScalarFunction fun("jsono_overlay", {}, JsonoType(), JsonoOverlayExecute, JsonoMergePatchBind, nullptr, nullptr,
+	ScalarFunction fun("jsono_overlay", {}, JsonoType(), JsonoOverlayExecute, JsonoMergePatchBind, nullptr,
 	                   JsonoMergeLocalState::Init);
-	fun.varargs = LogicalType::ANY;
+	fun.SetVarArgs(LogicalType::ANY);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetFallible();
 	return fun;
 }
 

@@ -23,6 +23,10 @@
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -322,17 +326,17 @@ bool TryReadJsonoExtractSource(ClientContext &context, Expression &expr, Express
 		return false;
 	}
 	auto &function = expr.Cast<BoundFunctionExpression>();
-	if (function.function.name != "->>" && function.function.name != "jsono_extract_string") {
+	if (function.Function().GetName() != "->>" && function.Function().GetName() != "jsono_extract_string") {
 		return false;
 	}
-	if (function.children.size() != 2 || !IsJsonoType(function.children[0]->return_type)) {
+	if (function.GetChildren().size() != 2 || !IsJsonoType(function.GetChildren()[0]->GetReturnType())) {
 		return false;
 	}
 	JsonoPathSpec path;
-	if (!TryReadExtractPath(context, *function.children[1], path)) {
+	if (!TryReadExtractPath(context, *function.GetChildren()[1], path)) {
 		return false;
 	}
-	source = function.children[0].get();
+	source = function.GetChildren()[0].get();
 	predicate.path = std::move(path);
 	predicate.compiled_path = CompileJsonoPath(predicate.path.steps);
 	return true;
@@ -345,7 +349,7 @@ void SetPredicateSource(JsonoRewritePredicate &predicate, Expression &source, Js
 
 // Equality plus the four range comparisons over a `->>` extract and a constant. A range with the
 // extract on the RIGHT flips its comparison (const < x  ==  x > const).
-bool TryReadComparisonPredicate(ClientContext &context, BoundComparisonExpression &comparison,
+bool TryReadComparisonPredicate(ClientContext &context, BoundFunctionExpression &comparison,
                                 JsonoRewritePredicate &predicate) {
 	auto type = comparison.GetExpressionType();
 	switch (type) {
@@ -361,12 +365,14 @@ bool TryReadComparisonPredicate(ClientContext &context, BoundComparisonExpressio
 	Expression *source = nullptr;
 	JsonoMatchPredicate match_predicate;
 	string value;
-	if (!TryReadJsonoExtractSource(context, *comparison.left, source, match_predicate) ||
-	    !TryReadStringValue(context, *comparison.right, value)) {
+	if (!TryReadJsonoExtractSource(context, *BoundComparisonExpression::LeftMutable(comparison), source,
+	                               match_predicate) ||
+	    !TryReadStringValue(context, *BoundComparisonExpression::RightMutable(comparison), value)) {
 		source = nullptr;
 		match_predicate = JsonoMatchPredicate();
-		if (!TryReadJsonoExtractSource(context, *comparison.right, source, match_predicate) ||
-		    !TryReadStringValue(context, *comparison.left, value)) {
+		if (!TryReadJsonoExtractSource(context, *BoundComparisonExpression::RightMutable(comparison), source,
+		                               match_predicate) ||
+		    !TryReadStringValue(context, *BoundComparisonExpression::LeftMutable(comparison), value)) {
 			return false;
 		}
 		type = FlipComparisonExpression(type);
@@ -378,17 +384,17 @@ bool TryReadComparisonPredicate(ClientContext &context, BoundComparisonExpressio
 }
 
 bool TryReadInPredicate(ClientContext &context, BoundOperatorExpression &comparison, JsonoRewritePredicate &predicate) {
-	if (comparison.GetExpressionType() != ExpressionType::COMPARE_IN || comparison.children.size() < 2) {
+	if (comparison.GetExpressionType() != ExpressionType::COMPARE_IN || comparison.GetChildren().size() < 2) {
 		return false;
 	}
 	Expression *source = nullptr;
 	JsonoMatchPredicate match_predicate;
-	if (!TryReadJsonoExtractSource(context, *comparison.children[0], source, match_predicate)) {
+	if (!TryReadJsonoExtractSource(context, *comparison.GetChildren()[0], source, match_predicate)) {
 		return false;
 	}
-	for (idx_t child_index = 1; child_index < comparison.children.size(); child_index++) {
+	for (idx_t child_index = 1; child_index < comparison.GetChildren().size(); child_index++) {
 		string value;
-		if (!TryReadStringValue(context, *comparison.children[child_index], value)) {
+		if (!TryReadStringValue(context, *comparison.GetChildren()[child_index], value)) {
 			return false;
 		}
 		match_predicate.values.push_back(std::move(value));
@@ -399,16 +405,16 @@ bool TryReadInPredicate(ClientContext &context, BoundOperatorExpression &compari
 
 bool TryReadContainsPredicate(ClientContext &context, BoundFunctionExpression &function,
                               JsonoRewritePredicate &predicate) {
-	if (function.function.name != "contains" || function.children.size() != 2) {
+	if (function.Function().GetName() != "contains" || function.GetChildren().size() != 2) {
 		return false;
 	}
 	vector<string> values;
-	if (!TryReadStringListValue(context, *function.children[0], values)) {
+	if (!TryReadStringListValue(context, *function.GetChildren()[0], values)) {
 		return false;
 	}
 	Expression *source = nullptr;
 	JsonoMatchPredicate match_predicate;
-	if (!TryReadJsonoExtractSource(context, *function.children[1], source, match_predicate)) {
+	if (!TryReadJsonoExtractSource(context, *function.GetChildren()[1], source, match_predicate)) {
 		return false;
 	}
 	match_predicate.values = std::move(values);
@@ -417,9 +423,10 @@ bool TryReadContainsPredicate(ClientContext &context, BoundFunctionExpression &f
 }
 
 bool TryReadPredicate(ClientContext &context, Expression &expr, JsonoRewritePredicate &predicate) {
+	if (BoundComparisonExpression::IsComparison(expr)) {
+		return TryReadComparisonPredicate(context, expr.Cast<BoundFunctionExpression>(), predicate);
+	}
 	switch (expr.GetExpressionClass()) {
-	case ExpressionClass::BOUND_COMPARISON:
-		return TryReadComparisonPredicate(context, expr.Cast<BoundComparisonExpression>(), predicate);
 	case ExpressionClass::BOUND_FUNCTION:
 		return TryReadContainsPredicate(context, expr.Cast<BoundFunctionExpression>(), predicate);
 	case ExpressionClass::BOUND_OPERATOR:
@@ -557,7 +564,7 @@ bool PredicateMatches(JsonoPathLocalState &lstate, JsonoRowReader &reader, const
 
 void WriteLocatedExtractString(JsonoPathLocalState &lstate, JsonoRowReader &reader, const JsonoProjectField &field,
                                Vector &result, idx_t row, const JsonoView &view, const JsonoMatchLocation &location) {
-	JsonoExtractStringSink sink {result, FlatVector::GetData<string_t>(result), row};
+	JsonoExtractStringSink sink {result, FlatVector::GetDataMutable<string_t>(result), row};
 	EmitLocatedText(reader, view, field.path.steps, location.cursor, lstate.scratch, sink);
 }
 
@@ -735,15 +742,15 @@ void JsonoExtractExtremaCombine(Vector &source, Vector &target, AggregateInputDa
 	}
 }
 
-void JsonoExtractExtremaFinalize(Vector &states, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
-                                 idx_t offset) {
+void JsonoExtractExtremaFinalize(Vector &states, AggregateFinalizeInputData &aggr_input_data, Vector &result,
+                                 idx_t count, idx_t offset) {
 	(void)aggr_input_data;
 	UnifiedVectorFormat state_fmt;
 	states.ToUnifiedFormat(count, state_fmt);
 	auto state_data = UnifiedVectorFormat::GetData<JsonoExtractExtremaState *>(state_fmt);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<string_t>(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 	for (idx_t i = 0; i < count; i++) {
 		auto rid = i + offset;
 		auto &state = *state_data[RowIndex(state_fmt, i)];
@@ -751,7 +758,7 @@ void JsonoExtractExtremaFinalize(Vector &states, AggregateInputData &aggr_input_
 			FlatVector::SetNull(result, rid, true);
 			continue;
 		}
-		FlatVector::Validity(result).SetValid(rid);
+		FlatVector::ValidityMutable(result).SetValid(rid);
 		if (state.numeric_mode) {
 			auto rendered = std::to_string(state.numeric_value);
 			result_data[rid] = StringVector::AddString(result, rendered.data(), rendered.size());
@@ -808,12 +815,12 @@ void JsonoVarcharExtremaUpdate(Vector inputs[], AggregateInputData &aggr_input_d
 template <class FUNC>
 void JsonoInternalSerializeUnsupported(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
                                        const FUNC &function) {
-	throw NotImplementedException("JSONO optimizer-internal function '%s' cannot be serialized", function.name);
+	throw NotImplementedException("JSONO optimizer-internal function '%s' cannot be serialized", function.GetName());
 }
 
 template <class FUNC>
 unique_ptr<FunctionData> JsonoInternalDeserializeUnsupported(Deserializer &deserializer, FUNC &function) {
-	throw NotImplementedException("JSONO optimizer-internal function '%s' cannot be deserialized", function.name);
+	throw NotImplementedException("JSONO optimizer-internal function '%s' cannot be deserialized", function.GetName());
 }
 
 AggregateFunction MakeJsonoVarcharExtremaAggregate(JsonoExtremaKind kind) {
@@ -823,20 +830,20 @@ AggregateFunction MakeJsonoVarcharExtremaAggregate(JsonoExtremaKind kind) {
 	                      AggregateFunction::StateSize<JsonoExtractExtremaState>,
 	                      AggregateFunction::StateInitialize<JsonoExtractExtremaState, JsonoExtractExtremaFunction>,
 	                      JsonoVarcharExtremaUpdate, JsonoExtractExtremaCombine, JsonoExtractExtremaFinalize,
-	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, JsonoVarcharExtremaSimpleUpdate, nullptr,
+	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr, nullptr,
 	                      AggregateFunction::StateDestroy<JsonoExtractExtremaState, JsonoExtractExtremaFunction>);
-	fun.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
-	fun.distinct_dependent = AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<AggregateFunction>);
-	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<AggregateFunction>);
+	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	fun.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
+	fun.SetFallible();
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<BoundAggregateFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<BoundAggregateFunction>);
 	return fun;
 }
 
-void SetProjectRowNull(Vector &result, vector<unique_ptr<Vector>> &children, idx_t row) {
+void SetProjectRowNull(Vector &result, vector<Vector> &children, idx_t row) {
 	FlatVector::SetNull(result, row, true);
 	for (auto &child : children) {
-		FlatVector::SetNull(*child, row, true);
+		FlatVector::SetNull(child, row, true);
 	}
 }
 
@@ -850,19 +857,19 @@ struct TextOutputPolicy {
 		JsonoPathLocalState &lstate;
 		JsonoRowReader &reader;
 		const vector<JsonoProjectField> &fields;
-		vector<unique_ptr<Vector>> &children;
+		vector<Vector> &children;
 	};
 
 	static JSONO_ALWAYS_INLINE void WriteLeaf(State &state, idx_t field_index, const JsonoView &view,
 	                                          const JsonoCursor &cursor, idx_t row) {
-		WriteLocatedExtractString(state.lstate, state.reader, state.fields[field_index], *state.children[field_index],
+		WriteLocatedExtractString(state.lstate, state.reader, state.fields[field_index], state.children[field_index],
 		                          row, view, JsonoMatchLocation {cursor});
 	}
 
 	static JSONO_ALWAYS_INLINE void NullLeaf(State &state, idx_t field_index, const JsonoView &view, idx_t row) {
 		// A miss covered by the row's shred manifest must not project a silent NULL.
 		state.reader.CheckPathMiss(view, state.fields[field_index].path.steps);
-		FlatVector::SetNull(*state.children[field_index], row, true);
+		FlatVector::SetNull(state.children[field_index], row, true);
 	}
 };
 
@@ -919,7 +926,7 @@ void ApplyProjectShapePlan(JsonoPathLocalState &lstate, const JsonoProjectBindDa
 
 void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<JsonoProjectBindData>();
+	auto &bind_data = expr.BindInfo()->Cast<JsonoProjectBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoPathLocalState>();
 	auto count = args.size();
 
@@ -933,9 +940,9 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &children = StructVector::GetEntries(result);
 	for (auto &child : children) {
-		child->SetVectorType(VectorType::FLAT_VECTOR);
+		child.SetVectorType(VectorType::FLAT_VECTOR);
 		// Zero-copy text values point into the input string_heap; keep its buffer alive per child.
-		StringVector::AddHeapReference(*child, reader.StringHeapVector());
+		StringVector::AddHeapReference(child, reader.StringHeapVector());
 	}
 
 	TextOutputPolicy::State policy_state {lstate, reader, bind_data.fields, children};
@@ -946,7 +953,7 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 			SetProjectRowNull(result, children, row);
 			continue;
 		}
-		FlatVector::Validity(result).SetValid(row);
+		FlatVector::ValidityMutable(result).SetValid(row);
 		// The window check runs before the lookup: a disable clears the entries, which would
 		// dangle a plan pointer handed out for this row.
 		lstate.project_shape_plans.EndOfWindowCheck();
@@ -974,11 +981,11 @@ void JsonoInternalProjectExecute(DataChunk &args, ExpressionState &state, Vector
 
 ScalarFunction MakeJsonoInternalProjectFunction(const LogicalType &return_type) {
 	ScalarFunction fun("__jsono_internal_project", {JsonoType()}, return_type, JsonoInternalProjectExecute, nullptr,
-	                   nullptr, nullptr, JsonoPathLocalState::Init);
+	                   nullptr, JsonoPathLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
-	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	fun.SetFallible();
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<BoundScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<BoundScalarFunction>);
 	return fun;
 }
 
@@ -995,8 +1002,8 @@ void JsonoInternalDoubleTextExecute(DataChunk &args, ExpressionState &state, Vec
 	args.data[0].ToUnifiedFormat(count, in);
 	auto in_data = UnifiedVectorFormat::GetData<double>(in);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<string_t>(result);
-	auto &result_validity = FlatVector::Validity(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
+	auto &result_validity = FlatVector::ValidityMutable(result);
 	std::string buf;
 	for (idx_t row = 0; row < count; row++) {
 		auto idx = in.sel->get_index(row);
@@ -1017,9 +1024,9 @@ ScalarFunction MakeJsonoInternalDoubleTextFunction() {
 	ScalarFunction fun("__jsono_internal_double_text", {LogicalType::DOUBLE}, LogicalType::VARCHAR,
 	                   JsonoInternalDoubleTextExecute);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
-	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	fun.SetFallible();
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<BoundScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<BoundScalarFunction>);
 	return fun;
 }
 
@@ -1040,9 +1047,9 @@ void JsonoReconstructInternalExecute(DataChunk &args, ExpressionState &state, Ve
 ScalarFunction MakeJsonoReconstructFunction(const LogicalType &input_type) {
 	ScalarFunction fun("__jsono_reconstruct", {input_type}, JsonoType(), JsonoReconstructInternalExecute);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
-	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	fun.SetFallible();
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<BoundScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<BoundScalarFunction>);
 	return fun;
 }
 
@@ -1058,9 +1065,9 @@ ScalarFunction MakeJsonoShreddedListsToJsonFunction(const LogicalType &input_typ
 	ScalarFunction fun("__jsono_shredded_lists_to_json", {input_type}, LogicalType::JSON(),
 	                   JsonoShreddedListsToJsonExecute);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
-	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	fun.SetFallible();
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<BoundScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<BoundScalarFunction>);
 	return fun;
 }
 
@@ -1101,7 +1108,7 @@ void ApplyConservativePredicateOrder(vector<JsonoMatchPredicate> &predicates) {
 
 void JsonoInternalMatchExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<JsonoMatchBindData>();
+	auto &bind_data = expr.BindInfo()->Cast<JsonoMatchBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoPathLocalState>();
 	auto count = args.size();
 
@@ -1109,7 +1116,7 @@ void JsonoInternalMatchExecute(DataChunk &args, ExpressionState &state, Vector &
 	reader.InitPointRead(args.data[0], count);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<bool>(result);
+	auto result_data = FlatVector::GetDataMutable<bool>(result);
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		lstate.locate_state.NextRow();
@@ -1134,11 +1141,11 @@ void JsonoInternalMatchExecute(DataChunk &args, ExpressionState &state, Vector &
 
 ScalarFunction MakeJsonoInternalMatchFunction() {
 	ScalarFunction fun("__jsono_internal_match", {JsonoType()}, LogicalType::BOOLEAN, JsonoInternalMatchExecute,
-	                   nullptr, nullptr, nullptr, JsonoPathLocalState::Init);
+	                   nullptr, nullptr, JsonoPathLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
-	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	fun.SetFallible();
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<BoundScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<BoundScalarFunction>);
 	return fun;
 }
 
@@ -1154,8 +1161,9 @@ unique_ptr<Expression> MakeJsonoInternalMatchExpression(const JsonoRewriteGroup 
 	}
 	vector<unique_ptr<Expression>> children;
 	children.push_back(group.source->Copy());
-	return make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, MakeJsonoInternalMatchFunction(),
-	                                          std::move(children), std::move(bind_data));
+	BoundScalarFunction bound_function(MakeJsonoInternalMatchFunction());
+	bound_function.SetReturnType(LogicalType::BOOLEAN);
+	return make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(children), std::move(bind_data));
 }
 
 idx_t FindRewriteGroup(vector<JsonoRewriteGroup> &groups, const Expression &source) {
@@ -1228,7 +1236,7 @@ idx_t FindProjectField(const vector<JsonoProjectField> &fields, const JsonoPathS
 struct JsonoProjectSource {
 	ColumnBinding binding;
 	LogicalType type;
-	string alias;
+	Identifier alias;
 	vector<JsonoProjectField> fields;
 };
 
@@ -1240,14 +1248,14 @@ void CollectProjectSources(ClientContext &context, Expression &expr, vector<Json
 		auto &column_ref = extract_source->Cast<BoundColumnRefExpression>();
 		JsonoProjectSource *source = nullptr;
 		for (auto &candidate : sources) {
-			if (candidate.binding == column_ref.binding) {
+			if (candidate.binding == column_ref.Binding()) {
 				source = &candidate;
 				break;
 			}
 		}
 		if (!source) {
 			sources.push_back(
-			    JsonoProjectSource {column_ref.binding, column_ref.return_type, column_ref.GetAlias(), {}});
+			    JsonoProjectSource {column_ref.Binding(), column_ref.GetReturnType(), column_ref.GetAlias(), {}});
 			source = &sources.back();
 		}
 		if (FindProjectField(source->fields, predicate.path) == DConstants::INVALID_INDEX) {
@@ -1276,33 +1284,34 @@ bool TryRewriteExtractExtremaAggregate(ClientContext &context, unique_ptr<Expres
 		return false;
 	}
 	auto &aggregate = expr->Cast<BoundAggregateExpression>();
-	if (aggregate.children.size() != 1 || aggregate.IsDistinct() || aggregate.filter || aggregate.order_bys) {
+	if (aggregate.GetChildren().size() != 1 || aggregate.IsDistinct() || aggregate.GetFilter() ||
+	    aggregate.GetOrderBys()) {
 		return false;
 	}
 	JsonoExtremaKind kind;
-	if (aggregate.function.name == "min") {
+	if (aggregate.Function().GetName() == "min") {
 		kind = JsonoExtremaKind::Min;
-	} else if (aggregate.function.name == "max") {
+	} else if (aggregate.Function().GetName() == "max") {
 		kind = JsonoExtremaKind::Max;
 	} else {
 		return false;
 	}
-	if (aggregate.return_type.id() != LogicalTypeId::VARCHAR) {
+	if (aggregate.GetReturnType().id() != LogicalTypeId::VARCHAR) {
 		return false;
 	}
 	Expression *extract_source = nullptr;
 	JsonoMatchPredicate predicate;
-	if (!TryReadJsonoExtractSource(context, *aggregate.children[0], extract_source, predicate) ||
+	if (!TryReadJsonoExtractSource(context, *aggregate.GetChildren()[0], extract_source, predicate) ||
 	    extract_source->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return false;
 	}
 
 	auto alias = expr->GetAlias();
 	vector<unique_ptr<Expression>> children;
-	children.push_back(std::move(aggregate.children[0]));
-	auto replacement = make_uniq<BoundAggregateExpression>(MakeJsonoVarcharExtremaAggregate(kind), std::move(children),
-	                                                       nullptr, make_uniq<JsonoExtremaAggregateBindData>(kind),
-	                                                       AggregateType::NON_DISTINCT);
+	children.push_back(std::move(aggregate.GetChildrenMutable()[0]));
+	auto replacement = make_uniq<BoundAggregateExpression>(
+	    BoundAggregateFunction(MakeJsonoVarcharExtremaAggregate(kind)), std::move(children), nullptr,
+	    make_uniq<JsonoExtremaAggregateBindData>(kind), AggregateType::NON_DISTINCT);
 	replacement->SetAlias(std::move(alias));
 	expr = std::move(replacement);
 	return true;
@@ -1325,24 +1334,24 @@ struct JsonoProjectRewriteState {
 	ClientContext &context;
 	ColumnBinding source_binding;
 	LogicalType source_type;
-	string source_alias;
+	Identifier source_alias;
 	vector<ColumnBinding> child_bindings;
 	vector<LogicalType> child_types;
 	vector<JsonoProjectField> fields;
 	LogicalType struct_type;
 	ColumnBinding struct_binding;
-	idx_t projection_index;
+	TableIndex projection_index;
 };
 
 unique_ptr<Expression> MakeStructExtractAtExpression(JsonoProjectRewriteState &state, idx_t field_index,
-                                                     const string &alias) {
+                                                     const Identifier &alias) {
 	vector<unique_ptr<Expression>> children;
 	children.push_back(
 	    make_uniq<BoundColumnRefExpression>("__jsono_internal_project", state.struct_type, state.struct_binding));
 	children.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(int64_t(field_index + 1))));
 	FunctionBinder function_binder(state.context);
 	auto result = function_binder.BindScalarFunction(StructExtractAtFun::GetFunction(), std::move(children));
-	result->alias = alias;
+	result->SetAlias(alias);
 	return result;
 }
 
@@ -1351,7 +1360,7 @@ void RewriteProjectExpression(unique_ptr<Expression> &expr, JsonoProjectRewriteS
 	JsonoMatchPredicate predicate;
 	if (TryReadJsonoExtractSource(state.context, *expr, extract_source, predicate) &&
 	    extract_source->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-	    extract_source->Cast<BoundColumnRefExpression>().binding == state.source_binding) {
+	    extract_source->Cast<BoundColumnRefExpression>().Binding() == state.source_binding) {
 		auto field_index = FindProjectField(state.fields, predicate.path);
 		if (field_index == DConstants::INVALID_INDEX) {
 			throw InternalException("JSONO projector rewrite missing collected field for path '%s'",
@@ -1363,10 +1372,10 @@ void RewriteProjectExpression(unique_ptr<Expression> &expr, JsonoProjectRewriteS
 	}
 	if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &bound_column_ref = expr->Cast<BoundColumnRefExpression>();
-		auto binding_index = FindBindingIndex(state.child_bindings, bound_column_ref.binding);
+		auto binding_index = FindBindingIndex(state.child_bindings, bound_column_ref.Binding());
 		if (binding_index != DConstants::INVALID_INDEX) {
-			bound_column_ref.binding = ColumnBinding(state.projection_index, binding_index);
-			bound_column_ref.return_type = state.child_types[binding_index];
+			bound_column_ref.BindingMutable() = ColumnBinding(state.projection_index, ProjectionIndex(binding_index));
+			bound_column_ref.SetReturnType(state.child_types[binding_index]);
 		}
 		return;
 	}
@@ -1382,15 +1391,16 @@ unique_ptr<Expression> MakeJsonoInternalProjectExpression(JsonoProjectRewriteSta
 	bind_data->BuildTrie();
 	child_list_t<LogicalType> child_types;
 	for (auto &field : bind_data->fields) {
-		child_types.push_back(make_pair(field.name, LogicalType::VARCHAR));
+		child_types.push_back(make_pair(Identifier(field.name), LogicalType::VARCHAR));
 	}
 	state.struct_type = LogicalType::STRUCT(child_types);
 
 	vector<unique_ptr<Expression>> children;
 	children.push_back(
 	    make_uniq<BoundColumnRefExpression>(state.source_alias, state.source_type, state.source_binding));
-	return make_uniq<BoundFunctionExpression>(state.struct_type, MakeJsonoInternalProjectFunction(state.struct_type),
-	                                          std::move(children), std::move(bind_data));
+	BoundScalarFunction bound_function(MakeJsonoInternalProjectFunction(state.struct_type));
+	bound_function.SetReturnType(state.struct_type);
+	return make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(children), std::move(bind_data));
 }
 
 // Insert one __jsono_internal_project STRUCT projection between `parent` and its child, then
@@ -1448,7 +1458,7 @@ bool RewriteJsonoProjector(OptimizerExtensionInput &input, LogicalOperator &pare
 		projection_expressions.push_back(
 		    make_uniq<BoundColumnRefExpression>(state.child_types[column_index], state.child_bindings[column_index]));
 	}
-	state.struct_binding = ColumnBinding(state.projection_index, projection_expressions.size());
+	state.struct_binding = ColumnBinding(state.projection_index, ProjectionIndex(projection_expressions.size()));
 	projection_expressions.push_back(MakeJsonoInternalProjectExpression(state));
 
 	for (auto *expression_list : expression_lists) {
@@ -1516,7 +1526,7 @@ vector<JsonoShred> CollectShreddedShreds(const LogicalType &shredded) {
 		return shreds;
 	}
 	for (idx_t i = 0; i < layout.shreds.size(); i++) {
-		auto &name = layout.shreds[i].first;
+		auto &name = layout.shreds[i].first.GetIdentifierName();
 		vector<PathStep> steps = ShredNamePath(name, "__jsono_shredded_shred");
 		// The premise EmitShredRead's soft-residual fallback and the per-lane no-NULL totality proof
 		// both rest on: a lane in the type carries the values of ITS OWN path, so a path that IS a lane
@@ -1653,13 +1663,13 @@ void AppendJsonoShreddedKey(Vector &result, idx_t &length, nonstd::string_view k
 	auto child_row = ListVector::GetListSize(result) + length;
 	EnsureListCapacity(result, child_row + 1);
 	auto &child = ListVector::GetEntry(result);
-	FlatVector::GetData<string_t>(child)[child_row] = StringVector::AddString(child, key.data(), key.size());
+	FlatVector::GetDataMutable<string_t>(child)[child_row] = StringVector::AddString(child, key.data(), key.size());
 	length++;
 }
 
 void JsonoInternalShreddedKeysExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<JsonoShreddedKeysBindData>();
+	auto &bind_data = expr.BindInfo()->Cast<JsonoShreddedKeysBindData>();
 	auto count = args.size();
 	JsonoRowReader reader;
 	reader.Init(args.data[0], count, bind_data.signatures);
@@ -1747,22 +1757,22 @@ ScalarFunction MakeJsonoInternalShreddedKeysFunction() {
 	ScalarFunction fun("__jsono_internal_shredded_keys", {JsonoType()}, LogicalType::LIST(LogicalType::VARCHAR),
 	                   JsonoInternalShreddedKeysExecute);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
-	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	fun.SetFallible();
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<BoundScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<BoundScalarFunction>);
 	return fun;
 }
 
 void JsonoInternalShreddedArrayLengthExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = expr.bind_info->Cast<JsonoShreddedArrayLengthBindData>();
+	auto &bind_data = expr.BindInfo()->Cast<JsonoShreddedArrayLengthBindData>();
 	auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonoSinglePathLocalState>();
 	auto count = args.size();
 	JsonoRowReader reader;
 	reader.Init(args.data[0], count, bind_data.signatures);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<int64_t>(result);
+	auto result_data = FlatVector::GetDataMutable<int64_t>(result);
 	JsonoView view;
 	for (idx_t row = 0; row < count; row++) {
 		lstate.locate_state.NextRow();
@@ -1789,12 +1799,11 @@ void JsonoInternalShreddedArrayLengthExecute(DataChunk &args, ExpressionState &s
 
 ScalarFunction MakeJsonoInternalShreddedArrayLengthFunction() {
 	ScalarFunction fun("__jsono_internal_shredded_array_length", {JsonoType()}, LogicalType::BIGINT,
-	                   JsonoInternalShreddedArrayLengthExecute, nullptr, nullptr, nullptr,
-	                   JsonoSinglePathLocalState::Init);
+	                   JsonoInternalShreddedArrayLengthExecute, nullptr, nullptr, JsonoSinglePathLocalState::Init);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
-	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
-	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+	fun.SetFallible();
+	fun.SetSerializeCallback(JsonoInternalSerializeUnsupported<BoundScalarFunction>);
+	fun.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<BoundScalarFunction>);
 	return fun;
 }
 
@@ -1963,7 +1972,7 @@ void CollectSpillProvenPaths(const BaseStatistics &stats, const LogicalType &typ
 	vector<string> shred_names;
 	shred_names.reserve(layout.shreds.size());
 	for (auto &shred : layout.shreds) {
-		shred_names.push_back(shred.first);
+		shred_names.push_back(shred.first.GetIdentifierName());
 	}
 	auto spill_ranks = JsonoRanksInByteOrder(shred_names);
 	for (idx_t k = 0; k < layout.shreds.size(); k++) {
@@ -1975,7 +1984,7 @@ void CollectSpillProvenPaths(const BaseStatistics &stats, const LogicalType &typ
 		auto bit = rank % JSONO_SPILL_BITS;
 		if (all_clean || (word < spill_words && ((exact_mask[word] && ((mask[word] >> bit) & 1) == 0) ||
 		                                         (high_bound[word] && (mask_max[word] >> bit) == 0)))) {
-			proven.insert(layout.shreds[k].first);
+			proven.insert(layout.shreds[k].first.GetIdentifierName());
 		}
 	}
 }
@@ -2026,7 +2035,7 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 				per_column[i] = entry->second;
 			}
 		}
-		cte_totality.emplace(cte.table_index, std::move(per_column));
+		cte_totality.emplace(cte.table_index.index, std::move(per_column));
 		CollectShredTotality(context, *op.children[1], totality, cte_totality, delim_totality);
 		return;
 	}
@@ -2043,7 +2052,7 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 				if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 					continue;
 				}
-				auto entry = totality.find(expr.Cast<BoundColumnRefExpression>().binding);
+				auto entry = totality.find(expr.Cast<BoundColumnRefExpression>().Binding());
 				if (entry != totality.end()) {
 					per_column[i] = entry->second;
 				}
@@ -2059,13 +2068,13 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte_ref = op.Cast<LogicalCTERef>();
-		auto entry = cte_totality.find(cte_ref.cte_index);
+		auto entry = cte_totality.find(cte_ref.cte_index.index);
 		if (entry == cte_totality.end()) {
 			return;
 		}
 		for (idx_t i = 0; i < entry->second.size(); i++) {
 			if (!entry->second[i].empty()) {
-				totality.emplace(ColumnBinding(cte_ref.table_index, i), entry->second[i]);
+				totality.emplace(ColumnBinding(cte_ref.table_index, ProjectionIndex(i)), entry->second[i]);
 			}
 		}
 		return;
@@ -2081,7 +2090,7 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 		}
 		for (idx_t i = 0; i < per_column.size(); i++) {
 			if (!per_column[i].empty()) {
-				totality.emplace(ColumnBinding(delim_get.table_index, i), per_column[i]);
+				totality.emplace(ColumnBinding(delim_get.table_index, ProjectionIndex(i)), per_column[i]);
 			}
 		}
 		return;
@@ -2121,7 +2130,7 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 				}
 			}
 			if (known && !merged.empty()) {
-				totality.emplace(ColumnBinding(setop.table_index, col), std::move(merged));
+				totality.emplace(ColumnBinding(setop.table_index, ProjectionIndex(col)), std::move(merged));
 			}
 		}
 		return;
@@ -2134,9 +2143,9 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 				continue;
 			}
 			auto &column_ref = expression->Cast<BoundColumnRefExpression>();
-			auto source = totality.find(column_ref.binding);
+			auto source = totality.find(column_ref.Binding());
 			if (source != totality.end()) {
-				totality.emplace(ColumnBinding(projection.table_index, i), source->second);
+				totality.emplace(ColumnBinding(projection.table_index, ProjectionIndex(i)), source->second);
 			}
 		}
 		return;
@@ -2180,7 +2189,7 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 			unordered_set<string> proven;
 			CollectSpillProvenPaths(*stats, returned_types[table_index], proven);
 			for (auto &shred : shreds) {
-				if (proven.count(read_layout.shreds[shred.child_index].first)) {
+				if (proven.count(read_layout.shreds[shred.child_index].first.GetIdentifierName())) {
 					per_shred[shred.child_index] = false;
 				}
 			}
@@ -2201,8 +2210,8 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 							if (!per_shred[shred.child_index] || IsShredListType(shred.type)) {
 								continue;
 							}
-							auto lane_child = JsonoFindShredsFieldIndex(shreds_stats_type,
-							                                            read_layout.shreds[shred.child_index].first);
+							auto lane_child = JsonoFindShredsFieldIndex(
+							    shreds_stats_type, read_layout.shreds[shred.child_index].first.GetIdentifierName());
 							if (lane_child == DConstants::INVALID_INDEX) {
 								continue;
 							}
@@ -2271,7 +2280,7 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 						if (!per_shred[shred.child_index] || IsShredListType(shred.type)) {
 							continue;
 						}
-						auto &lane_name = read_layout.shreds[shred.child_index].first;
+						auto &lane_name = read_layout.shreds[shred.child_index].first.GetIdentifierName();
 						auto &read_type = read_layout.shreds[shred.child_index].second;
 						bool every_file = true;
 						for (idx_t file_idx = 0; file_idx < file_proven.size() && every_file; file_idx++) {
@@ -2293,7 +2302,7 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 		}
 		// The same binding can recur across plan leaves (self-join); keep the conservative view —
 		// a shred is total only when every occurrence proves it total.
-		auto binding = ColumnBinding(get.table_index, i);
+		auto binding = ColumnBinding(get.table_index, ProjectionIndex(i));
 		auto existing = totality.find(binding);
 		if (existing == totality.end()) {
 			totality.emplace(binding, std::move(per_shred));
@@ -2329,8 +2338,8 @@ bool IsStringExtractFunction(const string &name) {
 // to_json-vs-extract divergence).
 unique_ptr<Expression> MakeNativeExtractOver(ClientContext &context, unique_ptr<Expression> source,
                                              unique_ptr<Expression> path, const LogicalType &value_type, bool string_fn,
-                                             const string &alias) {
-	auto path_type = path->return_type;
+                                             const Identifier &alias) {
+	auto path_type = path->GetReturnType();
 	vector<unique_ptr<Expression>> children;
 	children.push_back(std::move(source));
 	children.push_back(std::move(path));
@@ -2359,19 +2368,23 @@ public:
 protected:
 	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *expr_ptr) override {
 		(void)expr_ptr;
+		if (BoundCastExpression::IsCast(expr)) {
+			return RewriteShreddedCast(expr);
+		}
 		// Whole-value conversion: reconstruct the full value from residual + shreds.
-		if ((expr.function.name == "to_json" || expr.function.name == "json_quote") && expr.children.size() == 1) {
-			if (IsShreddedJsonoType(expr.children[0]->return_type)) {
+		if ((expr.Function().GetName() == "to_json" || expr.Function().GetName() == "json_quote") &&
+		    expr.GetChildren().size() == 1) {
+			if (IsShreddedJsonoType(expr.GetChildren()[0]->GetReturnType())) {
 				auto alias = expr.GetAlias();
-				auto rewritten = ReconstructShreddedToJson(std::move(expr.children[0]));
+				auto rewritten = ReconstructShreddedToJson(std::move(expr.GetChildrenMutable()[0]));
 				rewritten->SetAlias(alias);
 				return rewritten;
 			}
-			JsonoRejectMalformedAnchoredRead(expr.children[0]->return_type);
+			JsonoRejectMalformedAnchoredRead(expr.GetChildren()[0]->GetReturnType());
 		}
 		// Path extraction off a shredded value.
-		if (IsExtractFunction(expr.function.name) && expr.children.size() == 2) {
-			auto shredded_cast = ShreddedJsonCast(*expr.children[0]);
+		if (IsExtractFunction(expr.Function().GetName().GetIdentifierName()) && expr.GetChildren().size() == 2) {
+			auto shredded_cast = ShreddedJsonCast(*expr.GetChildren()[0]);
 			if (shredded_cast) {
 				return RewriteShreddedExtract(expr, *shredded_cast);
 			}
@@ -2382,19 +2395,19 @@ protected:
 			// optimizer-only STRUCT->JSON reconstruct cast, which const-folds (raw struct dump) to a
 			// silent NULL; the fused native jsono extract folds to the correct value.
 			vector<PathStep> steps;
-			auto chain_base = ShreddedExtractChain(*expr.children[0], steps);
+			auto chain_base = ShreddedExtractChain(*expr.GetChildren()[0], steps);
 			if (chain_base) {
 				JsonoPathSpec leaf;
 				string text;
-				if (TryReadExtractPath(context, *expr.children[1], leaf)) {
+				if (TryReadExtractPath(context, *expr.GetChildren()[1], leaf)) {
 					for (auto &s : leaf.steps) {
 						steps.push_back(s);
 					}
 					if (TryStepsToJsonPath(steps, text)) {
 						JsonoPathSpec combined(text, std::move(steps));
 						auto path = make_uniq<BoundConstantExpression>(Value(combined.text));
-						bool string_fn = IsStringExtractFunction(expr.function.name);
-						return BuildShreddedPathExtract(*chain_base, std::move(path), combined, expr.return_type,
+						bool string_fn = IsStringExtractFunction(expr.Function().GetName().GetIdentifierName());
+						return BuildShreddedPathExtract(*chain_base, std::move(path), combined, expr.GetReturnType(),
 						                                string_fn, expr.GetAlias());
 					}
 				}
@@ -2402,20 +2415,19 @@ protected:
 		}
 		// Introspection (jsono_type / jsono_keys) off a shredded value: feed the residual natively
 		// instead of reconstructing when that is value-equivalent (mutates the argument in place).
-		if (expr.function.name == "jsono_type" || expr.function.name == "jsono_keys") {
+		if (expr.Function().GetName() == "jsono_type" || expr.Function().GetName() == "jsono_keys") {
 			auto rewritten = ResidualizeIntrospect(expr);
 			if (rewritten) {
 				return rewritten;
 			}
 		}
-		if (expr.function.name == "jsono_array_length") {
+		if (expr.Function().GetName() == "jsono_array_length") {
 			return ResidualizeShreddedArrayLength(expr);
 		}
 		return nullptr;
 	}
 
-	unique_ptr<Expression> VisitReplace(BoundCastExpression &expr, unique_ptr<Expression> *expr_ptr) override {
-		(void)expr_ptr;
+	unique_ptr<Expression> RewriteShreddedCast(BoundFunctionExpression &expr) {
 		// Fold CAST(shred string extract AS T) where the shred is itself typed T: read the
 		// typed shred directly, skipping the BIGINT->VARCHAR->BIGINT round-trip and giving
 		// the planner the shred's typed column statistics.
@@ -2424,16 +2436,16 @@ protected:
 			return folded;
 		}
 		// Whole-value -> JSON: reconstruct from residual + shreds.
-		if (IsJsonTextType(expr.return_type)) {
-			if (IsShreddedJsonoType(expr.child->return_type)) {
+		if (IsJsonTextType(expr.GetReturnType())) {
+			if (IsShreddedJsonoType(BoundCastExpression::Child(expr).GetReturnType())) {
 				auto alias = expr.GetAlias();
-				auto rewritten = ReconstructShreddedToJson(std::move(expr.child));
+				auto rewritten = ReconstructShreddedToJson(std::move(BoundCastExpression::ChildMutable(expr)));
 				rewritten->SetAlias(alias);
 				return rewritten;
 			}
 			// The `->>`/`->` operators over such a type reach here too: the binder routes them through
 			// core json's CAST(struct AS JSON), which this visit sees.
-			JsonoRejectMalformedAnchoredRead(expr.child->return_type);
+			JsonoRejectMalformedAnchoredRead(BoundCastExpression::Child(expr).GetReturnType());
 		}
 		return nullptr;
 	}
@@ -2443,13 +2455,13 @@ private:
 	// `CAST(shredded->JSON)` from core json's STRUCT->JSON path (the core-named extracts), or
 	// `CAST(shredded->JSONO)` from the jsono-named extracts' bind-time reconstruct cast. Return that
 	// cast so the extract reads shreds/residual directly instead of reconstructing per row.
-	optional_ptr<BoundCastExpression> ShreddedJsonCast(Expression &arg) {
-		if (arg.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+	optional_ptr<BoundFunctionExpression> ShreddedJsonCast(Expression &arg) {
+		if (!BoundCastExpression::IsCast(arg)) {
 			return nullptr;
 		}
-		auto &cast = arg.Cast<BoundCastExpression>();
-		if ((IsJsonTextType(cast.return_type) || IsJsonoType(cast.return_type)) &&
-		    IsShreddedJsonoType(cast.child->return_type)) {
+		auto &cast = arg.Cast<BoundFunctionExpression>();
+		if ((IsJsonTextType(cast.GetReturnType()) || IsJsonoType(cast.GetReturnType())) &&
+		    IsShreddedJsonoType(BoundCastExpression::Child(cast).GetReturnType())) {
 			return &cast;
 		}
 		return nullptr;
@@ -2464,12 +2476,12 @@ private:
 	// (`->`/json_extract, which core json binds over `CAST(shredded AS JSON)`), optionally already
 	// wrapped in a CAST-to-JSON/JSONO by an earlier rewrite of an inner link — we run top-down, so the
 	// outer sees links raw, but the unwrap keeps recursion robust to either order.
-	optional_ptr<BoundCastExpression> ShreddedExtractChain(Expression &arg, vector<PathStep> &prefix) {
+	optional_ptr<BoundFunctionExpression> ShreddedExtractChain(Expression &arg, vector<PathStep> &prefix) {
 		Expression *node = &arg;
-		if (node->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-			auto &cast = node->Cast<BoundCastExpression>();
-			if (IsJsonTextType(cast.return_type) || IsJsonoType(cast.return_type)) {
-				node = cast.child.get();
+		if (BoundCastExpression::IsCast(*node)) {
+			auto &cast = node->Cast<BoundFunctionExpression>();
+			if (IsJsonTextType(cast.GetReturnType()) || IsJsonoType(cast.GetReturnType())) {
+				node = BoundCastExpression::ChildMutable(cast).get();
 			}
 		}
 		if (node->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
@@ -2478,17 +2490,17 @@ private:
 		auto &fn = node->Cast<BoundFunctionExpression>();
 		// Only json-valued extract links form the chain: a string-valued extract is the leaf, not a
 		// link (it can only sit at the top, handled by the caller).
-		if (!IsExtractFunction(fn.function.name) || IsStringExtractFunction(fn.function.name) ||
-		    fn.children.size() != 2) {
+		if (!IsExtractFunction(fn.Function().GetName().GetIdentifierName()) ||
+		    IsStringExtractFunction(fn.Function().GetName().GetIdentifierName()) || fn.GetChildren().size() != 2) {
 			return nullptr;
 		}
 		JsonoPathSpec step;
-		if (!TryReadExtractPath(context, *fn.children[1], step)) {
+		if (!TryReadExtractPath(context, *fn.GetChildren()[1], step)) {
 			return nullptr;
 		}
-		auto base = ShreddedJsonCast(*fn.children[0]);
+		auto base = ShreddedJsonCast(*fn.GetChildren()[0]);
 		if (!base) {
-			base = ShreddedExtractChain(*fn.children[0], prefix);
+			base = ShreddedExtractChain(*fn.GetChildren()[0], prefix);
 			if (!base) {
 				return nullptr;
 			}
@@ -2505,25 +2517,26 @@ private:
 	// instead: a json-valued extract of a shred (its value may be stripped from the residual),
 	// and any extract of a subtree that contains a stripped shred leaf — string extracts
 	// serialize containers, so they need the leaf as much as json-valued ones.
-	unique_ptr<Expression> RewriteShreddedExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast) {
-		bool string_fn = IsStringExtractFunction(expr.function.name);
+	unique_ptr<Expression> RewriteShreddedExtract(BoundFunctionExpression &expr,
+	                                              BoundFunctionExpression &shredded_cast) {
+		bool string_fn = IsStringExtractFunction(expr.Function().GetName().GetIdentifierName());
 		// Batch/list path overload: decompose a constant list of paths into a list_value of native
 		// per-path extracts, so each element reads its shred lane (with row-group pruning) instead of
 		// the whole value being reconstructed + reserialized + reparsed once per row by core json's list
 		// overload. A non-decomposable list is left to that overload, whose STRUCT->JSON argument cast
 		// the cast visitor reconstructs independently.
-		if (expr.children[1]->return_type.id() == LogicalTypeId::LIST) {
+		if (expr.GetChildren()[1]->GetReturnType().id() == LogicalTypeId::LIST) {
 			return RewriteShreddedListExtract(expr, shredded_cast, string_fn);
 		}
 		JsonoPathSpec path;
-		if (!TryReadExtractPath(context, *expr.children[1], path)) {
+		if (!TryReadExtractPath(context, *expr.GetChildren()[1], path)) {
 			// Non-constant (or otherwise unreadable) path: leave the plan untouched. The
 			// core-named extracts support per-row paths over the reconstruct cast, and the
 			// jsono-named extracts already refused such a path at their own bind.
 			return nullptr;
 		}
-		return BuildShreddedPathExtract(shredded_cast, std::move(expr.children[1]), path, expr.return_type, string_fn,
-		                                expr.GetAlias());
+		return BuildShreddedPathExtract(shredded_cast, std::move(expr.GetChildrenMutable()[1]), path,
+		                                expr.GetReturnType(), string_fn, expr.GetAlias());
 	}
 
 	// Build a native single-path extract over a shredded value: read a scalar shred lane directly, or
@@ -2531,10 +2544,10 @@ private:
 	// its parsed form; `value_type` is the extract's result type (VARCHAR for ->>/json_extract_string,
 	// JSON/JSONO for the json-valued ->/json_extract). Used once per scalar extract and once per element
 	// of a decomposed list extract.
-	unique_ptr<Expression> BuildShreddedPathExtract(BoundCastExpression &shredded_cast, unique_ptr<Expression> path,
+	unique_ptr<Expression> BuildShreddedPathExtract(BoundFunctionExpression &shredded_cast, unique_ptr<Expression> path,
 	                                                const JsonoPathSpec &path_spec, const LogicalType &value_type,
-	                                                bool string_fn, const string &alias) {
-		auto shreds = CollectShreddedShreds(shredded_cast.child->return_type);
+	                                                bool string_fn, const Identifier &alias) {
+		auto shreds = CollectShreddedShreds(BoundCastExpression::Child(shredded_cast).GetReturnType());
 		// Reconstruct-needed reads first, so a container read with a shred living strictly inside the
 		// read path (stripped from the residual) reconstructs rather than bare-reading the lane — a
 		// bare read would miss the nested shred, and the residual alone misses it too. This also covers
@@ -2549,7 +2562,7 @@ private:
 		// lane directly (with the residual COALESCE fallback, dropped when the shred is total).
 		for (auto &shred : shreds) {
 			if (PathStepsEqual(shred.steps, path_spec.steps) && string_fn && !IsShredListType(shred.type)) {
-				return MakeShredRead(shredded_cast.child->Copy(), shred, std::move(path), alias);
+				return MakeShredRead(BoundCastExpression::Child(shredded_cast).Copy(), shred, std::move(path), alias);
 			}
 		}
 		// No shred touched this read: serve it natively from the residual.
@@ -2560,16 +2573,16 @@ private:
 	// list_value(extract(p1), ..., extract(pN)) of native per-path reads, matching the cost of N scalar
 	// extracts. All-or-nothing: if any element is not a constant readable path, decline so core json's
 	// list overload serves the whole list (correct, but reconstructs the whole value per row).
-	unique_ptr<Expression> RewriteShreddedListExtract(BoundFunctionExpression &expr, BoundCastExpression &shredded_cast,
-	                                                  bool string_fn) {
-		if (ListType::GetChildType(expr.children[1]->return_type).id() != LogicalTypeId::VARCHAR) {
+	unique_ptr<Expression> RewriteShreddedListExtract(BoundFunctionExpression &expr,
+	                                                  BoundFunctionExpression &shredded_cast, bool string_fn) {
+		if (ListType::GetChildType(expr.GetChildren()[1]->GetReturnType()).id() != LogicalTypeId::VARCHAR) {
 			return nullptr;
 		}
 		vector<string> paths;
-		if (!TryReadStringListValue(context, *expr.children[1], paths)) {
+		if (!TryReadStringListValue(context, *expr.GetChildren()[1], paths)) {
 			return nullptr;
 		}
-		auto element_type = ListType::GetChildType(expr.return_type);
+		auto element_type = ListType::GetChildType(expr.GetReturnType());
 		vector<unique_ptr<Expression>> elements;
 		elements.reserve(paths.size());
 		for (auto &path_text : paths) {
@@ -2583,7 +2596,7 @@ private:
 		}
 		auto result = BindListValue(std::move(elements), element_type);
 		// Match the original list type exactly (JSON aliases VARCHAR; a no-op cast when already equal).
-		result = BoundCastExpression::AddCastToType(context, std::move(result), expr.return_type);
+		result = BoundCastExpression::AddCastToType(context, std::move(result), expr.GetReturnType());
 		result->SetAlias(expr.GetAlias());
 		return result;
 	}
@@ -2607,56 +2620,61 @@ private:
 	//   - jsono_type/jsono_keys(shredded, path): residual-equivalent when the path resolves to no
 	//     shred and holds no shred beneath it, since only shred leaves are stripped from the residual.
 	unique_ptr<Expression> ResidualizeIntrospect(BoundFunctionExpression &expr) {
-		auto shredded_cast = ShreddedJsonCast(*expr.children[0]);
+		auto shredded_cast = ShreddedJsonCast(*expr.GetChildren()[0]);
 		if (!shredded_cast) {
 			return nullptr;
 		}
-		if (expr.children.size() == 1) {
-			if (expr.function.name == "jsono_type") {
-				expr.children[0] = ResidualReinterpret(*shredded_cast->child);
-			} else if (expr.function.name == "jsono_keys") {
-				auto bind_data = BuildJsonoShreddedKeysBindData(shredded_cast->child->return_type);
+		if (expr.GetChildren().size() == 1) {
+			if (expr.Function().GetName() == "jsono_type") {
+				expr.GetChildrenMutable()[0] = ResidualReinterpret(BoundCastExpression::Child(*shredded_cast));
+			} else if (expr.Function().GetName() == "jsono_keys") {
+				auto bind_data =
+				    BuildJsonoShreddedKeysBindData(BoundCastExpression::Child(*shredded_cast).GetReturnType());
 				vector<unique_ptr<Expression>> children;
-				children.push_back(ResidualReinterpret(*shredded_cast->child, ResidualPolicy::PathScoped));
-				auto result =
-				    make_uniq<BoundFunctionExpression>(expr.return_type, MakeJsonoInternalShreddedKeysFunction(),
-				                                       std::move(children), std::move(bind_data));
+				children.push_back(
+				    ResidualReinterpret(BoundCastExpression::Child(*shredded_cast), ResidualPolicy::PathScoped));
+				BoundScalarFunction bound_function(MakeJsonoInternalShreddedKeysFunction());
+				bound_function.SetReturnType(expr.GetReturnType());
+				auto result = make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(children),
+				                                                 std::move(bind_data));
 				result->SetAlias(expr.GetAlias());
 				return result;
 			}
 			return nullptr;
 		}
 		JsonoPathSpec path;
-		if (!TryReadExtractPath(context, *expr.children[1], path)) {
+		if (!TryReadExtractPath(context, *expr.GetChildren()[1], path)) {
 			return nullptr;
 		}
-		for (auto &shred : CollectShreddedShreds(shredded_cast->child->return_type)) {
+		for (auto &shred : CollectShreddedShreds(BoundCastExpression::Child(*shredded_cast).GetReturnType())) {
 			if (PathStepsEqual(shred.steps, path.steps) || PathStepsObjectKeyPrefix(path.steps, shred.steps) ||
 			    ReadDescendsIntoArrayShred(shred.type, shred.steps, path.steps)) {
 				return nullptr;
 			}
 		}
-		expr.children[0] = ResidualReinterpret(*shredded_cast->child, ResidualPolicy::PathScoped);
+		expr.GetChildrenMutable()[0] =
+		    ResidualReinterpret(BoundCastExpression::Child(*shredded_cast), ResidualPolicy::PathScoped);
 		return nullptr;
 	}
 
 	unique_ptr<Expression> ResidualizeShreddedArrayLength(BoundFunctionExpression &expr) {
-		auto shredded_cast = ShreddedJsonCast(*expr.children[0]);
+		auto shredded_cast = ShreddedJsonCast(*expr.GetChildren()[0]);
 		if (!shredded_cast) {
 			return nullptr;
 		}
 		auto bind_data = make_uniq<JsonoShreddedArrayLengthBindData>();
 		auto signatures = make_shared_ptr<vector<JsonoShredSignature>>();
-		JsonoBuildShredSignatures(shredded_cast->child->return_type, *signatures);
+		JsonoBuildShredSignatures(BoundCastExpression::Child(*shredded_cast).GetReturnType(), *signatures);
 		bind_data->signatures = std::move(signatures);
-		if (expr.children.size() == 2) {
-			bind_data->path = make_uniq<JsonoPathSpec>(expr.bind_info->Cast<JsonoSinglePathBindData>().path);
+		if (expr.GetChildren().size() == 2) {
+			bind_data->path = make_uniq<JsonoPathSpec>(expr.BindInfo()->Cast<JsonoSinglePathBindData>().path);
 		}
 		vector<unique_ptr<Expression>> children;
-		children.push_back(ResidualReinterpret(*shredded_cast->child, ResidualPolicy::PathScoped));
+		children.push_back(ResidualReinterpret(BoundCastExpression::Child(*shredded_cast), ResidualPolicy::PathScoped));
+		BoundScalarFunction bound_function(MakeJsonoInternalShreddedArrayLengthFunction());
+		bound_function.SetReturnType(expr.GetReturnType());
 		auto result =
-		    make_uniq<BoundFunctionExpression>(expr.return_type, MakeJsonoInternalShreddedArrayLengthFunction(),
-		                                       std::move(children), std::move(bind_data));
+		    make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(children), std::move(bind_data));
 		result->SetAlias(expr.GetAlias());
 		return result;
 	}
@@ -2679,10 +2697,10 @@ private:
 	// (every reconstruct/read site gates list shreds out before reaching here).
 	unique_ptr<Expression> ShredExtract(const Expression &column, idx_t child_index) {
 		JsonoLayoutType layout;
-		TryParseJsonoLayoutType(column.return_type, layout);
-		auto &layout_type = StructType::GetChildTypes(column.return_type)[0].second;
+		TryParseJsonoLayoutType(column.GetReturnType(), layout);
+		auto &layout_type = StructType::GetChildTypes(column.GetReturnType())[0].second;
 		auto &shreds_type = StructType::GetChildTypes(layout_type)[1].second;
-		auto field_index = JsonoFindShredsFieldIndex(shreds_type, layout.shreds[child_index].first);
+		auto field_index = JsonoFindShredsFieldIndex(shreds_type, layout.shreds[child_index].first.GetIdentifierName());
 		if (field_index == DConstants::INVALID_INDEX) {
 			// The name came from this very type's parsed layout, so it is always there. Refusing loudly
 			// rather than asserting keeps a release build (where D_ASSERT is stripped) from folding
@@ -2705,7 +2723,7 @@ private:
 			return false;
 		}
 		auto &column_ref = column.Cast<BoundColumnRefExpression>();
-		auto entry = totality.find(column_ref.binding);
+		auto entry = totality.find(column_ref.Binding());
 		if (entry == totality.end() || child_index >= entry->second.size()) {
 			return false;
 		}
@@ -2765,22 +2783,22 @@ private:
 		FunctionBinder function_binder(context);
 		auto body_struct = StructExtractAt(StructExtractAt(column.Copy(), 1), 1);
 		auto body = policy == ResidualPolicy::Stripped ? StripManifestBody(*body_struct) : std::move(body_struct);
-		body->SetAlias(JsonoBodyName());
+		body->SetAlias(Identifier(JsonoBodyName()));
 		vector<unique_ptr<Expression>> inner_children;
 		inner_children.push_back(std::move(body));
 		auto inner = function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(inner_children));
-		inner->SetAlias(JsonoLayoutName());
+		inner->SetAlias(Identifier(JsonoLayoutName()));
 		vector<unique_ptr<Expression>> outer_children;
 		outer_children.push_back(std::move(inner));
 		auto outer = function_binder.BindScalarFunction(StructPackFun::GetFunction(), std::move(outer_children));
 		auto residual = BoundCastExpression::AddCastToType(context, std::move(outer), JsonoType());
 		JsonoLayoutType layout;
-		if (policy == ResidualPolicy::Checked && TryParseJsonoLayoutType(column.return_type, layout) &&
+		if (policy == ResidualPolicy::Checked && TryParseJsonoLayoutType(column.GetReturnType(), layout) &&
 		    !layout.shreds.empty()) {
 			// The signatures the residual check verifies each row's manifest against, derived from the
 			// column's own type through the one builder every other reader uses.
 			std::vector<JsonoShredSignature> signatures;
-			jsono::JsonoBuildShredSignatures(column.return_type, signatures);
+			jsono::JsonoBuildShredSignatures(column.GetReturnType(), signatures);
 			auto shreds = make_uniq<BoundConstantExpression>(JsonoShredSignaturesToValue(signatures));
 			vector<unique_ptr<Expression>> check_children;
 			check_children.push_back(std::move(residual));
@@ -2788,7 +2806,7 @@ private:
 			residual = function_binder.BindScalarFunction(JsonoCheckedResidualFunction(), std::move(check_children));
 		}
 		auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
-		is_null->children.push_back(column.Copy());
+		is_null->GetChildrenMutable().push_back(column.Copy());
 		auto null_jsono = make_uniq<BoundConstantExpression>(Value(JsonoType()));
 		return make_uniq<BoundCaseExpression>(std::move(is_null), std::move(null_jsono), std::move(residual));
 	}
@@ -2797,10 +2815,11 @@ private:
 	// non-shredded column's extract cost — no serialize/parse round-trip through core
 	// json. Correct because only shred leaves are stripped: a non-shred scalar keeps its
 	// value, and a json-valued read overlapping a stripped shred already reconstructed.
-	unique_ptr<Expression> MakeResidualExtract(BoundCastExpression &shredded_cast, unique_ptr<Expression> path,
-	                                           const LogicalType &value_type, bool string_fn, const string &alias) {
-		return MakeNativeExtractOver(context, ResidualReinterpret(*shredded_cast.child, ResidualPolicy::PathScoped),
-		                             std::move(path), value_type, string_fn, alias);
+	unique_ptr<Expression> MakeResidualExtract(BoundFunctionExpression &shredded_cast, unique_ptr<Expression> path,
+	                                           const LogicalType &value_type, bool string_fn, const Identifier &alias) {
+		return MakeNativeExtractOver(
+		    context, ResidualReinterpret(BoundCastExpression::Child(shredded_cast), ResidualPolicy::PathScoped),
+		    std::move(path), value_type, string_fn, alias);
 	}
 
 	// A shredded read whose value the residual alone cannot serve — its leaf is stripped into a
@@ -2808,41 +2827,44 @@ private:
 	// reconstruct the full plain JSONO value (the array-aware reconstruct cast) and extract natively.
 	// This keeps the result on jsono's own renderer, so it is byte-identical to to_json and a plain
 	// read instead of diverging through core json's normalizing/uppercasing `->>`.
-	unique_ptr<Expression> MakeReconstructExtract(BoundCastExpression &shredded_cast, unique_ptr<Expression> path,
-	                                              const LogicalType &value_type, bool string_fn, const string &alias) {
-		auto reconstruct = BoundCastExpression::AddCastToType(context, shredded_cast.child->Copy(), JsonoType());
+	unique_ptr<Expression> MakeReconstructExtract(BoundFunctionExpression &shredded_cast, unique_ptr<Expression> path,
+	                                              const LogicalType &value_type, bool string_fn,
+	                                              const Identifier &alias) {
+		auto reconstruct =
+		    BoundCastExpression::AddCastToType(context, BoundCastExpression::Child(shredded_cast).Copy(), JsonoType());
 		return MakeNativeExtractOver(context, std::move(reconstruct), std::move(path), value_type, string_fn, alias);
 	}
 
 	// Detect CAST(string-shred-extract AS T) where the shred's own type is exactly T, and
 	// fold it to a direct typed read so the cast no longer round-trips through VARCHAR.
-	unique_ptr<Expression> TryFoldTypedShredCast(BoundCastExpression &expr) {
-		auto &target = expr.return_type;
+	unique_ptr<Expression> TryFoldTypedShredCast(BoundFunctionExpression &expr) {
+		auto &target = expr.GetReturnType();
 		if (target.id() == LogicalTypeId::VARCHAR || IsJsonTextType(target) ||
-		    expr.child->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		    BoundCastExpression::Child(expr).GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 			return nullptr;
 		}
-		auto &fn = expr.child->Cast<BoundFunctionExpression>();
-		if (!IsStringExtractFunction(fn.function.name) || fn.children.size() != 2) {
+		auto &fn = BoundCastExpression::ChildMutable(expr)->Cast<BoundFunctionExpression>();
+		if (!IsStringExtractFunction(fn.Function().GetName().GetIdentifierName()) || fn.GetChildren().size() != 2) {
 			return nullptr;
 		}
-		auto shredded_cast = ShreddedJsonCast(*fn.children[0]);
+		auto shredded_cast = ShreddedJsonCast(*fn.GetChildren()[0]);
 		if (!shredded_cast) {
 			return nullptr;
 		}
 		JsonoPathSpec path;
-		if (!TryReadExtractPath(context, *fn.children[1], path)) {
+		if (!TryReadExtractPath(context, *fn.GetChildren()[1], path)) {
 			return nullptr;
 		}
-		for (auto &shred : CollectShreddedShreds(shredded_cast->child->return_type)) {
+		for (auto &shred : CollectShreddedShreds(BoundCastExpression::Child(*shredded_cast).GetReturnType())) {
 			// MakeTypedShredRead reads a bare scalar lane via ShredExtract; a list shred is reconstructed
 			// element-wise instead, so folding it crashes the extract. Leave the inner
 			// `->>` to RewriteShreddedExtract (which reconstructs for list shreds) and the cast on top.
 			if (!PathStepsEqual(shred.steps, path.steps) || shred.type != target || IsShredListType(shred.type)) {
 				continue;
 			}
-			return MakeTypedShredRead(std::move(shredded_cast->child), shred, std::move(fn.children[1]), target,
-			                          expr.try_cast, expr.GetAlias());
+			return MakeTypedShredRead(std::move(BoundCastExpression::ChildMutable(*shredded_cast)), shred,
+			                          std::move(fn.GetChildrenMutable()[1]), target,
+			                          BoundCastExpression::IsTryCast(expr), expr.GetAlias());
 		}
 		return nullptr;
 	}
@@ -2856,13 +2878,13 @@ private:
 	unique_ptr<Expression> EmitShredRead(const Expression &column, const JsonoShred &shred,
 	                                     unique_ptr<Expression> primary, unique_ptr<Expression> path,
 	                                     const LogicalType &result_type, FinishFallback finish_fallback,
-	                                     const string &alias) {
+	                                     const Identifier &alias) {
 		if (ShredIsTotal(column, shred.child_index)) {
 			primary->SetAlias(alias);
 			return primary;
 		}
 		FunctionBinder function_binder(context);
-		auto path_type = path->return_type.IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
+		auto path_type = path->GetReturnType().IsIntegral() ? LogicalType::BIGINT : LogicalType::VARCHAR;
 		// Soft residual: this fallback only runs for rows whose value diverted into the residual (the
 		// lane is NULL). A non-diverted row's lane already won the COALESCE, so a residual miss here
 		// must read as NULL, not a narrowing throw — see ResidualReinterpret.
@@ -2873,8 +2895,8 @@ private:
 		auto fallback_text =
 		    function_binder.BindScalarFunction(JsonoExtractStringFunction(path_type), std::move(ext_children));
 		auto coalesce = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, result_type);
-		coalesce->children.push_back(std::move(primary));
-		coalesce->children.push_back(finish_fallback(std::move(fallback_text)));
+		coalesce->GetChildrenMutable().push_back(std::move(primary));
+		coalesce->GetChildrenMutable().push_back(finish_fallback(std::move(fallback_text)));
 		coalesce->SetAlias(alias);
 		return std::move(coalesce);
 	}
@@ -2886,7 +2908,7 @@ private:
 	// bare struct_extract the planner pushes into the scan.
 	unique_ptr<Expression> MakeTypedShredRead(unique_ptr<Expression> column, const JsonoShred &shred,
 	                                          unique_ptr<Expression> path, const LogicalType &target, bool try_cast,
-	                                          const string &alias) {
+	                                          const Identifier &alias) {
 		auto primary = ShredExtract(*column, shred.child_index);
 		return EmitShredRead(
 		    *column, shred, std::move(primary), std::move(path), target,
@@ -2901,7 +2923,7 @@ private:
 	// any other typed shred casts to VARCHAR. Each falls back to a native residual text extract for
 	// its NULL-lane rows (EmitShredRead), and COALESCE short-circuits per row.
 	unique_ptr<Expression> MakeShredRead(unique_ptr<Expression> column, const JsonoShred &shred,
-	                                     unique_ptr<Expression> path, const string &alias) {
+	                                     unique_ptr<Expression> path, const Identifier &alias) {
 		auto shred_value = ShredExtract(*column, shred.child_index);
 		unique_ptr<Expression> primary;
 		if (shred.type.id() == LogicalTypeId::VARCHAR) {
@@ -2914,8 +2936,10 @@ private:
 			// its sole canonical text is jsono's own EmitDouble — render through that.
 			vector<unique_ptr<Expression>> double_text_children;
 			double_text_children.push_back(std::move(shred_value));
-			primary = make_uniq<BoundFunctionExpression>(LogicalType::VARCHAR, MakeJsonoInternalDoubleTextFunction(),
-			                                             std::move(double_text_children), nullptr);
+			BoundScalarFunction bound_function(MakeJsonoInternalDoubleTextFunction());
+			bound_function.SetReturnType(LogicalType::VARCHAR);
+			primary =
+			    make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(double_text_children), nullptr);
 		} else {
 			primary = BoundCastExpression::AddCastToType(context, std::move(shred_value), LogicalType::VARCHAR);
 		}
@@ -2934,7 +2958,7 @@ private:
 	// prefix-overlapping shapes use the general reconstruct cast.
 	unique_ptr<Expression> ReconstructShreddedToJson(unique_ptr<Expression> column) {
 		auto alias = column->GetAlias();
-		auto shreds = CollectShreddedShreds(column->return_type);
+		auto shreds = CollectShreddedShreds(column->GetReturnType());
 		bool needs_full_reconstruct = false;
 		bool has_list_shreds = false;
 		bool direct_list_render = true;
@@ -2971,11 +2995,12 @@ private:
 			}
 		}
 		if (has_list_shreds && direct_list_render && !needs_full_reconstruct) {
-			auto function = MakeJsonoShreddedListsToJsonFunction(column->return_type);
+			auto function = MakeJsonoShreddedListsToJsonFunction(column->GetReturnType());
 			vector<unique_ptr<Expression>> children;
 			children.push_back(std::move(column));
-			auto result = make_uniq<BoundFunctionExpression>(LogicalType::JSON(), std::move(function),
-			                                                 std::move(children), nullptr);
+			BoundScalarFunction bound_function(std::move(function));
+			bound_function.SetReturnType(LogicalType::JSON());
+			auto result = make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(children), nullptr);
 			result->SetAlias(alias);
 			return std::move(result);
 		}
@@ -2990,10 +3015,10 @@ private:
 		FunctionBinder function_binder(context);
 		auto residual = ResidualReinterpret(*column);
 		auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
-		is_null->children.push_back(column->Copy());
-		auto patch_function = JsonoShreddedPatchFunction(column->return_type);
-		patch_function.SetSerializeCallback(JsonoInternalSerializeUnsupported<ScalarFunction>);
-		patch_function.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<ScalarFunction>);
+		is_null->GetChildrenMutable().push_back(column->Copy());
+		auto patch_function = JsonoShreddedPatchFunction(column->GetReturnType());
+		patch_function.SetSerializeCallback(JsonoInternalSerializeUnsupported<BoundScalarFunction>);
+		patch_function.SetDeserializeCallback(JsonoInternalDeserializeUnsupported<BoundScalarFunction>);
 		vector<unique_ptr<Expression>> patch_children;
 		patch_children.push_back(std::move(column));
 		auto patch = function_binder.BindScalarFunction(std::move(patch_function), std::move(patch_children));
@@ -3037,7 +3062,7 @@ private:
 unique_ptr<Expression> MakeReshredExpression(ClientContext &context, unique_ptr<Expression> column,
                                              const LogicalType &target) {
 	auto alias = column->GetAlias();
-	if (column->return_type == target) {
+	if (column->GetReturnType() == target) {
 		return column;
 	}
 	unique_ptr<Expression> result;
@@ -3056,7 +3081,7 @@ unique_ptr<Expression> MakeReshredExpression(ClientContext &context, unique_ptr<
 		children.push_back(std::move(target_constant));
 		FunctionBinder function_binder(context);
 		result = function_binder.BindScalarFunction(JsonoReshredFunction(), std::move(children));
-		if (result->return_type != target) {
+		if (result->GetReturnType() != target) {
 			// The bind decoded `target`'s lane names and re-encoded them building its own return type,
 			// so this is also a `Encode ∘ Decode == id` self-test: codec drift, or drift in the canonical
 			// field order the two sides sort by, surfaces here.
@@ -3075,8 +3100,8 @@ unique_ptr<Expression> MakeReshredExpression(ClientContext &context, unique_ptr<
 child_list_t<LogicalType> SortedShreds(const child_list_t<LogicalType> &shreds) {
 	auto sorted = shreds;
 	std::sort(sorted.begin(), sorted.end(),
-	          [](const std::pair<string, LogicalType> &a, const std::pair<string, LogicalType> &b) {
-		          return a.first < b.first;
+	          [](const std::pair<Identifier, LogicalType> &a, const std::pair<Identifier, LogicalType> &b) {
+		          return a.first.GetIdentifierName() < b.first.GetIdentifierName();
 	          });
 	return sorted;
 }
@@ -3088,19 +3113,19 @@ bool SameShredSet(const child_list_t<LogicalType> &a, const child_list_t<Logical
 void NormalizeShreddedCastsInExpression(ClientContext &context, unique_ptr<Expression> &expr) {
 	ExpressionIterator::EnumerateChildren(
 	    *expr, [&](unique_ptr<Expression> &child) { NormalizeShreddedCastsInExpression(context, child); });
-	if (expr->GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+	if (!BoundCastExpression::IsCast(*expr)) {
 		return;
 	}
-	auto &cast = expr->Cast<BoundCastExpression>();
-	if (!IsShreddedJsonoType(cast.return_type)) {
+	auto &cast = expr->Cast<BoundFunctionExpression>();
+	if (!IsShreddedJsonoType(cast.GetReturnType())) {
 		return;
 	}
-	auto &source_type = cast.child->return_type;
+	auto &source_type = BoundCastExpression::Child(cast).GetReturnType();
 	if (!IsJsonoType(source_type) && !IsShreddedJsonoType(source_type)) {
 		return;
 	}
 	JsonoLayoutType target_layout;
-	TryParseJsonoLayoutType(cast.return_type, target_layout);
+	TryParseJsonoLayoutType(cast.GetReturnType(), target_layout);
 	if (IsShreddedJsonoType(source_type)) {
 		JsonoLayoutType source_layout;
 		TryParseJsonoLayoutType(source_type, source_layout);
@@ -3111,7 +3136,7 @@ void NormalizeShreddedCastsInExpression(ClientContext &context, unique_ptr<Expre
 		}
 	}
 	auto alias = expr->GetAlias();
-	auto target = cast.return_type;
+	auto target = cast.GetReturnType();
 	// The reshred constructor canonicalizes shred order (sorted by encoded lane name — which the
 	// order-preserving codec makes path order too, see SortedShreds), so reshred to the canonical
 	// type first and let a reorder-only by-name cast produce the exact target type.
@@ -3119,10 +3144,12 @@ void NormalizeShreddedCastsInExpression(ClientContext &context, unique_ptr<Expre
 	vector<JsonoLaneSpec> canonical_lanes;
 	canonical_lanes.reserve(canonical.size());
 	for (auto &shred : canonical) {
-		canonical_lanes.push_back(JsonoLaneSpec {ShredNamePath(shred.first, "jsono cast normalization"), shred.second});
+		canonical_lanes.push_back(
+		    JsonoLaneSpec {ShredNamePath(shred.first.GetIdentifierName(), "jsono cast normalization"), shred.second});
 	}
 	auto canonical_type = JsonoShreddedStructType(canonical_lanes);
-	auto replacement = MakeReshredExpression(context, std::move(cast.child), canonical_type);
+	auto replacement =
+	    MakeReshredExpression(context, std::move(BoundCastExpression::ChildMutable(cast)), canonical_type);
 	if (canonical_type != target) {
 		replacement = BoundCastExpression::AddCastToType(context, std::move(replacement), target);
 	}
@@ -3204,13 +3231,13 @@ private:
 		if (op.type == LogicalOperatorType::LOGICAL_UNION) {
 			auto &setop = op.Cast<LogicalSetOperation>();
 			if (setop.setop_all) {
-				unions.emplace(setop.table_index, setop);
+				unions.emplace(setop.table_index.index, setop);
 			}
 			return;
 		}
 		if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			auto &projection = op.Cast<LogicalProjection>();
-			projections.emplace(projection.table_index, projection);
+			projections.emplace(projection.table_index.index, projection);
 		}
 	}
 
@@ -3222,12 +3249,12 @@ private:
 	optional_ptr<LogicalSetOperation>
 	ResolveUnionSource(ColumnBinding binding, vector<reference<LogicalProjection>> &chain, idx_t &column_index) {
 		while (true) {
-			auto union_entry = unions.find(binding.table_index);
+			auto union_entry = unions.find(binding.table_index.index);
 			if (union_entry != unions.end()) {
 				column_index = binding.column_index;
 				return &union_entry->second.get();
 			}
-			auto forward = projections.find(binding.table_index);
+			auto forward = projections.find(binding.table_index.index);
 			if (forward == projections.end()) {
 				return nullptr;
 			}
@@ -3240,7 +3267,7 @@ private:
 				return nullptr;
 			}
 			chain.push_back(projection);
-			binding = forwarded.Cast<BoundColumnRefExpression>().binding;
+			binding = forwarded.Cast<BoundColumnRefExpression>().Binding();
 		}
 	}
 
@@ -3251,7 +3278,7 @@ private:
 		for (idx_t i = 0; i < projection.expressions.size(); i++) {
 			auto &existing = *projection.expressions[i];
 			if (existing.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-			    existing.Cast<BoundColumnRefExpression>().binding == binding) {
+			    existing.Cast<BoundColumnRefExpression>().Binding() == binding) {
 				return i;
 			}
 		}
@@ -3263,18 +3290,19 @@ private:
 	// JSON / JSONO argument cast the extract's own bind inserted over the merged column.
 	optional_ptr<BoundColumnRefExpression> ExtractSourceColumnRef(Expression &arg) {
 		auto *inner = &arg;
-		if (arg.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-			auto &cast = arg.Cast<BoundCastExpression>();
-			if (!IsJsonTextType(cast.return_type) && !IsJsonoType(cast.return_type)) {
+		if (BoundCastExpression::IsCast(arg)) {
+			auto &cast = arg.Cast<BoundFunctionExpression>();
+			if (!IsJsonTextType(cast.GetReturnType()) && !IsJsonoType(cast.GetReturnType())) {
 				return nullptr;
 			}
-			inner = cast.child.get();
+			inner = BoundCastExpression::ChildMutable(cast).get();
 		}
 		if (inner->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			return nullptr;
 		}
 		auto &colref = inner->Cast<BoundColumnRefExpression>();
-		if (colref.depth != 0 || (!IsJsonoType(colref.return_type) && !IsShreddedJsonoType(colref.return_type))) {
+		if (colref.Depth() != 0 ||
+		    (!IsJsonoType(colref.GetReturnType()) && !IsShreddedJsonoType(colref.GetReturnType()))) {
 			return nullptr;
 		}
 		return &colref;
@@ -3292,12 +3320,12 @@ private:
 				return false;
 			}
 			auto &branch_expr = *expressions[column_index];
-			if (branch_expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-				auto &cast = branch_expr.Cast<BoundCastExpression>();
-				if (cast.child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			if (BoundCastExpression::IsCast(branch_expr)) {
+				auto &cast = branch_expr.Cast<BoundFunctionExpression>();
+				if (BoundCastExpression::Child(cast).GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 					return false;
 				}
-				source = cast.child->Copy();
+				source = BoundCastExpression::Child(cast).Copy();
 				reconciles = true;
 			} else if (branch_expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 				source = branch_expr.Copy();
@@ -3313,7 +3341,7 @@ private:
 			source =
 			    make_uniq<BoundColumnRefExpression>(child.types[column_index], child.GetColumnBindings()[column_index]);
 		}
-		return IsJsonoType(source->return_type) || IsShreddedJsonoType(source->return_type);
+		return IsJsonoType(source->GetReturnType()) || IsShreddedJsonoType(source->GetReturnType());
 	}
 
 	idx_t FindPushedRead(idx_t table_index, idx_t source_column, bool string_fn, const LogicalType &return_type,
@@ -3332,16 +3360,16 @@ private:
 	}
 
 	unique_ptr<Expression> TryPushdown(BoundFunctionExpression &expr) {
-		if (expr.children.size() != 2 || !IsExtractFunction(expr.function.name)) {
+		if (expr.GetChildren().size() != 2 || !IsExtractFunction(expr.Function().GetName().GetIdentifierName())) {
 			return nullptr;
 		}
-		auto colref = ExtractSourceColumnRef(*expr.children[0]);
+		auto colref = ExtractSourceColumnRef(*expr.GetChildren()[0]);
 		if (!colref) {
 			return nullptr;
 		}
 		vector<reference<LogicalProjection>> chain;
 		idx_t column_index;
-		auto setop_ptr = ResolveUnionSource(colref->binding, chain, column_index);
+		auto setop_ptr = ResolveUnionSource(colref->Binding(), chain, column_index);
 		if (!setop_ptr) {
 			return nullptr;
 		}
@@ -3350,32 +3378,33 @@ private:
 			return nullptr;
 		}
 		JsonoPathSpec path;
-		if (!TryReadExtractPath(input.context, *expr.children[1], path)) {
+		if (!TryReadExtractPath(input.context, *expr.GetChildren()[1], path)) {
 			return nullptr;
 		}
-		auto string_fn = IsStringExtractFunction(expr.function.name);
-		auto output_column = FindPushedRead(setop.table_index, column_index, string_fn, expr.return_type, path);
+		auto string_fn = IsStringExtractFunction(expr.Function().GetName().GetIdentifierName());
+		auto output_column =
+		    FindPushedRead(setop.table_index.index, column_index, string_fn, expr.GetReturnType(), path);
 		if (output_column == DConstants::INVALID_INDEX) {
-			output_column = PushRead(setop, column_index, *expr.children[1], string_fn, expr.return_type);
+			output_column = PushRead(setop, column_index, *expr.GetChildren()[1], string_fn, expr.GetReturnType());
 			if (output_column == DConstants::INVALID_INDEX) {
 				return nullptr;
 			}
-			pushed[setop.table_index].push_back(
-			    JsonoPushedSetOpRead {column_index, string_fn, expr.return_type, std::move(path), output_column});
+			pushed[setop.table_index.index].push_back(
+			    JsonoPushedSetOpRead {column_index, string_fn, expr.GetReturnType(), std::move(path), output_column});
 		}
 		changed = true;
 		// Carry the pushed union column back up the interposed projections (innermost first) so
 		// the replacement reference is valid at the extract's level.
-		auto result_binding = ColumnBinding(setop.table_index, output_column);
+		auto result_binding = ColumnBinding(setop.table_index, ProjectionIndex(output_column));
 		for (auto projection = chain.rbegin(); projection != chain.rend(); ++projection) {
-			result_binding =
-			    ColumnBinding(projection->get().table_index,
-			                  ForwardThroughProjection(projection->get(), result_binding, expr.return_type));
+			result_binding = ColumnBinding(
+			    projection->get().table_index,
+			    ProjectionIndex(ForwardThroughProjection(projection->get(), result_binding, expr.GetReturnType())));
 		}
 		if (!chain.empty()) {
 			chain.front().get().ResolveOperatorTypes();
 		}
-		return make_uniq<BoundColumnRefExpression>(expr.GetAlias(), expr.return_type, result_binding);
+		return make_uniq<BoundColumnRefExpression>(expr.GetAlias(), expr.GetReturnType(), result_binding);
 	}
 
 	// Append the per-branch extract to every branch and extend the union's column list; returns the
@@ -3397,13 +3426,13 @@ private:
 		}
 		for (idx_t branch = 0; branch < setop.children.size(); branch++) {
 			auto source = std::move(sources[branch]);
-			if (IsShreddedJsonoType(source->return_type)) {
+			if (IsShreddedJsonoType(source->GetReturnType())) {
 				// The same reconstruct cast the jsono-named extracts' bind inserts; the shredded
 				// rewrite below recognizes it and serves the path from the branch's lanes/residual.
 				source = BoundCastExpression::AddCastToType(input.context, std::move(source), JsonoType());
 			}
-			auto extract =
-			    MakeNativeExtractOver(input.context, std::move(source), path.Copy(), return_type, string_fn, string());
+			auto extract = MakeNativeExtractOver(input.context, std::move(source), path.Copy(), return_type, string_fn,
+			                                     Identifier());
 			auto &child = setop.children[branch];
 			if (child->type != LogicalOperatorType::LOGICAL_PROJECTION) {
 				// Interpose a passthrough projection so the branch has a place to compute the read
@@ -3475,13 +3504,14 @@ void RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &pl
 
 // Name the operation that is about to consume a value, for the refusal message.
 string ForeignConsumerContext(const Expression &consumer) {
+	if (BoundCastExpression::IsCast(consumer)) {
+		return "cast to " + consumer.GetReturnType().ToString();
+	}
 	switch (consumer.GetExpressionClass()) {
 	case ExpressionClass::BOUND_FUNCTION:
-		return consumer.Cast<BoundFunctionExpression>().function.name;
+		return consumer.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName();
 	case ExpressionClass::BOUND_AGGREGATE:
-		return consumer.Cast<BoundAggregateExpression>().function.name;
-	case ExpressionClass::BOUND_CAST:
-		return "cast to " + consumer.return_type.ToString();
+		return consumer.Cast<BoundAggregateExpression>().Function().GetName().GetIdentifierName();
 	default:
 		return ExpressionTypeToString(consumer.GetExpressionType());
 	}
@@ -3513,7 +3543,7 @@ void RejectForeignLayoutsInExpression(Expression &expr) {
 	// being refused. jsono_layout_lanes is NOT exempt — it claims to enumerate lanes, which this build
 	// cannot do for a foreign naming, so it refuses in its own bind and never reaches this walk.
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
-	    expr.Cast<BoundFunctionExpression>().function.name == "jsono_layout_diagnose") {
+	    expr.Cast<BoundFunctionExpression>().Function().GetName() == "jsono_layout_diagnose") {
 		return;
 	}
 	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
@@ -3521,8 +3551,8 @@ void RejectForeignLayoutsInExpression(Expression &expr) {
 		// expression of every plan, and naming a BOUND_CAST consumer renders its whole return type
 		// (kilobytes for a wide shredded value).
 		JsonoLayoutType layout;
-		if (MatchJsonoLayoutType(child.return_type, layout) == JsonoLayoutMatch::Foreign) {
-			JsonoRejectForeignLayout(child.return_type, ForeignConsumerContext(expr));
+		if (MatchJsonoLayoutType(child.GetReturnType(), layout) == JsonoLayoutMatch::Foreign) {
+			JsonoRejectForeignLayout(child.GetReturnType(), ForeignConsumerContext(expr));
 		}
 		RejectForeignLayoutsInExpression(child);
 	});
@@ -3583,12 +3613,13 @@ void JsonoOptimizerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOp
 } // namespace
 
 unique_ptr<Expression> MakeJsonoReconstructExpression(unique_ptr<Expression> shredded_arg) {
-	D_ASSERT(IsShreddedJsonoType(shredded_arg->return_type));
-	auto input_type = shredded_arg->return_type;
+	D_ASSERT(IsShreddedJsonoType(shredded_arg->GetReturnType()));
+	auto input_type = shredded_arg->GetReturnType();
 	vector<unique_ptr<Expression>> children;
 	children.push_back(std::move(shredded_arg));
-	return make_uniq<BoundFunctionExpression>(JsonoType(), MakeJsonoReconstructFunction(input_type),
-	                                          std::move(children), nullptr);
+	BoundScalarFunction bound_function(MakeJsonoReconstructFunction(input_type));
+	bound_function.SetReturnType(JsonoType());
+	return make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(children), nullptr);
 }
 
 void RegisterJsonoOptimizer(ExtensionLoader &loader) {

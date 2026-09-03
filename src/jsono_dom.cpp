@@ -1,5 +1,6 @@
 #include "jsono_dom.hpp"
 #include "jsono_number.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 namespace duckdb {
 namespace jsono_dom {

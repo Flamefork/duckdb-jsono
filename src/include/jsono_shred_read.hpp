@@ -6,6 +6,8 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 
 namespace duckdb {
 
@@ -41,7 +43,7 @@ inline void InitShredLane(Vector &shred_vec, idx_t count, const LogicalType &shr
 		lane.sub_fmt.resize(subfield_vecs.size());
 		lane.sub_kind.resize(subfield_vecs.size());
 		for (idx_t j = 0; j < subfield_vecs.size(); j++) {
-			subfield_vecs[j]->ToUnifiedFormat(element_count, lane.sub_fmt[j]);
+			subfield_vecs[j].ToUnifiedFormat(element_count, lane.sub_fmt[j]);
 			lane.sub_kind[j] = jsono::JsonoScalarPrimitiveFromType(element_fields[j].second, "jsono shred lane reader");
 		}
 		break;
