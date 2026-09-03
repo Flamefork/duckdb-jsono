@@ -2066,6 +2066,25 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 	for (auto &child : op.children) {
 		CollectShredTotality(context, *child, totality, cte_totality, delim_totality);
 	}
+	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		// A grouping key's output value is one of its input values, so a per-row proof about the input
+		// column holds for the group representative. Only a bare column reference qualifies: any
+		// computed key is a different value. This is the path a flattened correlated subquery takes in
+		// DuckDB v2.0, where the duplicate elimination that DELIM_GET used to expose is a GROUP BY over
+		// the delim CTE scan.
+		auto &aggregate = op.Cast<LogicalAggregate>();
+		for (idx_t i = 0; i < aggregate.groups.size(); i++) {
+			auto &group = *aggregate.groups[i];
+			if (group.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				continue;
+			}
+			auto entry = totality.find(group.Cast<BoundColumnRefExpression>().Binding());
+			if (entry != totality.end()) {
+				totality.emplace(ColumnBinding(aggregate.group_index, ProjectionIndex(i)), entry->second);
+			}
+		}
+		return;
+	}
 	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte_ref = op.Cast<LogicalCTERef>();
 		auto entry = cte_totality.find(cte_ref.cte_index.index);
