@@ -30,7 +30,7 @@ physical_plan	<!REGEX>:.*(COALESCE|__jsono_internal|struct_pack).*
 query II
 EXPLAIN SELECT e->>'a' FROM (SELECT e FROM pu_shred UNION ALL SELECT e FROM pu_plain);
 ----
-physical_plan	<REGEX>:.*UNION.*
+physical_plan	<REGEX>:.*Union.*
 
 # The same read through the named function and through a filter is pushed too.
 query II

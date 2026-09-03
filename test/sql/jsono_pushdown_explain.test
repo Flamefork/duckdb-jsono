@@ -27,12 +27,12 @@ EXPLAIN SELECT ep ->> '$.URL.path' FROM tot;
 ----
 physical_plan	<!REGEX>:.*(jsono?_extract|COALESCE|reconstruct|overlay).*
 
-# PUSHED (filter/aggregate): the same lane read surfaces as a struct_extract_at over the shred column,
-# still COALESCE-free and prunable.
+# PUSHED (filter/aggregate): the same lane read reaches the shred column itself — DuckDB v2.0 carries
+# the nested reference into the scan's filter — still COALESCE-free and prunable.
 query II
 EXPLAIN SELECT count(*) FROM tot WHERE ep ->> '$.URL.path' = '/p1';
 ----
-physical_plan	<REGEX>:.*struct_extract_at.*
+physical_plan	<REGEX>:.*shreds.*
 
 query II
 EXPLAIN SELECT count(*) FROM tot WHERE ep ->> '$.URL.path' = '/p1';
