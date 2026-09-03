@@ -505,7 +505,7 @@ subfield
 # callbacks — a deserialize-side re-bind would see plain arguments with the := aliases stripped
 # and reject them. The result must reflect BOTH non-default thresholds.
 statement ok
-PRAGMA verify_serializer;
+SET debug_verify_serializer = true;
 
 query I
 SELECT jsono_suggest_shredding(j, min_presence := 0.25, min_fit := 0.5) FROM docs;
@@ -513,7 +513,7 @@ SELECT jsono_suggest_shredding(j, min_presence := 0.25, min_fit := 0.5) FROM doc
 {"$.meta.nested_int": "BIGINT", "flag": "BOOLEAN", "items": "STRUCT(n BIGINT, s VARCHAR)[]", "mixed": "BIGINT", "sparse": "BIGINT", "stable_int": "BIGINT", "stable_str": "VARCHAR", "tags": "BIGINT[]"}
 
 statement ok
-PRAGMA disable_verify_serializer;
+SET debug_verify_serializer = false;
 
 # ---- Parquet round-trip: both advisor aggregates read the physical vector shapes Parquet produces
 #      (blob children, per-column null masks) rather than the in-memory constructor's vectors, and

@@ -322,7 +322,7 @@ FROM (
 # failing a catalog lookup for its (unregistered) name. The probes below keep simple,
 # fully-serializable plans so verify_serializer actually exercises the round-trip.
 statement ok
-PRAGMA verify_serializer;
+SET debug_verify_serializer = true;
 
 # __jsono_internal_min_varchar_fast / __jsono_internal_max_varchar_fast
 query TTT
@@ -528,7 +528,7 @@ identity	1
 NULL	1
 
 statement ok
-PRAGMA disable_verify_serializer;
+SET debug_verify_serializer = false;
 
 # --- jsono_extract / jsono_extract_string over a shredded value are shred/residual-rewritten,
 #     matching the core-named ->> / json_extract rewrite (no per-row reconstruct cast). ---

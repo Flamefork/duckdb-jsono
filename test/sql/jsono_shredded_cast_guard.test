@@ -257,7 +257,7 @@ RESET disabled_optimizers;
 # must survive plan (de)serialization — they are registered in the catalog and re-bind by name.
 # Optimizer-injected functions that are not registered crash the DEBUG plan-serialize verifier.
 statement ok
-PRAGMA verify_serializer;
+SET debug_verify_serializer = true;
 
 query I
 SELECT e ->> 'b' FROM shred_ab WHERE e ->> 'a' = 'q';
