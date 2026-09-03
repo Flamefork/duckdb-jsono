@@ -98,17 +98,12 @@ unique_ptr<FunctionData> JsonoEntriesBind(BindScalarFunctionInput &input) {
 	auto &arguments = input.GetArguments();
 	auto style = JsonoEntriesKeyStyle::JsonPath;
 	auto array_style = JsonoEntriesArrayStyle::IndexedElements;
-	// key_style and array_style are named-only and order-independent: a call places them positionally in
-	// argument order with the parameter name carried as the expression alias (TransformNamedArg), so we
-	// dispatch by alias, not position. A bare positional value (empty alias) is rejected.
+	// key_style and array_style are declared parameters with defaults, so the binder places each call's
+	// value at its own position and rejects any other name before this bind runs.
+	static constexpr const char *OPTION_NAMES[] = {"key_style", "array_style"};
 	for (idx_t i = 1; i < arguments.size(); i++) {
 		auto &arg = arguments[i];
-		auto alias = arg->GetAlias();
-		if (alias != "key_style" && alias != "array_style") {
-			throw BinderException("jsono_entries: unknown argument '%s' (pass key_style := 'jsonpath' | "
-			                      "'dotted', array_style := 'indexed_elements' | 'whole_json')",
-			                      alias);
-		}
+		auto alias = string(OPTION_NAMES[i - 1]);
 		if (arg->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
@@ -596,13 +591,14 @@ void RegisterJsonoEntries(ExtensionLoader &loader) {
 	// instead of folding the whole call to NULL (DEFAULT_NULL_HANDLING short-circuits any NULL constant
 	// argument before bind). Execute already handles NULL input rows per-row, so this changes only the
 	// bind-time fold, not the output of any valid call.
-	for (auto &signature :
-	     {vector<LogicalType> {LogicalType::ANY}, vector<LogicalType> {LogicalType::ANY, LogicalType::VARCHAR},
-	      vector<LogicalType> {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
-		ScalarFunction f(signature, entry_type, JsonoEntriesExecute, JsonoEntriesBind);
-		f.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-		set.AddFunction(f);
-	}
+	ScalarFunction f({}, entry_type, JsonoEntriesExecute, JsonoEntriesBind);
+	f.GetSignature()
+	    .AddParameter(LogicalType::ANY)
+	    .AddParameter("key_style", LogicalType::VARCHAR, Value("jsonpath"))
+	    .AddParameter("array_style", LogicalType::VARCHAR, Value("indexed_elements"));
+	f.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	f.SetFallible();
+	set.AddFunction(f);
 	loader.RegisterFunction(set);
 }
 

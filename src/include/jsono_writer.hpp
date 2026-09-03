@@ -565,7 +565,7 @@ inline Vector &JsonoShredSetVector(Vector &result) {
 	auto &entries = StructVector::GetEntries(shreds);
 	auto &fields = JsonoShredsStructFields(result.GetType());
 	for (idx_t i = 0; i < fields.size(); i++) {
-		if (fields[i].first == JsonoShredSetName()) {
+		if (fields[i].first.GetIdentifierName() == JsonoShredSetName()) {
 			return entries[i];
 		}
 	}
@@ -580,7 +580,7 @@ inline Vector &JsonoShredSpillVector(Vector &result, idx_t column) {
 	auto &fields = JsonoShredsStructFields(result.GetType());
 	auto name = JsonoShredSpillName(column);
 	for (idx_t i = 0; i < fields.size(); i++) {
-		if (fields[i].first == name) {
+		if (fields[i].first.GetIdentifierName() == name) {
 			return entries[i];
 		}
 	}
@@ -651,7 +651,7 @@ struct JsonoSpillStamp {
 inline void JsonoFillShredMarker(Vector &result, idx_t count) {
 	auto &layout_type = StructType::GetChildTypes(result.GetType())[0].second;
 	auto &fields = StructType::GetChildTypes(layout_type);
-	if (fields.size() < 2 || fields[1].first != JsonoShredsName()) {
+	if (fields.size() < 2 || fields[1].first.GetIdentifierName() != JsonoShredsName()) {
 		return;
 	}
 	JsonoSpillStamp stamp;

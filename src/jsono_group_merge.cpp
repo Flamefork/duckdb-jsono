@@ -790,6 +790,7 @@ void RegisterJsonoGroupMerge(ExtensionLoader &loader) {
 	    JsonoGroupMergeCombine, JsonoGroupMergeFinalize, FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr,
 	    JsonoGroupMergeBind, AggregateFunction::StateDestroy<GroupMergeState, GroupMergeFunction>);
 	fun.SetOrderDependent(AggregateOrderDependent::ORDER_DEPENDENT);
+	fun.SetFallible();
 	loader.RegisterFunction(std::move(fun));
 }
 

@@ -523,7 +523,8 @@ unique_ptr<ShredBindData> BuildShredBindDataFromLayout(const LogicalType &target
 		field.lane_name = shred.first.GetIdentifierName();
 		field.steps = ShredNamePath(shred.first.GetIdentifierName(), "jsono reshred");
 		if (!FillShredFieldFromLayoutType(shred.second, field)) {
-			throw BinderException("__jsono_internal_reshred: lane '%s' carries an unsupported shred type", shred.first);
+			throw BinderException("__jsono_internal_reshred: lane '%s' carries an unsupported shred type",
+			                      shred.first.GetIdentifierName());
 		}
 		fields.push_back(std::move(field));
 	}
@@ -579,7 +580,7 @@ void BindShredSourcePlan(BoundScalarFunction &bound_function, Expression &value,
 	for (idx_t f = 0; f < bind_data.write.Fields().size(); f++) {
 		auto field_type = ShredFieldType(bind_data.write.Fields()[f]);
 		for (idx_t k = 0; k < src_layout.shreds.size(); k++) {
-			if (src_layout.shreds[k].first == bind_data.write.Fields()[f].lane_name &&
+			if (src_layout.shreds[k].first.GetIdentifierName() == bind_data.write.Fields()[f].lane_name &&
 			    src_layout.shreds[k].second == field_type) {
 				bind_data.keep_src[f] = k;
 				src_kept[k] = true;
@@ -1924,8 +1925,9 @@ void JsonoShredFromLayout(Vector &input, idx_t count, const ShredWriteSet &write
 // JsonoReshredFunction below, declared by TYPE — a spec is text, and text cannot carry a
 // case-colliding element struct.)
 ScalarFunction JsonoShredFromJsonoFunction() {
-	ScalarFunction from_jsono("jsono", {LogicalTypeId::STRUCT, LogicalType::ANY}, LogicalType::ANY, JsonoShredExecute,
-	                          JsonoShredBind, nullptr, ShredLocalState::Init);
+	ScalarFunction from_jsono("jsono", {}, LogicalType::ANY, JsonoShredExecute, JsonoShredBind, nullptr,
+	                          ShredLocalState::Init);
+	from_jsono.GetSignature().AddParameter(LogicalTypeId::STRUCT).AddParameter("shredding", LogicalType::ANY);
 	from_jsono.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	from_jsono.SetFallible();
 	return from_jsono;
@@ -1951,8 +1953,9 @@ void RegisterJsonoShred(ExtensionLoader &loader) {
 	ScalarFunctionSet set("jsono");
 
 	// jsono(text, shredding := spec) — the primary entry point: parse + shred.
-	ScalarFunction from_text({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, JsonoShredFromTextExecute,
-	                         JsonoShredBind, nullptr, ShredLocalState::Init);
+	ScalarFunction from_text({}, LogicalType::ANY, JsonoShredFromTextExecute, JsonoShredBind, nullptr,
+	                         ShredLocalState::Init);
+	from_text.GetSignature().AddParameter(LogicalType::VARCHAR).AddParameter("shredding", LogicalType::ANY);
 	from_text.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	from_text.SetFallible();
 	set.AddFunction(from_text);

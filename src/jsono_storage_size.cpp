@@ -236,12 +236,14 @@ void RegisterJsonoStorageSize(ExtensionLoader &loader) {
 	auto storage_size_type = LogicalType::STRUCT(std::move(size_children));
 	ScalarFunction fun("jsono_storage_size", {LogicalType::ANY}, storage_size_type, JsonoStorageSizeExecute,
 	                   JsonoStorageSizeBind);
+	fun.SetFallible();
 	loader.RegisterFunction(fun);
 
 	auto manifest_type =
 	    LogicalType::LIST(LogicalType::STRUCT({{"path", LogicalType::VARCHAR}, {"type", LogicalType::VARCHAR}}));
 	ScalarFunction manifest_fun("jsono_shred_manifest", {LogicalType::ANY}, manifest_type, JsonoShredManifestExecute,
 	                            JsonoStorageSizeBind);
+	manifest_fun.SetFallible();
 	loader.RegisterFunction(manifest_fun);
 }
 

@@ -776,10 +776,6 @@ unique_ptr<FunctionData> JsonoDiffBind(BindScalarFunctionInput &input) {
 	auto mode = DiffArrayMode::Atomic;
 	if (arguments.size() >= 3) {
 		auto &arrays_arg = arguments[2];
-		if (arrays_arg->GetAlias() != "arrays") {
-			throw BinderException("jsono_diff: unknown argument '%s' (pass arrays := 'atomic' | 'counts' | 'elements')",
-			                      arrays_arg->GetAlias());
-		}
 		if (arrays_arg->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
@@ -1164,8 +1160,12 @@ void JsonoDiffExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 }
 
 ScalarFunction MakeJsonoDiffFunction(const vector<LogicalType> &arguments) {
-	ScalarFunction fun("jsono_diff", arguments, JsonoType(), JsonoDiffExecute, JsonoDiffBind, nullptr,
+	ScalarFunction fun("jsono_diff", vector<LogicalType> {}, JsonoType(), JsonoDiffExecute, JsonoDiffBind, nullptr,
 	                   JsonoDiffLocalState::Init);
+	fun.GetSignature()
+	    .AddParameter(arguments[0])
+	    .AddParameter(arguments[1])
+	    .AddParameter("arrays", LogicalType::VARCHAR, Value("atomic"));
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.SetFallible();
 	return fun;
@@ -1178,7 +1178,6 @@ void RegisterJsonoDiff(ExtensionLoader &loader) {
 	// JsonoDiffBind validates each is JSONO or shredded and reconstructs it to plain. The optional
 	// third VARCHAR carries the `arrays := ...` named parameter (read by GetAlias at bind).
 	ScalarFunctionSet set("jsono_diff");
-	set.AddFunction(MakeJsonoDiffFunction({LogicalType::ANY, LogicalType::ANY}));
 	set.AddFunction(MakeJsonoDiffFunction({LogicalType::ANY, LogicalType::ANY, LogicalType::VARCHAR}));
 	loader.RegisterFunction(set);
 }

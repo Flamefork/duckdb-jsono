@@ -410,8 +410,8 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 	}
 	if (fields[0].second != JsonoBodyStructType()) {
 		return RejectNotJsono(reason, "'%s' carries revision %llu but its type is %s, not this build's %s",
-		                      fields[0].first, (unsigned long long)out.body_revision, fields[0].second.ToString(),
-		                      JsonoBodyStructType().ToString());
+		                      fields[0].first.GetIdentifierName(), (unsigned long long)out.body_revision,
+		                      fields[0].second.ToString(), JsonoBodyStructType().ToString());
 	}
 	if (fields.size() == 1) {
 		out.kind = JsonoLayoutKind::Plain;
@@ -429,7 +429,8 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 	}
 	auto &shreds_type = fields[1].second;
 	if (shreds_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(shreds_type)) {
-		return RejectNotJsono(reason, "'%s' is %s, not a named STRUCT", fields[1].first, shreds_type.ToString());
+		return RejectNotJsono(reason, "'%s' is %s, not a named STRUCT", fields[1].first.GetIdentifierName(),
+		                      shreds_type.ToString());
 	}
 	// Inside `shreds`: the marker and the spill bitmap columns (any integer width — a value
 	// round-tripped through a generic value->SQL->value path, e.g. DuckLake inlined-data INSERT,
@@ -443,16 +444,16 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 	// so recognition and reads agree regardless of which fields a merge displaced.
 	auto &shred_fields = StructType::GetChildTypes(shreds_type);
 	if (shred_fields.empty()) {
-		return RejectNotJsono(reason, "'%s' is an empty STRUCT", fields[1].first);
+		return RejectNotJsono(reason, "'%s' is an empty STRUCT", fields[1].first.GetIdentifierName());
 	}
 	idx_t marker_index = shred_fields.size();
 	idx_t spill_columns = 0;
 	for (idx_t i = 0; i < shred_fields.size(); i++) {
-		if (shred_fields[i].first == JSONO_SHRED_SET) {
+		if (shred_fields[i].first.GetIdentifierName() == JSONO_SHRED_SET) {
 			if (marker_index != shred_fields.size()) {
 				// duplicate marker: not a value any writer or merge produced
-				return RejectNotJsono(reason, "'%s' carries more than one '%s' marker field", fields[1].first,
-				                      JSONO_SHRED_SET);
+				return RejectNotJsono(reason, "'%s' carries more than one '%s' marker field",
+				                      fields[1].first.GetIdentifierName(), JSONO_SHRED_SET);
 			}
 			marker_index = i;
 			continue;
@@ -463,14 +464,16 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		}
 	}
 	if (marker_index == shred_fields.size()) {
-		return RejectNotJsono(reason, "'%s' has no '%s' marker field", fields[1].first, JSONO_SHRED_SET);
+		return RejectNotJsono(reason, "'%s' has no '%s' marker field", fields[1].first.GetIdentifierName(),
+		                      JSONO_SHRED_SET);
 	}
 	if (!shred_fields[marker_index].second.IsIntegral()) {
 		return RejectNotJsono(reason, "the '%s' marker is %s, not an integer", JSONO_SHRED_SET,
 		                      shred_fields[marker_index].second.ToString());
 	}
 	if (spill_columns == 0) {
-		return RejectNotJsono(reason, "'%s' has no '%s$<n>' spill bitmap column", fields[1].first, JSONO_SHRED_SPILL);
+		return RejectNotJsono(reason, "'%s' has no '%s$<n>' spill bitmap column", fields[1].first.GetIdentifierName(),
+		                      JSONO_SHRED_SPILL);
 	}
 	// Spill columns are a dense 0..spill_columns-1 family (see SpillColumnName) — a gap or a
 	// duplicate column number means a hand-built struct, not one any writer or merge produced.
@@ -484,11 +487,12 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 		if (TryParseSpillColumnName(shred_fields[i].first.GetIdentifierName(), column)) {
 			if (column >= spill_columns || spill_seen[column]) {
 				return RejectNotJsono(reason, "spill column '%s' breaks the dense 0..%llu numbering every writer emits",
-				                      shred_fields[i].first, (unsigned long long)(spill_columns - 1));
+				                      shred_fields[i].first.GetIdentifierName(),
+				                      (unsigned long long)(spill_columns - 1));
 			}
 			if (!shred_fields[i].second.IsIntegral()) {
-				return RejectNotJsono(reason, "spill column '%s' is %s, not an integer", shred_fields[i].first,
-				                      shred_fields[i].second.ToString());
+				return RejectNotJsono(reason, "spill column '%s' is %s, not an integer",
+				                      shred_fields[i].first.GetIdentifierName(), shred_fields[i].second.ToString());
 			}
 			spill_seen[column] = true;
 			continue;
@@ -503,12 +507,12 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 			return RejectNotJsono(reason,
 			                      "field '%s' is not a shred lane: a lane is named by the base32hex encoding of "
 			                      "its object-key path, and this name does not decode canonically",
-			                      shred_fields[i].first);
+			                      shred_fields[i].first.GetIdentifierName());
 		}
 		LogicalType value_type;
 		if (!UnwrapShredFieldType(shred_fields[i].second, value_type)) {
 			return RejectNotJsono(reason, "shred '%s' is %s, which is not a shred value type or LIST of one",
-			                      shred_fields[i].first, shred_fields[i].second.ToString());
+			                      shred_fields[i].first.GetIdentifierName(), shred_fields[i].second.ToString());
 		}
 		// An element subfield is a lane name one level down, minted by the same codec
 		// (JsonoEncodeLaneSubfieldName) — so a non-decoding subfield name marks the same
@@ -519,13 +523,14 @@ JsonoLayoutMatch MatchJsonoLayoutField(const string &name, const LogicalType &la
 			return RejectNotJsono(reason,
 			                      "array shred '%s' has an element subfield whose name is not the base32hex "
 			                      "encoding of a single object key",
-			                      shred_fields[i].first);
+			                      shred_fields[i].first.GetIdentifierName());
 		}
-		shreds.emplace_back(shred_fields[i].first, value_type);
+		shreds.emplace_back(shred_fields[i].first.GetIdentifierName(), value_type);
 	}
 	if (shreds.empty()) {
 		// the reserved fields alone are not a valid shredded value
-		return RejectNotJsono(reason, "'%s' carries only reserved layout fields and no shred", fields[1].first);
+		return RejectNotJsono(reason, "'%s' carries only reserved layout fields and no shred",
+		                      fields[1].first.GetIdentifierName());
 	}
 	// A set-op merged type can carry FEWER spill columns than the crossing union's shred count
 	// needs (see JsonoSpillColumnCount) — readable, never provable past its columns — but never
@@ -741,7 +746,7 @@ bool JsonoIsShredSpillName(const string &name) {
 idx_t JsonoFindShredsFieldIndex(const LogicalType &shreds_type, const string &name) {
 	auto &fields = StructType::GetChildTypes(shreds_type);
 	for (idx_t i = 0; i < fields.size(); i++) {
-		if (fields[i].first == name) {
+		if (fields[i].first.GetIdentifierName() == name) {
 			return i;
 		}
 	}
@@ -853,6 +858,7 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 		ScalarFunction diagnose({LogicalType::ANY}, JsonoLayoutDiagnoseResultType(), JsonoLayoutDiagnoseExecute,
 		                        JsonoLayoutDiagnoseBind);
 		diagnose.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		diagnose.SetFallible();
 		set.AddFunction(std::move(diagnose));
 		loader.RegisterFunction(set);
 	}
@@ -863,6 +869,7 @@ void RegisterJsonoType(ExtensionLoader &loader) {
 		ScalarFunction lanes({LogicalType::ANY}, JsonoLayoutLanesResultType(), JsonoLayoutLanesExecute,
 		                     JsonoLayoutLanesBind);
 		lanes.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		lanes.SetFallible();
 		set.AddFunction(std::move(lanes));
 		loader.RegisterFunction(set);
 	}

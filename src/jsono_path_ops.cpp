@@ -228,8 +228,10 @@ void JsonoArrayLengthExecute(DataChunk &args, ExpressionState &state, Vector &re
 // ScalarFunction must register JsonoSinglePathLocalState::Init in its init_local_state slot.
 ScalarFunction MakePathOpFunction(vector<LogicalType> arguments, LogicalType return_type, scalar_function_t function,
                                   bind_scalar_function_t bind) {
-	return ScalarFunction(std::move(arguments), std::move(return_type), std::move(function), bind, nullptr,
-	                      JsonoSinglePathLocalState::Init);
+	ScalarFunction fun(std::move(arguments), std::move(return_type), std::move(function), bind, nullptr,
+	                   JsonoSinglePathLocalState::Init);
+	fun.SetFallible();
+	return fun;
 }
 
 void RegisterJsonoPathOps(ExtensionLoader &loader) {

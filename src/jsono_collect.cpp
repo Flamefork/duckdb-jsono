@@ -417,6 +417,7 @@ void RegisterJsonoCollect(ExtensionLoader &loader) {
 		    JsonoGroupArrayCombine, JsonoGroupArrayFinalize, FunctionNullHandling::SPECIAL_HANDLING, nullptr,
 		    JsonoGroupArrayBind, AggregateFunction::StateDestroy<CollectArrayState, CollectArrayFunction>);
 		fun.SetOrderDependent(AggregateOrderDependent::ORDER_DEPENDENT);
+		fun.SetFallible();
 		loader.RegisterFunction(std::move(fun));
 	}
 	{
@@ -427,6 +428,7 @@ void RegisterJsonoCollect(ExtensionLoader &loader) {
 		                      FunctionNullHandling::SPECIAL_HANDLING, nullptr, JsonoGroupObjectBind,
 		                      AggregateFunction::StateDestroy<CollectObjectState, CollectObjectFunction>);
 		fun.SetOrderDependent(AggregateOrderDependent::ORDER_DEPENDENT);
+		fun.SetFallible();
 		loader.RegisterFunction(std::move(fun));
 	}
 }

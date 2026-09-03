@@ -579,6 +579,7 @@ unique_ptr<FunctionData> JsonoValidateBind(BindScalarFunctionInput &input) {
 void RegisterJsonoValidate(ExtensionLoader &loader) {
 	ScalarFunction fun("jsono_validate", {LogicalType::ANY}, LogicalType::BOOLEAN, JsonoValidateExecute,
 	                   JsonoValidateBind);
+	fun.SetFallible();
 	loader.RegisterFunction(fun);
 }
 

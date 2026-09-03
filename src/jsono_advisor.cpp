@@ -541,21 +541,12 @@ unique_ptr<FunctionData> JsonoSuggestBind(BindAggregateFunctionInput &input) {
 	auto &arguments = input.GetArguments();
 	double min_presence = 0.5;
 	double min_fit = 1.0;
-	bool seen_min_presence = false;
-	bool seen_min_fit = false;
+	// min_presence and min_fit are declared parameters with defaults, so the binder places each call's
+	// value at its own position and rejects an unknown or repeated name before this bind runs.
+	static constexpr const char *OPTION_NAMES[] = {"min_presence", "min_fit"};
 	for (idx_t i = 1; i < arguments.size(); i++) {
 		auto &arg = arguments[i];
-		auto alias = arg->GetAlias();
-		if (alias != "min_presence" && alias != "min_fit") {
-			throw BinderException("jsono_suggest_shredding: unknown argument '%s' (pass min_presence := <fraction>, "
-			                      "min_fit := <fraction>)",
-			                      alias);
-		}
-		auto &seen = alias == "min_presence" ? seen_min_presence : seen_min_fit;
-		if (seen) {
-			throw BinderException("jsono_suggest_shredding: duplicate argument '%s'", alias);
-		}
-		seen = true;
+		auto alias = string(OPTION_NAMES[i - 1]);
 		if (arg->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
@@ -1078,18 +1069,22 @@ void JsonoShredStatsFinalize(Vector &states, AggregateFinalizeInputData &aggr_in
 void RegisterJsonoAdvisor(ExtensionLoader &loader) {
 	// jsono_suggest_shredding(j [, min_presence := DOUBLE] [, min_fit := DOUBLE]) -> VARCHAR
 	AggregateFunctionSet suggest_set("jsono_suggest_shredding");
-	for (auto &signature :
-	     {vector<LogicalType> {LogicalType::ANY}, vector<LogicalType> {LogicalType::ANY, LogicalType::DOUBLE},
-	      vector<LogicalType> {LogicalType::ANY, LogicalType::DOUBLE, LogicalType::DOUBLE}}) {
-		AggregateFunction suggest(signature, LogicalType::VARCHAR, AggregateFunction::StateSize<SuggestState>,
+	{
+		AggregateFunction suggest(vector<LogicalType> {}, LogicalType::VARCHAR,
+		                          AggregateFunction::StateSize<SuggestState>,
 		                          AggregateFunction::StateInitialize<SuggestState, SuggestAggregate>,
 		                          JsonoSuggestUpdate, JsonoSuggestCombine, JsonoSuggestFinalize,
 		                          // SPECIAL_HANDLING so a NULL min_presence/min_fit constant reaches the bind validator
 		                          // instead of folding the whole aggregate call to NULL (the named-arg NULL-fold trap).
 		                          FunctionNullHandling::SPECIAL_HANDLING, nullptr, JsonoSuggestBind,
 		                          AggregateFunction::StateDestroy<SuggestState, SuggestAggregate>);
+		suggest.GetSignature()
+		    .AddParameter(LogicalType::ANY)
+		    .AddParameter("min_presence", LogicalType::DOUBLE, Value::DOUBLE(0.5))
+		    .AddParameter("min_fit", LogicalType::DOUBLE, Value::DOUBLE(1.0));
 		suggest.SetSerializeCallback(SuggestSerialize);
 		suggest.SetDeserializeCallback(SuggestDeserialize);
+		suggest.SetFallible();
 		suggest_set.AddFunction(suggest);
 	}
 	loader.RegisterFunction(suggest_set);
@@ -1100,6 +1095,7 @@ void RegisterJsonoAdvisor(ExtensionLoader &loader) {
 	    AggregateFunction::StateInitialize<ShredStatsState, ShredStatsAggregate>, JsonoShredStatsUpdate,
 	    JsonoShredStatsCombine, JsonoShredStatsFinalize, FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr,
 	    JsonoShredStatsBind, AggregateFunction::StateDestroy<ShredStatsState, ShredStatsAggregate>);
+	stats.SetFallible();
 	loader.RegisterFunction(stats);
 }
 

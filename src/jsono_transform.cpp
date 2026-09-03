@@ -398,10 +398,6 @@ unique_ptr<FunctionData> JsonoTransformBind(BindScalarFunctionInput &input) {
 		if (!arguments[2]->IsFoldable()) {
 			throw BinderException("jsono_transform: on_type_mismatch must be constant");
 		}
-		if (arguments[2]->HasAlias() && arguments[2]->GetAlias() != "on_type_mismatch") {
-			throw BinderException("jsono_transform: unknown named parameter '%s'; expected on_type_mismatch",
-			                      arguments[2]->GetAlias());
-		}
 		bind_data->mismatch_mode = ParseMismatchMode(ExpressionExecutor::EvaluateScalar(context, *arguments[2]));
 	}
 	// The struct's canonical string identifies the full spec (names, types, paths, joins) for
@@ -1081,17 +1077,15 @@ void RegisterJsonoTransform(ExtensionLoader &loader) {
 	// ANY input so a shredded JSONO struct (six BLOB prefix + shred columns) also binds; the
 	// bind validates it is a plain or shredded JSONO and maps shred columns to scalar fields.
 	ScalarFunctionSet set("jsono_transform");
-	ScalarFunction binary({LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, JsonoTransformExecute,
-	                      JsonoTransformBind, nullptr, TransformLocalState::Init);
-	binary.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	binary.SetFallible();
-	set.AddFunction(std::move(binary));
-
-	ScalarFunction ternary({LogicalType::ANY, LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::ANY,
-	                       JsonoTransformExecute, JsonoTransformBind, nullptr, TransformLocalState::Init);
-	ternary.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	ternary.SetFallible();
-	set.AddFunction(std::move(ternary));
+	ScalarFunction transform({}, LogicalType::ANY, JsonoTransformExecute, JsonoTransformBind, nullptr,
+	                         TransformLocalState::Init);
+	transform.GetSignature()
+	    .AddParameter(LogicalType::ANY)
+	    .AddParameter(LogicalType::ANY)
+	    .AddParameter("on_type_mismatch", LogicalType::VARCHAR, Value("convert"));
+	transform.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	transform.SetFallible();
+	set.AddFunction(std::move(transform));
 	loader.RegisterFunction(set);
 }
 

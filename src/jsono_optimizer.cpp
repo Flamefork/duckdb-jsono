@@ -1846,7 +1846,7 @@ BaseStatistics AlignStatsToReadType(const LogicalType &read_type, optional_ptr<c
 	auto &source_children = StructType::GetChildTypes(source->GetType());
 	for (idx_t i = 0; i < read_children.size(); i++) {
 		for (idx_t j = 0; j < source_children.size(); j++) {
-			if (source_children[j].first == read_children[i].first) {
+			if (source_children[j].first.GetIdentifierName() == read_children[i].first.GetIdentifierName()) {
 				StructStats::SetChildStats(
 				    result, i, AlignStatsToReadType(read_children[i].second, StructStats::GetChildStats(*source, j)));
 				break;
@@ -2286,7 +2286,7 @@ void CollectShredTotality(ClientContext &context, LogicalOperator &op, ShredTota
 						for (idx_t file_idx = 0; file_idx < file_proven.size() && every_file; file_idx++) {
 							bool carried_same_type = false;
 							for (auto &file_shred : *file_shreds[file_idx]) {
-								if (file_shred.first == lane_name) {
+								if (file_shred.first.GetIdentifierName() == lane_name) {
 									carried_same_type = file_shred.second == read_type;
 									break;
 								}
@@ -2740,7 +2740,7 @@ private:
 		idx_t i = 0;
 		for (auto &body_field : StructType::GetChildTypes(body_type)) {
 			auto field = StructExtractAt(body_struct.Copy(), int64_t(++i));
-			if (body_field.first == "skips") {
+			if (body_field.first.GetIdentifierName() == "skips") {
 				vector<unique_ptr<Expression>> strip_children;
 				strip_children.push_back(std::move(field));
 				field = function_binder.BindScalarFunction(JsonoStripManifestFunction(), std::move(strip_children));

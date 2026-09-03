@@ -2292,6 +2292,7 @@ AggregateFunction JsonoGroupMergeKeyedFunction(const char *name, bind_aggregate_
 	// Per-leaf conflict resolution by the key argument is commutative and associative: declaring it
 	// not-order-dependent lets DuckDB stream rows into Update (no ordered-aggregate row buffer).
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	fun.SetFallible();
 	return fun;
 }
 

@@ -137,12 +137,15 @@ void RegisterJsonoArrayElements(ExtensionLoader &loader) {
 	// validates it is JSONO or shredded and reconstructs to plain. The optional second argument is the
 	// path: VARCHAR (JSONPath / literal key) or BIGINT (array index), like jsono_extract.
 	ScalarFunctionSet set("jsono_array_elements");
-	set.AddFunction(ScalarFunction({LogicalType::ANY}, element_list, JsonoArrayElementsExecute,
-	                               JsonoArrayElementsArgOnlyBind, nullptr, JsonoSinglePathLocalState::Init));
-	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, element_list, JsonoArrayElementsExecute,
-	                               JsonoArrayElementsPathBind, nullptr, JsonoSinglePathLocalState::Init));
-	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::BIGINT}, element_list, JsonoArrayElementsExecute,
-	                               JsonoArrayElementsPathBind, nullptr, JsonoSinglePathLocalState::Init));
+	for (auto &signature :
+	     {vector<LogicalType> {LogicalType::ANY}, vector<LogicalType> {LogicalType::ANY, LogicalType::VARCHAR},
+	      vector<LogicalType> {LogicalType::ANY, LogicalType::BIGINT}}) {
+		auto bind = signature.size() == 1 ? JsonoArrayElementsArgOnlyBind : JsonoArrayElementsPathBind;
+		ScalarFunction fun(signature, element_list, JsonoArrayElementsExecute, bind, nullptr,
+		                   JsonoSinglePathLocalState::Init);
+		fun.SetFallible();
+		set.AddFunction(std::move(fun));
+	}
 	loader.RegisterFunction(set);
 }
 
