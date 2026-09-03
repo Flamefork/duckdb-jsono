@@ -16,10 +16,10 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: main
       extension_name: jsono
       # Empty on purpose: build exactly the set the community pipeline builds by default — the nine
       # platforms whose matrix entry is not `opt_in` (linux amd64/arm64, osx amd64/arm64, windows_amd64,
@@ -36,9 +36,9 @@ jobs:
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: main
       extension_name: jsono
       format_checks: 'format;tidy'
