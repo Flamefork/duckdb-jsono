@@ -164,14 +164,15 @@ unique_ptr<FunctionData> JsonoMergePatchBind(BindScalarFunctionInput &input) {
 	// shred columns; a plain input is bound as JSONO and contributes only its residual.
 	auto bind_data = make_uniq<JsonoMergeBindData>();
 	auto &shreds = bind_data->shreds;
-	for (auto &argument : arguments) {
+	for (idx_t arg_index = 0; arg_index < arguments.size(); arg_index++) {
+		auto &argument = arguments[arg_index];
 		if (argument->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
 		auto &type = argument->GetReturnType();
 		JsonoRequireExtensionOptimizerForShredded(context, type, bound_function.GetName().GetIdentifierName());
 		if (type.id() == LogicalTypeId::SQLNULL) {
-			bound_function.GetArguments().push_back(JsonoType());
+			bound_function.GetArguments()[arg_index] = JsonoType();
 			continue;
 		}
 		// One layout parse decides both branches: IsShreddedJsonoType/IsJsonoType would each re-parse
@@ -179,7 +180,7 @@ unique_ptr<FunctionData> JsonoMergePatchBind(BindScalarFunctionInput &input) {
 		JsonoLayoutType layout;
 		if (TryParseJsonoLayoutType(type, layout)) {
 			if (layout.kind != JsonoLayoutKind::Shredded) {
-				bound_function.GetArguments().push_back(JsonoType());
+				bound_function.GetArguments()[arg_index] = JsonoType();
 				continue;
 			}
 			for (auto &layout_shred : layout.shreds) {
@@ -201,7 +202,7 @@ unique_ptr<FunctionData> JsonoMergePatchBind(BindScalarFunctionInput &input) {
 					shreds.push_back(std::move(merge_shred));
 				}
 			}
-			bound_function.GetArguments().push_back(type);
+			bound_function.GetArguments()[arg_index] = type;
 			continue;
 		}
 		// The bind is shared with jsono_overlay, so both diagnostics name the function actually called.
