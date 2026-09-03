@@ -145,11 +145,11 @@ SELECT jsono_entries(jsono('{"a":1}'), key_style := key_style) FROM (VALUES ('do
 ----
 key_style must be constant
 
-# key_style is a named argument: a bare positional value is rejected.
-statement error
+# key_style is a declared parameter, so it also takes a positional value.
+query I
 SELECT jsono_entries(jsono('{}'), 'dotted');
 ----
-unknown argument
+[]
 
 # =====================================================================================
 # array_style := 'whole_json' (plan 031): an array renders as ONE leaf whose value is the
@@ -302,11 +302,11 @@ SELECT jsono_entries(jsono('{}'), array_style := NULL);
 ----
 array_style must not be NULL
 
-# array_style is named-only: a bare positional triple is rejected
-statement error
+# array_style is a declared parameter too, so a positional triple binds
+query I
 SELECT jsono_entries(jsono('{}'), 'dotted', 'whole_json');
 ----
-unknown argument
+[]
 
 # --- shred-aware: a shredded value flattens its residual tape AND its shred columns ---
 query I

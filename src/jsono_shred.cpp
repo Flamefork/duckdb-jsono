@@ -639,10 +639,6 @@ unique_ptr<FunctionData> JsonoShredBind(BindScalarFunctionInput &input) {
 	auto &context = input.GetClientContext();
 	auto &bound_function = input.GetBoundFunction();
 	auto &arguments = input.GetArguments();
-	if (arguments[1]->GetAlias() != "shredding") {
-		throw BinderException("jsono(): unknown argument '%s' (pass shredding := '{\"<path>\": \"<type>\", ...}')",
-		                      arguments[1]->GetAlias());
-	}
 	if (arguments[1]->HasParameter()) {
 		throw ParameterNotResolvedException();
 	}

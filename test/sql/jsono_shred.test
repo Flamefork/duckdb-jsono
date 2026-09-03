@@ -200,11 +200,12 @@ SELECT jsono(jsono('{"k":7}'), shredding := '{"$.k": "BIGINT"}') ->> '$.k';
 ----
 7
 
-# shredding is a named argument: a bare positional spec is rejected.
+# shredding is a declared parameter, so a positional spec binds — and the spec is still text, so a
+# STRUCT literal is refused for what it is rather than for its position.
 statement error
 SELECT jsono('{"a":1}', {'$.a':'BIGINT'});
 ----
-unknown argument
+shredding spec must be a non-NULL JSON object
 
 # A type string DuckDB's own parser refuses carries the parser's reason, not a bare "unsupported":
 # here the reason is the actual defect — SQL type text folds STRUCT field names case-insensitively,
