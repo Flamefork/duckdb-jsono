@@ -72,7 +72,7 @@ SELECT to_json(jsono('{"b":2,"a":1}'::JSON));
 statement error
 SELECT jsono({'a': 1}, {'nulls': 'omit'});
 ----
-pass shredding :=
+shredding spec must be a non-NULL JSON object
 
 # Non-finite doubles have no JSON representation and are rejected at construction.
 statement error
