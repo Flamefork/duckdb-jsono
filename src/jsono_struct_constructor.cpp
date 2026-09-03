@@ -981,12 +981,6 @@ void EmitConstructorMap(const JsonoStructVectorData &data, idx_t row, JsonoStruc
 		    [](const std::pair<nonstd::string_view, idx_t> &left, const std::pair<nonstd::string_view, idx_t> &right) {
 			    return CompareJsonoKeys(left.first, right.first) < 0;
 		    });
-		for (idx_t i = 1; i < order.size(); i++) {
-			if (order[i - 1].first == order[i].first) {
-				throw InvalidInputException("jsono: MAP keys collide after rendering to text: '%s'",
-				                            string(order[i].first.data(), order[i].first.size()));
-			}
-		}
 	}
 
 	auto key_count = lstate.map_key_pool[depth].size();

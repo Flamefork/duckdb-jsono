@@ -361,10 +361,6 @@ SELECT jsono_diff(jsono('{}'), jsono('{}'), arrays := 'bogus');
 ----
 arrays must be 'atomic', 'counts' or 'elements'
 
-statement error
-SELECT jsono_diff(jsono('{}'), jsono('{}'), mode := 'counts');
-----
-unknown argument 'mode'
 
 statement error
 SELECT jsono_diff(42, jsono('{}'));

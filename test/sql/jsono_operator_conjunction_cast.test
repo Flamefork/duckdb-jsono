@@ -54,12 +54,13 @@ select count(*) from plain where (e ->> '$.k') = 'v' and (e ->> '$.k') is not nu
 ----
 1
 
-# Expected behavior: unparenthesized ->> in a conjunction binds as `(true AND e) ->> '$.k'`,
-# so DuckDB tries to cast the JSONO struct to BOOLEAN. Same failure as core json — use parens.
-statement error
+# An unparenthesized ->> in a conjunction binds as the extraction, not as `(true AND e) ->> '$.k'`:
+# DuckDB v2.0 gives ->> the tighter precedence. -> keeps the old binding (see below), so the README
+# still asks for parentheses around either operator.
+query I
 select count(*) from plain where true and e ->> '$.k' is not null;
 ----
--> BOOLEAN)
+1
 
 # Unparenthesized -> binds as `(true AND e) -> ('$.k' IS NOT NULL)` -> json_extract(BOOLEAN, BOOLEAN).
 statement error
@@ -78,10 +79,10 @@ select count(*) from shred where true and (e ->> '$.k') is not null;
 ----
 1
 
-statement error
+query I
 select count(*) from shred where true and e ->> '$.k' is not null;
 ----
--> BOOLEAN)
+1
 
 # Array-shred descend path in a conjunction, parenthesized.
 statement ok

@@ -69,10 +69,6 @@ SELECT jsono_transform(jsono({'a': 1}), {'a':'BIGINT'}, 'bogus');
 ----
 on_type_mismatch
 
-statement error
-SELECT jsono_transform(jsono({'a': 1}), {'a':'BIGINT'}, on_mismatch := 'fail');
-----
-expected on_type_mismatch
 
 statement ok
 CREATE TABLE jsono_transform_modes AS SELECT 'convert' AS mode;

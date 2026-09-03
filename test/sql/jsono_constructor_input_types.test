@@ -126,14 +126,6 @@ SELECT typeof(jsono({'a': array_value(1, 2), 'n': 5})) = typeof(jsono({'a': [1, 
 ----
 true	{"a":[1,2],"n":5}	2
 
-# MAP keys that collide only after rendering to text. DuckDB v2.0 rejects this pair itself, so the
-# constructor's own collision check (which answers "MAP keys collide after rendering to text") is a
-# guard for whatever the core check lets through, not a path this call reaches.
-statement error
-SELECT jsono(MAP([union_value(a := 1)::UNION(a INT, b INT), union_value(b := 1)::UNION(a INT, b INT)], [10, 20]));
-----
-Map keys must be unique
-
 # The new inputs on a real (flat, multi-row, filtered) vector rather than a folded constant: NULL
 # rows, maps of different widths, and per-row keys all index through the same child offsets.
 statement ok

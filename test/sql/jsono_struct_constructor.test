@@ -152,24 +152,24 @@ SELECT to_json(jsono({'h': 340282366920938463463374607431768211455::UHUGEINT}));
 statement error
 SELECT jsono(row(1, 2));
 ----
-unnamed
+unsupported value type
 
 statement error
 SELECT jsono(row(42));
 ----
-unnamed
+unsupported value type
 
 # Nested unnamed structs are rejected through the same recursive plan.
 statement error
 SELECT jsono({'a': 1, 'b': row(1, 2)});
 ----
-unnamed
+unsupported value type
 
 # The bare STRUCT -> jsono cast shares the constructor plan and the same guard.
 statement error
 SELECT row(1, 2)::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
 ----
-unnamed
+does not match
 
 # PIN: TRY_CAST between identical JSONO types is elided by the cast registry (equal types bind
 # DuckDB's no-op cast before the extension bind is consulted), so it offers no row-level

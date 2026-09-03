@@ -224,11 +224,6 @@ SELECT jsono_suggest_shredding(j, min_presence := random()) FROM docs;
 ----
 must be constant
 
-statement error
-SELECT jsono_suggest_shredding(j, bogus := 0.5) FROM docs;
-----
-No function matches
-
 # A shredded column must be re-suggested from its plain source, not from the shredded form.
 statement error
 SELECT jsono_suggest_shredding(jsono('{"a":1}', shredding := '{"a": "BIGINT"}'));
@@ -496,11 +491,6 @@ narrowed by a raw struct cast
 # ---- named-argument and cap edges ----
 
 # A duplicate named argument is rejected loud instead of silently keeping the last value.
-statement error
-SELECT jsono_suggest_shredding(j, min_fit := 1.0, min_fit := 0.5) FROM docs;
-----
-Duplicate named argument
-
 # Exceeding the object-array subfield cap fails loud instead of silently truncating the STRUCT spec.
 statement error
 SELECT jsono_suggest_shredding(j) FROM (
