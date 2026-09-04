@@ -9,8 +9,12 @@
 # MainDistributionPipeline.yml: this build targets moving refs (the DuckDB ref below, ci-tools main,
 # the reusable workflow itself), so per-commit runs would go red for reasons that have nothing to do
 # with the commit under test — which trains ignoring red on the gate that does test it. The answer
-# changes when upstream changes, so upstream is what it samples: weekly, plus on demand around a
-# feature freeze.
+# changes when upstream changes, so upstream is what it samples.
+#
+# The weekly schedule is off while the v2.0 port lives on its own branch: main still carries the
+# v1.5.5 sources, so a run against the upcoming DuckDB is red for a reason already known, and a
+# permanently red gate is what this workflow exists to avoid. Restore the schedule and point
+# duckdb_version back at `main` when the port lands.
 #
 # Caveat worth knowing before trusting the silence: GitHub disables scheduled workflows in a
 # repository with no activity for 60 days, which is exactly the quiet stretch during which a DuckDB
@@ -18,9 +22,6 @@
 #
 name: Next DuckDB Compatibility
 on:
-  schedule:
-    # Weekly, Monday, off the top of the hour (scheduled runs queue behind the :00 stampede).
-    - cron: '17 5 * * 1'
   workflow_dispatch:
 
 permissions:
