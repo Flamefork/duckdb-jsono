@@ -29,11 +29,9 @@ ROWS = 120_000
 ROW_GROUP_SIZE = 12_000  # -> 10 row groups
 SELECTIVE_VALUE = 65_000  # mid-group, away from any row-group boundary
 
-# These two operator metrics are not in the default/detailed profiling set, so
-# they must be requested explicitly; they appear only in the JSON profile.
-CUSTOM_SETTINGS = (
-    '{"OPERATOR_TYPE":"true","OPERATOR_ROW_GROUPS_SCANNED":"true","OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN":"true"}'
-)
+# The row-group metrics are not in the default profiling set, so they are requested by pattern;
+# they appear only in the JSON profile.
+TRACKED_METRICS = "['*']"
 
 
 def run_sql(sql: str) -> None:
@@ -46,15 +44,16 @@ def scan_metric(profile_path: Path) -> tuple[int, int]:
     found: list[tuple[int, int]] = []
 
     def walk(node: dict) -> None:
-        if node.get("operator_type") == "TABLE_SCAN":
-            scanned = node.get("operator_row_groups_scanned")
-            total = node.get("operator_total_row_groups_to_scan")
+        if node.get("type") == "TABLE_SCAN":
+            scanned = node.get("row_groups_scanned")
+            total = node.get("total_row_groups_to_scan")
             if scanned is not None and total is not None:
                 found.append((int(scanned), int(total)))
         for child in node.get("children", []):
             walk(child)
 
-    walk(json_loads(profile_path.read_text()))
+    for root in json_loads(profile_path.read_text())["operator"]:
+        walk(root)
     if len(found) != 1:
         raise SystemExit(f"expected exactly one parquet scan in profile, got {found}")
     return found[0]
@@ -63,9 +62,9 @@ def scan_metric(profile_path: Path) -> tuple[int, int]:
 def profile_query(parquet: Path, profile_path: Path, query: str) -> tuple[int, int]:
     run_sql(
         f"LOAD '{EXTENSION}';\n"
-        f"PRAGMA enable_profiling='json';\n"
-        f"PRAGMA custom_profiling_settings='{CUSTOM_SETTINGS}';\n"
-        f"PRAGMA profiling_output='{profile_path}';\n"
+        f"SET enable_profiling='json';\n"
+        f"SET tracked_metrics={TRACKED_METRICS};\n"
+        f"SET profiling_output='{profile_path}';\n"
         f"{query};\n"
     )
     return scan_metric(profile_path)
@@ -117,7 +116,9 @@ def main() -> None:
         full_scanned, full_total = profile_query(
             parquet,
             profile,
-            f"SELECT count(t->>'$.kind') FROM '{parquet}'",
+            # sum(length(...)) reads the values: a bare count answers from the file statistics in
+            # DuckDB v2.0 and would report a metadata-only scan instead of the full one.
+            f"SELECT sum(length(t->>'$.kind')) FROM '{parquet}'",
         )
 
         failures: list[str] = []
