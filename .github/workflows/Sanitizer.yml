@@ -115,7 +115,9 @@ jobs:
       # since the two instrumentations cannot coexist.
       THREADSAN: 1
       # Report every race in one run instead of aborting on the first; TSan still exits non-zero.
-      TSAN_OPTIONS: halt_on_error=0
+      # Suppressions are DuckDB's own TSan list, so they follow the submodule: without them a known
+      # jemalloc mutex race inside DuckDB fails most weekly runs with no jsono frame in the stack.
+      TSAN_OPTIONS: halt_on_error=0:suppressions=${{ github.workspace }}/duckdb/.sanitizer-thread-suppressions.txt
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6

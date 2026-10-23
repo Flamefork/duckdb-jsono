@@ -27,7 +27,9 @@ Data races — the class the parallel aggregate paths (`group_merge`, `collect`,
 regress into, and the one no other tool here reports. Runs weekly in CI.
 
 ASan and TSan cannot coexist; DuckDB's CMake drops ASan when `THREADSAN=1`. `halt_on_error=0`
-reports every race in one pass instead of aborting on the first.
+reports every race in one pass instead of aborting on the first. CI additionally loads DuckDB's own
+TSan suppressions (`duckdb/.sanitizer-thread-suppressions.txt`) to silence known races inside DuckDB;
+this local run keeps them visible.
 
 **Do not pipe the run through `tail`.** The pipeline then reports `tail`'s exit status, so a crashed
 binary reads as a pass — the first TSan run of this repository "passed" that way while actually
