@@ -83,9 +83,10 @@ void BulkEmitSubtree(const JsonoView &view, const JsonoCursor &start, JsonoBuild
 		length_count = root_span.length_count;
 		num_count = root_span.num_count;
 	} else {
-		// Spanless root: a small flat object (an array or an object with a container child
-		// always stores a span). One iterative pass below discovers its end and stream spans.
-		if (root_tag != tag::OBJ_START) {
+		// Spanless root: a small object or an empty array (a non-empty array always stores a
+		// span). One iterative pass below discovers its end and stream spans.
+		if (root_tag != tag::OBJ_START &&
+		    (start.pos + 1 >= view.Slots() || SlotTag(view.SlotAt(start.pos + 1)) != tag::ARR_END)) {
 			throw InvalidInputException("malformed JSONO: container span missing");
 		}
 		slot_span = 0;

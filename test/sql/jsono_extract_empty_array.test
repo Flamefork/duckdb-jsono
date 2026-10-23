@@ -1,0 +1,128 @@
+# name: test/sql/jsono_extract_empty_array.test
+# description: Extracting an empty array yields the JSONO value [].
+# group: [sql]
+
+#   An empty array is an adjacent ARR_START, ARR_END pair and stores no ContainerSpan. The
+#   extract subtree copy used to accept a spanless root only for objects, so any path landing on
+#   an empty array failed with "malformed JSONO: container span missing" — in plain values and in
+#   shredded columns alike (the read reconstructs the residual and extracts through the same copy).
+
+require jsono
+
+# Shredded `->` binds through core json's extract over the STRUCT->JSON reconstruct cast.
+require json
+
+# ---------------------------------------------------------------------------
+# Plain values: root, key, nested key.
+# ---------------------------------------------------------------------------
+query IIII
+select
+    to_json(jsono('{"a":[],"b":1}') -> '$.a'),
+    (jsono('{"a":[],"b":1}') -> '$.a')::varchar,
+    to_json(jsono_extract(jsono('{"a":[],"b":1}'), '$.a')),
+    jsono_validate(jsono('{"a":[],"b":1}') -> '$.a');
+----
+[]	[]	[]	true
+
+query II
+select to_json(jsono('[]') -> '$'), (jsono('[]') -> '$')::varchar;
+----
+[]	[]
+
+query II
+select to_json(jsono('{"o":{"x":[],"y":[1]}}') -> '$.o.x'), to_json(jsono('{"o":{"x":[],"y":[1]}}') -> '$.o');
+----
+[]	{"x":[],"y":[1]}
+
+# An empty array inside an extracted array keeps its place.
+query I
+select to_json(jsono('{"a":[[],[1],[]]}') -> '$.a');
+----
+[[],[1],[]]
+
+# The extracted value is a regular JSONO value: functions over it see an empty array.
+query II
+select jsono_array_length(jsono('{"a":[]}') -> '$.a'), len(jsono_array_elements(jsono('{"a":[]}') -> '$.a'));
+----
+0	0
+
+# ---------------------------------------------------------------------------
+# Table column (non-constant input), mixing empty and non-empty arrays.
+# ---------------------------------------------------------------------------
+statement ok
+create table plain as select * from (values
+    (1, jsono('{"a":[],"b":1}')),
+    (2, jsono('{"a":[1,2],"b":2}')),
+    (3, jsono('{"a":{"x":[]},"b":3}')),
+    (4, jsono('{"b":4}'))
+) t(id, v);
+
+query III
+select id, to_json(v -> '$.a'), (v -> '$.a')::varchar from plain order by id;
+----
+1	[]	[]
+2	[1,2]	[1,2]
+3	{"x":[]}	{"x":[]}
+4	NULL	NULL
+
+query I
+select to_json(e) from (select unnest(jsono_array_elements(jsono('[[],[],[1]]'))) e);
+----
+[]
+[]
+[1]
+
+# ---------------------------------------------------------------------------
+# Shredded columns: the array itself is a lane, or a sibling key is.
+# ---------------------------------------------------------------------------
+statement ok
+create table shred_lane as
+select id, jsono(j, shredding := '{"$.a": "BIGINT[]"}') as v
+from (values (1, '{"a":[],"b":1}'), (2, '{"a":[1,2],"b":2}'), (3, '{"b":3}')) t(id, j);
+
+query III
+select id, to_json(v -> '$.a'), (v -> '$.a')::varchar from shred_lane order by id;
+----
+1	[]	[]
+2	[1,2]	[1,2]
+3	NULL	NULL
+
+statement ok
+create table shred_sibling as
+select id, jsono(j, shredding := '{"$.b": "BIGINT"}') as v
+from (values (1, '{"a":[],"b":1}'), (2, '{"a":[1,2],"b":2}'), (3, '{"o":{"a":[]},"b":3}')) t(id, j);
+
+query IIII
+select id, to_json(v -> '$.a'), (v -> '$.a')::varchar, to_json(v -> '$.o.a') from shred_sibling order by id;
+----
+1	[]	[]	NULL
+2	[1,2]	[1,2]	NULL
+3	NULL	NULL	[]
+
+# ---------------------------------------------------------------------------
+# Other entries into the same subtree copy: integer index, list-path extract over a shredded
+# value (decomposed into native extracts), dictionary-encoded input.
+# ---------------------------------------------------------------------------
+query II
+select to_json(jsono_extract(jsono('[[],[1]]'), 0)), to_json(jsono('{"a":[[]]}') -> 'a' -> 0);
+----
+[]	[]
+
+query I
+select json_extract(v, list_value('$.a', '$.b')) from shred_sibling where id = 1;
+----
+[[], 1]
+
+statement ok
+SET debug_verify_vector='dictionary_expression'
+
+query II
+select id, to_json(v -> '$.a') from plain order by id;
+----
+1	[]
+2	[1,2]
+3	{"x":[]}
+4	NULL
+
+statement ok
+RESET debug_verify_vector
