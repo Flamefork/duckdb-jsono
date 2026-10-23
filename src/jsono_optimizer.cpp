@@ -3085,9 +3085,45 @@ bool SameShredSet(const child_list_t<LogicalType> &a, const child_list_t<Logical
 	return a.size() == b.size() && SortedShreds(a) == SortedShreds(b);
 }
 
+// DuckDB's expression rewriter moves a cast off a comparison or IN operand onto the constant side when
+// BoundCastExpression::CastIsInvertible says so, and it says so for every STRUCT -> STRUCT pair. For
+// a shredded -> plain cast that turns the constant into a by-name plain -> shredded cast folded on
+// the spot, outside the plan: the same document in a different encoding (everything in the residual,
+// shreds NULL), and the byte-wise struct comparison answers as if the values differed. A function
+// call is not a cast, so the rule leaves the reconstruct where it is. Every comparison operand, not
+// only one against a foldable side: the same rewriter pass folds the other side first (a CASE with a
+// constant condition, say), so foldability here does not predict the move. Only comparison operands:
+// a reconstruct cast elsewhere is what the extract rewrites recognize to read lanes directly.
+void PinReconstructCastOperand(unique_ptr<Expression> &operand) {
+	if (operand->GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+		return;
+	}
+	auto &cast = operand->Cast<BoundCastExpression>();
+	if (cast.try_cast || !IsJsonoType(cast.return_type) || !IsShreddedJsonoType(cast.child->return_type)) {
+		return;
+	}
+	auto alias = operand->GetAlias();
+	operand = MakeJsonoReconstructExpression(std::move(cast.child));
+	operand->SetAlias(alias);
+}
+
+void PinReconstructCastOperands(Expression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
+		auto &comparison = expr.Cast<BoundComparisonExpression>();
+		PinReconstructCastOperand(comparison.left);
+		PinReconstructCastOperand(comparison.right);
+		return;
+	}
+	if (expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
+	    expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+		PinReconstructCastOperand(expr.Cast<BoundOperatorExpression>().children[0]);
+	}
+}
+
 void NormalizeShreddedCastsInExpression(ClientContext &context, unique_ptr<Expression> &expr) {
 	ExpressionIterator::EnumerateChildren(
 	    *expr, [&](unique_ptr<Expression> &child) { NormalizeShreddedCastsInExpression(context, child); });
+	PinReconstructCastOperands(*expr);
 	if (expr->GetExpressionClass() != ExpressionClass::BOUND_CAST) {
 		return;
 	}
@@ -3566,7 +3602,9 @@ void JsonoOptimizerPreOptimize(OptimizerExtensionInput &input, unique_ptr<Logica
 	}
 	// Replace lossy by-name shredded casts (INSERT into a differently-shredded column,
 	// set-operation branch widening, CASE/COALESCE arms) with lossless reconstruct+reshred first,
-	// so the shredded rewrites below see canonical shredded values.
+	// so the shredded rewrites below see canonical shredded values. The same pass pins a
+	// shredded -> plain cast under a comparison as a reconstruct call, out of reach of the built-in
+	// rewriter that would move it onto a constant.
 	if (plan) {
 		NormalizeShreddedCasts(input.context, *plan);
 	}

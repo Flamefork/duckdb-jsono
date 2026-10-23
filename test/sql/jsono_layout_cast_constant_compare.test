@@ -1,0 +1,161 @@
+# name: test/sql/jsono_layout_cast_constant_compare.test
+# description: an explicit shredded -> plain JSONO cast compared with a constant answers the same as without DuckDB's expression rewriter, whose comparison and IN rules would otherwise move the cast onto the constant as a by-name plain -> shredded cast and compare two encodings of one document
+# group: [sql]
+
+require jsono
+
+statement ok
+CREATE TABLE src(id INTEGER, t VARCHAR);
+
+# Row 1 fills the UBIGINT lane with a (2^59, 2^63) value; the rest are the edge values — empty
+# array, empty object, JSON null and SQL NULL as the root, then under the shredded path (where
+# they stay in the residual), then a document without the path.
+statement ok
+INSERT INTO src VALUES
+	(1, '{"a":1152921504606846976,"b":"x"}'),
+	(2, '[]'),
+	(3, '{}'),
+	(4, 'null'),
+	(5, NULL),
+	(6, '{"a":[]}'),
+	(7, '{"a":{}}'),
+	(8, '{"a":null}'),
+	(9, '{"b":1}');
+
+statement ok
+CREATE TABLE sh AS SELECT id, t, jsono(t, shredding := '{"$.a": "UBIGINT"}') AS x, jsono(t) AS p,
+	jsono(t, shredding := '{"$.b": "VARCHAR"}') AS y FROM src;
+
+# A macro expands at bind, so plain(x) is CAST(x AS plain) right in the comparison operand — the
+# shape the rewriter rules match. (A view would put the cast in its own projection, out of reach.)
+statement ok
+CREATE MACRO plain(v) AS
+	v::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB)));
+
+# Every check runs twice with the same expected answers: with the rewriter, and without it.
+# join_order stands in as the disabled optimizer of the first pass: none of the queries joins.
+foreach disabled join_order expression_rewriter
+
+statement ok
+SET disabled_optimizers = '${disabled}';
+
+# The byte-identical reconstruction form from jsono_numbers.test, over a table column.
+query I
+SELECT x::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB))) = jsono('{"a":1152921504606846976,"b":"x"}')
+FROM sh WHERE id = 1;
+----
+true
+
+# Each document against itself: every operator, the constant on either side, in a projection...
+foreach doc {"a":1152921504606846976,"b":"x"} [] {} null {"a":[]} {"a":{}} {"a":null} {"b":1}
+
+query IIIIIIIIIIIIII
+SELECT plain(x) = jsono('${doc}'), jsono('${doc}') = plain(x),
+	plain(x) <> jsono('${doc}'), jsono('${doc}') <> plain(x),
+	plain(x) IS NOT DISTINCT FROM jsono('${doc}'), jsono('${doc}') IS NOT DISTINCT FROM plain(x),
+	plain(x) IS DISTINCT FROM jsono('${doc}'), jsono('${doc}') IS DISTINCT FROM plain(x),
+	plain(x) IN (jsono('${doc}')), plain(x) IN (jsono('${doc}'), jsono('{"z":0}')),
+	plain(x) NOT IN (jsono('${doc}'), jsono('{"z":0}')),
+	plain(x) <= jsono('${doc}'), jsono('${doc}') >= plain(x), plain(x) < jsono('${doc}')
+FROM sh WHERE t = '${doc}';
+----
+true	true	false	false	true	true	false	false	true	true	false	true	true	false
+
+# ...and as a filter over all nine rows: one row matches; the SQL NULL row drops out of `<>` and
+# NOT IN, and counts as distinct.
+query I
+SELECT [
+	(SELECT count(*) FROM sh WHERE plain(x) = jsono('${doc}')),
+	(SELECT count(*) FROM sh WHERE jsono('${doc}') = plain(x)),
+	(SELECT count(*) FROM sh WHERE plain(x) <> jsono('${doc}')),
+	(SELECT count(*) FROM sh WHERE jsono('${doc}') <> plain(x)),
+	(SELECT count(*) FROM sh WHERE plain(x) IS NOT DISTINCT FROM jsono('${doc}')),
+	(SELECT count(*) FROM sh WHERE jsono('${doc}') IS NOT DISTINCT FROM plain(x)),
+	(SELECT count(*) FROM sh WHERE plain(x) IS DISTINCT FROM jsono('${doc}')),
+	(SELECT count(*) FROM sh WHERE jsono('${doc}') IS DISTINCT FROM plain(x)),
+	(SELECT count(*) FROM sh WHERE plain(x) IN (jsono('${doc}'))),
+	(SELECT count(*) FROM sh WHERE plain(x) IN (jsono('${doc}'), jsono('{"z":0}'))),
+	(SELECT count(*) FROM sh WHERE plain(x) NOT IN (jsono('${doc}'), jsono('{"z":0}')))];
+----
+[1, 1, 7, 7, 1, 1, 8, 8, 1, 1, 7]
+
+endloop
+
+# The SQL NULL row, against a NULL constant.
+query IIIIIIIIIII
+SELECT plain(x) = jsono(NULL::VARCHAR), jsono(NULL::VARCHAR) = plain(x),
+	plain(x) <> jsono(NULL::VARCHAR), jsono(NULL::VARCHAR) <> plain(x),
+	plain(x) IS NOT DISTINCT FROM jsono(NULL::VARCHAR), jsono(NULL::VARCHAR) IS NOT DISTINCT FROM plain(x),
+	plain(x) IS DISTINCT FROM jsono(NULL::VARCHAR), jsono(NULL::VARCHAR) IS DISTINCT FROM plain(x),
+	plain(x) IN (jsono(NULL::VARCHAR)), plain(x) IN (jsono(NULL::VARCHAR), jsono('{"z":0}')),
+	plain(x) NOT IN (jsono(NULL::VARCHAR), jsono('{"z":0}'))
+FROM sh WHERE id = 5;
+----
+NULL	NULL	NULL	NULL	true	true	false	false	NULL	NULL	NULL
+
+# A prepared parameter, bound per execution.
+statement ok
+PREPARE cmp AS SELECT list(id ORDER BY id) FROM sh WHERE plain(x) = $1;
+
+query I
+EXECUTE cmp(jsono('{"a":1152921504606846976,"b":"x"}'));
+----
+[1]
+
+query I
+EXECUTE cmp(jsono('{"a":[]}'));
+----
+[6]
+
+statement ok
+DEALLOCATE cmp;
+
+# Against another column.
+query I
+SELECT list(id ORDER BY id) FROM sh WHERE plain(x) = p;
+----
+[1, 2, 3, 4, 6, 7, 8, 9]
+
+# A side that only the rewriter itself folds into a constant: it drops the dead CASE branch first,
+# then moves the cast onto the result.
+query I
+SELECT list(id ORDER BY id) FROM sh
+WHERE plain(x) = CASE WHEN 1 = 1 THEN jsono('{"a":1152921504606846976,"b":"x"}') ELSE p END;
+----
+[1]
+
+# Casts INTO a shredded layout were never affected: the cast normalization turns them into a reshred
+# before the rewriter runs. Pinned so the two directions stay covered together.
+query I
+SELECT list(id ORDER BY id) FROM sh
+WHERE p::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 UBIGINT)))
+	= jsono('{"a":1152921504606846976,"b":"x"}', shredding := '{"$.a": "UBIGINT"}');
+----
+[1]
+
+query I
+SELECT list(id ORDER BY id) FROM sh
+WHERE y::STRUCT(jsono STRUCT("body$2" STRUCT(slots BLOB, key_heap BLOB, string_heap BLOB, skips BLOB, lengths BLOB, nums BLOB), "shreds$2" STRUCT("$jsono$set" BIGINT, "$jsono$spill$0" BIGINT, c4000 UBIGINT)))
+	= jsono('{"a":1152921504606846976,"b":"x"}', shredding := '{"$.a": "UBIGINT"}');
+----
+[1]
+
+endloop
+
+statement ok
+RESET disabled_optimizers;
+
+# A shredded -> plain cast outside a comparison stays a cast, so an extract over it still reads the
+# lane directly instead of reconstructing the document per row.
+statement ok
+PRAGMA explain_output = 'physical_only';
+
+query II
+EXPLAIN SELECT plain(x) ->> '$.a' FROM sh;
+----
+physical_plan	<!REGEX>:.*__jsono_reconstruct.*
+
+query II
+EXPLAIN SELECT plain(x) ->> '$.a' FROM sh;
+----
+physical_plan	<REGEX>:.*COALESCE.*
