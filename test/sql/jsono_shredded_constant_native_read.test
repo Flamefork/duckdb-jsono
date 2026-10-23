@@ -1,0 +1,196 @@
+# name: test/sql/jsono_shredded_constant_native_read.test
+# description: README "Core json reads over a constant shredded value" recommends the jsono-native full-path functions for a constant shredded value read inside another function or operator. Those calls bind on a plain reconstruct of the value, so the binder's constant evaluation of the argument is already correct and nothing folds to NULL. The same paragraph promises that a core read not inside another function, a comparison, and a bound `VALUES` value are correct; those are pinned here too. The wrong NULL of a wrapped core read over a constant is deliberately not pinned (plans/063).
+# group: [sql]
+
+require jsono
+
+require json
+
+# The README example and the other native full-path reads, each inside a wrapping function or operator.
+query IIIIII
+SELECT
+  upper(jsono_extract_string(jsono({'a': 'q'}), '$.a')),
+  to_json(jsono_extract(jsono({'a': 5}), '$.a')),
+  jsono_extract_string(jsono({'a': 5}), '$.a') || 'x',
+  lower(jsono_type(jsono({'a': {'b': 1}}), '$.a')),
+  array_length(jsono_keys(jsono({'a': {'b': 1}}), '$.a')),
+  jsono_array_length(jsono({'a': [1, 2]}), '$.a') + 0;
+----
+Q	5	5x	object	1	2
+
+# A chain becomes one full path; an explicitly shredded literal and a prepared parameter read the same way.
+query II
+SELECT
+  upper(jsono_extract_string(jsono({'URL': {'path': '/p'}}), '$.URL.path')),
+  upper(jsono_extract_string(jsono('{"a":"q","b":1}', shredding := '{"$.a":"VARCHAR"}'), '$.a'));
+----
+/P	Q
+
+statement ok
+PREPARE p AS SELECT upper(jsono_extract_string(jsono($1, shredding := '{"$.a":"VARCHAR"}'), '$.a'));
+
+query I
+EXECUTE p('{"a":"q"}');
+----
+Q
+
+# Value edges next to the happy path: empty array, empty object, JSON null and SQL NULL, at the root and
+# by path, in a shredded and a plain constant.
+query IIII
+SELECT
+  to_json(jsono_extract(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.e')),
+  to_json(jsono_extract(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.o')),
+  to_json(jsono_extract(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.n')),
+  upper(jsono_extract_string(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.s'));
+----
+[]	{}	null	X
+
+query IIII
+SELECT
+  to_json(jsono_extract(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.e')),
+  to_json(jsono_extract(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.o')),
+  to_json(jsono_extract(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.n')),
+  upper(jsono_extract_string(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.s'));
+----
+[]	{}	null	X
+
+query IIII
+SELECT
+  to_json(jsono_extract(jsono('[]', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  to_json(jsono_extract(jsono('{}', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  to_json(jsono_extract(jsono('null', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  to_json(jsono_extract(jsono(NULL::VARCHAR, shredding := '{"$.s":"VARCHAR"}'), '$'));
+----
+[]	{}	null	NULL
+
+query IIII
+SELECT
+  to_json(jsono_extract(jsono('[]'), '$')),
+  to_json(jsono_extract(jsono('{}'), '$')),
+  to_json(jsono_extract(jsono('null'), '$')),
+  to_json(jsono_extract(jsono(NULL::VARCHAR), '$'));
+----
+[]	{}	null	NULL
+
+query II
+SELECT
+  upper(jsono_extract_string(jsono(NULL::VARCHAR, shredding := '{"$.s":"VARCHAR"}'), '$.s')),
+  upper(jsono_extract_string(jsono(NULL::VARCHAR), '$.s'));
+----
+NULL	NULL
+
+# Native full-path introspection and string reads of the value edges inside a wrapping function, in a
+# shredded constant, then in a plain one: by path, then at the root.
+query IIIIIIIIIIII
+SELECT
+  lower(jsono_type(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.e')),
+  lower(jsono_type(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.o')),
+  lower(jsono_type(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.n')),
+  len(jsono_keys(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.e')),
+  len(jsono_keys(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.o')),
+  len(jsono_keys(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.n')),
+  jsono_array_length(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.e') + 0,
+  jsono_array_length(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.o') + 0,
+  jsono_array_length(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.n') + 0,
+  upper(jsono_extract_string(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.e')),
+  upper(jsono_extract_string(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.o')),
+  upper(jsono_extract_string(jsono('{"s":"x","e":[],"o":{},"n":null}', shredding := '{"$.s":"VARCHAR"}'), '$.n'));
+----
+array	object	null	NULL	0	NULL	0	NULL	NULL	[]	{}	NULL
+
+query IIIIIIIIIIII
+SELECT
+  lower(jsono_type(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.e')),
+  lower(jsono_type(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.o')),
+  lower(jsono_type(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.n')),
+  len(jsono_keys(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.e')),
+  len(jsono_keys(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.o')),
+  len(jsono_keys(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.n')),
+  jsono_array_length(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.e') + 0,
+  jsono_array_length(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.o') + 0,
+  jsono_array_length(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.n') + 0,
+  upper(jsono_extract_string(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.e')),
+  upper(jsono_extract_string(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.o')),
+  upper(jsono_extract_string(jsono('{"s":"x","e":[],"o":{},"n":null}'), '$.n'));
+----
+array	object	null	NULL	0	NULL	0	NULL	NULL	[]	{}	NULL
+
+query IIIIIIIIIIIIIIII
+SELECT
+  lower(jsono_type(jsono('[]', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  lower(jsono_type(jsono('{}', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  lower(jsono_type(jsono('null', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  lower(jsono_type(jsono(NULL::VARCHAR, shredding := '{"$.s":"VARCHAR"}'), '$')),
+  len(jsono_keys(jsono('[]', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  len(jsono_keys(jsono('{}', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  len(jsono_keys(jsono('null', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  len(jsono_keys(jsono(NULL::VARCHAR, shredding := '{"$.s":"VARCHAR"}'), '$')),
+  jsono_array_length(jsono('[]', shredding := '{"$.s":"VARCHAR"}'), '$') + 0,
+  jsono_array_length(jsono('{}', shredding := '{"$.s":"VARCHAR"}'), '$') + 0,
+  jsono_array_length(jsono('null', shredding := '{"$.s":"VARCHAR"}'), '$') + 0,
+  jsono_array_length(jsono(NULL::VARCHAR, shredding := '{"$.s":"VARCHAR"}'), '$') + 0,
+  upper(jsono_extract_string(jsono('[]', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  upper(jsono_extract_string(jsono('{}', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  upper(jsono_extract_string(jsono('null', shredding := '{"$.s":"VARCHAR"}'), '$')),
+  upper(jsono_extract_string(jsono(NULL::VARCHAR, shredding := '{"$.s":"VARCHAR"}'), '$'));
+----
+array	object	null	NULL	NULL	0	NULL	NULL	0	NULL	NULL	NULL	[]	{}	NULL	NULL
+
+query IIIIIIIIIIIIIIII
+SELECT
+  lower(jsono_type(jsono('[]'), '$')),
+  lower(jsono_type(jsono('{}'), '$')),
+  lower(jsono_type(jsono('null'), '$')),
+  lower(jsono_type(jsono(NULL::VARCHAR), '$')),
+  len(jsono_keys(jsono('[]'), '$')),
+  len(jsono_keys(jsono('{}'), '$')),
+  len(jsono_keys(jsono('null'), '$')),
+  len(jsono_keys(jsono(NULL::VARCHAR), '$')),
+  jsono_array_length(jsono('[]'), '$') + 0,
+  jsono_array_length(jsono('{}'), '$') + 0,
+  jsono_array_length(jsono('null'), '$') + 0,
+  jsono_array_length(jsono(NULL::VARCHAR), '$') + 0,
+  upper(jsono_extract_string(jsono('[]'), '$')),
+  upper(jsono_extract_string(jsono('{}'), '$')),
+  upper(jsono_extract_string(jsono('null'), '$')),
+  upper(jsono_extract_string(jsono(NULL::VARCHAR), '$'));
+----
+array	object	null	NULL	NULL	0	NULL	NULL	0	NULL	NULL	NULL	[]	{}	NULL	NULL
+
+# --- The correct side of the README limit, over the same constants: a core read that is not inside
+# another function, a comparison, and the value bound through VALUES.
+query IIIIIIII
+SELECT
+  jsono({'a': 'q'}) ->> 'a',
+  jsono({'a': 5}) -> '$.a',
+  json_extract(jsono({'a': 5}), '$.a'),
+  json_extract_string(jsono({'a': 'q'}), '$.a'),
+  json_value(jsono({'a': 'q'}), '$.a'),
+  json_type(jsono({'a': {'b': 1}}), '$.a'),
+  json_keys(jsono({'a': {'b': 1}}), '$.a'),
+  json_array_length(jsono({'a': [1, 2]}), '$.a');
+----
+q	5	5	q	"q"	OBJECT	[b]	2
+
+query IIII
+SELECT
+  (jsono({'a': 'q'}) ->> 'a') = 'q',
+  json_value(jsono({'a': 'q'}), '$.a') = '"q"',
+  json_type(jsono({'a': {'b': 1}}), '$.a') = 'OBJECT',
+  json_array_length(jsono({'a': [1, 2]}), '$.a') = 2;
+----
+true	true	true	true
+
+query IIIIIIII
+SELECT
+  upper(x ->> 'a'),
+  to_json(f -> '$.a'),
+  to_json(json_extract(f, '$.a')),
+  upper(json_extract_string(x, '$.a')),
+  upper(json_value(x, '$.a')),
+  lower(json_type(y, '$.a')),
+  len(json_keys(y, '$.a')),
+  json_array_length(z, '$.a') + 0
+FROM (VALUES (jsono({'a': 'q'}), jsono({'a': 5}), jsono({'a': {'b': 1}}), jsono({'a': [1, 2]}))) t(x, f, y, z);
+----
+Q	5	5	Q	"Q"	object	1	2
