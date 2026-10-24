@@ -8,7 +8,7 @@ each place that participates in local builds or CI:
   - `duckdb/` → the target tagged release.
   - `extension-ci-tools/` → the patch branch matching that release; it can trail
     the DuckDB tag, so fall back to the newest patch branch that exists (e.g.
-    DuckDB `v1.5.5` pairs with `extension-ci-tools` `v1.5.5`).
+    DuckDB `v1.5.6` pairs with `extension-ci-tools` `v1.5.6`).
 - Bump versions in `.github/workflows/MainDistributionPipeline.yml`
   - reusable workflow refs for `duckdb-stable-build` and `code-quality-check`.
   - `duckdb_version` and `ci_tools_version` inputs in both jobs.

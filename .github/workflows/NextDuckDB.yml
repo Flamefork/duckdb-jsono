@@ -12,7 +12,7 @@
 # changes when upstream changes, so upstream is what it samples.
 #
 # The weekly schedule is off while the v2.0 port lives on its own branch: main still carries the
-# v1.5.5 sources, so a run against the upcoming DuckDB is red for a reason already known, and a
+# v1.5.6 sources, so a run against the upcoming DuckDB is red for a reason already known, and a
 # permanently red gate is what this workflow exists to avoid. Restore the schedule and point
 # duckdb_version back at `main` when the port lands.
 #

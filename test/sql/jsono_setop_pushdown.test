@@ -144,15 +144,17 @@ SELECT count(*), count(e->>'a'), count(*) FILTER (WHERE (e->>'a') IS NULL) FROM 
 ----
 2000	1900	100
 
-# (f) UNION DISTINCT dedups on the full value: not pushed (the extract above keeps today's
-# reconciled-read form), values correct.
+# (f) UNION DISTINCT dedups on the full value. DuckDB itself moves the extract into the branches
+# (the shredded one reads its lane bare) and keeps `e` beside it: the dedup groups on `e` and
+# carries the extract through first(). Plan-lock: that first() — an extract under the DISTINCT,
+# deduping on the extracted string, groups on it with no aggregate.
 statement ok
 PRAGMA explain_output='physical_only';
 
 query II
 EXPLAIN SELECT e->>'a' FROM (SELECT e FROM pu_shred UNION SELECT e FROM pu_plain);
 ----
-physical_plan	<REGEX>:.*(COALESCE|__jsono_internal).*
+physical_plan	<REGEX>:.*HASH_GROUP_BY.*"first".*
 
 statement ok
 PRAGMA explain_output='all';
@@ -161,6 +163,42 @@ query I
 SELECT count(*) FROM (SELECT e FROM pu_shred UNION SELECT e FROM pu_plain) WHERE (e->>'a') = 'A5';
 ----
 1
+
+# Two different documents with the same $.a both survive the dedup.
+statement ok
+CREATE TABLE pu_plain_same_a AS SELECT jsono('{"a":"A5","n":-1}') AS e;
+
+query I
+SELECT count(*) FROM (SELECT e->>'a' AS a FROM (SELECT e FROM pu_shred UNION SELECT e FROM pu_plain_same_a)) WHERE a = 'A5';
+----
+2
+
+# Edge values, the same documents in a shredded and a plain branch: as roots and under the
+# shredded path. Each document survives once, and the extract carried through the dedup reads it.
+statement ok
+CREATE TABLE pu_edge_src(t VARCHAR);
+
+statement ok
+INSERT INTO pu_edge_src VALUES ('[]'), ('{}'), ('null'), (NULL), ('{"a":[]}'), ('{"a":{}}'), ('{"a":null}'), ('{"b":1}'), ('{"a":"A5"}');
+
+statement ok
+CREATE TABLE pu_edge_shred AS SELECT jsono(t, shredding := '{"a": "VARCHAR"}') AS e FROM pu_edge_src;
+
+statement ok
+CREATE TABLE pu_edge_plain AS SELECT jsono(t) AS e FROM pu_edge_src;
+
+query TT
+SELECT e->>'a', to_json(e)::VARCHAR AS doc FROM (SELECT e FROM pu_edge_shred UNION SELECT e FROM pu_edge_plain) ORDER BY doc NULLS FIRST;
+----
+NULL	NULL
+NULL	[]
+NULL	null
+A5	{"a":"A5"}
+[]	{"a":[]}
+NULL	{"a":null}
+{}	{"a":{}}
+NULL	{"b":1}
+NULL	{}
 
 # (g) a same-type UNION ALL (no branch reconciliation) is left structurally unchanged — the extract
 # stays above the union — but shred totality folds across the set operation (positional AND of the
