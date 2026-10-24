@@ -4,6 +4,26 @@ One entry per tag. Each entry records the SQL-surface changes, whether the
 layout revisions (`body$N` / `shreds$M`) moved, and — for a moved revision —
 the migration note.
 
+## v0.1.3 — 2026-10-24
+
+A correctness release built against DuckDB `v1.5.6` (was `v1.5.5`). Values
+written by `v0.1.0`–`v0.1.2` stay readable.
+
+- SQL surface: no change. No function, signature, return type, or documented
+  option changed.
+- Correctness:
+  - A path read that lands on an empty array (`->`, `jsono_extract`) now
+    returns `[]` instead of failing with `malformed JSONO: container span
+    missing`, in plain and shredded columns alike.
+  - A shredded value cast to the plain JSONO storage type and compared with a
+    constant (`=`, `IN`) now compares documents. DuckDB's expression rewriter
+    used to move the cast onto the constant, so the same document in two
+    encodings could compare as different.
+- Documentation: the README now names when a core json read over a fully
+  constant shredded value returns `NULL`, and the jsono-native workaround.
+- Format: no revision change. The layout stays `body$2` / `shreds$2`.
+- Migration: none.
+
 ## v0.1.2 — 2026-08-27
 
 A correctness and read-path performance release. Values written by `v0.1.0`
