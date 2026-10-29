@@ -1,0 +1,479 @@
+# name: test/sql/jsono_group_merge_keyed_kind_change.test
+# description: keyed group merge (jsono_group_merge_max / _min) when a path changes kind between rows, on equal keys and on NULL keys — the sequential RFC 7396 fold by key, in plain and shredded columns, in GROUP BY and in a running window
+# group: [sql]
+
+require jsono
+
+require json
+
+# Semantics: docs/adr/0001-keyed-group-merge-semantics.md. Each case reads the result twice, with the
+# rows fed in key order and in reverse: the fold must not depend on the order rows reach the state.
+
+# --- Plain column: kind changes ---
+
+# The README example: extra as an object, then an array, then an object again.
+query II
+WITH webhooks(doc, seq) AS (
+    VALUES
+        (jsono('{"extra":{"url":"/old"},"status":"new"}'), 1),
+        (jsono('{"extra":[]}'), 2),
+        (jsono('{"extra":{"url_0":"/a"}}'), 3)
+)
+SELECT to_json(jsono_group_merge_max(doc, seq)) AS latest_wins,
+       to_json(jsono_group_merge_min(doc, seq)) AS earliest_wins
+FROM webhooks;
+----
+{"extra":{"url_0":"/a"},"status":"new"}	{"extra":{"url":"/old"},"status":"new"}
+
+
+# object -> scalar -> object: the scalar erases the older object, the newer object starts afresh.
+# _min folds by descending key, so its newest patch is the row with key 1.
+statement ok
+CREATE TABLE kc_obj_scalar_obj AS SELECT * FROM (VALUES
+  (jsono('{"x":{"a":1,"b":1},"y":1}'), 1),
+  (jsono('{"x":7}'), 2),
+  (jsono('{"x":{"c":3}}'), 3)) t(j, k);
+
+query II
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_obj_scalar_obj ORDER BY k);
+----
+{"x":{"c":3},"y":1}	{"x":{"a":1,"b":1},"y":1}
+
+query II
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_obj_scalar_obj ORDER BY k DESC);
+----
+{"x":{"c":3},"y":1}	{"x":{"a":1,"b":1},"y":1}
+
+# object -> array, and the webhook case: array ([] or of objects) -> object.
+statement ok
+CREATE TABLE kc_arrays AS SELECT * FROM (VALUES
+  ('obj_arr', jsono('{"x":{"a":1}}'), 1),
+  ('obj_arr', jsono('{"x":[1,2]}'), 2),
+  ('arr_obj', jsono('{"extra":[]}'), 1),
+  ('arr_obj', jsono('{"extra":[{"url":"u"}]}'), 2),
+  ('arr_obj', jsono('{"extra":{"url_0":"u"}}'), 3),
+  ('obj_empty_arr', jsono('{"x":{"a":1}}'), 1),
+  ('obj_empty_arr', jsono('{"x":[]}'), 2)) t(g, j, k);
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_arrays ORDER BY k) GROUP BY g ORDER BY g;
+----
+arr_obj	{"extra":{"url_0":"u"}}	{"extra":[]}
+obj_arr	{"x":[1,2]}	{"x":{"a":1}}
+obj_empty_arr	{"x":[]}	{"x":{"a":1}}
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_arrays ORDER BY k DESC) GROUP BY g ORDER BY g;
+----
+arr_obj	{"extra":{"url_0":"u"}}	{"extra":[]}
+obj_arr	{"x":[1,2]}	{"x":{"a":1}}
+obj_empty_arr	{"x":[]}	{"x":{"a":1}}
+
+# A scalar on an ancestor erases the whole subtree: a.b.c does not come back when a.b.d appears later.
+statement ok
+CREATE TABLE kc_ancestor AS SELECT * FROM (VALUES
+  (jsono('{"a":{"b":{"c":1}}}'), 1),
+  (jsono('{"a":5}'), 2),
+  (jsono('{"a":{"b":{"d":2}}}'), 3)) t(j, k);
+
+query II
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_ancestor ORDER BY k);
+----
+{"a":{"b":{"d":2}}}	{"a":{"b":{"c":1}}}
+
+query II
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_ancestor ORDER BY k DESC);
+----
+{"a":{"b":{"d":2}}}	{"a":{"b":{"c":1}}}
+
+# The document root: JSON null, a scalar or an array replaces the document; an object, even {} or one
+# with only null members, starts it afresh.
+statement ok
+CREATE TABLE kc_root AS SELECT * FROM (VALUES
+  ('obj_null', jsono('{"a":1}'), 1),
+  ('obj_null', jsono('null'), 2),
+  ('scalar_empty', jsono('5'), 1),
+  ('scalar_empty', jsono('{}'), 2),
+  ('scalar_nulls', jsono('5'), 1),
+  ('scalar_nulls', jsono('{"a":null}'), 2),
+  ('restart', jsono('{"old":1}'), 1),
+  ('restart', jsono('null'), 2),
+  ('restart', jsono('{"new":2}'), 3),
+  ('array_root', jsono('{"a":1}'), 1),
+  ('array_root', jsono('[1,{"b":2}]'), 2)) t(g, j, k);
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_root ORDER BY k) GROUP BY g ORDER BY g;
+----
+array_root	[1,{"b":2}]	{"a":1}
+obj_null	null	{"a":1}
+restart	{"new":2}	{"old":1}
+scalar_empty	{}	5
+scalar_nulls	{}	5
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_root ORDER BY k DESC) GROUP BY g ORDER BY g;
+----
+array_root	[1,{"b":2}]	{"a":1}
+obj_null	null	{"a":1}
+restart	{"new":2}	{"old":1}
+scalar_empty	{}	5
+scalar_nulls	{}	5
+
+# IGNORE NULLS below the root: a null member, and a member object that strips to {} (empty, or only
+# null members), leave the path alone — they neither erase nor restart it. A SQL NULL document is
+# skipped.
+statement ok
+CREATE TABLE kc_nulls AS SELECT * FROM (VALUES
+  ('null_member', jsono('{"a":{"b":1}}'), 1),
+  ('null_member', jsono('{"a":null}'), 2),
+  ('empty_member', jsono('{"a":7}'), 1),
+  ('empty_member', jsono('{"a":{}}'), 2),
+  ('null_only_member', jsono('{"a":7}'), 1),
+  ('null_only_member', jsono('{"a":{"b":null}}'), 2),
+  ('sql_null', jsono('{"a":{"b":1}}'), 1),
+  ('sql_null', NULL, 2),
+  ('sql_null', jsono('{"a":3}'), 3)) t(g, j, k);
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_nulls ORDER BY k) GROUP BY g ORDER BY g;
+----
+empty_member	{"a":7}	{"a":7}
+null_member	{"a":{"b":1}}	{"a":{"b":1}}
+null_only_member	{"a":7}	{"a":7}
+sql_null	{"a":3}	{"a":{"b":1}}
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_nulls ORDER BY k DESC) GROUP BY g ORDER BY g;
+----
+empty_member	{"a":7}	{"a":7}
+null_member	{"a":{"b":1}}	{"a":{"b":1}}
+null_only_member	{"a":7}	{"a":7}
+sql_null	{"a":3}	{"a":{"b":1}}
+
+# --- Equal keys: one shared patch per key ---
+
+# Objects merge; between two non-object values on one path a fixed order over the value decides —
+# here it keeps 2 on both paths, whichever row each 2 came from.
+statement ok
+CREATE TABLE kc_ties AS SELECT * FROM (VALUES
+  ('values', jsono('{"a":1,"b":2}'), 1),
+  ('values', jsono('{"a":2,"b":1}'), 1),
+  ('scalar_vs_object', jsono('{"x":{"a":1}}'), 1),
+  ('scalar_vs_object', jsono('{"x":7}'), 1),
+  ('array_vs_object', jsono('{"x":{"a":1}}'), 1),
+  ('array_vs_object', jsono('{"x":[]}'), 1),
+  ('ancestor', jsono('{"a":{"b":{"c":1}}}'), 1),
+  ('ancestor', jsono('{"a":5}'), 1),
+  ('ancestor_then_newer', jsono('{"a":{"b":{"c":1}}}'), 1),
+  ('ancestor_then_newer', jsono('{"a":5}'), 1),
+  ('ancestor_then_newer', jsono('{"a":{"b":{"d":2}}}'), 2),
+  ('root', jsono('{"a":1}'), 1),
+  ('root', jsono('5'), 1),
+  ('root_empty', jsono('{}'), 1),
+  ('root_empty', jsono('[]'), 1)) t(g, j, k);
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_ties ORDER BY k, hash(to_json(j))) GROUP BY g ORDER BY g;
+----
+ancestor	{"a":5}	{"a":5}
+ancestor_then_newer	{"a":{"b":{"d":2}}}	{"a":5}
+array_vs_object	{"x":[]}	{"x":[]}
+root	5	5
+root_empty	[]	[]
+scalar_vs_object	{"x":7}	{"x":7}
+values	{"a":2,"b":2}	{"a":2,"b":2}
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_ties ORDER BY k DESC, hash(to_json(j)) DESC) GROUP BY g ORDER BY g;
+----
+ancestor	{"a":5}	{"a":5}
+ancestor_then_newer	{"a":{"b":{"d":2}}}	{"a":5}
+array_vs_object	{"x":[]}	{"x":[]}
+root	5	5
+root_empty	[]	[]
+scalar_vs_object	{"x":7}	{"x":7}
+values	{"a":2,"b":2}	{"a":2,"b":2}
+
+# --- NULL key: the first shared patch in both functions ---
+
+statement ok
+CREATE TABLE kc_null_key AS SELECT * FROM (VALUES
+  ('fields', jsono('{"a":1,"c":1}'), NULL),
+  ('fields', jsono('{"a":2}'), 1),
+  ('erased', jsono('{"x":5}'), NULL),
+  ('erased', jsono('{"x":{"a":1}}'), 1),
+  ('erases', jsono('{"x":{"a":1}}'), NULL),
+  ('erases', jsono('{"x":5}'), 1),
+  ('shared', jsono('{"x":{"a":1}}'), NULL),
+  ('shared', jsono('{"x":7}'), NULL),
+  ('only_null', jsono('{"a":1}'), NULL)) t(g, j, k);
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_null_key ORDER BY k NULLS FIRST) GROUP BY g ORDER BY g;
+----
+erased	{"x":{"a":1}}	{"x":{"a":1}}
+erases	{"x":5}	{"x":5}
+fields	{"a":2,"c":1}	{"a":2,"c":1}
+only_null	{"a":1}	{"a":1}
+shared	{"x":7}	{"x":7}
+
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT * FROM kc_null_key ORDER BY k NULLS LAST) GROUP BY g ORDER BY g;
+----
+erased	{"x":{"a":1}}	{"x":{"a":1}}
+erases	{"x":5}	{"x":5}
+fields	{"a":2,"c":1}	{"a":2,"c":1}
+only_null	{"a":1}	{"a":1}
+shared	{"x":7}	{"x":7}
+
+# With unique keys, _max equals the ordered form with NULLS FIRST, _min the descending one with NULLS FIRST.
+query II
+WITH p(j, k) AS (VALUES
+  (jsono('{"a":1,"c":{"d":1}}'), NULL),
+  (jsono('{"a":2,"c":5}'), 1),
+  (jsono('{"c":{"e":2}}'), 2))
+SELECT
+  to_json(jsono_group_merge_max(j, k)) = to_json(jsono_group_merge(j ORDER BY k ASC NULLS FIRST)),
+  to_json(jsono_group_merge_min(j, k)) = to_json(jsono_group_merge(j ORDER BY k DESC NULLS FIRST))
+FROM p;
+----
+true	true
+
+# A composite key with a NULL field is not a NULL key: DuckDB orders the NULL field after a value.
+query II
+WITH p(j, k) AS (VALUES
+  (jsono('{"a":"null_field"}'), ROW(1, NULL)),
+  (jsono('{"a":"two"}'), ROW(1, 2)))
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k)) FROM p;
+----
+{"a":"null_field"}	{"a":"two"}
+
+# --- Shredded column: lanes on paths that change kind ---
+
+# A scalar lane ($.x) on a path that is an object in other rows; the lane value sits between them.
+query IIII
+SELECT to_json(m), m ->> '$.x', typeof(m) = jsono_storage_type('{"$.x": "BIGINT"}'), to_json(n)
+FROM (
+  SELECT jsono_group_merge_max(j, k) AS m, jsono_group_merge_min(j, k) AS n
+  FROM (SELECT jsono(doc, shredding := '{"$.x": "BIGINT"}') AS j, k FROM (VALUES
+    ('{"x":{"a":1},"y":1}', 1),
+    ('{"x":7}', 2),
+    ('{"x":{"c":3}}', 3)) t(doc, k) ORDER BY k DESC)
+);
+----
+{"x":{"c":3},"y":1}	{"c":3}	true	{"x":{"a":1},"y":1}
+
+# The scalar lane wins over an older object and erases it; a lane value older than a scalar from the
+# residual loses.
+query III
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k)), jsono_group_merge_max(j, k) ->> '$.x'
+FROM (SELECT jsono(doc, shredding := '{"$.x": "BIGINT"}') AS j, k FROM (VALUES
+  ('{"x":{"a":1}}', 1),
+  ('{"x":7}', 2)) t(doc, k));
+----
+{"x":7}	{"x":{"a":1}}	7
+
+# A lane under an ancestor that becomes a scalar ($.a.b, a = 5), then an object again.
+query II
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT jsono(doc, shredding := '{"$.a.b": "VARCHAR"}') AS j, k FROM (VALUES
+  ('{"a":{"b":"x","c":1}}', 1),
+  ('{"a":5}', 2)) t(doc, k));
+----
+{"a":5}	{"a":{"b":"x","c":1}}
+
+query II
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT jsono(doc, shredding := '{"$.a.b": "VARCHAR"}') AS j, k FROM (VALUES
+  ('{"a":{"b":"x"}}', 1),
+  ('{"a":5}', 2),
+  ('{"a":{"c":1}}', 3)) t(doc, k) ORDER BY k DESC);
+----
+{"a":{"c":1}}	{"a":{"b":"x"}}
+
+# A scalar-array lane ($.extra BIGINT[]) on a path that is an object in other rows.
+query III
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k)),
+       typeof(jsono_group_merge_max(j, k)) = jsono_storage_type('{"$.extra": "BIGINT[]"}')
+FROM (SELECT jsono(doc, shredding := '{"$.extra": "BIGINT[]"}') AS j, k FROM (VALUES
+  ('{"extra":[]}', 1),
+  ('{"extra":[1,2]}', 2),
+  ('{"extra":{"url_0":"u"}}', 3)) t(doc, k));
+----
+{"extra":{"url_0":"u"}}	{"extra":[]}	true
+
+query II
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT jsono(doc, shredding := '{"$.extra": "BIGINT[]"}') AS j, k FROM (VALUES
+  ('{"extra":{"url_0":"u"},"z":1}', 1),
+  ('{"extra":[3]}', 2)) t(doc, k));
+----
+{"extra":[3],"z":1}	{"extra":{"url_0":"u"},"z":1}
+
+# Nested lanes ($.a and $.a.b): the scalar lane at a erases the older lane under it, and the other way.
+query II
+SELECT to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT jsono(doc, shredding := '{"$.a": "BIGINT", "$.a.b": "BIGINT"}') AS j, k FROM (VALUES
+  ('{"a":{"b":1}}', 1),
+  ('{"a":2}', 2)) t(doc, k));
+----
+{"a":2}	{"a":{"b":1}}
+
+# The root of a shredded column changes kind like a plain one.
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT g, jsono(doc, shredding := '{"$.a": "BIGINT"}') AS j, k FROM (VALUES
+  ('obj_null', '{"a":1}', 1),
+  ('obj_null', 'null', 2),
+  ('scalar_empty', '5', 1),
+  ('scalar_empty', '{}', 2),
+  ('scalar_lane', '5', 1),
+  ('scalar_lane', '{"a":3}', 2)) t(g, doc, k)) GROUP BY g ORDER BY g;
+----
+obj_null	null	{"a":1}
+scalar_empty	{}	5
+scalar_lane	{"a":3}	5
+
+# Equal keys across a lane and the residual: the lane's scalar beats the object; a null member and a
+# SQL NULL document leave the lane alone.
+query III
+SELECT g, to_json(jsono_group_merge_max(j, k)), to_json(jsono_group_merge_min(j, k))
+FROM (SELECT g, jsono(doc, shredding := '{"$.x": "BIGINT"}') AS j, k FROM (VALUES
+  ('tie', '{"x":7}', 1),
+  ('tie', '{"x":{"a":1}}', 1),
+  ('null_member', '{"x":5}', 1),
+  ('null_member', '{"x":null}', 2),
+  ('sql_null', '{"x":5}', 1),
+  ('sql_null', NULL, 2)) t(g, doc, k)) GROUP BY g ORDER BY g;
+----
+null_member	{"x":5}	{"x":5}
+sql_null	{"x":5}	{"x":5}
+tie	{"x":7}	{"x":7}
+
+# --- Many rows: GROUP BY across threads and a running window over thousands of rows per partition ---
+
+# Every row changes some path's kind; keys are unique per partition and unrelated to the window order
+# (pos). No member strips to {} here, so the ordered form over the same rows is a valid oracle in a
+# GROUP BY (its own `{"a":7}` then `{"a":{}}` case differs, see the ADR).
+statement ok
+CREATE TABLE kc_many AS
+SELECT i % 4 AS g, i // 4 AS pos, ((i // 4) * 7919) % 3001 AS k,
+  CASE (i * 31 // 4) % 9
+    WHEN 0 THEN '{"extra":[' || i || ']}'
+    WHEN 1 THEN '{"extra":{"u' || (i % 3) || '":' || i || '}}'
+    WHEN 2 THEN '{"extra":7,"a":{"b":{"c":' || i || '}}}'
+    WHEN 3 THEN '{"a":{"b":{"d":' || i || '}}}'
+    WHEN 4 THEN '{"a":' || i || '}'
+    WHEN 5 THEN '{"a":{"x":null,"k":' || i || '},"extra":[]}'
+    WHEN 6 THEN '5'
+    WHEN 7 THEN 'null'
+    ELSE '{"z":{"y":' || i || '}}' END AS doc
+FROM range(12000) t(i);
+
+# Wider copy for the GROUP BY: several row groups, so parallel scans split every group across thread
+# states and Combine merges them.
+statement ok
+CREATE TABLE kc_wide AS
+SELECT i % 50 AS g, ((i // 50) * 7919) % 6007 AS k,
+  CASE (i * 31 // 50) % 9
+    WHEN 0 THEN '{"extra":[' || i || ']}'
+    WHEN 1 THEN '{"extra":{"u' || (i % 3) || '":' || i || '}}'
+    WHEN 2 THEN '{"extra":7,"a":{"b":{"c":' || i || '}}}'
+    WHEN 3 THEN '{"a":{"b":{"d":' || i || '}}}'
+    WHEN 4 THEN '{"a":' || i || '}'
+    WHEN 5 THEN '{"a":{"x":null,"k":' || i || '},"extra":[]}'
+    WHEN 6 THEN '5'
+    WHEN 7 THEN 'null'
+    ELSE '{"z":{"y":' || i || '}}' END AS doc
+FROM range(300000) t(i);
+
+foreach threads 1 8
+
+statement ok
+SET threads = {threads};
+
+query I
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b OR c IS DISTINCT FROM d) FROM (
+  SELECT g,
+    to_json(jsono_group_merge_max(jsono(doc), k)) a, to_json(jsono_group_merge(jsono(doc) ORDER BY k)) b,
+    to_json(jsono_group_merge_min(jsono(doc), k)) c, to_json(jsono_group_merge(jsono(doc) ORDER BY k DESC)) d
+  FROM kc_wide GROUP BY g);
+----
+0
+
+# Running window: each sampled prefix equals the ordered fold over the same rows in a GROUP BY.
+statement ok
+CREATE OR REPLACE TABLE kc_running AS
+SELECT g, pos,
+  to_json(jsono_group_merge_max(jsono(doc), k) OVER w) AS mx,
+  to_json(jsono_group_merge_min(jsono(doc), k) OVER w) AS mn
+FROM kc_many
+WINDOW w AS (PARTITION BY g ORDER BY pos ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW);
+
+query III
+SELECT count(*),
+  count(*) FILTER (WHERE mx IS DISTINCT FROM
+    (SELECT to_json(jsono_group_merge(jsono(s.doc) ORDER BY s.k)) FROM kc_many s WHERE s.g = r.g AND s.pos <= r.pos)),
+  count(*) FILTER (WHERE mn IS DISTINCT FROM
+    (SELECT to_json(jsono_group_merge(jsono(s.doc) ORDER BY s.k DESC)) FROM kc_many s WHERE s.g = r.g AND s.pos <= r.pos))
+FROM kc_running r WHERE pos % 97 = 0 OR pos = 2999;
+----
+128	0	0
+
+# The shredded column folds to the same document in every window row and every group, keeps its
+# type, and its lanes read the same as the document. Nested lanes ($.a over $.a.b.c) and a list lane
+# on a path that is an object or a scalar in other rows.
+statement ok
+CREATE OR REPLACE TABLE kc_running_shredded AS
+SELECT g, pos,
+  jsono_group_merge_max(jsono(doc), k) OVER w AS px,
+  jsono_group_merge_max(jsono(doc, shredding := '{"$.extra":"BIGINT[]","$.a":"BIGINT","$.a.b.c":"BIGINT","$.z.y":"BIGINT"}'), k) OVER w AS sx,
+  jsono_group_merge_min(jsono(doc), k) OVER w AS pn,
+  jsono_group_merge_min(jsono(doc, shredding := '{"$.extra":"BIGINT[]","$.a.b.c":"BIGINT"}'), k) OVER w AS sn
+FROM kc_many
+WINDOW w AS (PARTITION BY g ORDER BY pos ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW);
+
+query IIII
+SELECT count(*),
+  count(*) FILTER (WHERE to_json(px) IS DISTINCT FROM to_json(sx) OR to_json(pn) IS DISTINCT FROM to_json(sn)),
+  count(*) FILTER (WHERE typeof(sx) <> jsono_storage_type('{"$.extra":"BIGINT[]","$.a":"BIGINT","$.a.b.c":"BIGINT","$.z.y":"BIGINT"}')
+                      OR typeof(sn) <> jsono_storage_type('{"$.extra":"BIGINT[]","$.a.b.c":"BIGINT"}')),
+  count(*) FILTER (WHERE (sx ->> '$.a') IS DISTINCT FROM (px ->> '$.a')
+                      OR (sx ->> '$.a.b.c') IS DISTINCT FROM (px ->> '$.a.b.c')
+                      OR (sx ->> '$.extra') IS DISTINCT FROM (px ->> '$.extra')
+                      OR (sn ->> '$.a.b.c') IS DISTINCT FROM (pn ->> '$.a.b.c')
+                      OR (sn ->> '$.extra') IS DISTINCT FROM (pn ->> '$.extra'))
+FROM kc_running_shredded;
+----
+12000	0	0	0
+
+query I
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b OR c IS DISTINCT FROM d) FROM (
+  SELECT g,
+    to_json(jsono_group_merge_max(jsono(doc), k)) a,
+    to_json(jsono_group_merge_max(jsono(doc, shredding := '{"$.extra":"BIGINT[]","$.a":"BIGINT","$.a.b.c":"BIGINT"}'), k)) b,
+    to_json(jsono_group_merge_min(jsono(doc), k)) c,
+    to_json(jsono_group_merge_min(jsono(doc, shredding := '{"$.extra":"BIGINT","$.a.b.d":"BIGINT"}'), k)) d
+  FROM kc_wide GROUP BY g);
+----
+0
+
+endloop
+
+statement ok
+RESET threads;

@@ -535,11 +535,11 @@ Use `GROUP BY` for state accumulation per group, or a window frame (`OVER (ORDER
 
 ### `jsono_group_merge_max` / `jsono_group_merge_min`
 
-`jsono_group_merge_max` and `jsono_group_merge_min` are order-independent versions of `jsono_group_merge`. They take the order key as a usual second argument, not as an `ORDER BY` clause. For each leaf, the value from the row with the **largest** `order_key` wins (`jsono_group_merge_max`), or the value from the row with the **smallest** `order_key` wins (`jsono_group_merge_min`). `null` object members never overwrite, exactly as in `jsono_group_merge`. The functions are direct replacements for the ordered form:
+`jsono_group_merge_max` and `jsono_group_merge_min` are order-independent versions of `jsono_group_merge`. They take the order key as a usual second argument, not as an `ORDER BY` clause. The result is the same RFC 7396 fold, with the rows applied by **increasing** `order_key` (`jsono_group_merge_max` — the largest key is applied last and wins), or by **decreasing** `order_key` (`jsono_group_merge_min` — the smallest key wins). `null` object members never overwrite, exactly as in `jsono_group_merge`. When the keys in a group are unique, the functions are direct replacements for the ordered form:
 
 ```text
-jsono_group_merge_max(value, order_key)  ≡  jsono_group_merge(value ORDER BY order_key)
-jsono_group_merge_min(value, order_key)  ≡  jsono_group_merge(value ORDER BY order_key DESC)
+jsono_group_merge_max(value, order_key)  ≡  jsono_group_merge(value ORDER BY order_key ASC NULLS FIRST)
+jsono_group_merge_min(value, order_key)  ≡  jsono_group_merge(value ORDER BY order_key DESC NULLS FIRST)
 ```
 
 ```sql
@@ -566,11 +566,34 @@ SELECT to_json(jsono_group_merge_max(params, ROW(event_ts, hit_id)))
 FROM hits;
 ```
 
-**Why a separate function?** The ordered form buffers and sorts each input row before the fold — `O(rows)` memory, which a large group can exhaust. The keyed versions are commutative and associative, so DuckDB streams the rows with no buffer and the state stays `O(distinct leaves per group)`. Use them when the ordered form runs out of memory.
+**Why a separate function?** The ordered form buffers and sorts each input row before the fold — `O(rows)` memory, which a large group can exhaust. The keyed versions are commutative and associative, so DuckDB streams the rows with no buffer and the state stays `O(distinct paths per group)`. Use them when the ordered form runs out of memory. In a running window (`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`), they give the fold of each prefix even when the key order is not the window order.
 
 A shredded input keeps its shredding in the output, the same as with `jsono_group_merge`.
 
-These functions require a consistent kind for each path across the rows: always an object, or always a scalar/array. A path that is an object in one row and a scalar or an array in a different row makes per-leaf last-write-wins order-dependent. So the functions refuse it with a clear error. For such structurally-inconsistent data, use `jsono_group_merge(value ORDER BY key)`.
+A path can change kind between rows. A scalar or an array erases everything that rows with a smaller key wrote at its path and under it. An object that comes after it starts fresh and holds only the members of later rows. A scalar on an ancestor erases the whole subtree in the same way:
+
+```sql
+WITH webhooks(doc, seq) AS (
+    VALUES
+        (jsono('{"extra":{"url":"/old"},"status":"new"}'), 1),
+        (jsono('{"extra":[]}'), 2),
+        (jsono('{"extra":{"url_0":"/a"}}'), 3)
+)
+SELECT to_json(jsono_group_merge_max(doc, seq)) AS latest_wins,
+       to_json(jsono_group_merge_min(doc, seq)) AS earliest_wins
+FROM webhooks;
+```
+*Result:*
+```text
+latest_wins                                    earliest_wins
+{"extra":{"url_0":"/a"},"status":"new"}        {"extra":{"url":"/old"},"status":"new"}
+```
+
+At the document root, a JSON `null`, a scalar, or an array replaces the whole document, and an object (even `{}`) after it starts a fresh document. Below the root, a member object that is empty after its `null` members are removed changes nothing.
+
+Rows with an equal `order_key` make one shared patch, which is applied at that key's place in the order. Their objects merge. A scalar or an array wins over an object at the same path and over everything under it. Between two different scalars or arrays at one path, a fixed order of the values selects the winner. So the result does not depend on the order of the rows, but it does not follow one specific row. To make one row win, give a unique key, for example `ROW(event_ts, hit_id)`.
+
+A row with a SQL `NULL` `order_key` is the oldest in both functions: these rows make the first shared patch, and each row with a key overwrites them. A `ROW(...)` key with a `NULL` field is not a `NULL` key. It compares as DuckDB orders it, with the `NULL` field after the values.
 
 ### `jsono_merge_patch`
 

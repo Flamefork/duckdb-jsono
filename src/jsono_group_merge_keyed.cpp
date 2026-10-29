@@ -39,26 +39,27 @@ using namespace jsono;
 //
 // jsono_group_merge(value ORDER BY key) is order_dependent, so DuckDB drives it through the
 // ordered-aggregate path that buffers and sorts EVERY input row before folding — O(rows) memory.
-// These keyed variants take the ordering key as an ordinary second argument and resolve per-leaf
-// conflicts themselves, so the aggregate is commutative and associative (registered WITHOUT
-// order_dependent): DuckDB streams rows straight into Update with no buffer and state stays
-// O(distinct leaves per group).
+// These keyed variants take the ordering key as an ordinary second argument and keep, per path, the
+// key of the write that decides it, so the aggregate is commutative and associative (registered
+// WITHOUT order_dependent): DuckDB streams rows straight into Update with no buffer and state stays
+// O(distinct paths per group).
 //
-// Drop-in semantics (identical to the ORDER BY form on structurally-stable data):
-//   _max(value, key)  ==  jsono_group_merge(value ORDER BY key)        — greatest key wins per leaf
-//   _min(value, key)  ==  jsono_group_merge(value ORDER BY key DESC)   — smallest key wins per leaf
-// Per leaf the value from the row with the winning key wins; null object members never overwrite
-// (RFC 7396 IGNORE NULLS, exactly like jsono_group_merge). The key is any comparable type —
+// Semantics (docs/adr/0001-keyed-group-merge-semantics.md): the sequential RFC 7396 fold with
+// IGNORE NULLS, exactly like jsono_group_merge, in key order —
+//   _max(value, key)  ==  jsono_group_merge(value ORDER BY key ASC NULLS FIRST)
+//   _min(value, key)  ==  jsono_group_merge(value ORDER BY key DESC NULLS FIRST)
+// including paths that change kind between rows: a scalar or array erases everything older at and
+// under its path, and an object written after it starts afresh. Rows with an equal key form one
+// shared patch (objects merge, a non-object value beats an object at its path and under it, and two
+// non-object values fall to a fixed comparison of their bytes). The key is any comparable type —
 // composite keys via ROW(...)/STRUCT compare lexicographically — encoded once per row into a
-// sort-key blob (CreateSortKey, NULLS FIRST so a NULL key never wins) so per-leaf comparison is a
-// memcmp and arbitrary types/null ordering are handled by DuckDB's own sort encoding. Exact ties
-// on the key fall back to a deterministic comparison of the value bytes so the result is fully
-// order-independent; supply a unique (composite) key when ties must resolve a specific way.
+// sort-key blob (CreateSortKey, NULLS FIRST so a NULL key is the oldest patch) so every comparison is
+// a memcmp and arbitrary types/null ordering are handled by DuckDB's own sort encoding.
 //
-// State is a heap-owned mutable tree. Object nodes keep sorted JSON-key children; leaf nodes keep
-// the winning sort-key bytes plus a standalone JSONO blob for the winning non-object value. An
-// object<->leaf change at the same path fails loud: a commutative per-leaf aggregate cannot
-// reproduce the order-dependent RFC 7396 fold for structurally-inconsistent rows.
+// State is a heap-owned mutable tree. A node holds its object children and/or the newest non-object
+// value written at its path with that row's sort key; children hold only writes newer than the
+// node's value. The value's key outlives a returning object, so a write that Combine brings in later
+// stays erased when it is older — that history is what the order-independent fold needs.
 
 struct GroupMergeLWWBindData : public FunctionData {
 	OrderModifiers modifiers;
@@ -76,6 +77,9 @@ struct GroupMergeLWWBindData : public FunctionData {
 	vector<idx_t> overlay_shreds;
 	vector<idx_t> scalar_text_indices;
 	ShredWriteSet write;
+	// A direct lane's path lies under another's ($.a and $.a.b): the direct finalize cannot place both,
+	// so a group with lane values takes the fold-and-reshred route (see LWWLanesNeedTreeFold).
+	bool nested_lane_paths = false;
 	// Carried into Update/Combine to account the LWW tree/lane growth; re-captured on plan round-trips
 	// (no serialize callback, so deserialize re-runs the bind).
 	BufferManager &buffer_manager;
@@ -98,8 +102,6 @@ struct GroupMergeLWWBindData : public FunctionData {
 		return modifiers == other.modifiers && shreds == other.shreds;
 	}
 };
-
-enum class LWWTreeKind : uint8_t { Object, Leaf };
 
 struct LWWTreeNode;
 
@@ -142,6 +144,10 @@ struct GroupMergeLWWState {
 	LWWListLane *list_lanes;
 	idx_t list_lane_count;
 	vector<string> *lane_sort_keys;
+	// Newest key of a row whose whole document was an object with no surviving member (`{}`, or only
+	// null members): such a row makes the root an object without leaving a child to say so. Kept only
+	// while newer than the root's value (nullptr otherwise).
+	string *root_object_key;
 	bool has_input;
 	JsonoMemoryReservation mem;
 	// Additions-only accounting for keyed Update: every fold that grows the state adds the exact growth to
@@ -162,6 +168,7 @@ struct GroupMergeLWWFunction {
 		state.list_lanes = nullptr;
 		state.list_lane_count = 0;
 		state.lane_sort_keys = nullptr;
+		state.root_object_key = nullptr;
 		state.has_input = false;
 		state.mem.reserved = 0;
 		state.mem.buffer_manager = nullptr;
@@ -177,6 +184,7 @@ struct GroupMergeLWWFunction {
 		delete[] state.scalar_texts;
 		delete[] state.list_lanes;
 		delete state.lane_sort_keys;
+		delete state.root_object_key;
 		state.root = nullptr;
 		state.scalar_lanes = nullptr;
 		state.scalar_lane_count = 0;
@@ -185,6 +193,7 @@ struct GroupMergeLWWFunction {
 		state.list_lanes = nullptr;
 		state.list_lane_count = 0;
 		state.lane_sort_keys = nullptr;
+		state.root_object_key = nullptr;
 		state.has_input = false;
 		state.mem_pending = 0;
 		state.mem_unmeasured = 0;
@@ -204,12 +213,25 @@ struct LWWObjectChild {
 	LWWObjectChild &operator=(const LWWObjectChild &) = delete;
 };
 
+// The newest non-object value at this path (`has_value`: a scalar, an array, or a JSON null at the
+// root) with its row's sort key, plus the object children written after it — each child holds only
+// writes newer than this value. A non-root node with neither is removed.
 struct LWWTreeNode {
-	LWWTreeKind kind = LWWTreeKind::Object;
+	bool has_value = false;
 	vector<LWWObjectChild> children;
 	string sort_key;
 	OwnedJsonoBlob value;
 };
+
+// A non-root node is an object exactly when writes newer than its value left children under it.
+bool LWWNodeIsObject(const LWWTreeNode &node) {
+	return !node.has_value || !node.children.empty();
+}
+
+// The root also turns into an object through a row that was an object with nothing left in it.
+bool LWWRootIsObject(const LWWTreeNode &root, const string *root_object_key) {
+	return LWWNodeIsObject(root) || root_object_key;
+}
 
 struct LWWTreeScratch {
 	JsonoBuilder builder;
@@ -249,6 +271,9 @@ idx_t GroupMergeLWWFootprint(const GroupMergeLWWState &state) {
 	idx_t bytes = 0;
 	if (state.root) {
 		bytes += LWWTreeNodeBytes(*state.root);
+	}
+	if (state.root_object_key) {
+		bytes += sizeof(string) + state.root_object_key->capacity();
 	}
 	bytes += state.scalar_lane_count * sizeof(LWWScalarLane);
 	if (state.scalar_texts) {
@@ -511,19 +536,6 @@ int CompareLWWListValueTie(const LWWListValue &a, const LogicalType &type, const
 	return CompareBlobValueTie(blob, b);
 }
 
-// Per-leaf last-write-wins is well-defined only when every path has a consistent kind across rows
-// (always an object, or always a non-object leaf). When a path is a non-empty object in one row and
-// a scalar/array in another, the sequential RFC 7396 fold's result depends on row order, so a
-// commutative per-leaf rule cannot reproduce it — failing loud beats a silently order-dependent
-// answer. Empty object members are stripped before touching a child, so a nested OBJ_START conflict
-// is a real structural object (the document root can still be an empty object input).
-[[noreturn]] void ThrowMixedKindConflict() {
-	throw InvalidInputException(
-	    "jsono_group_merge_max/min: a path is an object in one row and a scalar/array in another; "
-	    "last-write-wins per leaf is order-dependent for such structurally-inconsistent data. "
-	    "Use jsono_group_merge(value ORDER BY key) instead for paths that change kind across rows.");
-}
-
 size_t FindLWWChildIndex(const vector<LWWObjectChild> &children, nonstd::string_view key) {
 	size_t lo = 0;
 	size_t hi = children.size();
@@ -539,11 +551,57 @@ size_t FindLWWChildIndex(const vector<LWWObjectChild> &children, nonstd::string_
 	return lo;
 }
 
-void ResetLWWNodeToObject(LWWTreeNode &node) {
-	node.kind = LWWTreeKind::Object;
-	node.children.clear();
+void ClearLWWNodeValue(LWWTreeNode &node) {
+	node.has_value = false;
 	node.sort_key.clear();
 	node.value = OwnedJsonoBlob();
+}
+
+bool PruneLWWTreeNode(LWWTreeNode &node, nonstd::string_view floor);
+
+// Drop every write under `node` that is no newer than `floor` — a non-object value at the node's
+// path or above it with that key erased them — and the children left empty.
+void PruneLWWChildren(LWWTreeNode &node, nonstd::string_view floor) {
+	idx_t kept = 0;
+	for (idx_t i = 0; i < node.children.size(); i++) {
+		if (PruneLWWTreeNode(*node.children[i].node, floor)) {
+			continue;
+		}
+		if (kept != i) {
+			node.children[kept] = std::move(node.children[i]);
+		}
+		kept++;
+	}
+	node.children.erase(node.children.begin() + kept, node.children.end());
+}
+
+// Same for the node itself; returns whether it is left empty. Children of a surviving value are newer
+// than it, so the walk stops there.
+bool PruneLWWTreeNode(LWWTreeNode &node, nonstd::string_view floor) {
+	if (node.has_value) {
+		if (CompareRawBytes(node.sort_key, floor) > 0) {
+			return false;
+		}
+		ClearLWWNodeValue(node);
+	}
+	PruneLWWChildren(node, floor);
+	return node.children.empty();
+}
+
+// The newer of two optional keys (nullptr: none). Floors are the newest non-object value keys on a
+// path's strict ancestors.
+const string *NewerLWWKey(const string *a, const string *b) {
+	if (!a) {
+		return b;
+	}
+	if (!b) {
+		return a;
+	}
+	return CompareRawBytes(*a, *b) >= 0 ? a : b;
+}
+
+bool LWWKeyIsNewer(const string *a, const string *b) {
+	return a && (!b || CompareRawBytes(*a, *b) > 0);
 }
 
 bool LWWRootKeySkipped(const vector<nonstd::string_view> *root_skip_keys, size_t depth, nonstd::string_view key) {
@@ -572,27 +630,29 @@ void SerializeIncomingLWWLeaf(const JsonoView &view, JsonoCursor &cursor, OwnedJ
 void StoreLWWLeafFromIncoming(LWWTreeNode &node, const JsonoView &view, JsonoCursor &cursor, nonstd::string_view K,
                               LWWTreeScratch &scratch, size_t depth) {
 	// Metadata before the value emit: the keyed tie-break reads node.sort_key.
-	node.kind = LWWTreeKind::Leaf;
-	node.children.clear();
+	node.has_value = true;
 	AssignBytes(node.sort_key, K);
 	SerializeIncomingLWWLeaf(view, cursor, node.value, scratch, depth);
 }
 
-void BuildIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
+// Build/merge return whether the value was an object with no surviving member — the caller records
+// that at the root only (see GroupMergeLWWState::root_object_key); a nested such member never gets
+// here, MemberSurvivesStrip drops it.
+bool BuildIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
                           LWWTreeScratch &scratch, size_t depth,
                           const vector<nonstd::string_view> *root_skip_keys = nullptr);
 
-void BuildIncomingLWWObject(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
+bool BuildIncomingLWWObject(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
                             LWWTreeScratch &scratch, size_t depth,
                             const vector<nonstd::string_view> *root_skip_keys = nullptr) {
 	if (depth > JSONO_MAX_NESTING_DEPTH) {
 		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
 		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
 	}
-	ResetLWWNodeToObject(node);
 	auto layout = ReadObjectLayout(V, cursor.pos);
 	JsonoCursor vc = cursor;
 	vc.pos = layout.value_start;
+	bool any_member = false;
 	for (size_t i = 0; i < layout.key_count; i++) {
 		auto key_slot = V.SlotAt(layout.key_start + i);
 		if (SlotTag(key_slot) != tag::KEY) {
@@ -602,6 +662,7 @@ void BuildIncomingLWWObject(LWWTreeNode &node, const JsonoView &V, JsonoCursor &
 			SkipValueFast(V, vc);
 			continue;
 		}
+		any_member = true;
 		auto key = V.KeyAt(SlotPayload(key_slot));
 		if (LWWRootKeySkipped(root_skip_keys, depth, key)) {
 			SkipValueFast(V, vc);
@@ -618,27 +679,30 @@ void BuildIncomingLWWObject(LWWTreeNode &node, const JsonoView &V, JsonoCursor &
 	}
 	vc.pos++;
 	cursor = vc;
+	return !any_member;
 }
 
-void BuildIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
+bool BuildIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
                           LWWTreeScratch &scratch, size_t depth, const vector<nonstd::string_view> *root_skip_keys) {
 	auto slot_tag = SlotTag(V.SlotAt(cursor.pos));
 	if (slot_tag == tag::OBJ_START) {
-		BuildIncomingLWWObject(node, V, cursor, K, scratch, depth, root_skip_keys);
-		return;
+		return BuildIncomingLWWObject(node, V, cursor, K, scratch, depth, root_skip_keys);
 	}
-	// Arrays are a single leaf (replaced wholesale), exactly like jsono_group_merge. Scalars,
-	// including a top-level JSON null, are leaves too.
+	// Arrays are a single value (replaced wholesale), exactly like jsono_group_merge. Scalars,
+	// including a top-level JSON null, are values too.
 	StoreLWWLeafFromIncoming(node, V, cursor, K, scratch, depth);
+	return false;
 }
 
-void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
+bool MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cursor, nonstd::string_view K,
                           LWWTreeScratch &scratch, size_t depth,
                           const vector<nonstd::string_view> *root_skip_keys = nullptr) {
 	auto slot_tag = SlotTag(V.SlotAt(cursor.pos));
 	if (slot_tag == tag::OBJ_START) {
-		if (node.kind != LWWTreeKind::Object) {
-			ThrowMixedKindConflict();
+		if (node.has_value && CompareRawBytes(node.sort_key, K) >= 0) {
+			// A non-object value from a row at or after this one replaced the whole object.
+			SkipValueFast(V, cursor);
+			return false;
 		}
 		if (depth > JSONO_MAX_NESTING_DEPTH) {
 			throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
@@ -648,6 +712,7 @@ void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cu
 		JsonoCursor vc = cursor;
 		vc.pos = layout.value_start;
 		idx_t child_pos = 0;
+		bool any_member = false;
 		for (size_t i = 0; i < layout.key_count; i++) {
 			auto key_slot = V.SlotAt(layout.key_start + i);
 			if (SlotTag(key_slot) != tag::KEY) {
@@ -658,6 +723,7 @@ void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cu
 				SkipValueFast(V, vc);
 				continue;
 			}
+			any_member = true;
 			if (LWWRootKeySkipped(root_skip_keys, depth, key)) {
 				SkipValueFast(V, vc);
 				continue;
@@ -697,35 +763,42 @@ void MergeIncomingLWWNode(LWWTreeNode &node, const JsonoView &V, JsonoCursor &cu
 		}
 		vc.pos++;
 		cursor = vc;
-		return;
+		return !any_member;
 	}
-	if (node.kind != LWWTreeKind::Leaf) {
-		ThrowMixedKindConflict();
+	if (node.has_value) {
+		int key_cmp = CompareRawBytes(node.sort_key, K);
+		if (key_cmp > 0) {
+			SkipValueFast(V, cursor);
+			return false;
+		}
+		if (key_cmp == 0) {
+			// Same key: the shared patch keeps one of the two values by a fixed order. Children are newer
+			// than this key already, so nothing below changes.
+			SerializeIncomingLWWLeaf(V, cursor, scratch.candidate, scratch, depth);
+			if (CompareBlobValueTie(node.value, scratch.candidate) < 0) {
+				idx_t before = BlobBytes(node.value);
+				node.value = scratch.candidate;
+				idx_t after = BlobBytes(node.value);
+				scratch.bytes_added += (after > before ? after - before : 0);
+			}
+			return false;
+		}
 	}
-	int key_cmp = CompareRawBytes(node.sort_key, K);
-	if (key_cmp > 0) {
-		SkipValueFast(V, cursor);
-		return;
+	// The newest non-object value at this path: it replaces the value and erases every write under the
+	// path that is not newer than it.
+	idx_t before = node.sort_key.capacity() + BlobBytes(node.value);
+	StoreLWWLeafFromIncoming(node, V, cursor, K, scratch, depth);
+	idx_t after = node.sort_key.capacity() + BlobBytes(node.value);
+	scratch.bytes_added += (after > before ? after - before : 0);
+	if (!node.children.empty()) {
+		PruneLWWChildren(node, K);
 	}
-	if (key_cmp < 0) {
-		idx_t before = node.sort_key.capacity() + BlobBytes(node.value);
-		StoreLWWLeafFromIncoming(node, V, cursor, K, scratch, depth);
-		idx_t after = node.sort_key.capacity() + BlobBytes(node.value);
-		scratch.bytes_added += (after > before ? after - before : 0);
-		return;
-	}
-	SerializeIncomingLWWLeaf(V, cursor, scratch.candidate, scratch, depth);
-	if (CompareBlobValueTie(node.value, scratch.candidate) < 0) {
-		idx_t before = BlobBytes(node.value);
-		node.value = scratch.candidate;
-		idx_t after = BlobBytes(node.value);
-		scratch.bytes_added += (after > before ? after - before : 0);
-	}
+	return false;
 }
 
 unique_ptr<LWWTreeNode> CloneLWWTreeNode(const LWWTreeNode &source) {
 	auto result = make_uniq<LWWTreeNode>();
-	result->kind = source.kind;
+	result->has_value = source.has_value;
 	result->sort_key = source.sort_key;
 	result->value = source.value;
 	result->children.reserve(source.children.size());
@@ -740,17 +813,15 @@ unique_ptr<LWWTreeNode> CloneLWWTreeNode(const LWWTreeNode &source) {
 // aggregate's combine_type, constant for the whole Combine call, so every copy/move twin below is
 // one body branching on it: the non-destructive combine path also holds a mutable source, so the
 // copy branch simply reads it without resetting.
-void TransferLWWTreeNode(LWWTreeNode &target, LWWTreeNode &source, bool destructive) {
+void TransferLWWNodeValue(LWWTreeNode &target, LWWTreeNode &source, bool destructive) {
+	target.has_value = source.has_value;
 	if (destructive) {
-		target.kind = source.kind;
-		target.children = std::move(source.children);
 		target.sort_key = std::move(source.sort_key);
 		target.value = std::move(source.value);
-		source.children.clear();
-		source.sort_key.clear();
-		source.value = OwnedJsonoBlob();
+		ClearLWWNodeValue(source);
 	} else {
-		target = std::move(*CloneLWWTreeNode(source));
+		target.sort_key = source.sort_key;
+		target.value = source.value;
 	}
 }
 
@@ -875,7 +946,7 @@ int CompareLWWScalarLaneValueTie(const LWWScalarLane &lane, nonstd::string_view 
 	return CompareBlobValueTie(lane_blob, candidate_blob);
 }
 
-// Same copy/move split as the tree above (see TransferLWWTreeNode): `destructive` is the combine's
+// Same copy/move split as the tree above (see TransferLWWNodeValue): `destructive` is the combine's
 // constant combine_type, so the lane copy/move twins become one body. The source lane and its text
 // are mutable in both modes (the non-destructive combine holds a mutable source); only move resets
 // them. Re-storing the sort key into the target is identical for copy and move.
@@ -993,58 +1064,88 @@ void MergeLWWListLanes(GroupMergeLWWState &target, GroupMergeLWWState &source, c
 	}
 }
 
-void MergeLWWTreeInto(LWWTreeNode &target, LWWTreeNode &source, bool destructive) {
-	if (target.kind == LWWTreeKind::Object && source.kind == LWWTreeKind::Object) {
-		for (auto &source_child : source.children) {
-			if (destructive && !source_child.node) {
-				continue;
-			}
-			auto key = nonstd::string_view(source_child.key.data(), source_child.key.size());
-			auto child_idx = FindLWWChildIndex(target.children, key);
-			bool found = child_idx < target.children.size() &&
-			             CompareJsonoKeys(nonstd::string_view(target.children[child_idx].key.data(),
-			                                                  target.children[child_idx].key.size()),
-			                              key) == 0;
-			if (found) {
-				MergeLWWTreeInto(*target.children[child_idx].node, *source_child.node, destructive);
-			} else if (destructive) {
-				target.children.insert(target.children.begin() + child_idx, std::move(source_child));
-			} else {
-				target.children.insert(target.children.begin() + child_idx,
-				                       LWWObjectChild(source_child.key, CloneLWWTreeNode(*source_child.node)));
-			}
+// Merge `source` into `target` at the same path. `target_floor` / `source_floor` are the newest
+// non-object value keys on the path's strict ancestors within each state (nullptr: none). Each tree
+// already holds only writes newer than its own floor, so a write survives the merge only when it is
+// also newer than the other state's floor. Children merge before the values, while the two floors
+// they read — the values' keys — are still in place.
+void MergeLWWTreeInto(LWWTreeNode &target, LWWTreeNode &source, const string *target_floor, const string *source_floor,
+                      bool destructive) {
+	auto *target_child_floor = NewerLWWKey(target_floor, target.has_value ? &target.sort_key : nullptr);
+	auto *source_child_floor = NewerLWWKey(source_floor, source.has_value ? &source.sort_key : nullptr);
+	bool prune_target = LWWKeyIsNewer(source_child_floor, target_child_floor);
+	bool prune_source = LWWKeyIsNewer(target_child_floor, source_child_floor);
+	for (auto &source_child : source.children) {
+		if (destructive && !source_child.node) {
+			continue;
+		}
+		auto key = nonstd::string_view(source_child.key.data(), source_child.key.size());
+		auto child_idx = FindLWWChildIndex(target.children, key);
+		bool found = child_idx < target.children.size() &&
+		             CompareJsonoKeys(nonstd::string_view(target.children[child_idx].key.data(),
+		                                                  target.children[child_idx].key.size()),
+		                              key) == 0;
+		if (found) {
+			MergeLWWTreeInto(*target.children[child_idx].node, *source_child.node, target_child_floor,
+			                 source_child_floor, destructive);
+			continue;
 		}
 		if (destructive) {
-			source.children.clear();
+			target.children.insert(target.children.begin() + child_idx, std::move(source_child));
+		} else {
+			target.children.insert(target.children.begin() + child_idx,
+			                       LWWObjectChild(source_child.key, CloneLWWTreeNode(*source_child.node)));
 		}
-		return;
+		if (prune_source && PruneLWWTreeNode(*target.children[child_idx].node, *target_child_floor)) {
+			target.children.erase(target.children.begin() + child_idx);
+		}
 	}
-	if (target.kind == LWWTreeKind::Object || source.kind == LWWTreeKind::Object) {
-		ThrowMixedKindConflict();
+	if (destructive) {
+		source.children.clear();
 	}
-	int key_cmp = CompareRawBytes(target.sort_key, source.sort_key);
-	if (key_cmp < 0 || (key_cmp == 0 && CompareBlobValueTie(target.value, source.value) < 0)) {
-		TransferLWWTreeNode(target, source, destructive);
+	if (prune_target) {
+		// Also drops a merged child the source's floor left empty — only this side's floor can do that.
+		PruneLWWChildren(target, *source_child_floor);
+	}
+	if (source.has_value && (!target.has_value || CompareRawBytes(target.sort_key, source.sort_key) < 0 ||
+	                         (CompareRawBytes(target.sort_key, source.sort_key) == 0 &&
+	                          CompareBlobValueTie(target.value, source.value) < 0))) {
+		TransferLWWNodeValue(target, source, destructive);
+	}
+	auto *floor = NewerLWWKey(target_floor, source_floor);
+	if (target.has_value && floor && CompareRawBytes(target.sort_key, *floor) <= 0) {
+		ClearLWWNodeValue(target);
 	}
 }
 
-void EmitLWWTreeNode(const LWWTreeNode &node, JsonoBuilder &builder, size_t depth) {
-	if (depth > JSONO_MAX_NESTING_DEPTH) {
-		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
-		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+// The root object key only matters while it is newer than the root's value.
+void DropStaleLWWRootObjectKey(GroupMergeLWWState &state) {
+	if (state.root_object_key && state.root->has_value &&
+	    CompareRawBytes(*state.root_object_key, state.root->sort_key) <= 0) {
+		delete state.root_object_key;
+		state.root_object_key = nullptr;
 	}
-	if (node.kind == LWWTreeKind::Object) {
-		builder.EmitObjectStart(node.children.size());
-		for (auto &child : node.children) {
-			builder.EmitKeySlot(nonstd::string_view(child.key.data(), child.key.size()));
-		}
-		for (auto &child : node.children) {
-			builder.EmitObjectChildStart();
-			EmitLWWTreeNode(*child.node, builder, depth + 1);
-		}
-		builder.EmitObjectEnd();
+}
+
+void RecordLWWRootObject(GroupMergeLWWState &state, nonstd::string_view K) {
+	if (state.root->has_value && CompareRawBytes(state.root->sort_key, K) >= 0) {
 		return;
 	}
+	if (!state.root_object_key) {
+		state.root_object_key = new string();
+		state.mem_pending += sizeof(string) + state.root_object_key->capacity();
+	} else if (CompareRawBytes(*state.root_object_key, K) >= 0) {
+		return;
+	}
+	idx_t before = state.root_object_key->capacity();
+	AssignBytes(*state.root_object_key, K);
+	idx_t after = state.root_object_key->capacity();
+	state.mem_pending += (after > before ? after - before : 0);
+}
+
+void EmitLWWTreeNode(const LWWTreeNode &node, JsonoBuilder &builder, size_t depth);
+
+void EmitLWWNodeValue(const LWWTreeNode &node, JsonoBuilder &builder, size_t depth) {
 	JsonoView value_view = ViewOfBlob(node.value);
 	if (!value_view.ParseHeader()) {
 		throw InternalException("jsono_group_merge: malformed leaf blob");
@@ -1053,8 +1154,40 @@ void EmitLWWTreeNode(const LWWTreeNode &node, JsonoBuilder &builder, size_t dept
 	EmitValueVerbatim(value_view, cursor, builder, depth);
 }
 
+void EmitLWWObjectNode(const LWWTreeNode &node, JsonoBuilder &builder, size_t depth) {
+	if (depth > JSONO_MAX_NESTING_DEPTH) {
+		throw InvalidInputException("JSONO nesting depth exceeds maximum of %llu",
+		                            (unsigned long long)JSONO_MAX_NESTING_DEPTH);
+	}
+	builder.EmitObjectStart(node.children.size());
+	for (auto &child : node.children) {
+		builder.EmitKeySlot(nonstd::string_view(child.key.data(), child.key.size()));
+	}
+	for (auto &child : node.children) {
+		builder.EmitObjectChildStart();
+		EmitLWWTreeNode(*child.node, builder, depth + 1);
+	}
+	builder.EmitObjectEnd();
+}
+
+void EmitLWWTreeNode(const LWWTreeNode &node, JsonoBuilder &builder, size_t depth) {
+	if (LWWNodeIsObject(node)) {
+		EmitLWWObjectNode(node, builder, depth);
+	} else {
+		EmitLWWNodeValue(node, builder, depth);
+	}
+}
+
+void EmitLWWRoot(const LWWTreeNode &root, const string *root_object_key, JsonoBuilder &builder) {
+	if (LWWRootIsObject(root, root_object_key)) {
+		EmitLWWObjectNode(root, builder, 0);
+	} else {
+		EmitLWWNodeValue(root, builder, 0);
+	}
+}
+
 // Fold the incoming row into the mutable per-group tree. Object rows update only surviving
-// IGNORE NULLS leaves; arrays/scalars are standalone leaves with a copied sort key.
+// IGNORE NULLS members; arrays/scalars are standalone values with a copied sort key.
 void FoldRowLWW(GroupMergeLWWState &state, const JsonoView &V, nonstd::string_view K,
                 const vector<nonstd::string_view> *root_skip_keys = nullptr) {
 	// Never destroyed on purpose — TLS destructors corrupt the mingw heap; see FoldIntoGroupState in
@@ -1063,17 +1196,25 @@ void FoldRowLWW(GroupMergeLWWState &state, const JsonoView &V, nonstd::string_vi
 	JsonoCursor cursor;
 	if (!state.has_input) {
 		state.root = new LWWTreeNode();
-		BuildIncomingLWWNode(*state.root, V, cursor, K, scratch, 0, root_skip_keys);
+		bool empty_object = BuildIncomingLWWNode(*state.root, V, cursor, K, scratch, 0, root_skip_keys);
 		state.has_input = true;
 		state.mem_pending += LWWTreeNodeBytes(*state.root);
+		if (empty_object) {
+			RecordLWWRootObject(state, K);
+		}
 		return;
 	}
 	if (!state.root) {
 		throw InternalException("jsono_group_merge: missing keyed aggregate root");
 	}
 	scratch.bytes_added = 0;
-	MergeIncomingLWWNode(*state.root, V, cursor, K, scratch, 0, root_skip_keys);
+	bool empty_object = MergeIncomingLWWNode(*state.root, V, cursor, K, scratch, 0, root_skip_keys);
 	state.mem_pending += scratch.bytes_added;
+	if (empty_object) {
+		RecordLWWRootObject(state, K);
+	} else if (state.root_object_key) {
+		DropStaleLWWRootObjectKey(state);
+	}
 }
 
 vector<idx_t> LWWScalarTextLaneIndices(const vector<ReconShred> &shreds) {
@@ -1329,6 +1470,15 @@ void PrepareDirectLWWShreddedInput(const vector<std::pair<string, LogicalType>> 
 	std::sort(list_shreds.begin(), list_shreds.end(), by_manifest_path);
 }
 
+bool LWWPathIsPrefix(const vector<PathStep> &prefix, const vector<PathStep> &path) {
+	for (idx_t i = 0; i < prefix.size(); i++) {
+		if (prefix[i].kind != path[i].kind || prefix[i].key != path[i].key || prefix[i].index != path[i].index) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void GroupMergeLWWBindData::BuildShredPlan() {
 	scalar_shreds.clear();
 	list_shreds.clear();
@@ -1336,6 +1486,21 @@ void GroupMergeLWWBindData::BuildShredPlan() {
 	PrepareDirectLWWShreddedInput(shreds, scalar_shreds, list_shreds, overlay_shreds);
 	scalar_text_indices = LWWScalarTextLaneIndices(scalar_shreds);
 	write = JsonoBuildShredWriteSet(shreds);
+	vector<const vector<PathStep> *> lane_paths;
+	for (auto &shred : scalar_shreds) {
+		lane_paths.push_back(&shred.steps);
+	}
+	for (auto &shred : list_shreds) {
+		lane_paths.push_back(&shred.steps);
+	}
+	nested_lane_paths = false;
+	for (auto *outer : lane_paths) {
+		for (auto *inner : lane_paths) {
+			if (outer->size() < inner->size() && LWWPathIsPrefix(*outer, *inner)) {
+				nested_lane_paths = true;
+			}
+		}
+	}
 }
 
 // The four manifest walkers below each run the same two-pointer advance (manifest and shreds are
@@ -1600,10 +1765,16 @@ bool JsonoGroupMergeLWWUpdateDirectShredded(Vector inputs[], const GroupMergeLWW
 	    [&](idx_t row) -> GroupMergeLWWState & { return *state_data[RowIndex(state_fmt, row)]; });
 }
 
-void EmitLWWTreeNodeStrippingPaths(const LWWTreeNode &node, const vector<const vector<PathStep> *> &strip_paths,
-                                   JsonoBuilder &builder, size_t depth) {
-	if (strip_paths.empty() || node.kind != LWWTreeKind::Object) {
-		EmitLWWTreeNode(node, builder, depth);
+// `is_object` comes from the caller: the root's kind also depends on the state's root object key.
+void EmitLWWTreeNodeStrippingPaths(const LWWTreeNode &node, bool is_object,
+                                   const vector<const vector<PathStep> *> &strip_paths, JsonoBuilder &builder,
+                                   size_t depth) {
+	if (!is_object) {
+		EmitLWWNodeValue(node, builder, depth);
+		return;
+	}
+	if (strip_paths.empty()) {
+		EmitLWWObjectNode(node, builder, depth);
 		return;
 	}
 	idx_t child_count = 0;
@@ -1626,7 +1797,7 @@ void EmitLWWTreeNodeStrippingPaths(const LWWTreeNode &node, const vector<const v
 		}
 		builder.EmitObjectChildStart();
 		CollectContinuingPaths(strip_paths, depth, key, deeper);
-		EmitLWWTreeNodeStrippingPaths(*child.node, deeper, builder, depth + 1);
+		EmitLWWTreeNodeStrippingPaths(*child.node, LWWNodeIsObject(*child.node), deeper, builder, depth + 1);
 	}
 	builder.EmitObjectEnd();
 }
@@ -1646,16 +1817,16 @@ void EmitLWWListSkeleton(const LWWListLane &lane, JsonoBuilder &builder, size_t 
 	EmitValueVerbatim(value_view, cursor, builder, depth);
 }
 
-void EmitLWWTreeNodeWithListOverrides(const LWWTreeNode &node, JsonoBuilder &builder,
+void EmitLWWTreeNodeWithListOverrides(const LWWTreeNode &node, bool is_object, JsonoBuilder &builder,
                                       const vector<const vector<PathStep> *> &scalar_strip_paths,
                                       const vector<idx_t> &skip_children, const vector<idx_t> &list_override_indices,
                                       const vector<ReconShred> &list_shreds, const LWWListLane *list_lanes,
                                       size_t depth) {
 	if (list_override_indices.empty()) {
-		EmitLWWTreeNodeStrippingPaths(node, scalar_strip_paths, builder, depth);
+		EmitLWWTreeNodeStrippingPaths(node, is_object, scalar_strip_paths, builder, depth);
 		return;
 	}
-	if (node.kind != LWWTreeKind::Object || depth != 0 || !list_lanes) {
+	if (!is_object || depth != 0 || !list_lanes) {
 		throw InternalException("jsono_group_merge: list skeleton override requires a root object");
 	}
 	vector<LWWRootEmitEntry> entries;
@@ -1693,7 +1864,8 @@ void EmitLWWTreeNodeWithListOverrides(const LWWTreeNode &node, JsonoBuilder &bui
 		} else {
 			vector<const vector<PathStep> *> deeper;
 			CollectContinuingPaths(scalar_strip_paths, depth, entry.key, deeper);
-			EmitLWWTreeNodeStrippingPaths(*node.children[entry.index].node, deeper, builder, depth + 1);
+			auto &child = *node.children[entry.index].node;
+			EmitLWWTreeNodeStrippingPaths(child, LWWNodeIsObject(child), deeper, builder, depth + 1);
 		}
 	}
 	builder.EmitObjectEnd();
@@ -1701,8 +1873,8 @@ void EmitLWWTreeNodeWithListOverrides(const LWWTreeNode &node, JsonoBuilder &bui
 
 int CompareLWWScalarLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWScalarLane &lane, const string *lane_text,
                                    const ReconShred &shred, const LWWTreeNode &node) {
-	if (node.kind != LWWTreeKind::Leaf) {
-		ThrowMixedKindConflict();
+	if (LWWNodeIsObject(node)) {
+		throw InternalException("jsono_group_merge: lane compared against an object (see LWWLanesNeedTreeFold)");
 	}
 	int key_cmp = CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), node.sort_key);
 	if (key_cmp != 0) {
@@ -1717,8 +1889,8 @@ int CompareLWWScalarLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWSca
 
 int CompareLWWListLaneToTreeLeaf(const GroupMergeLWWState &state, const LWWListLane &lane, const ReconShred &shred,
                                  const LWWTreeNode &node) {
-	if (node.kind != LWWTreeKind::Leaf) {
-		ThrowMixedKindConflict();
+	if (LWWNodeIsObject(node)) {
+		throw InternalException("jsono_group_merge: lane compared against an object (see LWWLanesNeedTreeFold)");
 	}
 	int key_cmp = CompareRawBytes(LWWLaneSortKey(state, lane.sort_key_id), node.sort_key);
 	if (key_cmp != 0) {
@@ -1786,7 +1958,7 @@ void WriteLWWListLaneValue(const LWWListLane &lane, const ReconShred &shred, Vec
 bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, Vector &out, idx_t rid,
                               bool &diverted) {
 	diverted = false;
-	if (node.kind != LWWTreeKind::Leaf) {
+	if (LWWNodeIsObject(node)) {
 		// A merged object/array subtree at a scalar-shred path: it stays in the residual skeleton.
 		diverted = true;
 		return false;
@@ -1843,35 +2015,152 @@ bool WriteLWWScalarShredValue(const LWWTreeNode &node, const ReconShred &shred, 
 	return false;
 }
 
-enum class LWWPathLookupKind : uint8_t { Missing, Found, PrefixLeaf };
+LWWTreeNode *FindLWWChild(LWWTreeNode &node, const PathStep &step) {
+	auto key = nonstd::string_view(step.key.data(), step.key.size());
+	auto child_idx = FindLWWChildIndex(node.children, key);
+	bool found =
+	    child_idx < node.children.size() &&
+	    CompareJsonoKeys(nonstd::string_view(node.children[child_idx].key.data(), node.children[child_idx].key.size()),
+	                     key) == 0;
+	return found ? node.children[child_idx].node.get() : nullptr;
+}
 
-struct LWWPathLookup {
-	LWWPathLookup() {
-	}
-	LWWPathLookup(LWWPathLookupKind kind_p, LWWTreeNode *node_p) : kind(kind_p), node(node_p) {
-	}
-	LWWPathLookupKind kind = LWWPathLookupKind::Missing;
-	LWWTreeNode *node = nullptr;
-};
-
-LWWPathLookup FindLWWPathNode(LWWTreeNode &root, const vector<PathStep> &steps) {
+// The node at `steps`, or nullptr when the path is not in the tree.
+LWWTreeNode *FindLWWPathNode(LWWTreeNode &root, const vector<PathStep> &steps) {
 	LWWTreeNode *node = &root;
-	for (idx_t depth = 0; depth < steps.size(); depth++) {
-		if (node->kind != LWWTreeKind::Object) {
-			return {LWWPathLookupKind::PrefixLeaf, node};
+	for (auto &step : steps) {
+		node = FindLWWChild(*node, step);
+		if (!node) {
+			return nullptr;
 		}
-		auto key = nonstd::string_view(steps[depth].key.data(), steps[depth].key.size());
+	}
+	return node;
+}
+
+// The direct finalize resolves a lane against the tree only at the lane's own path: the lane wins or
+// loses to the value there by key. That is the whole resolution unless a non-object value sits on the
+// way down (it may erase the lane, or turn back into an object only because of it), the tree holds
+// an object at the lane path (it may be older or newer than the lane), or one lane path lies under
+// another. A group like that folds its lanes into a copy of the tree and reshreds instead.
+bool LWWLanePathNeedsTreeFold(LWWTreeNode &root, const vector<PathStep> &steps) {
+	LWWTreeNode *node = &root;
+	for (auto &step : steps) {
+		if (node->has_value) {
+			return true;
+		}
+		node = FindLWWChild(*node, step);
+		if (!node) {
+			return false;
+		}
+	}
+	return !node->children.empty();
+}
+
+bool LWWStateHasLaneValues(const GroupMergeLWWState &state) {
+	for (idx_t s = 0; state.scalar_lanes && s < state.scalar_lane_count; s++) {
+		if (state.scalar_lanes[s].has_value) {
+			return true;
+		}
+	}
+	for (idx_t s = 0; state.list_lanes && s < state.list_lane_count; s++) {
+		if (state.list_lanes[s].has_value) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool LWWLanesNeedTreeFold(const GroupMergeLWWState &state, const GroupMergeLWWBindData &bind_data) {
+	if (bind_data.nested_lane_paths) {
+		return LWWStateHasLaneValues(state);
+	}
+	for (idx_t s = 0; state.scalar_lanes && s < state.scalar_lane_count; s++) {
+		if (state.scalar_lanes[s].has_value &&
+		    LWWLanePathNeedsTreeFold(*state.root, bind_data.scalar_shreds[s].steps)) {
+			return true;
+		}
+	}
+	for (idx_t s = 0; state.list_lanes && s < state.list_lane_count; s++) {
+		if (state.list_lanes[s].has_value && LWWLanePathNeedsTreeFold(*state.root, bind_data.list_shreds[s].steps)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Fold one lane's winner into a tree as the write it stands for: its row wrote objects along the path
+// and this non-object value at the end of it.
+void FoldLWWLaneValue(LWWTreeNode &root, const vector<PathStep> &steps, nonstd::string_view K,
+                      const OwnedJsonoBlob &value) {
+	LWWTreeNode *node = &root;
+	for (auto &step : steps) {
+		if (node->has_value && CompareRawBytes(node->sort_key, K) >= 0) {
+			return;
+		}
+		auto key = nonstd::string_view(step.key.data(), step.key.size());
 		auto child_idx = FindLWWChildIndex(node->children, key);
 		bool found = child_idx < node->children.size() &&
 		             CompareJsonoKeys(nonstd::string_view(node->children[child_idx].key.data(),
 		                                                  node->children[child_idx].key.size()),
 		                              key) == 0;
 		if (!found) {
-			return {};
+			node->children.insert(node->children.begin() + child_idx,
+			                      LWWObjectChild(step.key, make_uniq<LWWTreeNode>()));
 		}
 		node = node->children[child_idx].node.get();
 	}
-	return {LWWPathLookupKind::Found, node};
+	if (node->has_value) {
+		int key_cmp = CompareRawBytes(node->sort_key, K);
+		if (key_cmp > 0) {
+			return;
+		}
+		if (key_cmp == 0) {
+			if (CompareBlobValueTie(node->value, value) < 0) {
+				node->value = value;
+			}
+			return;
+		}
+	}
+	node->has_value = true;
+	AssignBytes(node->sort_key, K);
+	node->value = value;
+	PruneLWWChildren(*node, K);
+}
+
+// The group's document with the lane winners folded back in, for the plain finalize (a plain input,
+// or a shredded group the direct finalize declined). The state itself is left as it is.
+void EmitLWWStateDocument(const GroupMergeLWWState &state, const GroupMergeLWWBindData &bind_data,
+                          JsonoBuilder &builder) {
+	if (!LWWStateHasLaneValues(state)) {
+		EmitLWWRoot(*state.root, state.root_object_key, builder);
+		return;
+	}
+	auto root = CloneLWWTreeNode(*state.root);
+	OwnedJsonoBlob value;
+	for (idx_t s = 0; state.scalar_lanes && s < state.scalar_lane_count; s++) {
+		auto &lane = state.scalar_lanes[s];
+		if (!lane.has_value) {
+			continue;
+		}
+		auto &shred = bind_data.scalar_shreds[s];
+		const string *text = nullptr;
+		if (LWWScalarLaneHasText(bind_data.scalar_text_indices, s)) {
+			text = &state.scalar_texts[bind_data.scalar_text_indices[s]];
+		}
+		SerializeLWWScalarLaneToBlob(shred.type, lane.value_bits, LWWScalarTextView(text), value);
+		FoldLWWLaneValue(*root, shred.steps, LWWLaneSortKey(state, lane.sort_key_id), value);
+	}
+	JsonoBuilder list_builder;
+	for (idx_t s = 0; state.list_lanes && s < state.list_lane_count; s++) {
+		auto &lane = state.list_lanes[s];
+		if (!lane.has_value) {
+			continue;
+		}
+		auto &shred = bind_data.list_shreds[s];
+		SerializeLWWListValueToBlob(lane.value, shred.type, value, list_builder);
+		FoldLWWLaneValue(*root, shred.steps, LWWLaneSortKey(state, lane.sort_key_id), value);
+	}
+	EmitLWWRoot(*root, state.root_object_key, builder);
 }
 
 bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorFormat &state_fmt,
@@ -1882,6 +2171,12 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 	auto &scalar_text_indices = bind_data.scalar_text_indices;
 	if (!list_shreds.empty() && !bind_data.overlay_shreds.empty()) {
 		return false;
+	}
+	for (idx_t i = 0; i < count; i++) {
+		auto &state = *state_data[RowIndex(state_fmt, i)];
+		if (state.has_input && state.root && LWWLanesNeedTreeFold(state, bind_data)) {
+			return false;
+		}
 	}
 
 	JsonoBodyWriter writer;
@@ -1932,21 +2227,17 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 		if (state.list_lanes && state.list_lane_count != list_shreds.size()) {
 			throw InternalException("jsono_group_merge: list lane count changed inside one aggregate state");
 		}
-		if ((state.scalar_lanes || state.list_lanes) && state.root->kind != LWWTreeKind::Object) {
-			ThrowMixedKindConflict();
-		}
-		if (state.root->kind == LWWTreeKind::Object) {
+		// A lane value makes the root an object: LWWLanesNeedTreeFold sent a group whose root holds a
+		// value and a lane value to the plain route.
+		bool root_is_object = LWWRootIsObject(*state.root, state.root_object_key);
+		if (root_is_object) {
 			for (idx_t s = 0; s < scalar_shreds.size(); s++) {
 				auto &shred = scalar_shreds[s];
-				auto lookup = FindLWWPathNode(*state.root, shred.steps);
+				auto *node = FindLWWPathNode(*state.root, shred.steps);
 				auto *lane = FindLWWScalarLane(state, s);
 				auto *lane_text = lane ? RequireLWWScalarLaneText(state, scalar_text_indices, s) : nullptr;
-				if (lane && lookup.kind == LWWPathLookupKind::PrefixLeaf) {
-					ThrowMixedKindConflict();
-				}
-				bool found = lookup.kind == LWWPathLookupKind::Found;
-				if (lane &&
-				    (!found || CompareLWWScalarLaneToTreeLeaf(state, *lane, lane_text, shred, *lookup.node) >= 0)) {
+				bool found = node != nullptr;
+				if (lane && (!found || CompareLWWScalarLaneToTreeLeaf(state, *lane, lane_text, shred, *node) >= 0)) {
 					WriteLWWScalarLaneValue(*lane, lane_text, shred, *shred_out[shred.child], rid);
 					if (found) {
 						scalar_strip_paths.push_back(&shred.steps);
@@ -1958,7 +2249,7 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 					continue;
 				}
 				bool diverted = false;
-				if (WriteLWWScalarShredValue(*lookup.node, shred, *shred_out[shred.child], rid, diverted)) {
+				if (WriteLWWScalarShredValue(*node, shred, *shred_out[shred.child], rid, diverted)) {
 					scalar_strip_paths.push_back(&shred.steps);
 					stripped_lanes.Mark(shred.child);
 				}
@@ -1990,8 +2281,9 @@ bool JsonoGroupMergeLWWFinalizeDirectShredded(Vector &result, UnifiedVectorForma
 			}
 		}
 		std::sort(stripped_child_indices.begin(), stripped_child_indices.end());
-		EmitLWWTreeNodeWithListOverrides(*state.root, builder, scalar_strip_paths, stripped_child_indices,
-		                                 list_override_indices, list_shreds, state.list_lanes, 0);
+		EmitLWWTreeNodeWithListOverrides(*state.root, root_is_object, builder, scalar_strip_paths,
+		                                 stripped_child_indices, list_override_indices, list_shreds, state.list_lanes,
+		                                 0);
 		stamp.StampRow(rid);
 		const std::string *manifest_ptr = nullptr;
 		if (!stripped_lanes.Empty()) {
@@ -2050,7 +2342,7 @@ unique_ptr<FunctionData> JsonoGroupMergeMinBind(ClientContext &context, Aggregat
 }
 
 // Encode each row's order key into a memcmp-comparable sort-key blob, with the direction baked in
-// at bind (ASC → greatest wins, DESC → smallest wins; NULLS FIRST so a NULL key never wins).
+// at bind (ASC → greatest wins, DESC → smallest wins; NULLS FIRST so a NULL key is the oldest patch).
 void LWWMakeSortKeys(Vector &order_key, idx_t count, const GroupMergeLWWBindData &bind_data, Vector &sort_keys) {
 	CreateSortKeyHelpers::CreateSortKey(order_key, count, bind_data.modifiers, sort_keys);
 }
@@ -2169,6 +2461,7 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 				tgt.list_lanes = src.list_lanes;
 				tgt.list_lane_count = src.list_lane_count;
 				tgt.lane_sort_keys = src.lane_sort_keys;
+				tgt.root_object_key = src.root_object_key;
 				src.root = nullptr;
 				src.scalar_lanes = nullptr;
 				src.scalar_lane_count = 0;
@@ -2177,9 +2470,13 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 				src.list_lanes = nullptr;
 				src.list_lane_count = 0;
 				src.lane_sort_keys = nullptr;
+				src.root_object_key = nullptr;
 				src.has_input = false;
 			} else {
 				tgt.root = CloneLWWTreeNode(*src.root).release();
+				if (src.root_object_key) {
+					tgt.root_object_key = new string(*src.root_object_key);
+				}
 				MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices, false);
 				MergeLWWListLanes(tgt, src, list_shreds, false);
 			}
@@ -2189,17 +2486,22 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 		if (!tgt.root) {
 			throw InternalException("jsono_group_merge: missing keyed aggregate root");
 		}
+		MergeLWWTreeInto(*tgt.root, *src.root, nullptr, nullptr, destructive);
+		if (LWWKeyIsNewer(src.root_object_key, tgt.root_object_key)) {
+			if (!tgt.root_object_key) {
+				tgt.root_object_key = new string();
+			}
+			*tgt.root_object_key = *src.root_object_key;
+		}
+		DropStaleLWWRootObjectKey(tgt);
+		MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices, destructive);
+		MergeLWWListLanes(tgt, src, list_shreds, destructive);
 		if (destructive) {
-			MergeLWWTreeInto(*tgt.root, *src.root, true);
-			MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices, true);
-			MergeLWWListLanes(tgt, src, list_shreds, true);
 			delete src.root;
 			src.root = nullptr;
+			delete src.root_object_key;
+			src.root_object_key = nullptr;
 			src.has_input = false;
-		} else {
-			MergeLWWTreeInto(*tgt.root, *src.root, false);
-			MergeLWWScalarLanes(tgt, src, scalar_shreds, scalar_text_indices, false);
-			MergeLWWListLanes(tgt, src, list_shreds, false);
 		}
 	}
 	auto &bm = bind_data.buffer_manager;
@@ -2232,9 +2534,9 @@ void JsonoGroupMergeLWWCombine(Vector &source, Vector &target, AggregateInputDat
 	}
 }
 
-// Serialize each group's tree (or an empty object for an empty group) into `out`.
+// Serialize each group's document into `out` (SQL NULL for a group without input).
 void FinalizeLWWPlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMergeLWWState *const *state_data,
-                            idx_t count, idx_t base) {
+                            const GroupMergeLWWBindData &bind_data, idx_t count, idx_t base) {
 	JsonoBodyWriter writer;
 	writer.Init(out);
 	JsonoBuilder builder;
@@ -2252,7 +2554,7 @@ void FinalizeLWWPlainGroups(Vector &out, UnifiedVectorFormat &state_fmt, GroupMe
 		if (!state.root) {
 			throw InternalException("jsono_group_merge: missing keyed aggregate root");
 		}
-		EmitLWWTreeNode(*state.root, builder, 0);
+		EmitLWWStateDocument(state, bind_data, builder);
 		writer.WriteRow(rid, builder);
 	}
 }
@@ -2265,14 +2567,14 @@ void JsonoGroupMergeLWWFinalize(Vector &states, AggregateInputData &aggr_input_d
 
 	auto &bind_data = aggr_input_data.bind_data->Cast<GroupMergeLWWBindData>();
 	if (bind_data.shreds.empty()) {
-		FinalizeLWWPlainGroups(result, state_fmt, state_data, count, offset);
+		FinalizeLWWPlainGroups(result, state_fmt, state_data, bind_data, count, offset);
 		return;
 	}
 	if (JsonoGroupMergeLWWFinalizeDirectShredded(result, state_fmt, state_data, bind_data, count, offset)) {
 		return;
 	}
 	Vector plain(JsonoType(), count);
-	FinalizeLWWPlainGroups(plain, state_fmt, state_data, count, 0);
+	FinalizeLWWPlainGroups(plain, state_fmt, state_data, bind_data, count, 0);
 	Vector shredded(result.GetType(), count);
 	JsonoShredFromLayout(plain, count, bind_data.write, shredded);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
@@ -2286,7 +2588,7 @@ AggregateFunction JsonoGroupMergeKeyedFunction(const char *name, bind_aggregate_
 	                      JsonoGroupMergeLWWUpdate, JsonoGroupMergeLWWCombine, JsonoGroupMergeLWWFinalize,
 	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, JsonoGroupMergeLWWSimpleUpdate, bind,
 	                      AggregateFunction::StateDestroy<GroupMergeLWWState, GroupMergeLWWFunction>);
-	// Per-leaf conflict resolution by the key argument is commutative and associative: declaring it
+	// The fold by the key argument is commutative and associative over the keyed state: declaring it
 	// not-order-dependent lets DuckDB stream rows into Update (no ordered-aggregate row buffer).
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	return fun;
@@ -2295,7 +2597,7 @@ AggregateFunction JsonoGroupMergeKeyedFunction(const char *name, bind_aggregate_
 } // namespace
 
 void RegisterJsonoGroupMergeKeyed(ExtensionLoader &loader) {
-	// Order-independent keyed variants: the order key is an argument, conflicts resolve per leaf,
+	// Order-independent keyed variants: the order key is an argument the state keeps per path,
 	// so these are commutative/associative (no ORDER BY, no O(rows) buffering — memory O(groups)).
 	loader.RegisterFunction(JsonoGroupMergeKeyedFunction("jsono_group_merge_max", JsonoGroupMergeMaxBind));
 	loader.RegisterFunction(JsonoGroupMergeKeyedFunction("jsono_group_merge_min", JsonoGroupMergeMinBind));

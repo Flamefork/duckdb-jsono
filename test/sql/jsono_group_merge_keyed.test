@@ -234,14 +234,15 @@ FROM (
 ----
 {"a":{"b":"new","c":"keep"},"x":1,"z":2}	{"a":{"c":"keep"},"x":1,"z":2}
 
-# Stripping a nested shred must not hide a scalar/object conflict at its parent.
-statement error
-SELECT to_json(jsono_group_merge_max(j, ts)) FROM (VALUES
+# A nested shred stripped out of the residual still takes part when its parent changes kind: the
+# newer object restarts a, the older scalar loses (more kind changes: jsono_group_merge_keyed_kind_change.test).
+query II
+SELECT to_json(jsono_group_merge_max(j, ts)), to_json(jsono_group_merge_min(j, ts)) FROM (VALUES
   (jsono('{"a":{"b":"x"}}', shredding := '{"$.a.b": "VARCHAR"}'), 2),
   (jsono('{"a":5}', shredding := '{"$.a.b": "VARCHAR"}'), 1)
 ) t(j, ts);
 ----
-structurally-inconsistent
+{"a":{"b":"x"}}	{"a":5}
 
 # GROUP BY over a shredded input: each group reshreds to its own value.
 query III
@@ -341,35 +342,36 @@ FROM p;
 ----
 7	5
 
-# --- Structurally-inconsistent paths fail loud (per-leaf LWW would be order-dependent) ---
+# --- A path that changes kind between rows folds like the ordered form ---
 
-# A path that is an object in one row and a scalar in another is rejected, not silently order-
-# dependent. The ORDER BY form remains available for such data.
-statement error
+# An object, then a scalar at the same path: the newer scalar replaces it, the newer object in _min too.
+# The full matrix (arrays, ancestors, the root, equal and NULL keys, shredded lanes, windows) lives
+# in jsono_group_merge_keyed_kind_change.test.
+query II
 WITH p(j, ts) AS (VALUES
   (jsono('{"x":{"a":1}}'), 1),
   (jsono('{"x":7}'), 2))
-SELECT to_json(jsono_group_merge_max(j, ts)) FROM p;
+SELECT to_json(jsono_group_merge_max(j, ts)), to_json(jsono_group_merge_min(j, ts)) FROM p;
 ----
-order-dependent
+{"x":7}	{"x":{"a":1}}
 
-# Same rejection at the document root (object then scalar).
-statement error
+# At the document root (object then scalar).
+query II
 WITH p(j, ts) AS (VALUES
   (jsono('{"k":"x"}'), 1),
   (jsono('5'), 2))
-SELECT to_json(jsono_group_merge_max(j, ts)) FROM p;
+SELECT to_json(jsono_group_merge_max(j, ts)), to_json(jsono_group_merge_min(j, ts)) FROM p;
 ----
-order-dependent
+5	{"k":"x"}
 
-# Object vs array at the same path is the same kind of conflict.
-statement error
+# Object vs array at the same path.
+query II
 WITH p(j, ts) AS (VALUES
   (jsono('{"x":{"a":1}}'), 1),
   (jsono('{"x":[1,2]}'), 2))
-SELECT to_json(jsono_group_merge_max(j, ts)) FROM p;
+SELECT to_json(jsono_group_merge_max(j, ts)), to_json(jsono_group_merge_min(j, ts)) FROM p;
 ----
-order-dependent
+{"x":[1,2]}	{"x":{"a":1}}
 
 # --- Materialized keyed merge: a container at a scalar-shred path must not read as a silent NULL ---
 
@@ -380,8 +382,7 @@ require parquet
 # mark that shred not-complete so the materialized column does not let the optimizer bare-read the
 # NULL lane. A VARCHAR shred ($.a) and a typed BIGINT shred ($.n) both exercise it. Before the fix the
 # bare `->>` returned NULL on the container groups while to_json showed the full container.
-# One row per group keeps each group's path kind self-consistent (the keyed merge rejects a path that
-# is an object in one row and a scalar/array in another). g1: $.a is an object; g2: $.a is an array;
+# One row per group, so each group's winner is that row's value. g1: $.a is an object; g2: $.a is an array;
 # g3: $.n is an object; g4: both scalar (control). Each container sits at a scalar-shred path.
 statement ok
 CREATE TABLE gm_src AS

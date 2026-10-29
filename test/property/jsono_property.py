@@ -3,6 +3,7 @@ from decimal import Decimal
 from json import dumps as json_dumps
 from json import loads as json_loads
 from os import environ
+from random import Random
 from pathlib import Path
 from select import select
 from subprocess import PIPE
@@ -1507,6 +1508,211 @@ def test_group_merge_keyed_parity(rows: list[dict[str, Any]], data: Any) -> None
     assert keyed_max == keyed_reordered, f"order-dependent: {rows!r} -> {keyed_max!r} vs {keyed_reordered!r}"
 
 
+# Keyed group merge against an independent sequential fold (docs/adr/0001-keyed-group-merge-semantics.md):
+# rows group into one shared patch per key, patches apply in key order (NULL key first) with RFC 7396
+# and IGNORE NULLS, and paths change kind between rows — including the root and ancestors of other
+# paths. The ordered aggregate is no oracle here: in a window its Combine is wrong
+# (.scratch/ordered-merge-combine) and it keeps a member that strips to `{}`.
+KIND_ATOMS: list[Any] = [0, 1, "s", "t", True, [], [1], [1, 2]]
+# The fixed order between two non-object values written under an equal key, lowest first: it compares
+# the values' JSONO bytes, so the generator draws from a small pool and the order is pinned here.
+KIND_TIE_ORDER: list[Any] = [[], [1], [1, 2], None, True, "s", "t", 0, 1, 2]
+KIND_SPECS: list[dict[str, str] | None] = [
+    None,
+    {"$.a": "BIGINT", "$.b.a": "VARCHAR"},
+    {"$.a": "BIGINT[]", "$.b": "VARCHAR"},
+    {"$.a": "BIGINT", "$.a.b": "BIGINT"},
+    {"$.b.a.b": "BIGINT", "$.b.b": "BIGINT[]"},
+]
+_KIND_MISSING = object()
+_KIND_SQL_NULL = object()
+
+
+def kind_strip(value: Any, root: bool) -> Any:
+    if not isinstance(value, dict):
+        return value
+    out = {}
+    for key, member in value.items():
+        if member is None:
+            continue
+        stripped = kind_strip(member, False)
+        if stripped is not _KIND_MISSING:
+            out[key] = stripped
+    return out if out or root else _KIND_MISSING
+
+
+def kind_tie_winner(a: Any, b: Any) -> Any:
+    ranks = [json_dumps(value) for value in KIND_TIE_ORDER]
+    return a if ranks.index(json_dumps(a)) >= ranks.index(json_dumps(b)) else b
+
+
+def kind_shared_patch(a: Any, b: Any) -> Any:
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = dict(a)
+        for key, member in b.items():
+            out[key] = kind_shared_patch(a[key], member) if key in a else member
+        return out
+    if isinstance(a, dict):
+        return b
+    if isinstance(b, dict):
+        return a
+    return kind_tie_winner(a, b)
+
+
+def kind_apply(target: Any, patch: Any) -> Any:
+    if not isinstance(patch, dict):
+        return patch
+    out = dict(target) if isinstance(target, dict) else {}
+    for key, member in patch.items():
+        out[key] = kind_apply(out.get(key, _KIND_MISSING), member)
+    return out
+
+
+def kind_fold(rows: list[tuple[Any, int | None]], descending: bool) -> Any:
+    patches: dict[int | None, Any] = {}
+    for doc, key in rows:
+        if doc is _KIND_SQL_NULL:
+            continue
+        stripped = kind_strip(doc, True)
+        patches[key] = kind_shared_patch(patches[key], stripped) if key in patches else stripped
+    if not patches:
+        return _KIND_SQL_NULL
+    keys = sorted((key for key in patches if key is not None), reverse=descending)
+    result: Any = _KIND_MISSING
+    for key in ([None] if None in patches else []) + keys:
+        result = kind_apply(result, patches[key])
+    return result
+
+
+def kind_canonical(value: Any) -> str:
+    return "SQL NULL" if value is _KIND_SQL_NULL else json_dumps(value, sort_keys=True)
+
+
+def kind_engine(text: str | None) -> str:
+    return "SQL NULL" if text is None else json_dumps(json_loads(text), sort_keys=True)
+
+
+def kind_value_sql(doc: Any, spec: dict[str, str] | None) -> str:
+    if doc is _KIND_SQL_NULL:
+        return "NULL::VARCHAR"
+    return sql_literal(json_dumps(doc))
+
+
+def kind_jsono_sql(column: str, spec: dict[str, str] | None) -> str:
+    return f"jsono({column})" if spec is None else f"jsono({column}, shredding := {shred_spec_sql(spec)})"
+
+
+kind_members = st.sampled_from(["a", "b"])
+kind_values = st.recursive(
+    st.one_of(st.sampled_from(KIND_ATOMS), st.none(), st.just({})),
+    lambda children: st.dictionaries(kind_members, children, max_size=2),
+    max_leaves=6,
+)
+kind_docs = st.one_of(
+    st.dictionaries(kind_members, kind_values, max_size=2),
+    st.sampled_from(KIND_ATOMS),
+    st.none(),
+    st.just(_KIND_SQL_NULL),
+)
+kind_rows = st.lists(
+    st.tuples(kind_docs, st.one_of(st.none(), st.integers(min_value=0, max_value=4))),
+    min_size=1,
+    max_size=10,
+)
+
+
+def kind_rows_cte(rows: list[tuple[Any, int | None]], spec: dict[str, str] | None) -> str:
+    values = ", ".join(
+        f"({pos}, {kind_value_sql(doc, spec)}, {'NULL::INTEGER' if key is None else key})"
+        for pos, (doc, key) in enumerate(rows)
+    )
+    return f"WITH r(pos, doc, k) AS (VALUES {values}), t AS (SELECT pos, {kind_jsono_sql('doc', spec)} AS j, k FROM r)"
+
+
+@settings(PROPERTY_SETTINGS)
+@example(rows=[({"x": {"a": 1}}, 1), ({"x": 7}, 2), ({"x": {"b": 2}}, 3)], spec_index=0, data=None)
+@example(rows=[({"a": 1}, 1), (None, 2), ({"b": 2}, 3)], spec_index=0, data=None)
+@example(rows=[(5, 1), ({"a": None}, 2)], spec_index=1, data=None)
+@example(rows=[({"a": 1, "b": 2}, 1), ({"a": 2, "b": 1}, 1)], spec_index=0, data=None)
+@example(rows=[({"a": {"b": 1}}, 1), ({"a": 2}, 2), ({"a": {"b": 3}}, None)], spec_index=3, data=None)
+@given(rows=kind_rows, spec_index=st.integers(min_value=0, max_value=len(KIND_SPECS) - 1), data=st.data())
+def test_group_merge_keyed_kind_change_fold(rows: list[tuple[Any, int | None]], spec_index: int, data: Any) -> None:
+    spec = KIND_SPECS[spec_index]
+    order = list(range(len(rows))) if data is None else data.draw(st.permutations(list(range(len(rows)))))
+    cte = kind_rows_cte(rows, spec)
+    for fn, descending in (("jsono_group_merge_max", False), ("jsono_group_merge_min", True)):
+        expected = kind_canonical(kind_fold(rows, descending))
+        for direction in ("ASC", "DESC"):
+            got = SESSION.value(
+                f"({cte} SELECT coalesce(to_json({fn}(j, k))::VARCHAR, 'SQL NULL') "
+                f"FROM (SELECT * FROM t ORDER BY list_position({order}, pos) {direction}))"
+            )
+            got = "SQL NULL" if got == "SQL NULL" else kind_engine(got)
+            assert got == expected, f"{fn} spec={spec!r} feed={direction}: {rows!r} -> {got} vs {expected}"
+        # The running fold in a window combines partial states in whatever split the segment tree
+        # picks; every prefix must still match.
+        running = SESSION.value(
+            f"({cte} SELECT to_json(list(coalesce(to_json(m)::VARCHAR, 'SQL NULL') ORDER BY pos)) FROM ("
+            f"SELECT pos, {fn}(j, k) OVER (ORDER BY pos ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS m "
+            f"FROM t))"
+        )
+        assert running is not None
+        for prefix, got in enumerate(json_loads(running)):
+            want = kind_canonical(kind_fold(rows[: prefix + 1], descending))
+            got = "SQL NULL" if got == "SQL NULL" else kind_engine(got)
+            assert got == want, f"{fn} window spec={spec!r} prefix {prefix}: {rows!r} -> {got} vs {want}"
+
+
+# The same oracle over long running windows: thousands of rows per partition, so the segment tree
+# combines many partial states, with keys in an order unrelated to the window order. Seeded, not
+# hypothesis-driven — one case is already thousands of folds.
+def test_group_merge_keyed_kind_change_long_window() -> None:
+    rng = Random(7396)
+    for spec in (None, {"$.a": "BIGINT", "$.a.b": "BIGINT"}, {"$.a": "BIGINT[]", "$.b.a": "VARCHAR"}):
+        rows = [(kind_random_doc(rng), rng.choice([None] + list(range(400)))) for _ in range(2500)]
+        SESSION.statement("CREATE OR REPLACE TEMP TABLE kind_long(pos INTEGER, doc VARCHAR, k INTEGER);")
+        for start in range(0, len(rows), 100):
+            values = ", ".join(
+                f"({pos}, {kind_value_sql(doc, spec)}, {'NULL' if key is None else key})"
+                for pos, (doc, key) in enumerate(rows[start : start + 100], start)
+            )
+            SESSION.statement(f"INSERT INTO kind_long VALUES {values};")
+        samples = sorted(set(rng.sample(range(len(rows)), 25)) | {len(rows) - 1})
+        for fn, descending in (("jsono_group_merge_max", False), ("jsono_group_merge_min", True)):
+            for threads in (1, 8):
+                SESSION.statement(f"SET threads = {threads};")
+                running = SESSION.value(
+                    f"(SELECT to_json(list(coalesce(to_json(m)::VARCHAR, 'SQL NULL') ORDER BY pos)) FROM ("
+                    f"SELECT pos, {fn}({kind_jsono_sql('doc', spec)}, k) OVER "
+                    f"(ORDER BY pos ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS m FROM kind_long) "
+                    f"WHERE pos IN ({', '.join(map(str, samples))}))"
+                )
+                assert running is not None
+                for pos, got in zip(samples, json_loads(running)):
+                    want = kind_canonical(kind_fold(rows[: pos + 1], descending))
+                    got = "SQL NULL" if got == "SQL NULL" else kind_engine(got)
+                    assert got == want, f"{fn} spec={spec!r} threads={threads} prefix {pos}: {got} vs {want}"
+        SESSION.statement("RESET threads;")
+
+
+def kind_random_value(rng: Any, depth: int) -> Any:
+    roll = rng.random()
+    if depth >= 3 or roll < 0.45:
+        return rng.choice(KIND_ATOMS + [None, {}])
+    return {key: kind_random_value(rng, depth + 1) for key in rng.sample(["a", "b"], rng.randint(1, 2))}
+
+
+def kind_random_doc(rng: Any) -> Any:
+    roll = rng.random()
+    if roll < 0.03:
+        return _KIND_SQL_NULL
+    if roll < 0.06:
+        return None
+    if roll < 0.12:
+        return rng.choice(KIND_ATOMS)
+    return {key: kind_random_value(rng, 1) for key in rng.sample(["a", "b"], rng.randint(0, 2))}
+
+
 # jsono_transform parity: the shared JsonoTrieWalk path (normal edges for named fields and wildcard
 # edges for the list field) must agree, value-by-value, with two independent oracles: (A) running
 # the same spec over the SAME document once shredded and once plain (the shred-lane read and the
@@ -2031,6 +2237,8 @@ PROPERTIES = [
     test_scalar_array_auto_shred_lossless,
     test_narrowing_fails_loud,
     test_group_merge_keyed_parity,
+    test_group_merge_keyed_kind_change_fold,
+    test_group_merge_keyed_kind_change_long_window,
     test_transform_walk_parity,
     test_diff_atomic_round_trip,
     test_diff_array_multiset_laws,
